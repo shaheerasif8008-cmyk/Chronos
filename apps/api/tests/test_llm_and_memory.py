@@ -79,7 +79,6 @@ async def test_extract_and_save_filters_embeds_and_publishes(monkeypatch):
 
     saved = []
     published = []
-    audit_events = []
 
     class FakeRedis:
         async def publish(self, channel, payload):
@@ -95,22 +94,13 @@ async def test_extract_and_save_filters_embeds_and_publishes(monkeypatch):
             }
         )
 
-    async def fake_embed(text):
-        return [0.4, 0.5]
-
-    async def fake_insert_memory(entry):
-        saved.append(entry)
+    async def fake_create_memory_entry(**kwargs):
+        saved.append(kwargs)
         return "memory-1"
-
-    async def fake_audit(*args, **kwargs):
-        audit_events.append((args, kwargs))
-        return "audit-1"
 
     monkeypatch.setattr(extraction, "_redis", FakeRedis())
     monkeypatch.setattr(extraction, "complete_json", fake_complete_json)
-    monkeypatch.setattr(extraction, "embed", fake_embed)
-    monkeypatch.setattr(extraction, "_insert_memory_entry", fake_insert_memory)
-    monkeypatch.setattr(extraction.audit, "log", fake_audit)
+    monkeypatch.setattr(extraction, "create_memory_entry", fake_create_memory_entry)
 
     await extraction.extract_and_save(
         "conversation-1",
@@ -121,7 +111,16 @@ async def test_extract_and_save_filters_embeds_and_publishes(monkeypatch):
 
     assert len(saved) == 1
     assert saved[0]["content"] == "Keep this"
-    assert saved[0]["embedding"] == [0.4, 0.5]
-    assert audit_events
+    assert saved[0]["source"] == "autonomous"
+    assert saved[0]["conversation_id"] == "conversation-1"
+    assert saved[0]["created_by"] == "chronos"
     assert published[0][0] == "memories:conversation-1"
     assert published[0][1]["type"] == "memory_saved"
+
+
+def test_extract_explicit_memory_content_handles_supported_phrases():
+    from core.memory_writes import extract_explicit_memory_content
+
+    assert extract_explicit_memory_content("remember that ACME uses HubSpot") == "ACME uses HubSpot"
+    assert extract_explicit_memory_content("Please remember: Alex hates pricing-first outbound") == "Alex hates pricing-first outbound"
+    assert extract_explicit_memory_content("what do you remember?") is None

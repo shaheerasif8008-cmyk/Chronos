@@ -12,6 +12,7 @@ from core.config import settings
 from core.context import assemble_context
 from core.db import engine, reflect_table
 from core.llm import stream_completion
+from core.memory_writes import create_memory_entry, extract_explicit_memory_content
 from core.models import Member, RequesterContext
 from memory.extraction import extract_and_save
 
@@ -96,6 +97,30 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
     conversation_id = req.conversation_id or await _create_conversation(member, req.message)
     await _save_message(conversation_id, "user", req.message)
     requester_context = RequesterContext.from_member(member)
+    explicit_memory = extract_explicit_memory_content(req.message)
+
+    if explicit_memory:
+        async def explicit_stream():
+            entry_id = await create_memory_entry(
+                content=explicit_memory,
+                requester_context=requester_context,
+                source="explicit",
+                scope="org",
+                scope_id=member.organization_id,
+                importance_score=0.9,
+                conversation_id=conversation_id,
+                created_by=member.id,
+            )
+            assistant_response = f"Got it, I'll remember that: {explicit_memory}"
+            await _save_message(conversation_id, "assistant", assistant_response)
+            await audit.log("chat_response", member.id, "chat.message", resource_id=conversation_id)
+            yield f"data: {json.dumps({'type': 'conversation', 'conversation_id': conversation_id})}\n\n"
+            yield f"data: {json.dumps({'type': 'memory_saved', 'entry_id': entry_id, 'content': explicit_memory, 'scope': 'org', 'source': 'explicit'})}\n\n"
+            yield f"data: {json.dumps({'type': 'token', 'content': assistant_response})}\n\n"
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+        return StreamingResponse(explicit_stream(), media_type="text/event-stream")
+
     context = await assemble_context(conversation_id, req.message, requester_context)
 
     async def stream():

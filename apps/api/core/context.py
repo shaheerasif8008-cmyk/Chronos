@@ -1,8 +1,10 @@
 from pathlib import Path
+import asyncio
 
 from sqlalchemy import select
 
 from core import memory
+from core.config import settings
 from core.db import engine, reflect_table
 from core.models import RequesterContext
 
@@ -36,7 +38,13 @@ async def assemble_context(
     if org_context:
         base += f"\n\n# Organization Context\n{org_context}"
 
-    memories = await memory.retrieve(message, requester_context)
+    try:
+        memories = await asyncio.wait_for(
+            memory.retrieve(message, requester_context),
+            timeout=settings.memory_retrieve_timeout_seconds,
+        )
+    except (Exception, asyncio.TimeoutError):
+        memories = []
     if memories:
         base += "\n\n# What I Remember\n" + "\n".join(f"- {m.content}" for m in memories)
 

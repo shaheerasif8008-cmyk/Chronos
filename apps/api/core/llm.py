@@ -1,5 +1,6 @@
 from typing import Any
 
+import asyncio
 import litellm
 
 from core.config import settings
@@ -44,13 +45,16 @@ def _message_content(response: Any) -> str:
 
 async def stream_completion(messages: list[dict[str, str]]):
     try:
-        stream = await litellm.acompletion(
-            model=settings.local_llm_model,
-            api_base=settings.local_llm_base_url,
-            messages=messages,
-            stream=True,
+        stream = await asyncio.wait_for(
+            litellm.acompletion(
+                model=settings.local_llm_model,
+                api_base=settings.local_llm_base_url,
+                messages=messages,
+                stream=True,
+            ),
+            timeout=settings.local_llm_timeout_seconds,
         )
-    except Exception:
+    except (Exception, asyncio.TimeoutError):
         stream = await litellm.acompletion(**backup_completion_kwargs(messages, stream=True))
 
     async for chunk in stream:
