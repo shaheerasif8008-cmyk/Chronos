@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from sqlalchemy import select, update
 from sqlalchemy.sql import func
 
-from core import permissions
+from core import audit, permissions
 from core.auth import get_current_member
 from core.config import settings
 from core.db import engine, reflect_table

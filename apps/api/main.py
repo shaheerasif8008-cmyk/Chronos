@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from jobs import context_update, profile_synthesis
-from routers import auth, chat, memory
+from routers import auth, chat, connectors, memory
 
 app = FastAPI(title="Chronos API", version="0.1.0")
 
@@ -17,6 +17,7 @@ app.add_middleware(
 app.include_router(auth.router)
 app.include_router(chat.router)
 app.include_router(memory.router)
+app.include_router(connectors.router)
 
 
 @app.on_event("startup")
