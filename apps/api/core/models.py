@@ -42,9 +42,15 @@ class AgentContext(BaseModel):
 
 class MemoryEntry(BaseModel):
     id: str
+    organization_id: str = "default"
+    region: str = "us"
     content: str
     scope: str = "org"
     source: str = "stub"
+    scope_id: str = "default"
+    importance_score: float = 0.5
+    is_deleted: bool = False
+    created_by: str | None = None
 
 
 class ToolResult(BaseModel):

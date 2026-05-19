@@ -12,6 +12,12 @@ class Settings(BaseSettings):
     local_llm_base_url: str = "http://localhost:11434"
     local_llm_model: str = "llama3"
     backup_api_key: str = ""
+    backup_model: str = "openrouter/minimax/minimax-m2.5:free"
+    openrouter_api_key: str = ""
+    openrouter_model: str = "openrouter/nvidia/nemotron-3-super-120b-a12b:free"
+    openrouter_api_base: str = "https://openrouter.ai/api/v1"
+    embedding_model: str = "openrouter/nvidia/llama-nemotron-embed-vl-1b-v2:free"
+    fast_model: str = "openrouter/minimax/minimax-m2.5:free"
     jwt_secret: str = "change-me-in-dev"
     access_token_expire_minutes: int = 60
 

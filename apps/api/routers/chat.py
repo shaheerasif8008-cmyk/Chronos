@@ -11,7 +11,9 @@ from core.auth import get_current_member
 from core.config import settings
 from core.context import assemble_context
 from core.db import engine, reflect_table
+from core.llm import stream_completion
 from core.models import Member, RequesterContext
+from memory.extraction import extract_and_save
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -93,21 +95,22 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
     await permissions.check(member, "chat", req.conversation_id or "new_conversation")
     conversation_id = req.conversation_id or await _create_conversation(member, req.message)
     await _save_message(conversation_id, "user", req.message)
-    await assemble_context(conversation_id, req.message, RequesterContext.from_member(member))
+    requester_context = RequesterContext.from_member(member)
+    context = await assemble_context(conversation_id, req.message, requester_context)
 
     async def stream():
-        response = (
-            "Chronos Sprint 1 skeleton is running. "
-            "I loaded organization context, persisted this conversation, and wrote audit events."
-        )
         yield f"data: {json.dumps({'type': 'conversation', 'conversation_id': conversation_id})}\n\n"
         full = ""
-        for token in response.split(" "):
-            full += token + " "
-            yield f"data: {json.dumps({'type': 'token', 'content': token + ' '})}\n\n"
-            await asyncio.sleep(0.01)
-        await _save_message(conversation_id, "assistant", full.strip())
+        async for token in stream_completion(context):
+            full += token
+            yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+            await asyncio.sleep(0)
+        assistant_response = full.strip()
+        await _save_message(conversation_id, "assistant", assistant_response)
         await audit.log("chat_response", member.id, "chat.message", resource_id=conversation_id)
+        asyncio.create_task(
+            extract_and_save(conversation_id, req.message, assistant_response, requester_context)
+        )
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
     return StreamingResponse(stream(), media_type="text/event-stream")
