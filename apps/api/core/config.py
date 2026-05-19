@@ -22,6 +22,16 @@ class Settings(BaseSettings):
     memory_retrieve_timeout_seconds: float = 1.5
     jwt_secret: str = "change-me-in-dev"
     access_token_expire_minutes: int = 60
+    # Connector / vault
+    vault_encryption_key: str = ""   # 32-byte hex string; required outside dev
+    composio_api_key: str = ""
+    composio_callback_base_url: str = "http://localhost:8000"
+    # MinIO
+    minio_endpoint: str = "localhost:9000"
+    minio_access_key: str = "chronos"
+    minio_secret_key: str = "chronos123"
+    minio_secure: bool = False
+    minio_bucket: str = "chronos"
 
     model_config = SettingsConfigDict(env_file=(".env", "../../.env"), extra="ignore")
 
