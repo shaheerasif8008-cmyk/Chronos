@@ -1,28 +1,46 @@
 # Chronos
 
-Chronos is the project repository for the Chronos application.
+Chronos is an autonomous AI agent platform for enterprises. This checkout is set up for Phase 1, Sprint 1: skeleton, local infrastructure, OTP auth, streaming chat, conversation persistence, context loading, audit logging, and the three critical seams.
 
-## Status
-
-This repository is in its initial setup stage. Project details, installation steps, and usage instructions will be expanded as the application is implemented.
-
-## Getting Started
-
-Clone the repository:
+## Local Setup
 
 ```bash
-git clone https://github.com/shaheerasif8008-cmyk/Chronos.git
-cd Chronos
+cp .env.example .env
+docker-compose up -d
+
+cd apps/api
+python3.12 -m venv .venv  # Python 3.11 also works
+source .venv/bin/activate
+pip install -r requirements.txt
+alembic upgrade head
+python seed.py
+uvicorn main:app --reload --port 8000
 ```
 
-## Project Structure
+In another terminal:
 
-The project structure has not been finalized yet. Add source code, tests, configuration, and documentation as the application takes shape.
+```bash
+cd apps/web
+npm install
+npm run dev
+```
 
-## Development
+Open `http://localhost:3000/login`. Use `admin@example.com`; the OTP prints in the API terminal.
 
-Development instructions will be added once the technology stack and local run commands are defined.
+## Structure
 
-## License
+```text
+apps/api     FastAPI backend, migrations, auth, chat, and core seams
+apps/web     Next.js frontend for login and chat
+context      Phase 1 local organization context folder
+skills       Seed skill packs
+packages     Shared TypeScript types
+```
 
-No license has been specified yet.
+## Sprint 1 Seams
+
+- `apps/api/core/permissions.py`: `permission.check()`
+- `apps/api/core/memory.py`: `memory.retrieve()`
+- `apps/api/core/tool_broker.py`: `tool_broker.execute()`
+
+These are intentionally Phase 1 stubs with audit logging. Their signatures should not change.

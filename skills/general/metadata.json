@@ -1,0 +1,7 @@
+{
+  "id": "general",
+  "name": "General",
+  "description": "Default Chronos operating guidance for general enterprise work.",
+  "requires_connectors": [],
+  "spawns_sub_agent": false
+}

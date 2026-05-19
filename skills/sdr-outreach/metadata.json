@@ -1,0 +1,7 @@
+{
+  "id": "sdr-outreach",
+  "name": "SDR Outreach",
+  "description": "Researches leads, qualifies ICP fit, and drafts personalized outreach emails.",
+  "requires_connectors": ["gmail", "browser"],
+  "spawns_sub_agent": true
+}
