@@ -4,14 +4,17 @@ import json
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import select, update
-from sqlalchemy.sql import func
 
 from core import audit, permissions
 from core.auth import get_current_member
 from core.config import settings
-from core.db import engine, reflect_table
-from core.memory_writes import create_memory_entry, embedding_literal_for_memory, undo_autonomous_memory
+from core.memory_writes import (
+    create_memory_entry,
+    list_memory_records,
+    soft_delete_memory_entry,
+    undo_autonomous_memory,
+    update_memory_entry,
+)
 from core.models import Member, RequesterContext
 from core.redis import redis_client
 
@@ -36,31 +39,7 @@ async def list_memory(
     member: Member = Depends(get_current_member),
 ) -> list[dict]:
     await permissions.check(member, "list_memory", settings.org_id)
-    memory_entries = await reflect_table("memory_entries")
-    async with engine.begin() as conn:
-        rows = (
-            await conn.execute(
-                select(
-                    memory_entries.c.id,
-                    memory_entries.c.scope,
-                    memory_entries.c.scope_id,
-                    memory_entries.c.content,
-                    memory_entries.c.source,
-                    memory_entries.c.importance_score,
-                    memory_entries.c.created_by,
-                    memory_entries.c.created_at,
-                    memory_entries.c.updated_at,
-                )
-                .where(
-                    memory_entries.c.organization_id == member.organization_id,
-                    memory_entries.c.is_deleted.is_(False),
-                )
-                .order_by(memory_entries.c.created_at.desc())
-                .limit(limit)
-                .offset(offset)
-            )
-        ).mappings().all()
-    return [dict(row) for row in rows]
+    return await list_memory_records(member, limit=limit, offset=offset)
 
 
 @router.post("/")
@@ -81,31 +60,13 @@ async def add_memory(req: MemoryCreate, member: Member = Depends(get_current_mem
 @router.patch("/{memory_id}")
 async def update_memory(memory_id: str, req: MemoryUpdate, member: Member = Depends(get_current_member)) -> dict:
     await permissions.check(member, "update_memory", memory_id)
-    embedding = await embedding_literal_for_memory(
-        req.content,
-        actor_id=member.id,
-        action="memory.update",
-    )
-    memory_entries = await reflect_table("memory_entries")
-    async with engine.begin() as conn:
-        result = await conn.execute(
-            update(memory_entries)
-            .where(
-                memory_entries.c.id == memory_id,
-                memory_entries.c.organization_id == member.organization_id,
-                memory_entries.c.is_deleted.is_(False),
-            )
-            .values(content=req.content, embedding=embedding, updated_at=func.now())
-            .returning(memory_entries.c.id)
-        )
-        updated = result.scalar_one_or_none()
-    if updated is None:
+    if not await update_memory_entry(memory_id, req.content, member):
         raise HTTPException(status_code=404, detail="Memory not found")
     await audit.log(
         "memory_write",
         member.id,
         "memory.update",
-        resource_type="memory_entries",
+        resource_type="memory",
         resource_id=memory_id,
     )
     return {"id": memory_id}
@@ -114,26 +75,13 @@ async def update_memory(memory_id: str, req: MemoryUpdate, member: Member = Depe
 @router.delete("/{memory_id}")
 async def delete_memory(memory_id: str, member: Member = Depends(get_current_member)) -> dict:
     await permissions.check(member, "delete_memory", memory_id)
-    memory_entries = await reflect_table("memory_entries")
-    async with engine.begin() as conn:
-        result = await conn.execute(
-            update(memory_entries)
-            .where(
-                memory_entries.c.id == memory_id,
-                memory_entries.c.organization_id == member.organization_id,
-                memory_entries.c.is_deleted.is_(False),
-            )
-            .values(is_deleted=True, updated_at=func.now())
-            .returning(memory_entries.c.id)
-        )
-        deleted = result.scalar_one_or_none()
-    if deleted is None:
+    if not await soft_delete_memory_entry(memory_id, member):
         raise HTTPException(status_code=404, detail="Memory not found")
     await audit.log(
         "memory_write",
         member.id,
         "memory.delete",
-        resource_type="memory_entries",
+        resource_type="memory",
         resource_id=memory_id,
     )
     return {"id": memory_id, "deleted": True}

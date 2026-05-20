@@ -1,5 +1,6 @@
 import pytest
 import os
+import json
 
 
 os.environ["DATABASE_URL"] = "postgresql+asyncpg://chronos:chronos@localhost:5432/chronos"
@@ -182,3 +183,35 @@ async def test_startup_recovery_schedules_only_resumable_tasks(monkeypatch):
 
     assert task_ids == ["pending-task", "running-task"]
     assert scheduled == ["resume:pending-task", "resume:running-task"]
+
+
+@pytest.mark.asyncio
+async def test_demo_gmail_drafts_are_written_to_tmp_jsonl(monkeypatch, tmp_path):
+    from connectors import gmail
+
+    draft_path = tmp_path / "chronos_demo_drafts.jsonl"
+    monkeypatch.setattr(gmail, "DEMO_DRAFTS_PATH", draft_path)
+
+    result = await gmail.gmail_connector._create_demo_draft(
+        {"to": "lead@example.com", "subject": "Proof", "body": "Hello"}
+    )
+
+    assert result.summary == "Demo draft recorded: demo-draft-1"
+    assert result.data["path"] == str(draft_path)
+    lines = draft_path.read_text().splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0])["to"] == "lead@example.com"
+
+
+def test_approved_approval_without_draft_result_is_ready_for_execution():
+    from runtime.executor import approvals_ready_for_drafting
+
+    ready = approvals_ready_for_drafting(
+        [
+            {"status": "pending", "action_payload": {"to": "pending@example.com"}},
+            {"status": "approved", "action_payload": {"to": "approved@example.com"}},
+            {"status": "approved", "action_payload": {"to": "done@example.com", "draft_result": {"id": "draft-1"}}},
+        ]
+    )
+
+    assert [row["action_payload"]["to"] for row in ready] == ["approved@example.com"]

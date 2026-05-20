@@ -67,6 +67,14 @@ def _plan_steps(task: dict[str, Any]) -> list[dict[str, Any]]:
     return plan if isinstance(plan, list) else []
 
 
+def approvals_ready_for_drafting(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        row
+        for row in rows
+        if row["status"] == "approved" and not (row.get("action_payload") or {}).get("draft_result")
+    ]
+
+
 def _demo_leads() -> list[dict[str, Any]]:
     verticals = [
         "sales enablement", "revops analytics", "customer success", "usage billing", "data catalog",
@@ -243,21 +251,52 @@ class TaskExecutor:
             )
             raise _PausedForApproval()
 
-        pending = [dict(row) for row in rows if row["status"] == "pending"]
-        rejected = [dict(row) for row in rows if row["status"] == "rejected"]
+        row_dicts = [dict(row) for row in rows]
+        pending = [row for row in row_dicts if row["status"] == "pending"]
+        rejected = [row for row in row_dicts if row["status"] == "rejected"]
+        draft_results = await self._execute_approved_drafts(task, step, approvals_ready_for_drafting(row_dicts))
         if pending:
             await update_task(task["id"], status="awaiting_approval")
+            if draft_results:
+                await emit_activity(
+                    task["id"],
+                    {"type": "approved_drafts_created", "step_id": step["id"], "drafts_created": draft_results},
+                )
             raise _PausedForApproval()
         if rejected:
             return {"approved": 0, "rejected": len(rejected), "drafts_created": []}
 
+        completed_results = [
+            {"approval_id": row["id"], **row["action_payload"]["draft_result"]}
+            for row in row_dicts
+            if (row.get("action_payload") or {}).get("draft_result")
+        ]
+        return {"approved": len(row_dicts), "rejected": 0, "drafts_created": completed_results + draft_results}
+
+    async def _execute_approved_drafts(
+        self,
+        task: dict[str, Any],
+        step: dict[str, Any],
+        rows: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not rows:
+            return []
+        approvals = await reflect_table("approvals")
         draft_results = []
-        for row in rows:
-            payload = dict(row["action_payload"])
-            tool = payload.pop("tool", step.get("tool") or "gmail.draft")
-            result = await tool_broker.execute(AgentContext.from_task(task), tool, payload)
-            draft_results.append({"approval_id": row["id"], "summary": result.summary, "data": result.data})
-        return {"approved": len(rows), "rejected": 0, "drafts_created": draft_results}
+        async with engine.begin() as conn:
+            for row in rows:
+                payload = dict(row["action_payload"])
+                tool = payload.pop("tool", step.get("tool") or "gmail.draft")
+                payload.pop("batch_id", None)
+                result = await tool_broker.execute(AgentContext.from_task(task), tool, payload)
+                draft_result = {"summary": result.summary, "data": result.data}
+                await conn.execute(
+                    update(approvals)
+                    .where(approvals.c.id == row["id"])
+                    .values(action_payload={**row["action_payload"], "draft_result": draft_result})
+                )
+                draft_results.append({"approval_id": row["id"], **draft_result})
+        return draft_results
 
     async def _create_approvals(self, task: dict[str, Any], step: dict[str, Any]) -> list[str]:
         task_result = dict(task.get("result") or {})

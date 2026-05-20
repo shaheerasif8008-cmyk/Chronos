@@ -1,13 +1,13 @@
 from datetime import datetime, timedelta, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from sqlalchemy import delete, insert, select
+from sqlalchemy import select
 
 from core import audit
 from core.config import settings
 from core.db import engine, reflect_table
 from core.llm import complete_text
-from core.memory_writes import embedding_literal_for_memory
+from core.memory_writes import embedding_literal_for_memory, replace_synthesized_memory_entry
 
 scheduler = AsyncIOScheduler()
 
@@ -48,36 +48,12 @@ async def synthesize_org_profile(org_id: str = "default") -> str | None:
         actor_id="chronos",
         action="memory.synthesize_profile",
     )
-    memory_entries = await reflect_table("memory_entries")
-    async with engine.begin() as conn:
-        await conn.execute(
-            delete(memory_entries).where(
-                memory_entries.c.organization_id == org_id,
-                memory_entries.c.scope == "org",
-                memory_entries.c.source == "synthesized",
-            )
-        )
-        result = await conn.execute(
-            insert(memory_entries)
-            .values(
-                organization_id=org_id,
-                region=settings.region,
-                scope="org",
-                scope_id=org_id,
-                content=profile,
-                embedding=embedding,
-                source="synthesized",
-                importance_score=0.9,
-                created_by="chronos",
-            )
-            .returning(memory_entries.c.id)
-        )
-        entry_id = str(result.scalar_one())
+    entry_id = await replace_synthesized_memory_entry(org_id=org_id, content=profile, embedding=embedding)
     await audit.log(
         "memory_write",
         "chronos",
         "memory.synthesize_profile",
-        resource_type="memory_entries",
+        resource_type="memory",
         resource_id=entry_id,
         payload={"source": "synthesized"},
     )

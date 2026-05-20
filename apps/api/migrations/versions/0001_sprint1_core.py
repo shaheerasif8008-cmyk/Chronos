@@ -78,12 +78,41 @@ def upgrade() -> None:
     )
     op.create_index("ix_audit_log_org_created", "audit_log", ["organization_id", "created_at"])
 
-    op.execute("CREATE ROLE app_user")
-    op.execute("GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA public TO app_user")
+    op.execute(
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_user') THEN
+                CREATE ROLE app_user LOGIN PASSWORD 'chronos_app';
+            END IF;
+        END
+        $$;
+        """
+    )
+    op.execute("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_user")
     op.execute("REVOKE UPDATE, DELETE ON audit_log FROM app_user")
+    op.execute(
+        """
+        CREATE OR REPLACE FUNCTION reject_audit_log_mutation()
+        RETURNS trigger AS $$
+        BEGIN
+            RAISE EXCEPTION 'audit_log is append-only';
+        END;
+        $$ LANGUAGE plpgsql;
+        """
+    )
+    op.execute(
+        """
+        CREATE TRIGGER audit_log_append_only
+        BEFORE UPDATE OR DELETE ON audit_log
+        FOR EACH ROW EXECUTE FUNCTION reject_audit_log_mutation()
+        """
+    )
 
 
 def downgrade() -> None:
+    op.execute("DROP TRIGGER IF EXISTS audit_log_append_only ON audit_log")
+    op.execute("DROP FUNCTION IF EXISTS reject_audit_log_mutation")
     op.execute("DROP ROLE IF EXISTS app_user")
     op.drop_table("audit_log")
     op.drop_table("messages")

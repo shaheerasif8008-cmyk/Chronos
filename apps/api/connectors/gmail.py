@@ -19,6 +19,7 @@ from core.exceptions import ApprovalRequired
 from core.models import ToolResult
 
 log = logging.getLogger(__name__)
+DEMO_DRAFTS_PATH = Path("/tmp/chronos_demo_drafts.jsonl")
 
 
 def _get_composio(api_key: str):
@@ -109,14 +110,17 @@ class GmailConnector:
         return ToolResult(data=data, summary=f"Draft created: {draft_id}")
 
     async def _create_demo_draft(self, args: dict) -> ToolResult:
-        path = Path(__file__).resolve().parents[3] / "artifacts" / "demo_gmail_drafts.json"
+        path = DEMO_DRAFTS_PATH
         path.parent.mkdir(parents=True, exist_ok=True)
         existing: list[dict[str, Any]] = []
         if path.exists():
-            try:
-                existing = json.loads(path.read_text())
-            except json.JSONDecodeError:
-                existing = []
+            for line in path.read_text().splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    existing.append(json.loads(line))
+                except json.JSONDecodeError:
+                    log.warning("Skipping malformed demo draft line in %s", path)
         draft = {
             "id": f"demo-draft-{len(existing) + 1}",
             "to": args.get("to", ""),
@@ -124,8 +128,8 @@ class GmailConnector:
             "body": args.get("body", ""),
             "cc": args.get("cc", ""),
         }
-        existing.append(draft)
-        path.write_text(json.dumps(existing, indent=2))
+        with path.open("a") as handle:
+            handle.write(json.dumps(draft) + "\n")
         return ToolResult(data={"id": draft["id"], "path": str(path)}, summary=f"Demo draft recorded: {draft['id']}")
 
 

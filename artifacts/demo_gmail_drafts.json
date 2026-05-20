@@ -1,0 +1,142 @@
+[
+  {
+    "id": "demo-draft-1",
+    "to": "sales@demosaas02.example.com",
+    "subject": "Helping DemoSaaS 02 convert more sales hiring into pipeline",
+    "body": "Hi DemoSaaS 02 team,\n\nI noticed reference their recent revops analytics hiring push. Chronos helps growing B2B SaaS teams turn hiring signals, account research, and outbound drafting into an approval-ready workflow.\n\nWould it be useful to compare notes on where your sales team is spending research time today?\n\nBest,\nChronos",
+    "cc": ""
+  },
+  {
+    "id": "demo-draft-2",
+    "to": "sales@demosaas01.example.com",
+    "subject": "Helping DemoSaaS 01 convert more sales hiring into pipeline",
+    "body": "Hi DemoSaaS 01 team,\n\nI noticed reference their recent sales enablement hiring push. Chronos helps growing B2B SaaS teams turn hiring signals, account research, and outbound drafting into an approval-ready workflow.\n\nWould it be useful to compare notes on where your sales team is spending research time today?\n\nBest,\nChronos",
+    "cc": ""
+  },
+  {
+    "id": "demo-draft-3",
+    "to": "sales@demosaas03.example.com",
+    "subject": "Helping DemoSaaS 03 convert more sales hiring into pipeline",
+    "body": "Hi DemoSaaS 03 team,\n\nI noticed reference their recent customer success hiring push. Chronos helps growing B2B SaaS teams turn hiring signals, account research, and outbound drafting into an approval-ready workflow.\n\nWould it be useful to compare notes on where your sales team is spending research time today?\n\nBest,\nChronos",
+    "cc": ""
+  },
+  {
+    "id": "demo-draft-4",
+    "to": "sales@demosaas04.example.com",
+    "subject": "Helping DemoSaaS 04 convert more sales hiring into pipeline",
+    "body": "Hi DemoSaaS 04 team,\n\nI noticed reference their recent usage billing hiring push. Chronos helps growing B2B SaaS teams turn hiring signals, account research, and outbound drafting into an approval-ready workflow.\n\nWould it be useful to compare notes on where your sales team is spending research time today?\n\nBest,\nChronos",
+    "cc": ""
+  },
+  {
+    "id": "demo-draft-5",
+    "to": "sales@demosaas05.example.com",
+    "subject": "Helping DemoSaaS 05 convert more sales hiring into pipeline",
+    "body": "Hi DemoSaaS 05 team,\n\nI noticed reference their recent data catalog hiring push. Chronos helps growing B2B SaaS teams turn hiring signals, account research, and outbound drafting into an approval-ready workflow.\n\nWould it be useful to compare notes on where your sales team is spending research time today?\n\nBest,\nChronos",
+    "cc": ""
+  },
+  {
+    "id": "demo-draft-6",
+    "to": "sales@demosaas06.example.com",
+    "subject": "Helping DemoSaaS 06 convert more sales hiring into pipeline",
+    "body": "Hi DemoSaaS 06 team,\n\nI noticed reference their recent security compliance hiring push. Chronos helps growing B2B SaaS teams turn hiring signals, account research, and outbound drafting into an approval-ready workflow.\n\nWould it be useful to compare notes on where your sales team is spending research time today?\n\nBest,\nChronos",
+    "cc": ""
+  },
+  {
+    "id": "demo-draft-7",
+    "to": "sales@demosaas07.example.com",
+    "subject": "Helping DemoSaaS 07 convert more sales hiring into pipeline",
+    "body": "Hi DemoSaaS 07 team,\n\nI noticed reference their recent contract lifecycle hiring push. Chronos helps growing B2B SaaS teams turn hiring signals, account research, and outbound drafting into an approval-ready workflow.\n\nWould it be useful to compare notes on where your sales team is spending research time today?\n\nBest,\nChronos",
+    "cc": ""
+  },
+  {
+    "id": "demo-draft-8",
+    "to": "sales@demosaas08.example.com",
+    "subject": "Helping DemoSaaS 08 convert more sales hiring into pipeline",
+    "body": "Hi DemoSaaS 08 team,\n\nI noticed reference their recent hr operations hiring push. Chronos helps growing B2B SaaS teams turn hiring signals, account research, and outbound drafting into an approval-ready workflow.\n\nWould it be useful to compare notes on where your sales team is spending research time today?\n\nBest,\nChronos",
+    "cc": ""
+  },
+  {
+    "id": "demo-draft-9",
+    "to": "sales@demosaas09.example.com",
+    "subject": "Helping DemoSaaS 09 convert more sales hiring into pipeline",
+    "body": "Hi DemoSaaS 09 team,\n\nI noticed reference their recent product analytics hiring push. Chronos helps growing B2B SaaS teams turn hiring signals, account research, and outbound drafting into an approval-ready workflow.\n\nWould it be useful to compare notes on where your sales team is spending research time today?\n\nBest,\nChronos",
+    "cc": ""
+  },
+  {
+    "id": "demo-draft-10",
+    "to": "sales@demosaas10.example.com",
+    "subject": "Helping DemoSaaS 10 convert more sales hiring into pipeline",
+    "body": "Hi DemoSaaS 10 team,\n\nI noticed reference their recent support automation hiring push. Chronos helps growing B2B SaaS teams turn hiring signals, account research, and outbound drafting into an approval-ready workflow.\n\nWould it be useful to compare notes on where your sales team is spending research time today?\n\nBest,\nChronos",
+    "cc": ""
+  },
+  {
+    "id": "demo-draft-11",
+    "to": "sales@demosaas11.example.com",
+    "subject": "Helping DemoSaaS 11 convert more sales hiring into pipeline",
+    "body": "Hi DemoSaaS 11 team,\n\nI noticed reference their recent cloud cost hiring push. Chronos helps growing B2B SaaS teams turn hiring signals, account research, and outbound drafting into an approval-ready workflow.\n\nWould it be useful to compare notes on where your sales team is spending research time today?\n\nBest,\nChronos",
+    "cc": ""
+  },
+  {
+    "id": "demo-draft-12",
+    "to": "sales@demosaas12.example.com",
+    "subject": "Helping DemoSaaS 12 convert more sales hiring into pipeline",
+    "body": "Hi DemoSaaS 12 team,\n\nI noticed reference their recent identity governance hiring push. Chronos helps growing B2B SaaS teams turn hiring signals, account research, and outbound drafting into an approval-ready workflow.\n\nWould it be useful to compare notes on where your sales team is spending research time today?\n\nBest,\nChronos",
+    "cc": ""
+  },
+  {
+    "id": "demo-draft-13",
+    "to": "sales@demosaas13.example.com",
+    "subject": "Helping DemoSaaS 13 convert more sales hiring into pipeline",
+    "body": "Hi DemoSaaS 13 team,\n\nI noticed reference their recent field sales hiring push. Chronos helps growing B2B SaaS teams turn hiring signals, account research, and outbound drafting into an approval-ready workflow.\n\nWould it be useful to compare notes on where your sales team is spending research time today?\n\nBest,\nChronos",
+    "cc": ""
+  },
+  {
+    "id": "demo-draft-14",
+    "to": "sales@demosaas14.example.com",
+    "subject": "Helping DemoSaaS 14 convert more sales hiring into pipeline",
+    "body": "Hi DemoSaaS 14 team,\n\nI noticed reference their recent marketing attribution hiring push. Chronos helps growing B2B SaaS teams turn hiring signals, account research, and outbound drafting into an approval-ready workflow.\n\nWould it be useful to compare notes on where your sales team is spending research time today?\n\nBest,\nChronos",
+    "cc": ""
+  },
+  {
+    "id": "demo-draft-15",
+    "to": "sales@demosaas15.example.com",
+    "subject": "Helping DemoSaaS 15 convert more sales hiring into pipeline",
+    "body": "Hi DemoSaaS 15 team,\n\nI noticed reference their recent api monitoring hiring push. Chronos helps growing B2B SaaS teams turn hiring signals, account research, and outbound drafting into an approval-ready workflow.\n\nWould it be useful to compare notes on where your sales team is spending research time today?\n\nBest,\nChronos",
+    "cc": ""
+  },
+  {
+    "id": "demo-draft-16",
+    "to": "sales@demosaas16.example.com",
+    "subject": "Helping DemoSaaS 16 convert more sales hiring into pipeline",
+    "body": "Hi DemoSaaS 16 team,\n\nI noticed reference their recent warehouse automation hiring push. Chronos helps growing B2B SaaS teams turn hiring signals, account research, and outbound drafting into an approval-ready workflow.\n\nWould it be useful to compare notes on where your sales team is spending research time today?\n\nBest,\nChronos",
+    "cc": ""
+  },
+  {
+    "id": "demo-draft-17",
+    "to": "sales@demosaas17.example.com",
+    "subject": "Helping DemoSaaS 17 convert more sales hiring into pipeline",
+    "body": "Hi DemoSaaS 17 team,\n\nI noticed reference their recent pipeline forecasting hiring push. Chronos helps growing B2B SaaS teams turn hiring signals, account research, and outbound drafting into an approval-ready workflow.\n\nWould it be useful to compare notes on where your sales team is spending research time today?\n\nBest,\nChronos",
+    "cc": ""
+  },
+  {
+    "id": "demo-draft-18",
+    "to": "sales@demosaas18.example.com",
+    "subject": "Helping DemoSaaS 18 convert more sales hiring into pipeline",
+    "body": "Hi DemoSaaS 18 team,\n\nI noticed reference their recent enablement coaching hiring push. Chronos helps growing B2B SaaS teams turn hiring signals, account research, and outbound drafting into an approval-ready workflow.\n\nWould it be useful to compare notes on where your sales team is spending research time today?\n\nBest,\nChronos",
+    "cc": ""
+  },
+  {
+    "id": "demo-draft-19",
+    "to": "sales@demosaas19.example.com",
+    "subject": "Helping DemoSaaS 19 convert more sales hiring into pipeline",
+    "body": "Hi DemoSaaS 19 team,\n\nI noticed reference their recent partner ops hiring push. Chronos helps growing B2B SaaS teams turn hiring signals, account research, and outbound drafting into an approval-ready workflow.\n\nWould it be useful to compare notes on where your sales team is spending research time today?\n\nBest,\nChronos",
+    "cc": ""
+  },
+  {
+    "id": "demo-draft-20",
+    "to": "sales@demosaas20.example.com",
+    "subject": "Helping DemoSaaS 20 convert more sales hiring into pipeline",
+    "body": "Hi DemoSaaS 20 team,\n\nI noticed reference their recent workflow search hiring push. Chronos helps growing B2B SaaS teams turn hiring signals, account research, and outbound drafting into an approval-ready workflow.\n\nWould it be useful to compare notes on where your sales team is spending research time today?\n\nBest,\nChronos",
+    "cc": ""
+  }
+]

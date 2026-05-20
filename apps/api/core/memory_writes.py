@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import insert, select, update
+from sqlalchemy import delete, insert, select, update
+from sqlalchemy.sql import func
 
 from core import audit
 from core.config import settings
@@ -83,11 +84,104 @@ async def create_memory_entry(
         "memory_write",
         requester_context.member_id,
         f"memory.{source}",
-        resource_type="memory_entries",
+        resource_type="memory",
         resource_id=entry_id,
         payload={"source": source, "scope": scope},
     )
     return entry_id
+
+
+async def list_memory_records(member: Member, *, limit: int = 50, offset: int = 0) -> list[dict]:
+    memory_entries = await reflect_table("memory_entries")
+    async with engine.begin() as conn:
+        rows = (
+            await conn.execute(
+                select(
+                    memory_entries.c.id,
+                    memory_entries.c.scope,
+                    memory_entries.c.scope_id,
+                    memory_entries.c.content,
+                    memory_entries.c.source,
+                    memory_entries.c.importance_score,
+                    memory_entries.c.created_by,
+                    memory_entries.c.created_at,
+                    memory_entries.c.updated_at,
+                )
+                .where(
+                    memory_entries.c.organization_id == member.organization_id,
+                    memory_entries.c.is_deleted.is_(False),
+                )
+                .order_by(memory_entries.c.created_at.desc())
+                .limit(limit)
+                .offset(offset)
+            )
+        ).mappings().all()
+    return [dict(row) for row in rows]
+
+
+async def update_memory_entry(memory_id: str, content: str, member: Member) -> bool:
+    embedding = await embedding_literal_for_memory(
+        content,
+        actor_id=member.id,
+        action="memory.update",
+    )
+    memory_entries = await reflect_table("memory_entries")
+    async with engine.begin() as conn:
+        result = await conn.execute(
+            update(memory_entries)
+            .where(
+                memory_entries.c.id == memory_id,
+                memory_entries.c.organization_id == member.organization_id,
+                memory_entries.c.is_deleted.is_(False),
+            )
+            .values(content=content, embedding=embedding, updated_at=func.now())
+            .returning(memory_entries.c.id)
+        )
+        return result.scalar_one_or_none() is not None
+
+
+async def soft_delete_memory_entry(memory_id: str, member: Member) -> bool:
+    memory_entries = await reflect_table("memory_entries")
+    async with engine.begin() as conn:
+        result = await conn.execute(
+            update(memory_entries)
+            .where(
+                memory_entries.c.id == memory_id,
+                memory_entries.c.organization_id == member.organization_id,
+                memory_entries.c.is_deleted.is_(False),
+            )
+            .values(is_deleted=True, updated_at=func.now())
+            .returning(memory_entries.c.id)
+        )
+        return result.scalar_one_or_none() is not None
+
+
+async def replace_synthesized_memory_entry(*, org_id: str, content: str, embedding: str | None) -> str:
+    memory_entries = await reflect_table("memory_entries")
+    async with engine.begin() as conn:
+        await conn.execute(
+            delete(memory_entries).where(
+                memory_entries.c.organization_id == org_id,
+                memory_entries.c.scope == "org",
+                memory_entries.c.source == "synthesized",
+            )
+        )
+        result = await conn.execute(
+            insert(memory_entries)
+            .values(
+                organization_id=org_id,
+                region=settings.region,
+                scope="org",
+                scope_id=org_id,
+                content=content,
+                embedding=embedding,
+                source="synthesized",
+                importance_score=0.9,
+                created_by="chronos",
+            )
+            .returning(memory_entries.c.id)
+        )
+        return str(result.scalar_one())
 
 
 def extract_explicit_memory_content(message: str) -> str | None:
@@ -151,7 +245,7 @@ async def undo_autonomous_memory(memory_id: str, member: Member) -> bool:
         "memory_undo",
         member.id,
         "memory.undo_autonomous",
-        resource_type="memory_entries",
+        resource_type="memory",
         resource_id=memory_id,
     )
     return True

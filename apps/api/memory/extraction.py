@@ -41,7 +41,7 @@ Assistant: {assistant_response}
             "memory_extraction_error",
             requester_context.member_id,
             "memory.extract",
-            resource_type="memory_entries",
+            resource_type="memory",
             resource_id=conversation_id,
             payload={"error": str(exc)[:240]},
             decision="skipped",
