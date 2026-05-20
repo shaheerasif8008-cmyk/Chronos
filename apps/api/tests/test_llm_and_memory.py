@@ -39,6 +39,24 @@ async def test_stream_chat_completion_falls_back_after_local_failure(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_stream_chat_completion_reports_provider_unavailable(monkeypatch):
+    from core import llm
+
+    async def fake_completion(**kwargs):
+        raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(llm.litellm, "acompletion", fake_completion)
+
+    tokens = []
+    async for token in llm.stream_completion([{"role": "user", "content": "hi"}]):
+        tokens.append(token)
+
+    assert tokens == [
+        "Chronos is connected, but the AI provider is unavailable right now. The local runtime, memory, task, approval, and connector tools are still available."
+    ]
+
+
+@pytest.mark.asyncio
 async def test_embed_uses_redis_cache(monkeypatch):
     from core import embeddings
 

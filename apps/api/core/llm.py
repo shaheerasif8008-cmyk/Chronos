@@ -55,7 +55,11 @@ async def stream_completion(messages: list[dict[str, str]]):
             timeout=settings.local_llm_timeout_seconds,
         )
     except (Exception, asyncio.TimeoutError):
-        stream = await litellm.acompletion(**backup_completion_kwargs(messages, stream=True))
+        try:
+            stream = await litellm.acompletion(**backup_completion_kwargs(messages, stream=True))
+        except Exception:
+            yield "Chronos is connected, but the AI provider is unavailable right now. The local runtime, memory, task, approval, and connector tools are still available."
+            return
 
     async for chunk in stream:
         token = _choice_delta_content(chunk)

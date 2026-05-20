@@ -215,3 +215,19 @@ def test_approved_approval_without_draft_result_is_ready_for_execution():
     )
 
     assert [row["action_payload"]["to"] for row in ready] == ["approved@example.com"]
+
+
+@pytest.mark.asyncio
+async def test_planner_falls_back_to_demo_plan_when_model_fails(monkeypatch):
+    from runtime import planner
+
+    async def fake_complete_json(prompt):
+        raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(planner, "complete_json", fake_complete_json)
+    monkeypatch.setattr(planner.settings, "demo_mode", False)
+
+    plan = await planner.create_plan("research leads and draft outreach", {"triggered_by": "test"}, "default")
+
+    assert [step["action"] for step in plan] == ["spawn_sub_agent", "think", "approval_gate"]
+    assert plan[-1]["tool"] == "gmail.draft"

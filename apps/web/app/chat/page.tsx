@@ -34,6 +34,11 @@ type Task = { id: string; status: string; goal: string; current_step: number; pl
 type TaskStep = { id: string; action: string; description: string; tool?: string | null; args?: Record<string, unknown>; approval_required?: boolean; depends_on?: string[] };
 type ActivityEvent = { type: string; task_id?: string; ts?: string; step?: TaskStep; step_index?: number; result?: unknown; error?: string; approval_ids?: string[]; sub_task_id?: string; event?: ActivityEvent };
 type Approval = { id: string; task_id: string; step_id: string; action_type: string; action_payload: Record<string, unknown>; requested_at?: string; status: string };
+type MessageActionHandlers = {
+  onRetry: () => void;
+  onCreateTask: () => void;
+  onSaveMemory: () => void;
+};
 
 const ORG = {
   name: "Chronos workspace",
@@ -346,7 +351,9 @@ function ChatScreen({ activeConversation, onConversationCreated, onTaskCreated }
             setMessages((prev) => {
               const next = [...prev];
               const last = next[next.length - 1];
-              if (last?.role === "assistant") last.content += eventData.content;
+              if (last?.role === "assistant") {
+                next[next.length - 1] = { ...last, content: `${last.content}${eventData.content}` };
+              }
               return next;
             });
           }
@@ -354,7 +361,15 @@ function ChatScreen({ activeConversation, onConversationCreated, onTaskCreated }
             setMessages((prev) => {
               const next = [...prev];
               const last = next[next.length - 1];
-              if (last?.role === "assistant" && !last.content) last.content = `Memory saved: ${eventData.content}`;
+              if (last?.role === "assistant") {
+                next[next.length - 1] = {
+                  ...last,
+                  memory_refs: [
+                    ...(last.memory_refs || []),
+                    { id: eventData.entry_id, label: "Saved memory" },
+                  ],
+                };
+              }
               return next;
             });
           }
@@ -364,7 +379,10 @@ function ChatScreen({ activeConversation, onConversationCreated, onTaskCreated }
               const next = [...prev];
               const last = next[next.length - 1];
               if (last?.role === "assistant") {
-                last.content = `${last.content.trim() || "I started this as an autonomous task."}\n\nTask created: ${eventData.task_id}`;
+                next[next.length - 1] = {
+                  ...last,
+                  content: `${last.content.trim() || "I started this as an autonomous task."}\n\nTask created: ${eventData.task_id}`,
+                };
               }
               return next;
             });
@@ -377,7 +395,7 @@ function ChatScreen({ activeConversation, onConversationCreated, onTaskCreated }
           const next = [...prev];
           const last = next[next.length - 1];
           if (last?.role === "assistant") {
-            last.status = "paused";
+            next[next.length - 1] = { ...last, status: "paused" };
           }
           return next;
         });
@@ -402,6 +420,49 @@ function ChatScreen({ activeConversation, onConversationCreated, onTaskCreated }
     streamAbortRef.current?.abort();
   }
 
+  async function createTaskFromMessage(message: Message) {
+    const goal = message.content.trim();
+    if (!goal) return;
+    setError("");
+    try {
+      const data = (await (await apiFetch("/tasks/", {
+        method: "POST",
+        body: JSON.stringify({ goal, conversation_id: activeConversation }),
+      })).json()) as { task_id: string };
+      onTaskCreated(data.task_id);
+      setMessages((prev) => prev.map((item) => item === message ? {
+        ...item,
+        artifacts: [
+          ...(item.artifacts || inferredArtifacts(item)),
+          { id: data.task_id, label: `Task ${data.task_id.slice(0, 8)}` },
+        ],
+      } : item));
+    } catch (exc) {
+      setError(humanizeError(exc));
+    }
+  }
+
+  async function saveMessageToMemory(message: Message) {
+    const content = message.content.trim();
+    if (!content) return;
+    setError("");
+    try {
+      const data = (await (await apiFetch("/memory/", {
+        method: "POST",
+        body: JSON.stringify({ content, scope: "org" }),
+      })).json()) as { id: string };
+      setMessages((prev) => prev.map((item) => item === message ? {
+        ...item,
+        memory_refs: [
+          ...(item.memory_refs || inferredMemoryRefs(item)),
+          { id: data.id, label: "Saved memory" },
+        ],
+      } : item));
+    } catch (exc) {
+      setError(humanizeError(exc));
+    }
+  }
+
   return (
     <div className="flex h-full">
       <div className="flex min-w-0 flex-1 flex-col">
@@ -416,7 +477,16 @@ function ChatScreen({ activeConversation, onConversationCreated, onTaskCreated }
         </header>
         {error ? <div className="border-b border-red-200 bg-red-50 px-6 py-2 text-sm text-red-700">{error}</div> : null}
         <div className="flex-1 overflow-auto px-6 py-10">
-          {messages.length === 0 ? <EmptyChat /> : <Thread messages={messages} onRetry={retryResponse} />}
+          {messages.length === 0 ? (
+            <EmptyChat />
+          ) : (
+            <Thread
+              messages={messages}
+              onRetry={retryResponse}
+              onCreateTask={createTaskFromMessage}
+              onSaveMemory={saveMessageToMemory}
+            />
+          )}
         </div>
         <Composer value={draft} setValue={setDraft} onSubmit={send} disabled={isStreaming} isStreaming={isStreaming} onStop={stopStreaming} />
       </div>
@@ -437,7 +507,17 @@ function EmptyChat() {
   );
 }
 
-function Thread({ messages, onRetry }: { messages: Message[]; onRetry: (index: number) => void }) {
+function Thread({
+  messages,
+  onRetry,
+  onCreateTask,
+  onSaveMemory,
+}: {
+  messages: Message[];
+  onRetry: (index: number) => void;
+  onCreateTask: (message: Message) => void;
+  onSaveMemory: (message: Message) => void;
+}) {
   async function copyResponse(content: string) {
     if (!content) return;
     await navigator.clipboard.writeText(content);
@@ -458,7 +538,11 @@ function Thread({ messages, onRetry }: { messages: Message[]; onRetry: (index: n
             {message.role === "assistant" && message.content ? (
               <MessageControls
                 onCopy={() => copyResponse(message.content)}
-                onRetry={() => onRetry(index)}
+                actions={{
+                  onRetry: () => onRetry(index),
+                  onCreateTask: () => onCreateTask(message),
+                  onSaveMemory: () => onSaveMemory(message),
+                }}
               />
             ) : null}
           </div>
@@ -529,31 +613,19 @@ function MessageOperationalDetails({ message }: { message: Message }) {
   );
 }
 
-function ActionSuggestions({ onRetry }: { onRetry: () => void }) {
-  const suggestions: Array<[string, string]> = [
-    ["plus", "Create task"],
-    ["memory", "Save to memory"],
-    ["workflow", "Turn into workflow"],
-    ["assistants", "Assign employee"],
-    ["artifact", "Generate report"],
-    ["approvals", "Request approval"],
+function ActionSuggestions({ actions }: { actions: MessageActionHandlers }) {
+  const suggestions: Array<[string, string, () => void]> = [
+    ["plus", "Create task", actions.onCreateTask],
+    ["memory", "Save to memory", actions.onSaveMemory],
   ];
   return (
     <div className="message-actions-menu" role="menu" aria-label="Message actions">
-      <button onClick={onRetry} className="message-menu-item" type="button" role="menuitem">
+      <button onClick={actions.onRetry} className="message-menu-item" type="button" role="menuitem">
         <Icon name="retry" className="h-3.5 w-3.5" />
         Retry response
       </button>
-      <button className="message-menu-item" type="button" role="menuitem">
-        <Icon name="branch" className="h-3.5 w-3.5" />
-        Branch conversation
-      </button>
-      <button className="message-menu-item" type="button" role="menuitem">
-        <Icon name="pin" className="h-3.5 w-3.5" />
-        Pin output
-      </button>
-      {suggestions.map(([icon, label]) => (
-        <button key={label} className="message-menu-item" type="button" role="menuitem">
+      {suggestions.map(([icon, label, onClick]) => (
+        <button key={label} onClick={onClick} className="message-menu-item" type="button" role="menuitem">
           <Icon name={icon} className="h-3.5 w-3.5" />
           {label}
         </button>
@@ -562,7 +634,7 @@ function ActionSuggestions({ onRetry }: { onRetry: () => void }) {
   );
 }
 
-function MessageControls({ onCopy, onRetry }: { onCopy: () => void; onRetry: () => void }) {
+function MessageControls({ onCopy, actions }: { onCopy: () => void; actions: MessageActionHandlers }) {
   return (
     <div className="mt-3 flex items-start gap-1">
       <button onClick={onCopy} className="rounded-md p-1.5 text-stone-500 hover:bg-stone-100 dark:hover:bg-stone-800" aria-label="Copy response" title="Copy response">
@@ -573,7 +645,7 @@ function MessageControls({ onCopy, onRetry }: { onCopy: () => void; onRetry: () 
           <Icon name="more" />
           <span>Actions</span>
         </summary>
-        <ActionSuggestions onRetry={onRetry} />
+        <ActionSuggestions actions={actions} />
       </details>
     </div>
   );
