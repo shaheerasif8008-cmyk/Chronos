@@ -6,8 +6,8 @@ from sqlalchemy import delete, insert, select
 from core import audit
 from core.config import settings
 from core.db import engine, reflect_table
-from core.embeddings import embed
 from core.llm import complete_text
+from core.memory_writes import embedding_literal_for_memory
 
 scheduler = AsyncIOScheduler()
 
@@ -43,8 +43,11 @@ async def synthesize_org_profile(org_id: str = "default") -> str | None:
     if not profile:
         return None
 
-    vector = await embed(profile)
-    vector_literal = "[" + ",".join(str(value) for value in vector) + "]"
+    embedding = await embedding_literal_for_memory(
+        profile,
+        actor_id="chronos",
+        action="memory.synthesize_profile",
+    )
     memory_entries = await reflect_table("memory_entries")
     async with engine.begin() as conn:
         await conn.execute(
@@ -62,7 +65,7 @@ async def synthesize_org_profile(org_id: str = "default") -> str | None:
                 scope="org",
                 scope_id=org_id,
                 content=profile,
-                embedding=vector_literal,
+                embedding=embedding,
                 source="synthesized",
                 importance_score=0.9,
                 created_by="chronos",

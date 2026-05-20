@@ -8,9 +8,40 @@ from core.db import engine, reflect_table
 from core.embeddings import embed
 from core.models import Member, RequesterContext
 
+EXPECTED_EMBEDDING_DIMENSIONS = 1536
+
 
 def vector_literal(vector: list[float]) -> str:
     return "[" + ",".join(str(value) for value in vector) + "]"
+
+
+async def embedding_literal_for_memory(content: str, *, actor_id: str, action: str) -> str | None:
+    try:
+        vector = await embed(content)
+    except Exception as exc:
+        await audit.log(
+            "memory_embedding_skipped",
+            actor_id,
+            action,
+            resource_type="memory_entries",
+            payload={"error": str(exc)[:240]},
+            decision="embedding_failed",
+        )
+        return None
+    if len(vector) != EXPECTED_EMBEDDING_DIMENSIONS:
+        await audit.log(
+            "memory_embedding_skipped",
+            actor_id,
+            action,
+            resource_type="memory_entries",
+            payload={
+                "expected_dimensions": EXPECTED_EMBEDDING_DIMENSIONS,
+                "actual_dimensions": len(vector),
+            },
+            decision="dimension_mismatch",
+        )
+        return None
+    return vector_literal(vector)
 
 
 async def create_memory_entry(
@@ -24,7 +55,11 @@ async def create_memory_entry(
     conversation_id: str | None = None,
     created_by: str | None = None,
 ) -> str:
-    vector = await embed(content)
+    embedding = await embedding_literal_for_memory(
+        content,
+        actor_id=requester_context.member_id,
+        action=f"memory.{source}",
+    )
     memory_entries = await reflect_table("memory_entries")
     async with engine.begin() as conn:
         result = await conn.execute(
@@ -35,7 +70,7 @@ async def create_memory_entry(
                 scope=scope,
                 scope_id=scope_id or requester_context.org_id,
                 content=content,
-                embedding=vector_literal(vector),
+                embedding=embedding,
                 source=source,
                 source_conversation_id=conversation_id,
                 importance_score=importance_score,

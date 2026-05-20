@@ -124,3 +124,86 @@ def test_extract_explicit_memory_content_handles_supported_phrases():
     assert extract_explicit_memory_content("remember that ACME uses HubSpot") == "ACME uses HubSpot"
     assert extract_explicit_memory_content("Please remember: Alex hates pricing-first outbound") == "Alex hates pricing-first outbound"
     assert extract_explicit_memory_content("what do you remember?") is None
+
+
+def test_memory_router_has_audit_available_for_mutations():
+    from routers import memory
+
+    assert memory.audit.log
+
+
+def test_apply_context_suggestion_appends_patch_to_org_context(tmp_path):
+    from routers.context import apply_context_patch
+
+    org_path = tmp_path / "context" / "default" / "org.md"
+    org_path.parent.mkdir(parents=True)
+    org_path.write_text("# Org\nExisting fact.\n")
+
+    result = apply_context_patch(org_path, "- New approved fact.")
+
+    assert result == "# Org\nExisting fact.\n\n- New approved fact.\n"
+    assert org_path.read_text() == result
+
+
+@pytest.mark.asyncio
+async def test_memory_embedding_literal_returns_none_for_wrong_dimension(monkeypatch):
+    from core import memory_writes
+
+    audit_events = []
+
+    async def fake_embed(content):
+        return [0.1] * 2048
+
+    async def fake_audit_log(*args, **kwargs):
+        audit_events.append((args, kwargs))
+
+    monkeypatch.setattr(memory_writes, "embed", fake_embed)
+    monkeypatch.setattr(memory_writes.audit, "log", fake_audit_log)
+
+    literal = await memory_writes.embedding_literal_for_memory(
+        "i have a dog",
+        actor_id="member-1",
+        action="memory.explicit",
+    )
+
+    assert literal is None
+    assert audit_events[0][0][0] == "memory_embedding_skipped"
+    assert audit_events[0][1]["decision"] == "dimension_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_memory_retrieve_falls_back_to_recent_memories_on_embedding_dimension_mismatch(monkeypatch):
+    from core import memory
+    from core.models import RequesterContext
+
+    audit_events = []
+
+    async def fake_embed(query):
+        return [0.1] * 2048
+
+    async def fake_recent(requester_context, *, decision):
+        assert requester_context.org_id == "default"
+        assert decision == "dimension_mismatch"
+        return [
+            memory.MemoryEntry(
+                id="memory-1",
+                organization_id="default",
+                region="us",
+                content="i have a dog",
+                scope="org",
+                scope_id="default",
+                source="explicit",
+            )
+        ]
+
+    async def fake_audit_log(*args, **kwargs):
+        audit_events.append((args, kwargs))
+
+    monkeypatch.setattr(memory, "embed", fake_embed)
+    monkeypatch.setattr(memory, "_retrieve_recent_memories", fake_recent)
+    monkeypatch.setattr(memory.audit, "log", fake_audit_log)
+
+    results = await memory.retrieve("what do you remember about my pet?", RequesterContext(member_id="member-1"))
+
+    assert [entry.content for entry in results] == ["i have a dog"]
+    assert audit_events[0][1]["decision"] == "dimension_mismatch"

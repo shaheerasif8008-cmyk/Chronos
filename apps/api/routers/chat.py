@@ -4,7 +4,7 @@ import json
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import insert, select, update
+from sqlalchemy import delete, insert, select, update
 
 from core import audit, permissions
 from core.auth import get_current_member
@@ -89,6 +89,35 @@ async def list_messages(conversation_id: str, member: Member = Depends(get_curre
             )
         ).mappings().all()
     return [dict(row) for row in rows]
+
+
+@router.delete("/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str, member: Member = Depends(get_current_member)) -> dict:
+    await permissions.check(member, "delete_conversation", conversation_id)
+    conversations = await reflect_table("conversations")
+    messages = await reflect_table("messages")
+    async with engine.begin() as conn:
+        row = (
+            await conn.execute(
+                select(conversations.c.id).where(
+                    conversations.c.id == conversation_id,
+                    conversations.c.member_id == member.id,
+                    conversations.c.organization_id == member.organization_id,
+                )
+            )
+        ).first()
+        if row is None:
+            return {"id": conversation_id, "deleted": False}
+        await conn.execute(delete(messages).where(messages.c.conversation_id == conversation_id))
+        await conn.execute(delete(conversations).where(conversations.c.id == conversation_id))
+    await audit.log(
+        "conversation_deleted",
+        member.id,
+        "chat.delete_conversation",
+        resource_type="conversations",
+        resource_id=conversation_id,
+    )
+    return {"id": conversation_id, "deleted": True}
 
 
 @router.post("/message")

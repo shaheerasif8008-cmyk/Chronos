@@ -11,8 +11,7 @@ from core import audit, permissions
 from core.auth import get_current_member
 from core.config import settings
 from core.db import engine, reflect_table
-from core.embeddings import embed
-from core.memory_writes import create_memory_entry, undo_autonomous_memory, vector_literal
+from core.memory_writes import create_memory_entry, embedding_literal_for_memory, undo_autonomous_memory
 from core.models import Member, RequesterContext
 from core.redis import redis_client
 
@@ -82,7 +81,11 @@ async def add_memory(req: MemoryCreate, member: Member = Depends(get_current_mem
 @router.patch("/{memory_id}")
 async def update_memory(memory_id: str, req: MemoryUpdate, member: Member = Depends(get_current_member)) -> dict:
     await permissions.check(member, "update_memory", memory_id)
-    vector = await embed(req.content)
+    embedding = await embedding_literal_for_memory(
+        req.content,
+        actor_id=member.id,
+        action="memory.update",
+    )
     memory_entries = await reflect_table("memory_entries")
     async with engine.begin() as conn:
         result = await conn.execute(
@@ -92,7 +95,7 @@ async def update_memory(memory_id: str, req: MemoryUpdate, member: Member = Depe
                 memory_entries.c.organization_id == member.organization_id,
                 memory_entries.c.is_deleted.is_(False),
             )
-            .values(content=req.content, embedding=vector_literal(vector), updated_at=func.now())
+            .values(content=req.content, embedding=embedding, updated_at=func.now())
             .returning(memory_entries.c.id)
         )
         updated = result.scalar_one_or_none()

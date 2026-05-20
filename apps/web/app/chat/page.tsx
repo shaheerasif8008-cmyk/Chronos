@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, ReactNode, useEffect, useState } from "react";
+import { FormEvent, KeyboardEvent, ReactNode, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
@@ -54,6 +54,7 @@ function Icon({ name, className = "h-4 w-4" }: { name: string; className?: strin
     send: <path d="M4 12 20 5l-6 16-3-7z" />,
     edit: <path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" />,
     trash: <><path d="M3 6h18" /><path d="M8 6V4h8v2M6 6l1 15h10l1-15" /></>,
+    more: <><circle cx="5" cy="12" r="1" /><circle cx="12" cy="12" r="1" /><circle cx="19" cy="12" r="1" /></>,
   };
   return <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
 }
@@ -77,6 +78,7 @@ export default function ChronosApp() {
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("account");
   const [activeConversation, setActiveConversation] = useState<string | null>(null);
   const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [conversationMenu, setConversationMenu] = useState<string | null>(null);
   const [accountOpen, setAccountOpen] = useState(false);
   const [theme, setTheme] = useState<"light" | "dark">("light");
   const [error, setError] = useState("");
@@ -116,6 +118,18 @@ export default function ChronosApp() {
     router.replace("/login");
   }
 
+  async function deleteConversation(conversationId: string) {
+    setError("");
+    try {
+      await apiFetch(`/chat/conversations/${conversationId}`, { method: "DELETE" });
+      setConversationMenu(null);
+      setConversations((current) => current.filter((conversation) => conversation.id !== conversationId));
+      if (activeConversation === conversationId) setActiveConversation(null);
+    } catch (exc) {
+      setError(exc instanceof Error ? exc.message : "Unable to delete conversation");
+    }
+  }
+
   const nav: Array<[Route, string, string, number]> = [
     ["activity", "Activity", "activity", 0],
     ["approvals", "Approvals", "approvals", 0],
@@ -151,9 +165,25 @@ export default function ChronosApp() {
           <h3 className="px-2 py-1 text-[11.5px] font-medium uppercase tracking-wider" style={{ color: "var(--text-dim)" }}>Conversations</h3>
           {conversations.length === 0 ? <p className="px-2 py-2 text-[13.5px]" style={{ color: "var(--text-dim)" }}>No conversations yet.</p> : null}
           {conversations.map((conversation) => (
-            <button key={conversation.id} onClick={() => { setRoute("chat"); setActiveConversation(conversation.id); }} className={`convo-row w-full ${route === "chat" && activeConversation === conversation.id ? "active" : ""}`}>
-              {conversation.title || "Untitled conversation"}
-            </button>
+            <div key={conversation.id} className="group relative">
+              <button onClick={() => { setRoute("chat"); setActiveConversation(conversation.id); setConversationMenu(null); }} className={`convo-row w-full pr-9 ${route === "chat" && activeConversation === conversation.id ? "active" : ""}`}>
+                {conversation.title || "Untitled conversation"}
+              </button>
+              <button
+                onClick={(event) => { event.stopPropagation(); setConversationMenu((current) => current === conversation.id ? null : conversation.id); }}
+                className="absolute right-1 top-1/2 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-md text-stone-500 opacity-0 hover:bg-stone-100 group-hover:opacity-100 dark:hover:bg-stone-800"
+                aria-label="Conversation actions"
+              >
+                <Icon name="more" />
+              </button>
+              {conversationMenu === conversation.id ? (
+                <div className="surface absolute right-1 top-8 z-30 w-36 overflow-hidden rounded-lg border shadow-lg" style={{ borderColor: "var(--border)" }}>
+                  <button onClick={() => deleteConversation(conversation.id)} className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-red-600 hover:bg-red-50 dark:hover:bg-stone-800">
+                    <Icon name="trash" /> Delete chat
+                  </button>
+                </div>
+              ) : null}
+            </div>
           ))}
         </div>
         <div className="relative border-t hairline p-2">
@@ -243,6 +273,11 @@ function ChatScreen({ activeConversation, onConversationCreated }: { activeConve
         headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({ message, conversation_id: activeConversation }),
       });
+      if (res.status === 401) {
+        localStorage.removeItem("chronos_token");
+        window.location.href = "/login";
+        return;
+      }
       if (!res.ok || !res.body) throw new Error(await res.text());
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
@@ -277,7 +312,7 @@ function ChatScreen({ activeConversation, onConversationCreated }: { activeConve
         }
       }
     } catch (exc) {
-      setError(exc instanceof Error ? exc.message : "Message failed");
+      setError(humanizeError(exc));
       setMessages((prev) => prev.slice(0, -1));
     } finally {
       setIsStreaming(false);
@@ -335,11 +370,29 @@ function Thread({ messages }: { messages: Message[] }) {
   );
 }
 
+function humanizeError(error: unknown) {
+  const message = error instanceof Error ? error.message : "Message failed";
+  try {
+    const parsed = JSON.parse(message) as { detail?: string };
+    if (parsed.detail === "Invalid bearer token" || parsed.detail === "Missing bearer token") return "Your session expired. Sign in again.";
+    return parsed.detail ?? message;
+  } catch {
+    return message;
+  }
+}
+
 function Composer({ value, setValue, onSubmit, disabled }: { value: string; setValue: (value: string) => void; onSubmit: (event: FormEvent) => void; disabled: boolean }) {
+  function handleKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      event.currentTarget.form?.requestSubmit();
+    }
+  }
+
   return (
     <form onSubmit={onSubmit} className="border-t hairline p-4" style={{ background: "var(--bg)" }}>
       <div className="composer-shell relative mx-auto max-w-4xl p-3">
-        <textarea value={value} onChange={(event) => setValue(event.target.value)} placeholder="Message Chronos..." className="min-h-16 w-full resize-none bg-transparent px-2 text-[15px] outline-none" />
+        <textarea value={value} onChange={(event) => setValue(event.target.value)} onKeyDown={handleKeyDown} placeholder="Message Chronos..." className="min-h-16 w-full resize-none bg-transparent px-2 text-[15px] outline-none" />
         <div className="flex items-center justify-end">
           <button className="flex h-9 w-9 items-center justify-center rounded-full text-white disabled:opacity-40" style={{ background: "var(--text)", color: "var(--bg)" }} disabled={!value.trim() || disabled}><Icon name="send" /></button>
         </div>
