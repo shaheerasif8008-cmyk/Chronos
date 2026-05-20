@@ -9,7 +9,24 @@ type Route = "chat" | "activity" | "approvals" | "memory" | "connectors" | "assi
 type ActivityMode = "jobs" | "actions";
 type SettingsTab = "account" | "preferences" | "workspace" | "notifications" | "audit";
 type Conversation = { id: string; title: string | null; updated_at?: string; created_at?: string };
-type Message = { id?: string; role: "user" | "assistant" | "system" | "tool"; content: string; status?: "paused" };
+type MessageRole = "user" | "assistant" | "system" | "tool";
+type MessageStatus = "streaming" | "complete" | "paused" | "approval_pending" | "error";
+type Message = {
+  id?: string;
+  role: MessageRole;
+  content: string;
+  status?: MessageStatus;
+  created_at?: string;
+  runtime_source?: string;
+  persona_source?: string;
+  tool_traces?: ToolTrace[];
+  citations?: ReferenceItem[];
+  memory_refs?: ReferenceItem[];
+  artifacts?: ReferenceItem[];
+  approval_state?: string;
+};
+type ToolTrace = { id: string; tool: string; summary: string; status: MessageStatus };
+type ReferenceItem = { id: string; label: string; href?: string };
 type MemoryEntry = { id: string; scope: string; scope_id: string; content: string; source: string; created_by?: string | null };
 type Connector = { id: string; provider: string; account_handle?: string | null; status: string; connected_at?: string | null; last_used_at?: string | null };
 type ConnectorProof = { connectorId: string; status: string; detail: string; tool?: string | null };
@@ -52,7 +69,9 @@ function Icon({ name, className = "h-4 w-4" }: { name: string; className?: strin
     logo: <><circle cx="12" cy="12" r="8" /><path d="M12 7v5l3 2" /></>,
     plus: <><path d="M12 5v14M5 12h14" /></>,
     activity: <path d="M4 12h4l2-6 4 12 2-6h4" />,
+    artifact: <><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z" /><path d="M14 2v6h6" /></>,
     approvals: <><rect x="4" y="5" width="16" height="14" rx="2" /><path d="M4 9h16" /></>,
+    branch: <><path d="M6 3v6a3 3 0 0 0 3 3h6" /><path d="M15 7l4 5-4 5" /><path d="M6 21v-6" /></>,
     memory: <><path d="M7 10c0-4 3-7 7-7s7 3 7 7v7a3 3 0 0 1-3 3H9a3 3 0 0 1-3-3" /><path d="M10 10h6M10 14h5" /></>,
     connectors: <><path d="M8 3v5M16 3v5M6 8h12v3a6 6 0 0 1-12 0z" /><path d="M12 17v4" /></>,
     assistants: <><circle cx="12" cy="8" r="4" /><path d="M4 21c0-4 3.5-7 8-7s8 3 8 7" /></>,
@@ -63,6 +82,8 @@ function Icon({ name, className = "h-4 w-4" }: { name: string; className?: strin
     trash: <><path d="M3 6h18" /><path d="M8 6V4h8v2M6 6l1 15h10l1-15" /></>,
     copy: <><rect x="9" y="9" width="10" height="10" rx="2" /><path d="M5 15V5h10" /></>,
     retry: <><path d="M20 12a8 8 0 1 1-2.3-5.7" /><path d="M20 4v6h-6" /></>,
+    pin: <><path d="M12 17v5" /><path d="m5 17 7-14 7 14Z" /></>,
+    workflow: <><rect x="3" y="4" width="6" height="6" rx="1.5" /><rect x="15" y="4" width="6" height="6" rx="1.5" /><rect x="9" y="15" width="6" height="6" rx="1.5" /><path d="M9 7h6M12 10v5" /></>,
     more: <><circle cx="5" cy="12" r="1" /><circle cx="12" cy="12" r="1" /><circle cx="19" cy="12" r="1" /></>,
   };
   return <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
@@ -423,29 +444,175 @@ function Thread({ messages, onRetry }: { messages: Message[]; onRetry: (index: n
   }
 
   return (
-    <div className="mx-auto max-w-3xl space-y-10">
+    <div className="mx-auto max-w-4xl space-y-5">
       {messages.map((message, index) => (
-        <article key={message.id ?? index} className="flex gap-4">
-          <Avatar label={message.role === "user" ? "You" : "Chronos"} />
+        <article key={message.id ?? index} className="message-block">
+          <Avatar label={message.role === "user" ? "You" : "Chronos"} color={message.role === "user" ? "#5f6d7a" : "#d37a36"} />
           <div className="min-w-0 flex-1">
-            <p className="mb-1 text-sm font-semibold">{message.role === "user" ? "You" : "Chronos"}</p>
-            {message.content ? <p className="prose-body whitespace-pre-wrap">{message.content}</p> : <TypingDots />}
-            {message.status === "paused" ? <p className="mt-2 text-xs" style={{ color: "var(--text-dim)" }}>Chat response paused</p> : null}
+            <MessageHeader message={message} />
+            <div className="mt-3">
+              {message.content ? <p className="prose-body whitespace-pre-wrap">{message.content}</p> : <TypingDots />}
+              {message.status === "paused" ? <p className="mt-2 text-xs" style={{ color: "var(--text-dim)" }}>Chat response paused</p> : null}
+            </div>
+            <MessageOperationalDetails message={message} />
             {message.role === "assistant" && message.content ? (
-              <div className="mt-3 flex gap-1">
-                <button onClick={() => copyResponse(message.content)} className="rounded-md p-1.5 text-stone-500 hover:bg-stone-100 dark:hover:bg-stone-800" aria-label="Copy response" title="Copy response">
-                  <Icon name="copy" />
-                </button>
-                <button onClick={() => onRetry(index)} className="rounded-md p-1.5 text-stone-500 hover:bg-stone-100 dark:hover:bg-stone-800" aria-label="Retry response" title="Retry response">
-                  <Icon name="retry" />
-                </button>
-              </div>
+              <MessageControls
+                onCopy={() => copyResponse(message.content)}
+                onRetry={() => onRetry(index)}
+              />
             ) : null}
           </div>
         </article>
       ))}
     </div>
   );
+}
+
+function MessageHeader({ message }: { message: Message }) {
+  const source = message.role === "user" ? "Operator" : message.persona_source || "Chronos";
+  const runtime = message.runtime_source || (message.role === "assistant" ? "API runtime" : "User input");
+  return (
+    <div className="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
+      <div>
+        <div className="flex flex-wrap items-center gap-2">
+          <p className="text-sm font-semibold">{source}</p>
+          <Pill tone={messageStatusTone(message.status)}>{message.status || "complete"}</Pill>
+          {message.approval_state ? <Pill tone="warn">{message.approval_state}</Pill> : null}
+        </div>
+        <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs" style={{ color: "var(--text-dim)" }}>
+          <span>{formatMessageTime(message.created_at)}</span>
+          <span>{runtime}</span>
+          <span>{messageTypeLabel(message)}</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MessageOperationalDetails({ message }: { message: Message }) {
+  const traces = message.tool_traces || inferredToolTraces(message);
+  const memories = message.memory_refs || inferredMemoryRefs(message);
+  const artifacts = message.artifacts || inferredArtifacts(message);
+  const citations = message.citations || [];
+  if (!traces.length && !memories.length && !artifacts.length && !citations.length) return null;
+
+  return (
+    <div className="mt-4 grid gap-2">
+      {traces.length ? (
+        <details className="message-detail">
+          <summary>Tool execution traces</summary>
+          <div className="mt-3 space-y-2">
+            {traces.map((trace) => (
+              <div key={trace.id} className="flex items-start justify-between gap-3 rounded-lg border border-soft px-3 py-2">
+                <div>
+                  <p className="text-sm font-medium">{trace.tool}</p>
+                  <p className="text-xs" style={{ color: "var(--text-dim)" }}>{trace.summary}</p>
+                </div>
+                <Pill tone={messageStatusTone(trace.status)}>{trace.status}</Pill>
+              </div>
+            ))}
+          </div>
+        </details>
+      ) : null}
+      {[["Memory references", memories], ["Citations", citations], ["Artifacts", artifacts]].map(([label, items]) => {
+        const refs = items as ReferenceItem[];
+        return refs.length ? (
+          <div key={label as string} className="message-ref-row">
+            <span>{label as string}</span>
+            <div className="flex flex-wrap gap-1.5">
+              {refs.map((item) => <span key={item.id} className="tag">{item.label}</span>)}
+            </div>
+          </div>
+        ) : null;
+      })}
+    </div>
+  );
+}
+
+function ActionSuggestions({ onRetry }: { onRetry: () => void }) {
+  const suggestions: Array<[string, string]> = [
+    ["plus", "Create task"],
+    ["memory", "Save to memory"],
+    ["workflow", "Turn into workflow"],
+    ["assistants", "Assign employee"],
+    ["artifact", "Generate report"],
+    ["approvals", "Request approval"],
+  ];
+  return (
+    <div className="message-actions-menu" role="menu" aria-label="Message actions">
+      <button onClick={onRetry} className="message-menu-item" type="button" role="menuitem">
+        <Icon name="retry" className="h-3.5 w-3.5" />
+        Retry response
+      </button>
+      <button className="message-menu-item" type="button" role="menuitem">
+        <Icon name="branch" className="h-3.5 w-3.5" />
+        Branch conversation
+      </button>
+      <button className="message-menu-item" type="button" role="menuitem">
+        <Icon name="pin" className="h-3.5 w-3.5" />
+        Pin output
+      </button>
+      {suggestions.map(([icon, label]) => (
+        <button key={label} className="message-menu-item" type="button" role="menuitem">
+          <Icon name={icon} className="h-3.5 w-3.5" />
+          {label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function MessageControls({ onCopy, onRetry }: { onCopy: () => void; onRetry: () => void }) {
+  return (
+    <div className="mt-3 flex items-start gap-1">
+      <button onClick={onCopy} className="rounded-md p-1.5 text-stone-500 hover:bg-stone-100 dark:hover:bg-stone-800" aria-label="Copy response" title="Copy response">
+        <Icon name="copy" />
+      </button>
+      <details className="message-actions-dropdown">
+        <summary aria-label="Open message actions" title="Message actions">
+          <Icon name="more" />
+          <span>Actions</span>
+        </summary>
+        <ActionSuggestions onRetry={onRetry} />
+      </details>
+    </div>
+  );
+}
+
+function messageStatusTone(status?: MessageStatus): "neutral" | "ok" | "warn" {
+  if (status === "paused" || status === "approval_pending") return "warn";
+  if (status === "complete" || !status) return "ok";
+  return "neutral";
+}
+
+function messageTypeLabel(message: Message) {
+  if (message.role === "tool") return "Tool execution";
+  if (message.role === "system") return "Runtime event";
+  if (message.approval_state) return "Approval request";
+  if (message.content.toLowerCase().includes("task created")) return "Task handoff";
+  return message.role === "assistant" ? "AI response" : "User message";
+}
+
+function formatMessageTime(value?: string) {
+  if (!value) return "Just now";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "Just now";
+  return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+
+function inferredToolTraces(message: Message): ToolTrace[] {
+  if (!message.content.toLowerCase().includes("task created")) return [];
+  return [{ id: "task-created", tool: "tasks.create", summary: "Created an autonomous task from this response.", status: "complete" }];
+}
+
+function inferredMemoryRefs(message: Message): ReferenceItem[] {
+  if (!message.content.toLowerCase().startsWith("memory saved:")) return [];
+  return [{ id: "saved-memory", label: "Saved memory" }];
+}
+
+function inferredArtifacts(message: Message): ReferenceItem[] {
+  if (!message.content.toLowerCase().includes("task created")) return [];
+  return [{ id: "activity-stream", label: "Live activity stream" }];
 }
 
 function TypingDots() {
