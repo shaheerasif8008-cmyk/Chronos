@@ -15,6 +15,7 @@ from core.llm import stream_completion
 from core.memory_writes import create_memory_entry, extract_explicit_memory_content
 from core.models import Member, RequesterContext
 from memory.extraction import extract_and_save
+from runtime.executor import TaskExecutor
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -59,6 +60,13 @@ async def _save_message(conversation_id: str, role: str, content: str) -> None:
             .where(conversations.c.id == conversation_id)
             .values(updated_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc))
         )
+
+
+def _looks_like_task(message: str) -> bool:
+    lowered = message.lower()
+    task_verbs = ("find ", "research ", "draft ", "create ", "build ", "prepare ", "analyze ", "summarize ")
+    multi_step_markers = (" and ", " then ", " for each", "companies", "leads", "outreach")
+    return any(verb in lowered for verb in task_verbs) and any(marker in lowered for marker in multi_step_markers)
 
 
 @router.get("/conversations")
@@ -150,6 +158,26 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
 
         return StreamingResponse(explicit_stream(), media_type="text/event-stream")
 
+    if settings.demo_mode and _looks_like_task(req.message):
+        async def demo_task_stream():
+            from routers.tasks import create_task_record
+
+            task_id = await create_task_record(
+                goal=req.message,
+                member=member,
+                triggered_by=conversation_id,
+            )
+            asyncio.create_task(TaskExecutor().run(task_id))
+            assistant_response = "I started this as an autonomous task. You can watch live progress in Activity and approve drafts in Approvals."
+            await _save_message(conversation_id, "assistant", assistant_response)
+            await audit.log("chat_response", member.id, "chat.message", resource_id=conversation_id)
+            yield f"data: {json.dumps({'type': 'conversation', 'conversation_id': conversation_id})}\n\n"
+            yield f"data: {json.dumps({'type': 'token', 'content': assistant_response})}\n\n"
+            yield f"data: {json.dumps({'type': 'task_created', 'task_id': task_id})}\n\n"
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+        return StreamingResponse(demo_task_stream(), media_type="text/event-stream")
+
     context = await assemble_context(conversation_id, req.message, requester_context)
 
     async def stream():
@@ -165,6 +193,16 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
         asyncio.create_task(
             extract_and_save(conversation_id, req.message, assistant_response, requester_context)
         )
+        if _looks_like_task(req.message):
+            from routers.tasks import create_task_record
+
+            task_id = await create_task_record(
+                goal=req.message,
+                member=member,
+                triggered_by=conversation_id,
+            )
+            asyncio.create_task(TaskExecutor().run(task_id))
+            yield f"data: {json.dumps({'type': 'task_created', 'task_id': task_id})}\n\n"
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
     return StreamingResponse(stream(), media_type="text/event-stream")

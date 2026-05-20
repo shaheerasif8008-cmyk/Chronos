@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, KeyboardEvent, ReactNode, useEffect, useState } from "react";
+import { FormEvent, KeyboardEvent, ReactNode, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
@@ -9,8 +9,14 @@ type Route = "chat" | "activity" | "approvals" | "memory" | "connectors" | "assi
 type ActivityMode = "jobs" | "actions";
 type SettingsTab = "account" | "preferences" | "workspace" | "notifications" | "audit";
 type Conversation = { id: string; title: string | null; updated_at?: string; created_at?: string };
-type Message = { id?: string; role: "user" | "assistant" | "system" | "tool"; content: string };
+type Message = { id?: string; role: "user" | "assistant" | "system" | "tool"; content: string; status?: "paused" };
 type MemoryEntry = { id: string; scope: string; scope_id: string; content: string; source: string; created_by?: string | null };
+type Connector = { id: string; provider: string; account_handle?: string | null; status: string; connected_at?: string | null; last_used_at?: string | null };
+type ConnectorProof = { connectorId: string; status: string; detail: string; tool?: string | null };
+type Task = { id: string; status: string; goal: string; current_step: number; plan?: TaskStep[]; result?: Record<string, unknown>; created_at?: string; parent_task_id?: string | null; depth?: number };
+type TaskStep = { id: string; action: string; description: string; tool?: string | null; args?: Record<string, unknown>; approval_required?: boolean; depends_on?: string[] };
+type ActivityEvent = { type: string; task_id?: string; ts?: string; step?: TaskStep; step_index?: number; result?: unknown; error?: string; approval_ids?: string[]; sub_task_id?: string; event?: ActivityEvent };
+type Approval = { id: string; task_id: string; step_id: string; action_type: string; action_payload: Record<string, unknown>; requested_at?: string; status: string };
 
 const ORG = {
   name: "Chronos workspace",
@@ -52,8 +58,11 @@ function Icon({ name, className = "h-4 w-4" }: { name: string; className?: strin
     assistants: <><circle cx="12" cy="8" r="4" /><path d="M4 21c0-4 3.5-7 8-7s8 3 8 7" /></>,
     settings: <><circle cx="12" cy="12" r="3" /><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M19.1 4.9 17 7M7 17l-2.1 2.1" /></>,
     send: <path d="M4 12 20 5l-6 16-3-7z" />,
+    stop: <rect x="7" y="7" width="10" height="10" rx="1.5" />,
     edit: <path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" />,
     trash: <><path d="M3 6h18" /><path d="M8 6V4h8v2M6 6l1 15h10l1-15" /></>,
+    copy: <><rect x="9" y="9" width="10" height="10" rx="2" /><path d="M5 15V5h10" /></>,
+    retry: <><path d="M20 12a8 8 0 1 1-2.3-5.7" /><path d="M20 4v6h-6" /></>,
     more: <><circle cx="5" cy="12" r="1" /><circle cx="12" cy="12" r="1" /><circle cx="19" cy="12" r="1" /></>,
   };
   return <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
@@ -79,6 +88,8 @@ export default function ChronosApp() {
   const [activeConversation, setActiveConversation] = useState<string | null>(null);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [conversationMenu, setConversationMenu] = useState<string | null>(null);
+  const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
+  const [pendingApprovals, setPendingApprovals] = useState(0);
   const [accountOpen, setAccountOpen] = useState(false);
   const [theme, setTheme] = useState<"light" | "dark">("light");
   const [error, setError] = useState("");
@@ -93,7 +104,17 @@ export default function ChronosApp() {
       return;
     }
     void refreshConversations();
+    void refreshPendingApprovals();
   }, [router]);
+
+  async function refreshPendingApprovals() {
+    try {
+      const data = (await (await apiFetch("/approvals/?status=pending")).json()) as Approval[];
+      setPendingApprovals(data.length);
+    } catch {
+      setPendingApprovals(0);
+    }
+  }
 
   async function refreshConversations(selectedId?: string) {
     setError("");
@@ -132,7 +153,7 @@ export default function ChronosApp() {
 
   const nav: Array<[Route, string, string, number]> = [
     ["activity", "Activity", "activity", 0],
-    ["approvals", "Approvals", "approvals", 0],
+    ["approvals", "Approvals", "approvals", pendingApprovals],
     ["memory", "Memory", "memory", 0],
     ["connectors", "Connectors", "connectors", 0],
     ["assistants", "Assistants", "assistants", 0],
@@ -219,9 +240,9 @@ export default function ChronosApp() {
         </div>
         {error ? <div className="border-b border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700">{error}</div> : null}
         <div className="min-h-0 flex-1">
-          {route === "chat" && <ChatScreen activeConversation={activeConversation} onConversationCreated={(id) => refreshConversations(id)} />}
-          {route === "activity" && <ActivityScreen onAudit={() => openSettings("audit")} />}
-          {route === "approvals" && <ApprovalsScreen />}
+          {route === "chat" && <ChatScreen activeConversation={activeConversation} onConversationCreated={(id) => refreshConversations(id)} onTaskCreated={(id) => { setActiveTaskId(id); setRoute("activity"); }} />}
+          {route === "activity" && <ActivityScreen activeTaskId={activeTaskId} setActiveTaskId={setActiveTaskId} onAudit={() => openSettings("audit")} />}
+          {route === "approvals" && <ApprovalsScreen onDecision={refreshPendingApprovals} onOpenTask={(id) => { setActiveTaskId(id); setRoute("activity"); }} />}
           {route === "memory" && <MemoryScreen />}
           {route === "connectors" && <ConnectorsScreen />}
           {route === "assistants" && <AssistantsScreen />}
@@ -232,11 +253,12 @@ export default function ChronosApp() {
   );
 }
 
-function ChatScreen({ activeConversation, onConversationCreated }: { activeConversation: string | null; onConversationCreated: (id: string) => void }) {
+function ChatScreen({ activeConversation, onConversationCreated, onTaskCreated }: { activeConversation: string | null; onConversationCreated: (id: string) => void; onTaskCreated: (id: string) => void }) {
   const [draft, setDraft] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
   const [error, setError] = useState("");
+  const streamAbortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -261,17 +283,23 @@ function ChatScreen({ activeConversation, onConversationCreated }: { activeConve
 
   async function send(event: FormEvent) {
     event.preventDefault();
-    const message = draft.trim();
+    await sendMessage(draft.trim(), { appendUser: true });
+  }
+
+  async function sendMessage(message: string, { appendUser }: { appendUser: boolean }) {
     if (!message || isStreaming) return;
-    setDraft("");
+    const controller = new AbortController();
+    streamAbortRef.current = controller;
+    if (appendUser) setDraft("");
     setError("");
     setIsStreaming(true);
-    setMessages((prev) => [...prev, { role: "user", content: message }, { role: "assistant", content: "" }]);
+    setMessages((prev) => [...prev, ...(appendUser ? [{ role: "user" as const, content: message }] : []), { role: "assistant", content: "" }]);
     try {
       const res = await fetch(`${API_BASE}/chat/message`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({ message, conversation_id: activeConversation }),
+        signal: controller.signal,
       });
       if (res.status === 401) {
         localStorage.removeItem("chronos_token");
@@ -309,14 +337,48 @@ function ChatScreen({ activeConversation, onConversationCreated }: { activeConve
               return next;
             });
           }
+          if (eventData.type === "task_created") {
+            onTaskCreated(eventData.task_id);
+            setMessages((prev) => {
+              const next = [...prev];
+              const last = next[next.length - 1];
+              if (last?.role === "assistant") {
+                last.content = `${last.content.trim() || "I started this as an autonomous task."}\n\nTask created: ${eventData.task_id}`;
+              }
+              return next;
+            });
+          }
         }
       }
     } catch (exc) {
+      if (exc instanceof DOMException && exc.name === "AbortError") {
+        setMessages((prev) => {
+          const next = [...prev];
+          const last = next[next.length - 1];
+          if (last?.role === "assistant") {
+            last.status = "paused";
+          }
+          return next;
+        });
+        return;
+      }
       setError(humanizeError(exc));
       setMessages((prev) => prev.slice(0, -1));
     } finally {
+      if (streamAbortRef.current === controller) streamAbortRef.current = null;
       setIsStreaming(false);
     }
+  }
+
+  function retryResponse(index: number) {
+    const previousUser = [...messages.slice(0, index)].reverse().find((message) => message.role === "user");
+    if (!previousUser) return;
+    setMessages((prev) => prev.slice(0, index));
+    void sendMessage(previousUser.content, { appendUser: false });
+  }
+
+  function stopStreaming() {
+    streamAbortRef.current?.abort();
   }
 
   return (
@@ -333,9 +395,9 @@ function ChatScreen({ activeConversation, onConversationCreated }: { activeConve
         </header>
         {error ? <div className="border-b border-red-200 bg-red-50 px-6 py-2 text-sm text-red-700">{error}</div> : null}
         <div className="flex-1 overflow-auto px-6 py-10">
-          {messages.length === 0 ? <EmptyChat /> : <Thread messages={messages} />}
+          {messages.length === 0 ? <EmptyChat /> : <Thread messages={messages} onRetry={retryResponse} />}
         </div>
-        <Composer value={draft} setValue={setDraft} onSubmit={send} disabled={isStreaming} />
+        <Composer value={draft} setValue={setDraft} onSubmit={send} disabled={isStreaming} isStreaming={isStreaming} onStop={stopStreaming} />
       </div>
     </div>
   );
@@ -354,19 +416,45 @@ function EmptyChat() {
   );
 }
 
-function Thread({ messages }: { messages: Message[] }) {
+function Thread({ messages, onRetry }: { messages: Message[]; onRetry: (index: number) => void }) {
+  async function copyResponse(content: string) {
+    if (!content) return;
+    await navigator.clipboard.writeText(content);
+  }
+
   return (
     <div className="mx-auto max-w-3xl space-y-10">
       {messages.map((message, index) => (
         <article key={message.id ?? index} className="flex gap-4">
           <Avatar label={message.role === "user" ? "You" : "Chronos"} />
-          <div>
+          <div className="min-w-0 flex-1">
             <p className="mb-1 text-sm font-semibold">{message.role === "user" ? "You" : "Chronos"}</p>
-            <p className="prose-body whitespace-pre-wrap">{message.content || "..."}</p>
+            {message.content ? <p className="prose-body whitespace-pre-wrap">{message.content}</p> : <TypingDots />}
+            {message.status === "paused" ? <p className="mt-2 text-xs" style={{ color: "var(--text-dim)" }}>Chat response paused</p> : null}
+            {message.role === "assistant" && message.content ? (
+              <div className="mt-3 flex gap-1">
+                <button onClick={() => copyResponse(message.content)} className="rounded-md p-1.5 text-stone-500 hover:bg-stone-100 dark:hover:bg-stone-800" aria-label="Copy response" title="Copy response">
+                  <Icon name="copy" />
+                </button>
+                <button onClick={() => onRetry(index)} className="rounded-md p-1.5 text-stone-500 hover:bg-stone-100 dark:hover:bg-stone-800" aria-label="Retry response" title="Retry response">
+                  <Icon name="retry" />
+                </button>
+              </div>
+            ) : null}
           </div>
         </article>
       ))}
     </div>
+  );
+}
+
+function TypingDots() {
+  return (
+    <span className="typing-wave" aria-label="Chronos is responding">
+      <span />
+      <span />
+      <span />
+    </span>
   );
 }
 
@@ -381,7 +469,7 @@ function humanizeError(error: unknown) {
   }
 }
 
-function Composer({ value, setValue, onSubmit, disabled }: { value: string; setValue: (value: string) => void; onSubmit: (event: FormEvent) => void; disabled: boolean }) {
+function Composer({ value, setValue, onSubmit, disabled, isStreaming, onStop }: { value: string; setValue: (value: string) => void; onSubmit: (event: FormEvent) => void; disabled: boolean; isStreaming: boolean; onStop: () => void }) {
   function handleKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
@@ -394,31 +482,228 @@ function Composer({ value, setValue, onSubmit, disabled }: { value: string; setV
       <div className="composer-shell relative mx-auto max-w-4xl p-3">
         <textarea value={value} onChange={(event) => setValue(event.target.value)} onKeyDown={handleKeyDown} placeholder="Message Chronos..." className="min-h-16 w-full resize-none bg-transparent px-2 text-[15px] outline-none" />
         <div className="flex items-center justify-end">
-          <button className="flex h-9 w-9 items-center justify-center rounded-full text-white disabled:opacity-40" style={{ background: "var(--text)", color: "var(--bg)" }} disabled={!value.trim() || disabled}><Icon name="send" /></button>
+          {isStreaming ? (
+            <button type="button" onClick={onStop} className="flex h-9 w-9 items-center justify-center rounded-full text-white" style={{ background: "var(--danger)", color: "white" }} aria-label="Stop response" title="Stop response">
+              <Icon name="stop" />
+            </button>
+          ) : (
+            <button className="flex h-9 w-9 items-center justify-center rounded-full text-white disabled:opacity-40" style={{ background: "var(--text)", color: "var(--bg)" }} disabled={!value.trim() || disabled} aria-label="Send message"><Icon name="send" /></button>
+          )}
         </div>
       </div>
     </form>
   );
 }
 
-function ActivityScreen({ onAudit }: { onAudit: () => void }) {
+function ActivityScreen({ activeTaskId, setActiveTaskId, onAudit }: { activeTaskId: string | null; setActiveTaskId: (id: string) => void; onAudit: () => void }) {
   const [mode, setMode] = useState<ActivityMode>("jobs");
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [events, setEvents] = useState<ActivityEvent[]>([]);
+  const [streamStatus, setStreamStatus] = useState("Select a task to stream live activity.");
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    void refreshTasks();
+  }, []);
+
+  useEffect(() => {
+    if (!activeTaskId) return;
+    let cancelled = false;
+    const controller = new AbortController();
+
+    async function streamTask() {
+      setEvents([]);
+      setError("");
+      setStreamStatus("Connecting to activity stream...");
+      try {
+        const res = await fetch(`${API_BASE}/tasks/${activeTaskId}/stream`, {
+          headers: authHeaders(),
+          signal: controller.signal,
+        });
+        if (!res.ok || !res.body) throw new Error(await res.text());
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        while (!cancelled) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const chunks = buffer.split("\n\n");
+          buffer = chunks.pop() ?? "";
+          for (const chunk of chunks) {
+            const line = chunk.split("\n").find((row) => row.startsWith("data: "));
+            if (!line) continue;
+            const eventData = JSON.parse(line.slice(6)) as ActivityEvent & { task?: Task };
+            if (eventData.type === "catch_up") {
+              setStreamStatus(`Streaming ${eventData.task?.status ?? "task"} task`);
+              continue;
+            }
+            setEvents((current) => [...current, eventData]);
+            if (eventData.type === "task_complete" || eventData.type === "task_failed") {
+              setStreamStatus(eventData.type === "task_complete" ? "Task complete" : "Task failed");
+              void refreshTasks();
+            }
+          }
+        }
+      } catch (exc) {
+        if (!cancelled && !(exc instanceof DOMException && exc.name === "AbortError")) {
+          setError(humanizeError(exc));
+          setStreamStatus("Activity stream disconnected.");
+        }
+      }
+    }
+
+    void streamTask();
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [activeTaskId]);
+
+  async function refreshTasks() {
+    setError("");
+    try {
+      const data = (await (await apiFetch("/tasks/")).json()) as Task[];
+      setTasks(data);
+      if (!activeTaskId && data[0]) setActiveTaskId(data[0].id);
+    } catch (exc) {
+      setError(humanizeError(exc));
+    }
+  }
+
+  const selectedTask = tasks.find((task) => task.id === activeTaskId);
+
   return (
     <Page title="Activity" subtitle="Live work will appear here when the task engine writes activity events." action={
       <div className="surface rounded-lg border border-soft p-1">
         {(["jobs", "actions"] as ActivityMode[]).map((item) => <button key={item} onClick={() => setMode(item)} className="smooth rounded-md px-3 py-1.5 text-[13px] font-medium capitalize" style={{ background: mode === item ? "var(--surface-2)" : "transparent", color: mode === item ? "var(--text)" : "var(--text-muted)" }}>{item === "actions" ? "Every action" : "Jobs"}</button>)}
       </div>
     }>
-      <EmptyState>{mode === "jobs" ? "No jobs have been started in this workspace." : "No activity events are available yet."}</EmptyState>
+      {error ? <p className="mb-4 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">{error}</p> : null}
+      {mode === "jobs" ? (
+        <div className="grid gap-4 lg:grid-cols-[320px_1fr]">
+          <div className="space-y-3">
+            <div className="flex items-center justify-between">
+              <h2 className="text-sm font-semibold">Tasks</h2>
+              <button onClick={refreshTasks} className="rounded-lg border border-stone-200 px-2.5 py-1.5 text-xs hover:bg-stone-50 dark:border-stone-700 dark:hover:bg-stone-800">Refresh</button>
+            </div>
+            {tasks.length === 0 ? <EmptyState>No jobs have been started in this workspace.</EmptyState> : null}
+            {tasks.map((task) => (
+              <button key={task.id} onClick={() => setActiveTaskId(task.id)} className={`surface block w-full rounded-xl border p-4 text-left smooth ${activeTaskId === task.id ? "border-[var(--accent)]" : "border-soft hover:border-[var(--border)]"}`}>
+                <div className="flex items-center justify-between gap-3">
+                  <Pill tone={task.status === "complete" ? "ok" : task.status === "awaiting_approval" ? "warn" : "neutral"}>{task.status}</Pill>
+                  <span className="text-xs" style={{ color: "var(--text-dim)" }}>Step {task.current_step ?? 0}</span>
+                </div>
+                <p className="mt-3 line-clamp-3 text-sm font-medium">{task.goal}</p>
+                <p className="mt-2 truncate text-xs" style={{ color: "var(--text-dim)" }}>{task.id}</p>
+              </button>
+            ))}
+          </div>
+          <Surface>
+            {selectedTask ? (
+              <div>
+                <div className="flex flex-col gap-3 border-b border-stone-100 pb-4 dark:border-stone-700 md:flex-row md:items-start md:justify-between">
+                  <div>
+                    <h2 className="font-semibold">{selectedTask.goal}</h2>
+                    <p className="mt-1 text-sm" style={{ color: "var(--text-dim)" }}>{streamStatus}</p>
+                  </div>
+                  <Pill tone={selectedTask.status === "complete" ? "ok" : selectedTask.status === "awaiting_approval" ? "warn" : "neutral"}>{selectedTask.status}</Pill>
+                </div>
+                <div className="mt-5 space-y-3">
+                  {events.length === 0 ? <EmptyState>No live events have arrived for this task yet.</EmptyState> : null}
+                  {events.map((event, index) => <ActivityEventRow key={`${event.type}-${index}`} event={event} />)}
+                </div>
+              </div>
+            ) : <EmptyState>Select a task to inspect its live activity stream.</EmptyState>}
+          </Surface>
+        </div>
+      ) : <EmptyState>No audit activity read endpoint is available in the UI yet.</EmptyState>}
       {mode === "actions" ? <button onClick={onAudit} className="mt-4 w-full rounded-xl py-3 text-sm text-stone-500 hover:bg-stone-100 dark:hover:bg-stone-800">Open audit settings</button> : null}
     </Page>
   );
 }
 
-function ApprovalsScreen() {
+function ActivityEventRow({ event }: { event: ActivityEvent }) {
+  const title = event.type.replaceAll("_", " ");
+  const description = event.step?.description || event.error || (event.sub_task_id ? `Sub-task ${event.sub_task_id}` : "");
+  return (
+    <div className="rounded-xl border border-soft p-4">
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <p className="text-sm font-semibold capitalize">{title}</p>
+          {description ? <p className="mt-1 text-sm" style={{ color: "var(--text-dim)" }}>{description}</p> : null}
+        </div>
+        {typeof event.step_index === "number" ? <span className="text-xs" style={{ color: "var(--text-dim)" }}>#{event.step_index + 1}</span> : null}
+      </div>
+      {event.event ? <div className="mt-3 border-l-2 pl-3" style={{ borderColor: "var(--border)" }}><ActivityEventRow event={event.event} /></div> : null}
+    </div>
+  );
+}
+
+function ApprovalsScreen({ onDecision, onOpenTask }: { onDecision: () => void; onOpenTask: (taskId: string) => void }) {
+  const [approvals, setApprovals] = useState<Approval[]>([]);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    void refreshApprovals();
+  }, []);
+
+  async function refreshApprovals() {
+    setError("");
+    try {
+      const data = (await (await apiFetch("/approvals/?status=pending")).json()) as Approval[];
+      setApprovals(data);
+    } catch (exc) {
+      setError(humanizeError(exc));
+    }
+  }
+
+  async function decide(approval: Approval, decision: "approved" | "rejected", batch = false) {
+    setBusy(batch ? "batch" : approval.id);
+    setError("");
+    try {
+      await apiFetch(`/approvals/${approval.id}/decide`, {
+        method: "POST",
+        body: JSON.stringify({ decision, batch }),
+      });
+      await refreshApprovals();
+      onDecision();
+    } catch (exc) {
+      setError(humanizeError(exc));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   return (
     <Page title="Approvals" subtitle="Requests that need operator approval before Chronos acts.">
-      <EmptyState>No approvals are waiting.</EmptyState>
+      {error ? <p className="mb-4 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">{error}</p> : null}
+      {approvals.length === 0 ? <EmptyState>No approvals are waiting.</EmptyState> : null}
+      <div className="grid gap-3">
+        {approvals.map((approval, index) => (
+          <Surface key={approval.id}>
+            <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <Pill tone="warn">Pending</Pill>
+                  <p className="text-sm font-semibold">{approval.action_type}</p>
+                  <span className="text-xs" style={{ color: "var(--text-dim)" }}>#{index + 1}</span>
+                </div>
+                <p className="mt-3 text-sm"><span className="font-medium">To:</span> {String(approval.action_payload.to ?? "Not specified")}</p>
+                <p className="mt-1 text-sm"><span className="font-medium">Subject:</span> {String(approval.action_payload.subject ?? "No subject")}</p>
+                <p className="mt-3 max-h-36 overflow-auto whitespace-pre-wrap rounded-lg border border-soft p-3 text-sm" style={{ color: "var(--text-muted)" }}>{String(approval.action_payload.body ?? JSON.stringify(approval.action_payload, null, 2))}</p>
+                <button onClick={() => onOpenTask(approval.task_id)} className="mt-3 text-sm font-medium" style={{ color: "var(--accent-text)" }}>Open task activity</button>
+              </div>
+              <div className="flex shrink-0 flex-wrap gap-2">
+                <button onClick={() => decide(approval, "approved")} disabled={busy !== null} className="rounded-lg px-3 py-2 text-sm font-medium disabled:opacity-50" style={{ background: "var(--text)", color: "var(--bg)" }}>Approve</button>
+                <button onClick={() => decide(approval, "approved", true)} disabled={busy !== null} className="rounded-lg border border-stone-200 px-3 py-2 text-sm font-medium hover:bg-stone-50 disabled:opacity-50 dark:border-stone-700 dark:hover:bg-stone-800">Approve batch</button>
+                <button onClick={() => decide(approval, "rejected")} disabled={busy !== null} className="rounded-lg border border-stone-200 px-3 py-2 text-sm text-red-600 hover:bg-red-50 disabled:opacity-50 dark:border-stone-700 dark:hover:bg-stone-800">Reject</button>
+              </div>
+            </div>
+          </Surface>
+        ))}
+      </div>
     </Page>
   );
 }
@@ -497,9 +782,132 @@ function MemoryScreen() {
 }
 
 function ConnectorsScreen() {
+  const [connectors, setConnectors] = useState<Connector[]>([]);
+  const [proof, setProof] = useState<ConnectorProof | null>(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState<string | null>(null);
+
+  useEffect(() => {
+    void refreshConnectors();
+  }, []);
+
+  async function refreshConnectors() {
+    setError("");
+    try {
+      const data = (await (await apiFetch("/connectors/")).json()) as Connector[];
+      setConnectors(data);
+    } catch (exc) {
+      setError(humanizeError(exc));
+    }
+  }
+
+  async function enableBrowser() {
+    setBusy("browser");
+    setError("");
+    try {
+      await apiFetch("/connectors/browser/enable", { method: "POST" });
+      await refreshConnectors();
+    } catch (exc) {
+      setError(humanizeError(exc));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function connectGmail() {
+    setBusy("gmail");
+    setError("");
+    try {
+      const data = (await (await apiFetch("/connectors/gmail/oauth-url")).json()) as { url: string };
+      window.location.href = data.url;
+    } catch (exc) {
+      setError(humanizeError(exc));
+      setBusy(null);
+    }
+  }
+
+  async function runProof(connector: Connector) {
+    setBusy(connector.id);
+    setError("");
+    setProof(null);
+    try {
+      const data = (await (await apiFetch(`/connectors/${connector.id}/test`, {
+        method: "POST",
+        body: JSON.stringify(connector.provider === "gmail" ? {
+          to: "operator@example.com",
+          subject: "Chronos connector proof",
+          body: "This draft proves Gmail actions route through the Chronos tool broker.",
+        } : { url: "https://example.com" }),
+      })).json()) as { status: string; detail: string; tool?: string | null };
+      setProof({ connectorId: connector.id, ...data });
+      await refreshConnectors();
+    } catch (exc) {
+      setError(humanizeError(exc));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function disconnect(connector: Connector) {
+    setBusy(connector.id);
+    setError("");
+    try {
+      await apiFetch(`/connectors/${connector.id}`, { method: "DELETE" });
+      if (proof?.connectorId === connector.id) setProof(null);
+      await refreshConnectors();
+    } catch (exc) {
+      setError(humanizeError(exc));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  const hasBrowser = connectors.some((connector) => connector.provider === "browser" && connector.status === "active");
+
   return (
-    <Page title="Connectors" subtitle="Connector status will appear here when connector APIs are implemented.">
-      <EmptyState>No connectors are configured.</EmptyState>
+    <Page title="Connectors" subtitle="Broker-routed Gmail and browser capabilities with audit-backed proof.">
+      <div className="mb-5 flex flex-wrap gap-2">
+        <button onClick={enableBrowser} disabled={hasBrowser || busy === "browser"} className="rounded-lg px-3 py-2 text-sm font-medium disabled:opacity-50" style={{ background: "var(--text)", color: "var(--bg)" }}>
+          {hasBrowser ? "Browser enabled" : "Enable browser"}
+        </button>
+        <button onClick={connectGmail} disabled={busy === "gmail"} className="rounded-lg border border-stone-200 px-3 py-2 text-sm font-medium hover:bg-stone-50 disabled:opacity-50 dark:border-stone-700 dark:hover:bg-stone-800">
+          Connect Gmail
+        </button>
+      </div>
+      {error ? <p className="mb-4 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">{error}</p> : null}
+      {proof ? (
+        <Surface>
+          <p className="text-sm font-semibold">Proof result</p>
+          <p className="mt-2 text-sm text-stone-600 dark:text-stone-300">Tool: {proof.tool || "unknown"} · Status: {proof.status}</p>
+          <p className="mt-1 text-sm text-stone-500">{proof.detail}</p>
+          <p className="mt-3 text-xs text-stone-500">This proof is executed through tool_broker.execute and writes connector_proof plus tool_call/tool_result audit events.</p>
+        </Surface>
+      ) : null}
+      <div className="mt-4 grid gap-3">
+        {connectors.length === 0 ? <EmptyState>No connectors are configured.</EmptyState> : null}
+        {connectors.map((connector) => (
+          <Surface key={connector.id}>
+            <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+              <div>
+                <div className="flex items-center gap-2">
+                  <h3 className="font-semibold capitalize">{connector.provider}</h3>
+                  <Pill tone={connector.status === "active" ? "ok" : "neutral"}>{connector.status}</Pill>
+                </div>
+                <p className="mt-1 text-sm text-stone-500">{connector.account_handle || "Org-level connector"}</p>
+                <p className="mt-2 text-xs text-stone-500">Last proof: {connector.last_used_at || "Not run yet"}</p>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <button onClick={() => runProof(connector)} disabled={busy === connector.id} className="rounded-lg px-3 py-2 text-sm font-medium disabled:opacity-50" style={{ background: "var(--text)", color: "var(--bg)" }}>
+                  Run proof
+                </button>
+                <button onClick={() => disconnect(connector)} disabled={busy === connector.id} className="rounded-lg border border-stone-200 px-3 py-2 text-sm text-red-600 hover:bg-red-50 disabled:opacity-50 dark:border-stone-700 dark:hover:bg-stone-800">
+                  Disconnect
+                </button>
+              </div>
+            </div>
+          </Surface>
+        ))}
+      </div>
     </Page>
   );
 }

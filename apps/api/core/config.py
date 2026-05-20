@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     vault_encryption_key: str = ""   # 32-byte hex string; required outside dev
     composio_api_key: str = ""
     composio_callback_base_url: str = "http://localhost:8000"
+    demo_mode: bool = False
     # MinIO
     minio_endpoint: str = "localhost:9000"
     minio_access_key: str = "chronos"

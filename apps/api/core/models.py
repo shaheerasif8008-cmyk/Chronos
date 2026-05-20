@@ -31,6 +31,17 @@ class AgentContext(BaseModel):
     persona_id: str | None = None
     task_id: str | None = None
 
+    @classmethod
+    def from_task(cls, task_dict: dict) -> "AgentContext":
+        return cls(
+            id=f"task:{task_dict['id']}",
+            org_id=task_dict.get("organization_id", "default"),
+            member_id=task_dict.get("triggered_by_member_id") or "chronos",
+            workspace_id=task_dict.get("workspace_id"),
+            persona_id=task_dict.get("persona_id"),
+            task_id=task_dict["id"],
+        )
+
     def as_member(self) -> Member:
         return Member(
             id=self.member_id,

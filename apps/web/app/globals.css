@@ -217,6 +217,43 @@ textarea {
   line-height: 1.65;
 }
 
+.typing-wave {
+  align-items: center;
+  display: inline-flex;
+  gap: 4px;
+  height: 24px;
+}
+
+.typing-wave span {
+  animation: typing-wave 1.15s ease-in-out infinite;
+  background: var(--text-dim);
+  border-radius: 999px;
+  display: block;
+  height: 5px;
+  width: 5px;
+}
+
+.typing-wave span:nth-child(2) {
+  animation-delay: 0.14s;
+}
+
+.typing-wave span:nth-child(3) {
+  animation-delay: 0.28s;
+}
+
+@keyframes typing-wave {
+  0%,
+  60%,
+  100% {
+    opacity: 0.45;
+    transform: translateY(0);
+  }
+  30% {
+    opacity: 1;
+    transform: translateY(-5px);
+  }
+}
+
 .mem-card {
   background: var(--surface);
   border: 1px solid var(--border-soft);

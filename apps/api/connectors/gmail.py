@@ -11,7 +11,9 @@ Composio manages OAuth token storage.  We store only the entity_id in our vault.
 from __future__ import annotations
 
 import logging
+import json
 from typing import Any
+from pathlib import Path
 
 from core.exceptions import ApprovalRequired
 from core.models import ToolResult
@@ -46,6 +48,12 @@ class GmailConnector:
         # This guard is a belt-and-suspenders defence.
         if tool == "gmail.send":
             raise ApprovalRequired("gmail.send", "use gmail.draft; sending requires an approval record")
+
+        if settings.demo_mode:
+            if tool == "gmail.draft":
+                return await self._create_demo_draft(args)
+            if tool == "gmail.read_inbox":
+                return ToolResult(data={"threads": []}, summary="Demo inbox: 0 threads")
 
         credentials = await vault_get(vault_ref)
         entity_id = credentials.get("composio_entity_id")
@@ -99,6 +107,26 @@ class GmailConnector:
         data = result if isinstance(result, dict) else {"raw": str(result)}
         draft_id = data.get("id", "unknown")
         return ToolResult(data=data, summary=f"Draft created: {draft_id}")
+
+    async def _create_demo_draft(self, args: dict) -> ToolResult:
+        path = Path(__file__).resolve().parents[3] / "artifacts" / "demo_gmail_drafts.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        existing: list[dict[str, Any]] = []
+        if path.exists():
+            try:
+                existing = json.loads(path.read_text())
+            except json.JSONDecodeError:
+                existing = []
+        draft = {
+            "id": f"demo-draft-{len(existing) + 1}",
+            "to": args.get("to", ""),
+            "subject": args.get("subject", ""),
+            "body": args.get("body", ""),
+            "cc": args.get("cc", ""),
+        }
+        existing.append(draft)
+        path.write_text(json.dumps(existing, indent=2))
+        return ToolResult(data={"id": draft["id"], "path": str(path)}, summary=f"Demo draft recorded: {draft['id']}")
 
 
 gmail_connector = GmailConnector()

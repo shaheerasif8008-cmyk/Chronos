@@ -132,6 +132,126 @@ def test_memory_router_has_audit_available_for_mutations():
     assert memory.audit.log
 
 
+@pytest.mark.asyncio
+async def test_connector_proof_routes_gmail_draft_through_tool_broker(monkeypatch):
+    from core.models import Member, ToolResult
+    from routers import connectors
+
+    calls = []
+
+    async def fake_execute(agent, tool, args):
+        calls.append((agent, tool, args))
+        return ToolResult(data={"id": "draft-1"}, summary="Draft created: draft-1")
+
+    async def noop_mark(connector_id):
+        return None
+
+    async def noop_audit(**kwargs):
+        return None
+
+    monkeypatch.setattr(connectors.tool_broker, "execute", fake_execute)
+    monkeypatch.setattr(connectors, "_mark_connector_used", noop_mark)
+    monkeypatch.setattr(connectors, "_audit_connector_proof", noop_audit)
+
+    result = await connectors.execute_connector_proof(
+        connector_id="connector-1",
+        provider="gmail",
+        member=Member(id="member-1", organization_id="default", email="admin@example.com"),
+    )
+
+    assert result == {"status": "ok", "detail": "Draft created: draft-1", "tool": "gmail.draft"}
+    assert calls[0][1] == "gmail.draft"
+    assert calls[0][2]["subject"] == "Chronos connector proof"
+
+
+@pytest.mark.asyncio
+async def test_connector_proof_routes_browser_fetch_through_tool_broker(monkeypatch):
+    from core.models import Member, ToolResult
+    from routers import connectors
+
+    calls = []
+
+    async def fake_execute(agent, tool, args):
+        calls.append((agent, tool, args))
+        return ToolResult(data={"title": "Example Domain"}, summary="Fetched https://example.com: 120 chars")
+
+    async def noop_mark(connector_id):
+        return None
+
+    async def noop_audit(**kwargs):
+        return None
+
+    monkeypatch.setattr(connectors.tool_broker, "execute", fake_execute)
+    monkeypatch.setattr(connectors, "_mark_connector_used", noop_mark)
+    monkeypatch.setattr(connectors, "_audit_connector_proof", noop_audit)
+
+    result = await connectors.execute_connector_proof(
+        connector_id="connector-1",
+        provider="browser",
+        member=Member(id="member-1", organization_id="default", email="admin@example.com"),
+    )
+
+    assert result == {"status": "ok", "detail": "Fetched https://example.com: 120 chars", "tool": "browser.fetch"}
+    assert calls[0][1] == "browser.fetch"
+    assert calls[0][2] == {"url": "https://example.com"}
+
+
+@pytest.mark.asyncio
+async def test_tool_broker_audits_gmail_draft_without_logging_raw_args(monkeypatch):
+    from connectors import registry
+    from core import permissions, tool_broker
+    from core.models import AgentContext, ToolResult
+
+    audit_events = []
+
+    class ConnectorRecord:
+        provider = "gmail"
+        vault_ref = "vlt_safe_ref"
+
+    async def fake_permission(*args, **kwargs):
+        return True
+
+    async def fake_registry_get(agent, tool):
+        return ConnectorRecord()
+
+    async def noop_rate_limit(org_id):
+        return None
+
+    async def noop_loop(org_id, tool, args_hash):
+        return None
+
+    async def fake_route(tool, args, vault_ref):
+        assert tool == "gmail.draft"
+        assert args["body"] == "Sensitive draft body"
+        assert vault_ref == "vlt_safe_ref"
+        return ToolResult(data={"id": "draft-1"}, summary="Draft created: draft-1")
+
+    async def fake_audit_log(*args, **kwargs):
+        audit_events.append((args, kwargs))
+        return "audit-1"
+
+    monkeypatch.setattr(permissions, "check", fake_permission)
+    monkeypatch.setattr(tool_broker, "_check_rate_limit", noop_rate_limit)
+    monkeypatch.setattr(tool_broker, "_check_loop", noop_loop)
+    monkeypatch.setattr(registry, "get", fake_registry_get)
+    monkeypatch.setattr(tool_broker, "_route", fake_route)
+    monkeypatch.setattr(tool_broker.audit, "log", fake_audit_log)
+
+    result = await tool_broker.execute(
+        AgentContext(id="agent-1", org_id="default", member_id="member-1"),
+        "gmail.draft",
+        {"to": "client@example.com", "subject": "Proof", "body": "Sensitive draft body"},
+    )
+
+    assert result.summary == "Draft created: draft-1"
+    assert audit_events[0][0][0] == "tool_call"
+    assert audit_events[0][0][2] == "gmail.draft"
+    assert "args_hash" in audit_events[0][1]["payload"]
+    assert "Sensitive draft body" not in str(audit_events[0][1]["payload"])
+    assert audit_events[1][0][0] == "tool_result"
+    assert audit_events[1][1]["payload"] == {"summary": "Draft created: draft-1"}
+
+
 def test_apply_context_suggestion_appends_patch_to_org_context(tmp_path):
     from routers.context import apply_context_patch
 

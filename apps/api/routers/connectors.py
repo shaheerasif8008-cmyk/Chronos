@@ -1,12 +1,12 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, insert, select, update
 from sqlalchemy.sql import func
 
 from connectors import vault
 from connectors.gmail import oauth_finish, oauth_start_url
-from core import audit, permissions
+from core import audit, permissions, tool_broker
 from core.auth import get_current_member
 from core.config import settings
 from core.db import engine, reflect_table
@@ -24,6 +24,13 @@ class ConnectorOut(BaseModel):
     last_used_at: str | None
 
 
+class ConnectorProofRequest(BaseModel):
+    to: str = "operator@example.com"
+    subject: str = "Chronos connector proof"
+    body: str = "This draft proves Gmail actions route through the Chronos tool broker."
+    url: str = "https://example.com"
+
+
 async def _row_to_out(row: dict) -> ConnectorOut:
     return ConnectorOut(
         id=row["id"],
@@ -33,6 +40,78 @@ async def _row_to_out(row: dict) -> ConnectorOut:
         connected_at=str(row["connected_at"]) if row.get("connected_at") else None,
         last_used_at=str(row["last_used_at"]) if row.get("last_used_at") else None,
     )
+
+
+def _proof_tool_args(provider: str, req: ConnectorProofRequest) -> tuple[str, dict]:
+    if provider == "gmail":
+        return "gmail.draft", {
+            "to": req.to,
+            "subject": req.subject,
+            "body": req.body,
+        }
+    if provider == "browser":
+        return "browser.fetch", {"url": req.url}
+    raise ValueError(f"No proof action for provider: {provider}")
+
+
+async def _mark_connector_used(connector_id: str) -> None:
+    connectors = await reflect_table("connectors")
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(connectors)
+            .where(connectors.c.id == connector_id)
+            .values(last_used_at=func.now())
+        )
+
+
+async def _audit_connector_proof(
+    *,
+    member_id: str,
+    tool: str | None,
+    connector_id: str,
+    status: str,
+) -> None:
+    await audit.log(
+        "connector_proof",
+        member_id,
+        tool or "connector.proof",
+        resource_type="connectors",
+        resource_id=connector_id,
+        payload={"tool": tool},
+        decision=status,
+    )
+
+
+async def execute_connector_proof(
+    *,
+    connector_id: str,
+    provider: str,
+    member: Member,
+    req: ConnectorProofRequest | None = None,
+) -> dict:
+    proof_req = req or ConnectorProofRequest()
+    try:
+        tool, args = _proof_tool_args(provider, proof_req)
+    except ValueError as exc:
+        return {"status": "unknown_provider", "detail": str(exc), "tool": None}
+
+    agent = AgentContext(id=f"connector-proof:{member.id}", org_id=member.organization_id, member_id=member.id)
+    try:
+        result = await tool_broker.execute(agent, tool, args)
+        status = "ok"
+        detail = result.summary
+    except Exception as exc:
+        status = "error"
+        detail = str(exc)
+
+    await _mark_connector_used(connector_id)
+    await _audit_connector_proof(
+        member_id=member.id,
+        tool=tool,
+        connector_id=connector_id,
+        status=status,
+    )
+    return {"status": status, "detail": detail, "tool": tool}
 
 
 @router.get("/")
@@ -109,13 +188,17 @@ async def disconnect_connector(connector_id: str, member: Member = Depends(get_c
 
 
 @router.post("/{connector_id}/test")
-async def test_connector(connector_id: str, member: Member = Depends(get_current_member)) -> dict:
+async def test_connector(
+    connector_id: str,
+    req: ConnectorProofRequest | None = None,
+    member: Member = Depends(get_current_member),
+) -> dict:
     await permissions.check(member, "test_connector", connector_id)
     connectors = await reflect_table("connectors")
     async with engine.begin() as conn:
         row = (
             await conn.execute(
-                select(connectors.c.provider, connectors.c.vault_ref).where(
+                select(connectors.c.provider).where(
                     connectors.c.id == connector_id,
                     connectors.c.organization_id == member.organization_id,
                 )
@@ -124,36 +207,66 @@ async def test_connector(connector_id: str, member: Member = Depends(get_current
     if row is None:
         raise HTTPException(status_code=404, detail="Connector not found")
 
-    provider = row["provider"]
-    vault_ref = row["vault_ref"]
+    return await execute_connector_proof(
+        connector_id=connector_id,
+        provider=row["provider"],
+        member=member,
+        req=req,
+    )
 
-    if provider == "gmail":
-        try:
-            from connectors.gmail import gmail_connector
-            agent = AgentContext(id=f"test:{member.id}", org_id=member.organization_id, member_id=member.id)
-            result = await gmail_connector.execute("gmail.read_inbox", {"max_results": 1}, vault_ref)
-            status = "ok"
-            detail = result.summary
-        except Exception as exc:
-            status = "error"
-            detail = str(exc)
-    elif provider == "browser":
-        try:
-            from connectors.browser import browser_connector
-            result = await browser_connector.execute("browser.fetch", {"url": "https://example.com"})
-            status = "ok"
-            detail = result.summary
-        except Exception as exc:
-            status = "error"
-            detail = str(exc)
-    else:
-        status = "unknown_provider"
-        detail = f"No test implementation for provider: {provider}"
 
-    await audit.log("connector_test", member.id, f"connector.test.{provider}",
-                    resource_type="connectors", resource_id=connector_id,
-                    decision=status)
-    return {"status": status, "detail": detail}
+@router.post("/browser/enable")
+async def enable_browser_connector(member: Member = Depends(get_current_member)) -> ConnectorOut:
+    await permissions.check(member, "connect_browser", member.organization_id)
+    connectors = await reflect_table("connectors")
+    async with engine.begin() as conn:
+        existing = (
+            await conn.execute(
+                select(
+                    connectors.c.id,
+                    connectors.c.provider,
+                    connectors.c.account_handle,
+                    connectors.c.status,
+                    connectors.c.connected_at,
+                    connectors.c.last_used_at,
+                ).where(
+                    connectors.c.organization_id == member.organization_id,
+                    connectors.c.provider == "browser",
+                    connectors.c.status == "active",
+                )
+            )
+        ).mappings().first()
+        if existing is not None:
+            return await _row_to_out(dict(existing))
+
+        result = await conn.execute(
+            insert(connectors).values(
+                organization_id=member.organization_id,
+                region=member.region,
+                provider="browser",
+                account_handle="local browser sandbox",
+                vault_ref="browser:local",
+                status="active",
+                scopes=["browser.fetch", "browser.search", "browser.extract_contacts"],
+            ).returning(
+                connectors.c.id,
+                connectors.c.provider,
+                connectors.c.account_handle,
+                connectors.c.status,
+                connectors.c.connected_at,
+                connectors.c.last_used_at,
+            )
+        )
+        row = result.mappings().first()
+
+    await audit.log(
+        "connector_connected",
+        member.id,
+        "connector.browser.enabled",
+        resource_type="connectors",
+        resource_id=row["id"] if row else "browser",
+    )
+    return await _row_to_out(dict(row))
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +283,18 @@ async def gmail_oauth_start(member: Member = Depends(get_current_member)) -> Red
     await audit.log("connector_oauth_start", member.id, "connector.gmail.oauth_start",
                     resource_type="connectors", resource_id="gmail")
     return RedirectResponse(url=url)
+
+
+@router.get("/gmail/oauth-url")
+async def gmail_oauth_url(member: Member = Depends(get_current_member)) -> dict:
+    await permissions.check(member, "connect_gmail", member.organization_id)
+    try:
+        url = await oauth_start_url(member_id=member.id, org_id=member.organization_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    await audit.log("connector_oauth_start", member.id, "connector.gmail.oauth_start",
+                    resource_type="connectors", resource_id="gmail")
+    return {"url": url}
 
 
 @router.get("/gmail/oauth-callback")
@@ -198,7 +323,6 @@ async def gmail_oauth_callback(
 
     # Persist connector record
     connectors = await reflect_table("connectors")
-    from sqlalchemy import insert
     async with engine.begin() as conn:
         result = await conn.execute(
             insert(connectors).values(

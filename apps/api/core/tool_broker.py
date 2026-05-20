@@ -9,6 +9,7 @@ import json
 import time
 
 from core import audit, permissions
+from core.config import settings
 from core.exceptions import ApprovalRequired, LoopDetected, RateLimitExceeded, SafetyLimitViolation
 from core.models import AgentContext, ToolResult
 from core.redis import redis_client
@@ -97,7 +98,8 @@ class ToolBroker:
         await permissions.check(agent.as_member(), f"use_tool:{tool}", agent.workspace_id or "default")
 
         # 2. Rate limiting (per org, Redis-backed — survives restarts)
-        await _check_rate_limit(agent.org_id)
+        if not (settings.demo_mode and tool == "gmail.draft"):
+            await _check_rate_limit(agent.org_id)
 
         # 3. Loop detection
         await _check_loop(agent.org_id, tool, args_hash)
@@ -117,13 +119,16 @@ class ToolBroker:
             payload={"args_hash": args_hash},   # never log raw args — they may contain credentials
         )
 
-        # 7. Look up connector record + credentials
-        from connectors.registry import get as registry_get
-        from connectors.vault import get as vault_get
+        # 7. Look up connector record + credentials. Demo mode still routes
+        # through the broker, but avoids requiring live Composio connector rows.
+        if settings.demo_mode:
+            vault_ref = "demo"
+        else:
+            from connectors.registry import get as registry_get
 
-        connector = await registry_get(agent, tool)
-        # vault_ref is the only credential identifier that touches logs
-        vault_ref = connector.vault_ref
+            connector = await registry_get(agent, tool)
+            # vault_ref is the only credential identifier that touches logs
+            vault_ref = connector.vault_ref
 
         # 8. Execute via connector
         result = await _route(tool, args, vault_ref)

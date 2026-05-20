@@ -96,6 +96,27 @@ class BrowserConnector:
         query = args.get("query", "")
         max_results = int(args.get("max_results", 10))
 
+        if settings.demo_mode:
+            results = [
+                {
+                    "title": f"DemoSaaS {i:02d} hiring sales team",
+                    "snippet": (
+                        f"Series {'A' if i % 2 else 'B'} B2B SaaS company with "
+                        f"{75 + (i * 5 % 110)} employees hiring SDRs and AEs."
+                    ),
+                    "url": f"https://demosaas{i:02d}.example.com/careers",
+                    "company": f"DemoSaaS {i:02d}",
+                    "employee_count": 75 + (i * 5 % 110),
+                    "stage": "Series A" if i % 2 else "Series B",
+                    "hiring_signal": "Open sales roles listed on careers page.",
+                }
+                for i in range(1, 21)
+            ][:max_results]
+            return ToolResult(
+                data={"query": query, "results": results, "leads": results},
+                summary=f"Demo search '{query}': {len(results)} fixture leads",
+            )
+
         playwright, browser, context, page = await _new_page()
         try:
             url = f"https://html.duckduckgo.com/html/?q={_url_encode(query)}"
