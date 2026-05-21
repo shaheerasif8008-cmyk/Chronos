@@ -169,6 +169,12 @@ class TaskExecutor:
                         merged["leads"] = result["leads"]
                     if "drafts" in result:
                         merged["drafts"] = result["drafts"]
+                    data = result.get("data")
+                    if isinstance(data, dict):
+                        if "leads" in data:
+                            merged["leads"] = data["leads"]
+                        if "drafts" in data:
+                            merged["drafts"] = data["drafts"]
             current_step += 1
             await update_task(task_id, result=merged, current_step=current_step)
             await emit_activity(task_id, {"type": "step_done", "step_index": current_step - 1, "step": step, "result": result})
@@ -226,7 +232,8 @@ class TaskExecutor:
     async def _think(self, task: dict[str, Any], step: dict[str, Any]) -> dict[str, Any]:
         result = dict(task.get("result") or {})
         leads = result.get("leads") or _demo_leads()
-        if settings.demo_mode and "draft" in step.get("description", "").lower():
+        should_draft = "draft" in step.get("description", "").lower()
+        if should_draft and (settings.demo_mode or result.get("leads")):
             return {"leads": leads, "drafts": _drafts_from_leads(leads)}
         return {"note": step.get("description", "completed")}
 

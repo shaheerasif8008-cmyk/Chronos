@@ -231,3 +231,139 @@ async def test_planner_falls_back_to_demo_plan_when_model_fails(monkeypatch):
 
     assert [step["action"] for step in plan] == ["spawn_sub_agent", "think", "approval_gate"]
     assert plan[-1]["tool"] == "gmail.draft"
+
+
+@pytest.mark.asyncio
+async def test_browser_search_operator_workflow_fixture_avoids_live_duckduckgo(monkeypatch):
+    from connectors import browser
+
+    async def fail_new_page():
+        raise AssertionError("operator workflow proof search should not open a browser")
+
+    monkeypatch.setattr(browser.settings, "demo_mode", False)
+    monkeypatch.setattr(browser, "_new_page", fail_new_page)
+
+    result = await browser.browser_connector._search(
+        {"query": "operator workflow proof: draft approvals", "max_results": 3, "fixture": "operator_workflow_proof"}
+    )
+
+    assert result.summary == "Fixture search 'operator workflow proof: draft approvals': 3 leads"
+    assert len(result.data["leads"]) == 3
+    assert result.data["leads"][0]["domain"] == "demosaas01.example.com"
+
+
+@pytest.mark.asyncio
+async def test_operator_workflow_proof_task_api_reaches_pending_approval(monkeypatch):
+    from core.models import Member, ToolResult
+    from routers import tasks
+    from runtime import executor
+
+    task_id = "operator-proof-task"
+    task_state = {}
+    events = []
+    approvals = []
+    scheduled = []
+
+    async def fake_create_task_record(*, goal, member, triggered_by, persona_id=None, workspace_id=None):
+        plan = await tasks.create_plan(goal, {"triggered_by": triggered_by}, member.organization_id)
+        task_state.update(
+            {
+                "id": task_id,
+                "organization_id": member.organization_id,
+                "region": member.region,
+                "triggered_by_member_id": member.id,
+                "workspace_id": workspace_id,
+                "persona_id": persona_id,
+                "status": "pending",
+                "goal": goal,
+                "plan": plan,
+                "current_step": 0,
+                "result": {},
+                "started_at": None,
+            }
+        )
+        return task_id
+
+    def fake_create_task(coro):
+        scheduled.append(coro)
+        return coro
+
+    async def fake_get_task(requested_task_id):
+        assert requested_task_id == task_id
+        return dict(task_state)
+
+    async def fake_update_task(requested_task_id, **values):
+        assert requested_task_id == task_id
+        task_state.update(values)
+
+    async def fake_emit(requested_task_id, event, **kwargs):
+        assert requested_task_id == task_id
+        events.append(event)
+
+    async def fake_permission(*args, **kwargs):
+        return True
+
+    async def fake_tool_execute(agent, tool, args):
+        assert tool == "browser.search"
+        assert args["fixture"] == "operator_workflow_proof"
+        return ToolResult(
+            summary="Fixture search 'operator workflow proof': 2 leads",
+            data={
+                "leads": [
+                    {
+                        "company": "DemoSaaS 01",
+                        "domain": "demosaas01.example.com",
+                        "personalization": "Reference their sales hiring motion.",
+                    },
+                    {
+                        "company": "DemoSaaS 02",
+                        "domain": "demosaas02.example.com",
+                        "personalization": "Reference their sales hiring motion.",
+                    },
+                ]
+            },
+        )
+
+    async def fake_create_approvals(self, task, step):
+        approvals.append({"task_id": task["id"], "step_id": step["id"], "draft_count": len(task["result"]["drafts"])})
+        return ["approval-1", "approval-2"]
+
+    async def fake_handle_approval_gate(self, task, step):
+        approval_ids = await fake_create_approvals(self, task, step)
+        await executor.update_task(task["id"], status="awaiting_approval")
+        await executor.emit_activity(
+            task["id"],
+            {"type": "awaiting_approval", "approval_ids": approval_ids, "step_id": step["id"]},
+        )
+        raise executor._PausedForApproval()
+
+    monkeypatch.setattr(tasks, "create_task_record", fake_create_task_record)
+    monkeypatch.setattr(tasks.asyncio, "create_task", fake_create_task)
+    monkeypatch.setattr(executor, "get_task", fake_get_task)
+    monkeypatch.setattr(executor, "update_task", fake_update_task)
+    monkeypatch.setattr(executor, "emit_activity", fake_emit)
+    monkeypatch.setattr(executor.permissions, "check", fake_permission)
+    monkeypatch.setattr(executor.tool_broker, "execute", fake_tool_execute)
+    monkeypatch.setattr(executor.TaskExecutor, "_handle_approval_gate", fake_handle_approval_gate)
+
+    response = await tasks.create_task(
+        tasks.CreateTaskRequest(
+            goal="operator workflow proof: research leads, draft outreach, and request approval",
+            conversation_id="conversation-1",
+        ),
+        Member(id="member-1", organization_id="default", region="us", email="operator@example.com"),
+    )
+
+    assert response == {"task_id": task_id}
+    assert len(scheduled) == 1
+
+    await scheduled[0]
+
+    assert task_state["status"] == "awaiting_approval", task_state.get("error")
+    assert [step["action"] for step in task_state["plan"]] == ["tool_call", "think", "approval_gate"]
+    assert task_state["plan"][0]["tool"] == "browser.search"
+    assert task_state["plan"][0]["args"]["fixture"] == "operator_workflow_proof"
+    assert len(task_state["result"]["leads"]) == 2
+    assert len(task_state["result"]["drafts"]) == 2
+    assert approvals == [{"task_id": task_id, "step_id": "proof_approval", "draft_count": 2}]
+    assert events[-1] == {"type": "awaiting_approval", "approval_ids": ["approval-1", "approval-2"], "step_id": "proof_approval"}

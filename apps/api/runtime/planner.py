@@ -61,7 +61,47 @@ def _demo_plan(goal: str) -> list[dict[str, Any]]:
     ]
 
 
+def _operator_workflow_proof_plan(goal: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": "proof_search",
+            "action": "tool_call",
+            "description": "Use the browser connector proof fixture to produce deterministic lead research.",
+            "tool": "browser.search",
+            "args": {"query": goal, "max_results": 20, "fixture": "operator_workflow_proof"},
+            "approval_required": False,
+            "depends_on": [],
+        },
+        {
+            "id": "proof_drafts",
+            "action": "think",
+            "description": "Draft approval-ready outreach from the deterministic operator workflow leads.",
+            "tool": None,
+            "args": {},
+            "approval_required": False,
+            "depends_on": ["proof_search"],
+        },
+        {
+            "id": "proof_approval",
+            "action": "approval_gate",
+            "description": "Request operator approval for the proof outreach drafts.",
+            "tool": "gmail.draft",
+            "args": {"from_result": "drafts"},
+            "approval_required": True,
+            "depends_on": ["proof_drafts"],
+        },
+    ]
+
+
+def _is_operator_workflow_proof(goal: str) -> bool:
+    normalized = " ".join(goal.lower().split())
+    return "operator workflow proof" in normalized
+
+
 async def create_plan(goal: str, context: dict[str, Any] | None, org_id: str) -> list[dict[str, Any]]:
+    if _is_operator_workflow_proof(goal):
+        return _operator_workflow_proof_plan(goal)
+
     if settings.demo_mode:
         return _demo_plan(goal)
 
