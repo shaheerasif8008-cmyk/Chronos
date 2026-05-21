@@ -62,7 +62,7 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  font-family: 'Geist', system-ui, sans-serif;
+  font-family: var(--font-geist), 'Geist', system-ui, sans-serif;
   font-feature-settings: "ss01", "ss03", "cv11";
   font-size: 15px;
   line-height: 1.55;
@@ -214,11 +214,12 @@ textarea {
 .btn-danger-soft:hover { background: var(--danger-soft); border-color: var(--danger); }
 
 .btn-ok-soft {
-  background: var(--ok);
-  color: white;
+  background: var(--ok-soft);
+  color: var(--ok);
   font-weight: 500;
+  border-color: transparent;
 }
-.btn-ok-soft:hover { filter: brightness(1.08); }
+.btn-ok-soft:hover { background: color-mix(in oklch, var(--ok) 18%, transparent); }
 
 .btn-sm { padding: 5px 10px; font-size: 12.5px; border-radius: 6px; gap: 5px; }
 .btn-icon { padding: 7px; }
@@ -434,7 +435,7 @@ textarea {
 .prose-body li { margin-bottom: 0.3em; list-style: disc; }
 
 .inline-ref {
-  font-family: 'Geist Mono', monospace;
+  font-family: var(--font-geist-mono), 'Geist Mono', monospace;
   font-size: 0.9em;
   padding: 1px 5px;
   background: var(--surface-2);
