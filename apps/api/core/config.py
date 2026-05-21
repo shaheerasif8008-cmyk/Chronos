@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     org_id: str = "default"
     region: str = "us"
     admin_email: str = "admin@example.com"
-    database_url: str = "postgresql+asyncpg://chronos:chronos@localhost:5432/chronos"
+    database_url: str = "postgresql+asyncpg://chronos:chronos@localhost:55432/chronos"
     redis_url: str = "redis://localhost:6379"
     local_llm_base_url: str = "http://localhost:11434"
     local_llm_model: str = "llama3"

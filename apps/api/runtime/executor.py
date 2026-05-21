@@ -261,17 +261,13 @@ class TaskExecutor:
         row_dicts = [dict(row) for row in rows]
         pending = [row for row in row_dicts if row["status"] == "pending"]
         rejected = [row for row in row_dicts if row["status"] == "rejected"]
-        draft_results = await self._execute_approved_drafts(task, step, approvals_ready_for_drafting(row_dicts))
         if pending:
             await update_task(task["id"], status="awaiting_approval")
-            if draft_results:
-                await emit_activity(
-                    task["id"],
-                    {"type": "approved_drafts_created", "step_id": step["id"], "drafts_created": draft_results},
-                )
             raise _PausedForApproval()
+
+        draft_results = await self._execute_approved_drafts(task, step, approvals_ready_for_drafting(row_dicts))
         if rejected:
-            return {"approved": 0, "rejected": len(rejected), "drafts_created": []}
+            return {"approved": len(row_dicts) - len(rejected), "rejected": len(rejected), "drafts_created": draft_results}
 
         completed_results = [
             {"approval_id": row["id"], **row["action_payload"]["draft_result"]}
@@ -295,6 +291,7 @@ class TaskExecutor:
                 payload = dict(row["action_payload"])
                 tool = payload.pop("tool", step.get("tool") or "gmail.draft")
                 payload.pop("batch_id", None)
+                payload["__approved_by_gate"] = True
                 result = await tool_broker.execute(AgentContext.from_task(task), tool, payload)
                 draft_result = {"summary": result.summary, "data": result.data}
                 await conn.execute(

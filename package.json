@@ -2,6 +2,7 @@
   "name": "chronos",
   "private": true,
   "scripts": {
+    "dev": "bash scripts/dev.sh",
     "dev:web": "npm --prefix apps/web run dev",
     "build:web": "npm --prefix apps/web run build",
     "lint:web": "npm --prefix apps/web run lint"

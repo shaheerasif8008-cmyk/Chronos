@@ -248,9 +248,13 @@ async def test_tool_broker_audits_gmail_draft_without_logging_raw_args(monkeypat
         audit_events.append((args, kwargs))
         return "audit-1"
 
+    async def fake_tool_policy(org_id, provider):
+        return {"enabled": True, "approval_required": False}
+
     monkeypatch.setattr(permissions, "check", fake_permission)
     monkeypatch.setattr(tool_broker, "_check_rate_limit", noop_rate_limit)
     monkeypatch.setattr(tool_broker, "_check_loop", noop_loop)
+    monkeypatch.setattr(tool_broker, "tool_policy", fake_tool_policy)
     monkeypatch.setattr(registry, "get", fake_registry_get)
     monkeypatch.setattr(tool_broker, "_route", fake_route)
     monkeypatch.setattr(tool_broker.audit, "log", fake_audit_log)
@@ -268,6 +272,42 @@ async def test_tool_broker_audits_gmail_draft_without_logging_raw_args(monkeypat
     assert "Sensitive draft body" not in str(audit_events[0][1]["payload"])
     assert audit_events[1][0][0] == "tool_result"
     assert audit_events[1][1]["payload"] == {"summary": "Draft created: draft-1"}
+
+
+@pytest.mark.asyncio
+async def test_tool_broker_blocks_disabled_tool_from_settings(monkeypatch):
+    from core import permissions, tool_broker
+    from core.exceptions import ApprovalRequired
+    from core.models import AgentContext
+
+    async def fake_permission(*args, **kwargs):
+        return True
+
+    async def noop_rate_limit(org_id):
+        return None
+
+    async def noop_loop(org_id, tool, args_hash):
+        return None
+
+    async def fake_tool_policy(org_id, provider):
+        assert provider == "browser"
+        return {"enabled": False, "approval_required": False}
+
+    async def fake_audit_log(*args, **kwargs):
+        return "audit-1"
+
+    monkeypatch.setattr(permissions, "check", fake_permission)
+    monkeypatch.setattr(tool_broker, "_check_rate_limit", noop_rate_limit)
+    monkeypatch.setattr(tool_broker, "_check_loop", noop_loop)
+    monkeypatch.setattr(tool_broker, "tool_policy", fake_tool_policy)
+    monkeypatch.setattr(tool_broker.audit, "log", fake_audit_log)
+
+    with pytest.raises(ApprovalRequired, match="tool is disabled in settings"):
+        await tool_broker.execute(
+            AgentContext(id="agent-1", org_id="default", member_id="member-1"),
+            "browser.fetch",
+            {"url": "https://example.com"},
+        )
 
 
 def test_apply_context_suggestion_appends_patch_to_org_context(tmp_path):

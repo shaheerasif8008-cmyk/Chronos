@@ -13,6 +13,7 @@ from core.config import settings
 from core.exceptions import ApprovalRequired, LoopDetected, RateLimitExceeded, SafetyLimitViolation
 from core.models import AgentContext, ToolResult
 from core.redis import redis_client
+from core.settings_store import tool_policy
 
 # Tools that always require a human approval record — regardless of autonomy level.
 _ALWAYS_APPROVAL_TOOLS = {
@@ -92,6 +93,7 @@ async def _route(tool: str, args: dict, vault_ref: str) -> ToolResult:
 
 class ToolBroker:
     async def execute(self, agent: AgentContext, tool: str, args: dict) -> ToolResult:
+        approved_by_gate = bool(args.pop("__approved_by_gate", False))
         args_hash = hashlib.sha256(json.dumps(args, sort_keys=True).encode()).hexdigest()
 
         # 1. Permission check (seam — always runs)
@@ -110,6 +112,11 @@ class ToolBroker:
         # 5. Approval gate — check always-approval set first
         if tool in _ALWAYS_APPROVAL_TOOLS:
             raise ApprovalRequired(tool, "tool requires an approval record (none exists in Phase 1)")
+        policy = await tool_policy(agent.org_id, tool.split(".")[0])
+        if policy.get("enabled") is False:
+            raise ApprovalRequired(tool, "tool is disabled in settings")
+        if policy.get("approval_required") is True and not approved_by_gate:
+            raise ApprovalRequired(tool, "tool requires approval by settings policy")
 
         # 6. Audit: tool_call before execution
         await audit.log(

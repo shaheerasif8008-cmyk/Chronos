@@ -69,6 +69,11 @@ def _looks_like_task(message: str) -> bool:
     return any(verb in lowered for verb in task_verbs) and any(marker in lowered for marker in multi_step_markers)
 
 
+def _is_operator_workflow_proof(message: str) -> bool:
+    normalized = " ".join(message.lower().split())
+    return "operator workflow proof" in normalized
+
+
 @router.get("/conversations")
 async def list_conversations(member: Member = Depends(get_current_member)) -> list[dict]:
     await permissions.check(member, "list_conversations", settings.org_id)
@@ -158,8 +163,8 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
 
         return StreamingResponse(explicit_stream(), media_type="text/event-stream")
 
-    if settings.demo_mode and _looks_like_task(req.message):
-        async def demo_task_stream():
+    if (settings.demo_mode and _looks_like_task(req.message)) or _is_operator_workflow_proof(req.message):
+        async def task_stream():
             from routers.tasks import create_task_record
 
             task_id = await create_task_record(
@@ -176,7 +181,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
             yield f"data: {json.dumps({'type': 'task_created', 'task_id': task_id})}\n\n"
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
-        return StreamingResponse(demo_task_stream(), media_type="text/event-stream")
+        return StreamingResponse(task_stream(), media_type="text/event-stream")
 
     context = await assemble_context(conversation_id, req.message, requester_context)
 

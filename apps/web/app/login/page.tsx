@@ -3,7 +3,18 @@
 import { FormEvent, useState } from "react";
 import { useRouter } from "next/navigation";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
+const CONFIGURED_API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
+
+function apiBase() {
+  if (CONFIGURED_API_BASE) return CONFIGURED_API_BASE;
+  if (typeof window !== "undefined") {
+    const webPort = Number(window.location.port || "3000");
+    if (Number.isFinite(webPort) && webPort >= 3000 && webPort < 3100) {
+      return `http://${window.location.hostname}:${8000 + (webPort - 3000)}`;
+    }
+  }
+  return "http://localhost:8000";
+}
 
 export default function LoginPage() {
   const router = useRouter();
@@ -15,7 +26,7 @@ export default function LoginPage() {
   async function requestOtp(event: FormEvent) {
     event.preventDefault();
     setError("");
-    const res = await fetch(`${API_BASE}/auth/request-otp`, {
+    const res = await fetch(`${apiBase()}/auth/request-otp`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email }),
@@ -30,7 +41,7 @@ export default function LoginPage() {
   async function verifyOtp(event: FormEvent) {
     event.preventDefault();
     setError("");
-    const res = await fetch(`${API_BASE}/auth/verify-otp`, {
+    const res = await fetch(`${apiBase()}/auth/verify-otp`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email, code }),

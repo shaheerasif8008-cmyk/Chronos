@@ -218,6 +218,91 @@ def test_approved_approval_without_draft_result_is_ready_for_execution():
 
 
 @pytest.mark.asyncio
+async def test_approval_gate_waits_for_all_pending_decisions_before_drafting(monkeypatch):
+    from runtime import executor
+
+    task = {
+        "id": "task-approval-batch",
+        "organization_id": "default",
+        "region": "us",
+        "triggered_by_member_id": "member-1",
+        "workspace_id": None,
+        "persona_id": None,
+        "status": "awaiting_approval",
+        "result": {},
+    }
+    step = {"id": "approve_drafts", "tool": "gmail.draft"}
+    events = []
+    updates = []
+    executed = False
+
+    class FakeColumn:
+        def __eq__(self, other):
+            return ("eq", other)
+
+    class FakeApprovals:
+        class c:
+            task_id = FakeColumn()
+            step_id = FakeColumn()
+
+        def where(self, *args):
+            return self
+
+    class FakeResult:
+        def mappings(self):
+            return self
+
+        def all(self):
+            return [
+                {"id": "approval-1", "status": "approved", "action_payload": {"to": "approved@example.com"}},
+                {"id": "approval-2", "status": "pending", "action_payload": {"to": "pending@example.com"}},
+            ]
+
+    class FakeConn:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def execute(self, stmt):
+            return FakeResult()
+
+    class FakeEngine:
+        def begin(self):
+            return FakeConn()
+
+    async def fake_reflect_table(name):
+        assert name == "approvals"
+        return FakeApprovals()
+
+    async def fake_update_task(task_id, **values):
+        updates.append((task_id, values))
+
+    async def fake_emit(task_id, event, **kwargs):
+        events.append(event)
+
+    async def fake_execute_approved_drafts(self, task_arg, step_arg, rows):
+        nonlocal executed
+        executed = True
+        return []
+
+    monkeypatch.setattr(executor, "reflect_table", fake_reflect_table)
+    monkeypatch.setattr(executor, "engine", FakeEngine())
+    monkeypatch.setattr(executor, "update_task", fake_update_task)
+    monkeypatch.setattr(executor, "emit_activity", fake_emit)
+    monkeypatch.setattr(executor, "select", lambda table: table)
+    monkeypatch.setattr(executor.TaskExecutor, "_execute_approved_drafts", fake_execute_approved_drafts)
+
+    with pytest.raises(executor._PausedForApproval):
+        await executor.TaskExecutor()._handle_approval_gate(task, step)
+
+    assert executed is False
+    assert updates == [("task-approval-batch", {"status": "awaiting_approval"})]
+    assert events == []
+
+
+@pytest.mark.asyncio
 async def test_planner_falls_back_to_demo_plan_when_model_fails(monkeypatch):
     from runtime import planner
 

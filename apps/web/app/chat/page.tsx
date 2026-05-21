@@ -1,14 +1,25 @@
 "use client";
 
 import { ReactNode, useEffect, useRef, useState, useMemo, useCallback } from "react";
-import { useRouter } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
+const CONFIGURED_API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
+
+function apiBase() {
+  if (CONFIGURED_API_BASE) return CONFIGURED_API_BASE;
+  if (typeof window !== "undefined") {
+    const webPort = Number(window.location.port || "3000");
+    if (Number.isFinite(webPort) && webPort >= 3000 && webPort < 3100) {
+      return `http://${window.location.hostname}:${8000 + (webPort - 3000)}`;
+    }
+  }
+  return "http://localhost:8000";
+}
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 type Route = "chat" | "activity" | "approvals" | "memory" | "connectors" | "assistants" | "settings";
-type SettingsTab = "account" | "preferences" | "workspace" | "notifications" | "audit";
+type SettingsTab = "general" | "profile" | "organization" | "members" | "permissions" | "employees" | "runtime" | "memory-settings" | "tools-settings" | "approval-settings" | "notifications" | "security" | "billing" | "audit" | "developer" | "danger";
 type Conversation = { id: string; title: string | null; updated_at?: string; created_at?: string };
 type MessageRole = "user" | "assistant" | "system" | "tool";
 type MessageStatus = "streaming" | "complete" | "paused" | "approval_pending" | "error";
@@ -26,6 +37,30 @@ type Connector = { id: string; provider: string; account_handle?: string | null;
 type Task = { id: string; status: string; goal: string; current_step: number; plan?: TaskStep[]; result?: Record<string, unknown>; created_at?: string; parent_task_id?: string | null; depth?: number };
 type TaskStep = { id: string; action: string; description: string; tool?: string | null };
 type Approval = { id: string; task_id: string; step_id: string; action_type: string; action_payload: Record<string, unknown>; requested_at?: string; status: string };
+type SettingsOverview = {
+  member: { id: string; email: string; name?: string | null; role: string; can_admin: boolean };
+  organization: Record<string, unknown>;
+  sections: Record<string, Record<string, unknown>>;
+  members: Array<{ id: string; name: string; email: string; role: string; status: string; is_self: boolean }>;
+  connectors: Array<Connector & { scopes?: string[]; policy?: Record<string, unknown> }>;
+  memory_stats: { active: number; deleted: number };
+  runtime_health: Record<string, unknown>;
+  capabilities: Record<string, { supported: boolean; reason: string }>;
+};
+
+function routeFromPath(pathname: string | null): Route {
+  if (pathname === "/activity") return "activity";
+  if (pathname === "/approvals") return "approvals";
+  if (pathname === "/memory") return "memory";
+  if (pathname === "/connectors") return "connectors";
+  if (pathname === "/assistants") return "assistants";
+  if (pathname === "/settings") return "settings";
+  return "chat";
+}
+
+function pathForRoute(route: Route) {
+  return route === "chat" ? "/chat" : `/${route}`;
+}
 
 const ACCENT_PALETTES: Record<string, { accent: string; hover: string; soft: string; text: string }> = {
   coral:  { accent: "oklch(0.66 0.135 45)",  hover: "oklch(0.60 0.145 45)",  soft: "oklch(0.94 0.04 50)",  text: "oklch(0.40 0.13 45)" },
@@ -45,7 +80,7 @@ async function apiFetch(path: string, init: RequestInit = {}) {
   const token = getToken();
   if (token) headers.set("Authorization", `Bearer ${token}`);
   if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
-  const res = await fetch(`${API_BASE}${path}`, { ...init, headers });
+  const res = await fetch(`${apiBase()}${path}`, { ...init, headers });
   if (res.status === 401) {
     localStorage.removeItem("chronos_token");
     window.location.href = "/login";
@@ -193,8 +228,9 @@ const SKILLS = [
 // ─── Root App ─────────────────────────────────────────────────────────────────
 export default function ChronosApp() {
   const router = useRouter();
-  const [route, setRoute] = useState<Route>("chat");
-  const [settingsTab, setSettingsTab] = useState<SettingsTab>("account");
+  const pathname = usePathname();
+  const [route, setRoute] = useState<Route>(() => routeFromPath(pathname));
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>("general");
   const [activeConvoId, setActiveConvoId] = useState<string | null>(null);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [pendingApprovals, setPendingApprovals] = useState(0);
@@ -221,6 +257,15 @@ export default function ChronosApp() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => {
+    setRoute(routeFromPath(pathname));
+  }, [pathname]);
+
+  function navigateRoute(next: Route) {
+    setRoute(next);
+    router.push(pathForRoute(next));
+  }
+
   async function loadConversations(selectId?: string) {
     try {
       const data = (await (await apiFetch("/chat/conversations")).json()) as Conversation[];
@@ -239,7 +284,7 @@ export default function ChronosApp() {
 
   function openSettings(tab: SettingsTab) {
     setSettingsTab(tab);
-    setRoute("settings");
+    navigateRoute("settings");
   }
 
   function signOut() {
@@ -262,11 +307,11 @@ export default function ChronosApp() {
         onCollapse={() => setSidebarCollapsed(true)}
         onExpand={() => setSidebarCollapsed(false)}
         route={route}
-        onNavigate={(r: Route) => setRoute(r)}
+        onNavigate={navigateRoute}
         conversations={conversations}
         activeConvoId={activeConvoId}
-        onSelectConvo={(id) => { setActiveConvoId(id); setRoute("chat"); }}
-        onNewConvo={() => { setActiveConvoId(null); setRoute("chat"); }}
+        onSelectConvo={(id) => { setActiveConvoId(id); navigateRoute("chat"); }}
+        onNewConvo={() => { setActiveConvoId(null); navigateRoute("chat"); }}
         onDeleteConvo={deleteConversation}
         pendingApprovals={pendingApprovals}
         onOpenSettings={openSettings}
@@ -483,9 +528,9 @@ function AccountMenu({ onClose, onSettings, onSignOut }: { onClose: () => void; 
       </div>
 
       {[
-        { label: "Account",            icon: <IC.Personas size={14}/>, tab: "account" as SettingsTab },
-        { label: "Preferences",        icon: <IC.Settings size={14}/>, tab: "preferences" as SettingsTab },
-        { label: "Workspace settings", icon: <IC.Briefcase size={14}/>, tab: "workspace" as SettingsTab },
+        { label: "Profile",            icon: <IC.Personas size={14}/>, tab: "profile" as SettingsTab },
+        { label: "General settings",   icon: <IC.Settings size={14}/>, tab: "general" as SettingsTab },
+        { label: "Organization",       icon: <IC.Briefcase size={14}/>, tab: "organization" as SettingsTab },
         { label: "Notifications",      icon: <IC.Bell size={14}/>, tab: "notifications" as SettingsTab },
         { label: "Audit log",          icon: <IC.Audit size={14}/>, tab: "audit" as SettingsTab },
       ].map(it => (
@@ -510,7 +555,7 @@ function AccountMenu({ onClose, onSettings, onSignOut }: { onClose: () => void; 
 
       <div className="px-3 py-2 border-t hairline">
         <div className="flex items-center justify-between text-[11px]" style={{ color: "var(--text-dim)" }}>
-          <span>Chronos · Sprint 1</span>
+        <span>Chronos · Sprint 4</span>
           <span className="flex items-center gap-1"><Dot color="var(--ok)" size={5}/> Healthy</span>
         </div>
       </div>
@@ -554,15 +599,9 @@ function ChatScreen({ activeConvoId, onConvoCreated }: { activeConvoId: string |
 
     try {
       let convoId = activeConvoId;
-      if (!convoId) {
-        const created = await (await apiFetch("/chat/conversations", { method: "POST", body: JSON.stringify({ title: text.slice(0, 60) }) })).json() as { id: string };
-        convoId = created.id;
-        onConvoCreated(convoId);
-      }
-
-      const resp = await apiFetch(`/chat/conversations/${convoId}/messages`, {
+      const resp = await apiFetch("/chat/message", {
         method: "POST",
-        body: JSON.stringify({ content: text }),
+        body: JSON.stringify({ message: text, conversation_id: convoId }),
         signal: ab.signal,
       });
 
@@ -580,7 +619,11 @@ function ChatScreen({ activeConvoId, onConvoCreated }: { activeConvoId: string |
         for (const line of chunk.split("\n")) {
           if (!line.startsWith("data: ")) continue;
           try {
-            const ev = JSON.parse(line.slice(6)) as { type: string; content?: string };
+            const ev = JSON.parse(line.slice(6)) as { type: string; content?: string; conversation_id?: string; task_id?: string };
+            if (ev.type === "conversation" && ev.conversation_id) {
+              convoId = ev.conversation_id;
+              onConvoCreated(ev.conversation_id);
+            }
             if (ev.type === "token" && ev.content) {
               partial += ev.content;
               setMessages(prev => {
@@ -589,6 +632,8 @@ function ChatScreen({ activeConvoId, onConvoCreated }: { activeConvoId: string |
                 if (last?.role === "assistant") updated[updated.length - 1] = { ...last, content: partial };
                 return updated;
               });
+            } else if (ev.type === "task_created" && ev.task_id) {
+              setActivityOpen(true);
             } else if (ev.type === "done") {
               setMessages(prev => {
                 const updated = [...prev];
@@ -899,27 +944,43 @@ function ApprovalsScreen({ onDecision }: { onDecision: () => void }) {
   const [loading, setLoading] = useState(true);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [decisions, setDecisions] = useState<Record<string, "approved" | "rejected">>({});
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [error, setError] = useState("");
+
+  async function loadApprovals(preferredId?: string | null) {
+    setLoading(true);
+    setError("");
+    try {
+      const data = (await (await apiFetch("/approvals/")).json()) as Approval[];
+      setApprovals(data);
+      setActiveId(preferredId && data.some(item => item.id === preferredId) ? preferredId : data[0]?.id ?? null);
+    } catch (exc) {
+      setError(exc instanceof Error ? exc.message : "Unable to load approvals");
+    } finally {
+      setLoading(false);
+    }
+  }
 
   useEffect(() => {
-    setLoading(true);
-    apiFetch("/approvals/")
-      .then(r => r.json())
-      .then((data: Approval[]) => {
-        setApprovals(data);
-        if (data[0]) setActiveId(data[0].id);
-      })
-      .catch(() => {})
-      .finally(() => setLoading(false));
+    void loadApprovals();
   }, []);
 
   const active = approvals.find(a => a.id === activeId);
 
   async function decide(id: string, decision: "approved" | "rejected") {
+    setBusyId(id);
+    setError("");
     try {
-      await apiFetch(`/approvals/${id}`, { method: "POST", body: JSON.stringify({ decision }) });
+      await apiFetch(`/approvals/${id}/decide`, { method: "POST", body: JSON.stringify({ decision }) });
       setDecisions(prev => ({ ...prev, [id]: decision }));
+      const nextPending = approvals.find(a => a.id !== id && !decisions[a.id] && a.status === "pending");
+      await loadApprovals(nextPending?.id ?? null);
       onDecision();
-    } catch { /* silently */ }
+    } catch (exc) {
+      setError(exc instanceof Error ? exc.message : "Unable to update approval");
+    } finally {
+      setBusyId(null);
+    }
   }
 
   const pending = approvals.filter(a => !decisions[a.id] && a.status === "pending");
@@ -932,8 +993,13 @@ function ApprovalsScreen({ onDecision }: { onDecision: () => void }) {
         <div className="px-5 pt-5 pb-3 flex-shrink-0">
           <h1 className="h-section">Approvals</h1>
           <p className="text-[12.5px] mt-0.5" style={{ color: "var(--text-dim)" }}>
-            {pending.length} waiting · auto-expire in 24h
+            {pending.length} waiting · approved drafts are created after the batch is decided
           </p>
+          {error && (
+            <p className="mt-3 rounded-lg border px-3 py-2 text-[12.5px]" style={{ borderColor: "var(--danger)", color: "var(--danger)" }}>
+              {error}
+            </p>
+          )}
         </div>
         <div className="flex-1 overflow-y-auto">
           {loading && <p className="px-5 py-4 text-[13.5px]" style={{ color: "var(--text-dim)" }}>Loading…</p>}
@@ -1006,11 +1072,11 @@ function ApprovalsScreen({ onDecision }: { onDecision: () => void }) {
             {/* Decisions */}
             {!decisions[active.id] && active.status === "pending" ? (
               <div className="flex items-center gap-3">
-                <button onClick={() => void decide(active.id, "approved")} className="btn btn-ok-soft flex-1 justify-center">
-                  <IC.Check size={15} stroke={2.2}/> Approve
+                <button onClick={() => void decide(active.id, "approved")} disabled={busyId === active.id} className="btn btn-ok-soft flex-1 justify-center disabled:opacity-50">
+                  <IC.Check size={15} stroke={2.2}/> {busyId === active.id ? "Approving..." : "Approve draft"}
                 </button>
-                <button onClick={() => void decide(active.id, "rejected")} className="btn btn-danger-soft flex-1 justify-center">
-                  <IC.X size={15}/> Reject
+                <button onClick={() => void decide(active.id, "rejected")} disabled={busyId === active.id} className="btn btn-danger-soft flex-1 justify-center disabled:opacity-50">
+                  <IC.X size={15}/> {busyId === active.id ? "Rejecting..." : "Reject draft"}
                 </button>
               </div>
             ) : (
@@ -1366,194 +1432,312 @@ function AssistantsScreen() {
 }
 
 // ─── Settings Screen ──────────────────────────────────────────────────────────
+const SETTING_TABS: Array<{ id: SettingsTab; label: string; icon: ReactNode; keywords: string }> = [
+  { id: "general", label: "General", icon: <IC.Settings size={15}/>, keywords: "workspace name timezone language theme notifications landing" },
+  { id: "profile", label: "Profile", icon: <IC.Personas size={15}/>, keywords: "name avatar email role response citations interaction" },
+  { id: "organization", label: "Organization", icon: <IC.Briefcase size={15}/>, keywords: "org logo domain plan seats workspace creation" },
+  { id: "members", label: "Members & roles", icon: <IC.Personas size={15}/>, keywords: "member invite role remove owner admin manager operator viewer" },
+  { id: "permissions", label: "Permissions", icon: <IC.Lock size={15}/>, keywords: "rbac matrix workspace employee tools approval memory audit" },
+  { id: "employees", label: "AI employees", icon: <IC.Sparkles size={15}/>, keywords: "employee runtime memory scope sub agent depth" },
+  { id: "runtime", label: "Runtime", icon: <IC.Activity size={15}/>, keywords: "mode isolation heartbeat restart logs queue recovery budget" },
+  { id: "memory-settings", label: "Memory", icon: <IC.Memory size={15}/>, keywords: "retention review auto save sensitive export purge" },
+  { id: "tools-settings", label: "Tools & integrations", icon: <IC.Connectors size={15}/>, keywords: "connectors oauth disconnect scopes approval required risk enabled" },
+  { id: "approval-settings", label: "Approvals", icon: <IC.Approvals size={15}/>, keywords: "mode thresholds rules external sub agent runtime memory" },
+  { id: "notifications", label: "Notifications", icon: <IC.Bell size={15}/>, keywords: "email in app runtime alerts approval task weekly digest security" },
+  { id: "security", label: "Security", icon: <IC.Lock size={15}/>, keywords: "sessions password two factor api keys login history revoke" },
+  { id: "billing", label: "Billing", icon: <IC.Audit size={15}/>, keywords: "plan usage seats runtime tokens storage invoices stripe" },
+  { id: "audit", label: "Audit logs", icon: <IC.Audit size={15}/>, keywords: "actor action target date risk search export" },
+  { id: "developer", label: "Developer", icon: <IC.Lightbulb size={15}/>, keywords: "feature flags api mode webhooks debug experimental environment model provider" },
+  { id: "danger", label: "Danger zone", icon: <IC.Trash size={15}/>, keywords: "reset delete leave transfer ownership irreversible" },
+];
+
 function SettingsScreen({ tab, setTab, theme, setTheme, accent, setAccent, signOut }: {
   tab: SettingsTab; setTab: (t: SettingsTab) => void;
   theme: "light" | "dark"; setTheme: (t: "light" | "dark") => void;
   accent: string; setAccent: (a: string) => void;
   signOut: () => void;
 }) {
-  const tabs: Array<{ id: SettingsTab; label: string; icon: ReactNode }> = [
-    { id: "account",       label: "Account",         icon: <IC.Personas size={15}/> },
-    { id: "preferences",   label: "Preferences",     icon: <IC.Settings size={15}/> },
-    { id: "workspace",     label: "Workspace",       icon: <IC.Briefcase size={15}/> },
-    { id: "notifications", label: "Notifications",   icon: <IC.Bell size={15}/> },
-    { id: "audit",         label: "Audit log",       icon: <IC.Audit size={15}/> },
-  ];
+  const [overview, setOverview] = useState<SettingsOverview | null>(null);
+  const [drafts, setDrafts] = useState<Record<string, Record<string, unknown>>>({});
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [search, setSearch] = useState("");
+  const [toast, setToast] = useState<{ kind: "ok" | "danger"; text: string } | null>(null);
+  const [confirm, setConfirm] = useState<{ title: string; text: string; required?: string; action: (typed: string) => Promise<void> } | null>(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = (await (await apiFetch("/settings/")).json()) as SettingsOverview;
+      setOverview(data);
+      setDrafts(data.sections);
+      const savedTheme = String(data.sections.general?.theme ?? "system");
+      if (savedTheme === "light" || savedTheme === "dark") setTheme(savedTheme);
+      setToast(null);
+    } catch (exc) {
+      setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to load settings" });
+    } finally {
+      setLoading(false);
+    }
+  }, [setTheme]);
+
+  useEffect(() => { void load(); }, [load]);
+
+  const visibleTabs = SETTING_TABS.filter(item => {
+    const query = search.trim().toLowerCase();
+    return !query || item.label.toLowerCase().includes(query) || item.keywords.includes(query);
+  });
+  const activeMeta = SETTING_TABS.find(item => item.id === tab) ?? SETTING_TABS[0];
+  const activeSection = apiSectionForTab(tab);
+  const sectionDraft = drafts[activeSection] || {};
+  const sectionSaved = overview?.sections?.[activeSection] || {};
+  const dirty = JSON.stringify(sectionDraft) !== JSON.stringify(sectionSaved);
+  const canAdmin = Boolean(overview?.member.can_admin);
+  const readOnly = !canEditTab(tab, canAdmin);
+
+  function patch(section: string, values: Record<string, unknown>) {
+    setDrafts(prev => ({ ...prev, [section]: { ...(prev[section] || {}), ...values } }));
+  }
+
+  async function save(section = activeSection) {
+    if (!overview) return;
+    setSaving(true);
+    try {
+      const data = (await (await apiFetch(`/settings/${section}`, {
+        method: "PATCH",
+        body: JSON.stringify({ values: drafts[section] || {} }),
+      })).json()) as { values: Record<string, unknown> };
+      setOverview(prev => prev ? { ...prev, sections: { ...prev.sections, [section]: data.values } } : prev);
+      if (section === "general") {
+        const savedTheme = String(data.values.theme ?? "system");
+        if (savedTheme === "light" || savedTheme === "dark") setTheme(savedTheme);
+      }
+      setToast({ kind: "ok", text: "Settings saved" });
+    } catch (exc) {
+      setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to save settings" });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function cancel(section = activeSection) {
+    if (!overview) return;
+    setDrafts(prev => ({ ...prev, [section]: overview.sections[section] || {} }));
+  }
+
+  function selectTab(next: SettingsTab) {
+    if (dirty && !window.confirm("Discard unsaved changes?")) return;
+    setTab(next);
+  }
+
+  if (loading) {
+    return (
+      <div className="flex-1 px-10 py-9">
+        <div className="h-7 w-48 rounded-md mb-6" style={{ background: "var(--surface-2)" }}/>
+        {[0, 1, 2, 3].map(i => <div key={i} className="h-16 rounded-xl mb-3" style={{ background: "var(--surface-2)" }}/>)}
+      </div>
+    );
+  }
+
+  if (!overview) return <EmptyState icon={<IC.Settings size={20}/>} title="Settings unavailable" sub="The settings API did not return data."/>;
 
   return (
     <div className="flex-1 flex min-w-0 overflow-hidden">
-      {/* Settings sidebar */}
-      <div className="flex-shrink-0 border-r hairline py-6" style={{ width: 220, background: "var(--bg-deep)" }}>
-        <div className="px-4 mb-4">
-          <h2 className="text-[13px] font-semibold uppercase tracking-wider" style={{ color: "var(--text-dim)" }}>Settings</h2>
+      <div className="flex-shrink-0 border-r hairline py-5" style={{ width: 260, background: "var(--bg-deep)" }}>
+        <div className="px-4 mb-3">
+          <div className="text-[11px] font-semibold uppercase tracking-wider mb-3" style={{ color: "var(--text-dim)" }}>Settings</div>
+          <div className="surface border border-soft rounded-lg flex items-center gap-2 px-2.5 py-2">
+            <IC.Search size={14} style={{ color: "var(--text-dim)" }}/>
+            <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search settings" className="bg-transparent outline-none text-[13px] w-full" aria-label="Search settings"/>
+          </div>
         </div>
-        <div className="px-3 space-y-0.5">
-          {tabs.map(t => (
-            <button key={t.id} onClick={() => setTab(t.id)}
-                    className={`nav-item w-full ${tab === t.id ? "active" : ""}`}>
-              <span className="nav-icon">{t.icon}</span>
-              <span className="flex-1 text-left">{t.label}</span>
+        <div className="px-3 space-y-0.5 overflow-y-auto" style={{ maxHeight: "calc(100vh - 116px)" }}>
+          {visibleTabs.map(item => (
+            <button key={item.id} onClick={() => selectTab(item.id)} className={`nav-item w-full ${tab === item.id ? "active" : ""}`}>
+              <span className="nav-icon">{item.icon}</span>
+              <span className="flex-1 text-left">{item.label}</span>
             </button>
           ))}
         </div>
       </div>
 
-      {/* Settings content */}
-      <div className="flex-1 overflow-y-auto px-10 py-9">
-        {tab === "account" && <AccountSettings signOut={signOut}/>}
-        {tab === "preferences" && <PreferencesSettings theme={theme} setTheme={setTheme} accent={accent} setAccent={setAccent}/>}
-        {tab === "workspace" && <WorkspaceSettings/>}
-        {tab === "notifications" && <NotificationsSettings/>}
-        {tab === "audit" && <AuditSettings/>}
+      <div className="flex-1 min-w-0 overflow-y-auto" style={{ background: "var(--bg)" }}>
+        <div className="sticky top-0 z-20 border-b hairline px-10 py-4 flex items-center justify-between" style={{ background: "var(--bg)" }}>
+          <div>
+            <div className="text-[12px]" style={{ color: "var(--text-dim)" }}>Settings / {activeMeta.label}</div>
+            <h1 className="h-section mt-1">{activeMeta.label}</h1>
+          </div>
+          <div className="flex items-center gap-2">
+            {dirty && <span className="text-[12px]" style={{ color: "var(--text-dim)" }}>Unsaved changes</span>}
+            {dirty && <button onClick={() => cancel()} className="btn btn-sm">Cancel</button>}
+            {!["members", "audit", "security", "billing", "danger"].includes(tab) && (
+              <button onClick={() => void save()} disabled={!dirty || readOnly || saving} className="btn btn-accent btn-sm disabled:opacity-50">
+                {saving ? "Saving..." : readOnly ? "Read only" : "Save"}
+              </button>
+            )}
+          </div>
+        </div>
+
+        <div className="px-10 py-8 max-w-[1040px]">
+          {toast && (
+            <div className="mb-5 rounded-lg border px-3 py-2 text-[13px]" style={{ borderColor: toast.kind === "ok" ? "var(--ok)" : "var(--danger)", color: toast.kind === "ok" ? "var(--ok)" : "var(--danger)" }}>
+              {toast.text}
+            </div>
+          )}
+          {readOnly && <Unavailable reason="Your role can view this section but cannot edit it."/>}
+          {tab === "general" && <GeneralSettings data={sectionDraft} patch={v => patch("general", v)} theme={theme} setTheme={setTheme} accent={accent} setAccent={setAccent}/>}
+          {tab === "profile" && <ProfileSettings data={sectionDraft} patch={v => patch("profile", v)} overview={overview}/>}
+          {tab === "organization" && <OrganizationSettings data={sectionDraft} patch={v => patch("organization", v)} overview={overview}/>}
+          {tab === "members" && <MembersSettings overview={overview} reload={load} setToast={setToast} setConfirm={setConfirm}/>}
+          {tab === "permissions" && <PermissionsSettings data={sectionDraft} patch={v => patch("permissions", v)}/>}
+          {tab === "employees" && <EmployeeSettings data={sectionDraft} patch={v => patch("ai_employee", v)}/>}
+          {tab === "runtime" && <RuntimeSettings data={sectionDraft} patch={v => patch("runtime", v)} health={overview.runtime_health}/>}
+          {tab === "memory-settings" && <MemorySettings data={sectionDraft} patch={v => patch("memory", v)} stats={overview.memory_stats} setToast={setToast} setConfirm={setConfirm} reload={load}/>}
+          {tab === "tools-settings" && <ToolsSettings data={sectionDraft} patch={v => patch("tool_settings", v)} connectors={overview.connectors} capabilities={overview.capabilities}/>}
+          {tab === "approval-settings" && <ApprovalSettings data={sectionDraft} patch={v => patch("approval", v)}/>}
+          {tab === "notifications" && <NotificationSettings data={sectionDraft} patch={v => patch("notifications", v)} capabilities={overview.capabilities}/>}
+          {tab === "security" && <SecuritySettings capabilities={overview.capabilities} signOut={signOut}/>}
+          {tab === "billing" && <BillingSettings overview={overview}/>}
+          {tab === "audit" && <AuditSettings />}
+          {tab === "developer" && <DeveloperSettings data={sectionDraft} patch={v => patch("developer", v)} capabilities={overview.capabilities}/>}
+          {tab === "danger" && <DangerSettings capabilities={overview.capabilities} setToast={setToast}/>}
+        </div>
       </div>
+      {confirm && <ConfirmModal confirm={confirm} onClose={() => setConfirm(null)}/>}
     </div>
   );
 }
 
-function SettingsSection({ title, children }: { title: string; children: ReactNode }) {
-  return (
-    <div className="mb-8">
-      <h2 className="text-[16px] font-semibold mb-4">{title}</h2>
-      {children}
-    </div>
-  );
+function apiSectionForTab(tab: SettingsTab) {
+  return ({ "memory-settings": "memory", "tools-settings": "tool_settings", "approval-settings": "approval", employees: "ai_employee" } as Record<string, string>)[tab] || tab;
+}
+
+function canEditTab(tab: SettingsTab, canAdmin: boolean) {
+  if (["organization", "members", "permissions", "employees", "runtime", "memory-settings", "tools-settings", "approval-settings", "developer", "danger"].includes(tab)) return canAdmin;
+  return !["audit", "security", "billing"].includes(tab);
+}
+
+function val(data: Record<string, unknown>, key: string, fallback = "") {
+  return String(data[key] ?? fallback);
+}
+
+function SettingsSection({ title, children, note }: { title: string; children: ReactNode; note?: string }) {
+  return <section className="mb-8"><h2 className="text-[16px] font-semibold mb-1">{title}</h2>{note && <p className="text-[13px] mb-3" style={{ color: "var(--text-dim)" }}>{note}</p>}<div className="surface border border-soft rounded-xl overflow-hidden">{children}</div></section>;
 }
 
 function SettingsField({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
-  return (
-    <div className="flex items-start justify-between gap-6 py-4 border-b hairline">
-      <div className="min-w-0">
-        <div className="text-[14px] font-medium">{label}</div>
-        {hint && <div className="text-[13px] mt-0.5" style={{ color: "var(--text-dim)" }}>{hint}</div>}
-      </div>
-      <div className="flex-shrink-0">{children}</div>
-    </div>
-  );
+  return <div className="flex items-start justify-between gap-6 px-5 py-4 border-b hairline last:border-b-0"><div className="min-w-0"><div className="text-[14px] font-medium">{label}</div>{hint && <div className="text-[13px] mt-0.5" style={{ color: "var(--text-dim)" }}>{hint}</div>}</div><div className="flex-shrink-0 max-w-[440px]">{children}</div></div>;
 }
 
-function AccountSettings({ signOut }: { signOut: () => void }) {
-  return (
-    <div className="max-w-[640px]">
-      <h1 className="h-page mb-6">Account</h1>
-      <SettingsSection title="Profile">
-        <SettingsField label="Name"><input defaultValue="Admin" className="surface border border-soft rounded-lg px-3 py-2 text-[14px] outline-none w-56" style={{ color: "var(--text)" }}/></SettingsField>
-        <SettingsField label="Email" hint="Used for OTP login"><input defaultValue="admin@example.com" className="surface border border-soft rounded-lg px-3 py-2 text-[14px] outline-none w-56" style={{ color: "var(--text)" }}/></SettingsField>
-        <SettingsField label="Role"><Tag>Owner</Tag></SettingsField>
-      </SettingsSection>
-      <SettingsSection title="Danger zone">
-        <div className="surface border rounded-lg p-4" style={{ borderColor: "var(--danger)" }}>
-          <h3 className="text-[14px] font-semibold mb-1" style={{ color: "var(--danger)" }}>Sign out</h3>
-          <p className="text-[13px] mb-3" style={{ color: "var(--text-dim)" }}>Ends your current session.</p>
-          <button onClick={signOut} className="btn btn-danger-soft btn-sm">Sign out</button>
-        </div>
-      </SettingsSection>
-    </div>
-  );
+function TextInput({ value, onChange, disabled = false, wide = false, ariaLabel }: { value: string; onChange: (value: string) => void; disabled?: boolean; wide?: boolean; ariaLabel: string }) {
+  return <input aria-label={ariaLabel} disabled={disabled} value={value} onChange={e => onChange(e.target.value)} className={`surface border border-soft rounded-lg px-3 py-2 text-[14px] outline-none disabled:opacity-60 ${wide ? "w-96" : "w-64"}`} style={{ color: "var(--text)" }}/>;
 }
 
-function PreferencesSettings({ theme, setTheme, accent, setAccent }: { theme: "light" | "dark"; setTheme: (t: "light" | "dark") => void; accent: string; setAccent: (a: string) => void }) {
-  return (
-    <div className="max-w-[640px]">
-      <h1 className="h-page mb-6">Preferences</h1>
-      <SettingsSection title="Appearance">
-        <SettingsField label="Theme" hint="Light is the default.">
-          <div className="flex items-center gap-1 surface border border-soft rounded-lg p-1">
-            {(["light", "dark"] as const).map(t => (
-              <button key={t} onClick={() => setTheme(t)}
-                      className="px-3 py-1 rounded-md text-[13px] font-medium smooth capitalize"
-                      style={{ background: theme === t ? "var(--surface-2)" : "transparent", color: theme === t ? "var(--text)" : "var(--text-muted)" }}>
-                {t}
-              </button>
-            ))}
-          </div>
-        </SettingsField>
-        <SettingsField label="Accent color">
-          <div className="flex items-center gap-2">
-            {Object.entries(ACCENT_PALETTES).map(([key, p]) => (
-              <button key={key} onClick={() => setAccent(key)} title={key}
-                      className="w-7 h-7 rounded-full smooth"
-                      style={{ background: p.accent, boxShadow: accent === key ? `0 0 0 2px var(--bg), 0 0 0 4px ${p.accent}` : "none" }}/>
-            ))}
-          </div>
-        </SettingsField>
-      </SettingsSection>
-    </div>
-  );
+function SelectInput({ value, onChange, options, ariaLabel, disabled = false }: { value: string; onChange: (value: string) => void; options: string[]; ariaLabel: string; disabled?: boolean }) {
+  return <select aria-label={ariaLabel} disabled={disabled} value={value} onChange={e => onChange(e.target.value)} className="surface border border-soft rounded-lg px-3 py-2 text-[14px] outline-none w-64 disabled:opacity-60">{options.map(option => <option key={option} value={option}>{option}</option>)}</select>;
 }
 
-function WorkspaceSettings() {
-  return (
-    <div className="max-w-[640px]">
-      <h1 className="h-page mb-6">Workspace</h1>
-      <SettingsSection title="Organization">
-        <SettingsField label="Name"><input defaultValue="My Workspace" className="surface border border-soft rounded-lg px-3 py-2 text-[14px] outline-none w-56" style={{ color: "var(--text)" }}/></SettingsField>
-        <SettingsField label="Region"><Tag>us-east-1</Tag></SettingsField>
-        <SettingsField label="Plan"><Tag variant="accent">Trial</Tag></SettingsField>
-      </SettingsSection>
-    </div>
-  );
+function Toggle({ checked, onChange, disabled = false, label }: { checked: boolean; onChange: (value: boolean) => void; disabled?: boolean; label: string }) {
+  return <button aria-label={label} disabled={disabled} onClick={() => onChange(!checked)} className="rounded-full smooth disabled:opacity-50" style={{ width: 42, height: 24, background: checked ? "var(--accent)" : "var(--border)", position: "relative" }}><span className="absolute top-1 rounded-full bg-white smooth" style={{ width: 16, height: 16, left: checked ? 22 : 3, boxShadow: "0 1px 2px rgba(0,0,0,0.2)" }}/></button>;
 }
 
-function NotificationsSettings() {
-  const [emailNotifs, setEmailNotifs] = useState(true);
-  return (
-    <div className="max-w-[640px]">
-      <h1 className="h-page mb-6">Notifications</h1>
-      <SettingsSection title="Email">
-        <SettingsField label="Approval requests" hint="Email when Chronos needs your go-ahead.">
-          <button onClick={() => setEmailNotifs(v => !v)}
-                  className="rounded-full smooth"
-                  style={{ width: 40, height: 24, background: emailNotifs ? "var(--accent)" : "var(--border)", position: "relative" }}>
-            <div className="absolute top-1 rounded-full bg-white smooth"
-                 style={{ width: 16, height: 16, left: emailNotifs ? 22 : 2, boxShadow: "0 1px 2px rgba(0,0,0,0.2)" }}/>
-          </button>
-        </SettingsField>
-      </SettingsSection>
-    </div>
-  );
+function Unavailable({ reason }: { reason: string }) {
+  return <div className="mb-5 surface border border-soft rounded-xl px-4 py-3 flex gap-3"><IC.Info size={16} style={{ color: "var(--text-dim)" }}/><p className="text-[13px]" style={{ color: "var(--text-dim)" }}>{reason}</p></div>;
+}
+
+function GeneralSettings({ data, patch, theme, setTheme, accent, setAccent }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void; theme: "light" | "dark"; setTheme: (t: "light" | "dark") => void; accent: string; setAccent: (a: string) => void }) {
+  const notifications = (data.notifications || {}) as Record<string, unknown>;
+  return <>
+    <SettingsSection title="Workspace basics"><SettingsField label="Workspace name"><TextInput ariaLabel="Workspace name" value={val(data, "workspace_name")} onChange={workspace_name => patch({ workspace_name })}/></SettingsField><SettingsField label="Description"><TextInput ariaLabel="Workspace description" wide value={val(data, "workspace_description")} onChange={workspace_description => patch({ workspace_description })}/></SettingsField><SettingsField label="Icon/avatar"><TextInput ariaLabel="Workspace icon" value={val(data, "workspace_icon")} onChange={workspace_icon => patch({ workspace_icon })}/></SettingsField><SettingsField label="Default landing page"><SelectInput ariaLabel="Default landing page" value={val(data, "default_landing_page", "chat")} onChange={default_landing_page => patch({ default_landing_page })} options={["chat", "activity", "approvals", "memory", "connectors", "assistants"]}/></SettingsField></SettingsSection>
+    <SettingsSection title="Locale and appearance"><SettingsField label="Time zone"><TextInput ariaLabel="Time zone" value={val(data, "time_zone")} onChange={time_zone => patch({ time_zone })}/></SettingsField><SettingsField label="Date/time format"><TextInput ariaLabel="Date time format" value={val(data, "date_time_format")} onChange={date_time_format => patch({ date_time_format })}/></SettingsField><SettingsField label="Language"><SelectInput ariaLabel="Language" value={val(data, "language", "en-US")} onChange={language => patch({ language })} options={["en-US"]}/></SettingsField><SettingsField label="Theme"><SelectInput ariaLabel="Theme" value={val(data, "theme", "system")} onChange={themeValue => { patch({ theme: themeValue }); if (themeValue === "light" || themeValue === "dark") setTheme(themeValue); }} options={["system", "light", "dark"]}/></SettingsField><SettingsField label="Accent color"><div className="flex gap-2">{Object.entries(ACCENT_PALETTES).map(([key, p]) => <button key={key} onClick={() => setAccent(key)} title={key} aria-label={`Accent ${key}`} className="w-7 h-7 rounded-full smooth" style={{ background: p.accent, boxShadow: accent === key ? `0 0 0 2px var(--bg), 0 0 0 4px ${p.accent}` : "none" }}/>)}</div></SettingsField></SettingsSection>
+    <SettingsSection title="Notification defaults"><SettingsField label="In-app notifications"><Toggle label="In-app notifications" checked={Boolean(notifications.in_app)} onChange={in_app => patch({ notifications: { ...notifications, in_app } })}/></SettingsField><SettingsField label="Email notifications"><Toggle label="Email notifications" checked={Boolean(notifications.email)} onChange={email => patch({ notifications: { ...notifications, email } })}/></SettingsField></SettingsSection>
+  </>;
+}
+
+function ProfileSettings({ data, patch, overview }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void; overview: SettingsOverview }) {
+  return <><SettingsSection title="Editable profile"><SettingsField label="Display name"><TextInput ariaLabel="Display name" value={val(data, "display_name")} onChange={display_name => patch({ display_name })}/></SettingsField><SettingsField label="Avatar"><TextInput ariaLabel="Profile avatar" value={val(data, "profile_avatar")} onChange={profile_avatar => patch({ profile_avatar })}/></SettingsField><SettingsField label="Personal preferences"><TextInput ariaLabel="Personal preferences" wide value={val(data, "personal_preferences")} onChange={personal_preferences => patch({ personal_preferences })}/></SettingsField></SettingsSection><SettingsSection title="Identity"><SettingsField label="Email" hint={overview.capabilities.email_edit.reason}><TextInput ariaLabel="Email" disabled value={overview.member.email} onChange={() => {}}/></SettingsField><SettingsField label="Role"><Tag>{overview.member.role}</Tag></SettingsField></SettingsSection><SettingsSection title="AI defaults"><SettingsField label="Interaction style"><SelectInput ariaLabel="AI interaction style" value={val(data, "ai_interaction_style", "balanced")} onChange={ai_interaction_style => patch({ ai_interaction_style })} options={["concise", "balanced", "detailed"]}/></SettingsField><SettingsField label="Response length"><SelectInput ariaLabel="Preferred response length" value={val(data, "preferred_response_length", "medium")} onChange={preferred_response_length => patch({ preferred_response_length })} options={["short", "medium", "long"]}/></SettingsField><SettingsField label="Citation/detail level"><SelectInput ariaLabel="Citation detail level" value={val(data, "citation_detail_level", "standard")} onChange={citation_detail_level => patch({ citation_detail_level })} options={["minimal", "standard", "detailed"]}/></SettingsField></SettingsSection></>;
+}
+
+function OrganizationSettings({ data, patch, overview }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void; overview: SettingsOverview }) {
+  return <SettingsSection title="Organization profile" note={overview.member.can_admin ? "Organization changes are persisted and audited." : "Only admins can edit organization settings."}><SettingsField label="Name"><TextInput ariaLabel="Organization name" value={val(data, "name", val(data, "organization_name"))} onChange={organization_name => patch({ organization_name, name: organization_name })}/></SettingsField><SettingsField label="Logo"><TextInput ariaLabel="Organization logo" value={val(data, "logo")} onChange={logo => patch({ logo })}/></SettingsField><SettingsField label="Domain"><TextInput ariaLabel="Organization domain" value={val(data, "domain")} onChange={domain => patch({ domain })}/></SettingsField><SettingsField label="Owner/admin"><Tag>{String(overview.organization.owner ?? "Owner/Admin")}</Tag></SettingsField><SettingsField label="Plan"><Tag variant="accent">{String(overview.organization.plan ?? "trial")}</Tag></SettingsField><SettingsField label="Seats/users"><Tag>{String(overview.organization.seats ?? 0)}</Tag></SettingsField><SettingsField label="Default workspace creation"><SelectInput ariaLabel="Workspace creation permissions" value={val(data, "default_workspace_creation", "admins")} onChange={default_workspace_creation => patch({ default_workspace_creation })} options={["owners", "admins", "managers"]}/></SettingsField></SettingsSection>;
+}
+
+function MembersSettings({ overview, reload, setToast, setConfirm }: { overview: SettingsOverview; reload: () => Promise<void>; setToast: (t: { kind: "ok" | "danger"; text: string }) => void; setConfirm: (c: { title: string; text: string; required?: string; action: (typed: string) => Promise<void> } | null) => void }) {
+  const [query, setQuery] = useState(""); const [role, setRole] = useState("all");
+  const canAdmin = overview.member.can_admin;
+  const rows = overview.members.filter(m => (role === "all" || m.role === role) && `${m.name} ${m.email}`.toLowerCase().includes(query.toLowerCase()));
+  async function changeRole(id: string, nextRole: string) { try { await apiFetch(`/settings/members/${id}/role`, { method: "PATCH", body: JSON.stringify({ role: nextRole }) }); setToast({ kind: "ok", text: "Role updated" }); await reload(); } catch (exc) { setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to update role" }); } }
+  async function remove(id: string) { try { await apiFetch(`/settings/members/${id}`, { method: "DELETE" }); setToast({ kind: "ok", text: "Member removed" }); await reload(); } catch (exc) { setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to remove member" }); } }
+  return <><Unavailable reason={overview.capabilities.invitations.reason}/><div className="flex gap-2 mb-4"><TextInput ariaLabel="Search members" value={query} onChange={setQuery}/><SelectInput ariaLabel="Filter by role" value={role} onChange={setRole} options={["all", "owner", "admin", "manager", "operator", "viewer"]}/><button className="btn btn-sm" disabled title={overview.capabilities.invitations.reason}>Invite member</button></div><div className="surface border border-soft rounded-xl overflow-hidden">{rows.map(member => <div key={member.id} className="grid grid-cols-[1fr_150px_120px] gap-3 items-center px-4 py-3 border-b hairline last:border-b-0"><div><div className="font-medium text-[14px]">{member.name}</div><div className="text-[12px]" style={{ color: "var(--text-dim)" }}>{member.email} · {member.status}</div></div><SelectInput ariaLabel={`Role for ${member.email}`} disabled={!canAdmin} value={member.role} onChange={next => void changeRole(member.id, next)} options={["owner", "admin", "manager", "operator", "viewer"]}/><button disabled={!canAdmin || member.is_self} className="btn btn-danger-soft btn-sm disabled:opacity-50" onClick={() => setConfirm({ title: "Remove member", text: `Remove ${member.email} from this organization?`, action: async () => remove(member.id) })}>Remove</button></div>)}</div></>;
+}
+
+function PermissionsSettings({ data, patch }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void }) {
+  const roles = (data.roles || {}) as Record<string, Record<string, string>>; const areas = ["workspace", "employee", "tools", "approvals", "memory", "audit"];
+  return <SettingsSection title="Permission matrix" note="Changes are persisted and read by settings policy. Dangerous tool approvals are enforced by the tool broker."><div className="overflow-x-auto"><table className="w-full text-[13px]"><thead><tr><th className="text-left p-3">Role</th>{areas.map(a => <th key={a} className="text-left p-3 capitalize">{a}</th>)}</tr></thead><tbody>{Object.keys(roles).map(role => <tr key={role} className="border-t hairline"><td className="p-3 font-medium">{role}</td>{areas.map(area => <td key={area} className="p-2"><SelectInput ariaLabel={`${role} ${area}`} value={roles[role]?.[area] || "deny"} onChange={state => patch({ roles: { ...roles, [role]: { ...(roles[role] || {}), [area]: state } } })} options={["allow", "deny", "approval_required"]}/></td>)}</tr>)}</tbody></table></div></SettingsSection>;
+}
+
+function EmployeeSettings({ data, patch }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void }) {
+  return <><SettingsSection title="Creation and memory policy"><SettingsField label="Creation policy"><SelectInput ariaLabel="Employee creation policy" value={val(data, "creation_policy")} onChange={creation_policy => patch({ creation_policy })} options={["admins_only", "admins_and_managers", "operators_with_approval"]}/></SettingsField><SettingsField label="Default memory scope"><SelectInput ariaLabel="Employee memory scope" value={val(data, "memory_scope")} onChange={memory_scope => patch({ memory_scope })} options={["user", "workspace", "org"]}/></SettingsField><SettingsField label="Tool access mode"><SelectInput ariaLabel="Employee tool access mode" value={val(data, "tool_access_mode")} onChange={tool_access_mode => patch({ tool_access_mode })} options={["disabled", "approval_required", "enabled"]}/></SettingsField></SettingsSection><SettingsSection title="Runtime limits"><SettingsField label="Runtime auto-start"><Toggle label="Runtime auto-start" checked={Boolean(data.runtime_auto_start)} onChange={runtime_auto_start => patch({ runtime_auto_start })}/></SettingsField><SettingsField label="Idle timeout minutes"><TextInput ariaLabel="Runtime idle timeout" value={val(data, "runtime_idle_timeout_minutes")} onChange={runtime_idle_timeout_minutes => patch({ runtime_idle_timeout_minutes: Number(runtime_idle_timeout_minutes) || 0 })}/></SettingsField><SettingsField label="Max concurrent runtimes"><TextInput ariaLabel="Max concurrent runtimes" value={val(data, "max_concurrent_runtimes")} onChange={max_concurrent_runtimes => patch({ max_concurrent_runtimes: Number(max_concurrent_runtimes) || 0 })}/></SettingsField><SettingsField label="Max sub-agent depth"><TextInput ariaLabel="Max sub-agent depth" value={val(data, "max_sub_agent_depth")} onChange={max_sub_agent_depth => patch({ max_sub_agent_depth: Number(max_sub_agent_depth) || 0 })}/></SettingsField><SettingsField label="Sub-agent spawning"><Toggle label="Sub-agent spawning" checked={Boolean(data.sub_agent_spawning)} onChange={sub_agent_spawning => patch({ sub_agent_spawning })}/></SettingsField></SettingsSection></>;
+}
+
+function RuntimeSettings({ data, patch, health }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void; health: Record<string, unknown> }) {
+  return <><Unavailable reason={`Current runtime health: ${String(health.status)}. High-risk changes require confirmation before production rollout.`}/><SettingsSection title="Runtime operation"><SettingsField label="Runtime mode"><SelectInput ariaLabel="Runtime mode" value={val(data, "runtime_mode")} onChange={runtime_mode => patch({ runtime_mode })} options={["local", "demo", "managed"]}/></SettingsField><SettingsField label="Isolation"><SelectInput ariaLabel="Isolation" value={val(data, "isolation")} onChange={isolation => patch({ isolation })} options={["process", "container_unavailable"]}/></SettingsField><SettingsField label="Heartbeat seconds"><TextInput ariaLabel="Heartbeat interval" value={val(data, "heartbeat_interval_seconds")} onChange={heartbeat_interval_seconds => patch({ heartbeat_interval_seconds: Number(heartbeat_interval_seconds) || 0 })}/></SettingsField><SettingsField label="Restart policy"><SelectInput ariaLabel="Restart policy" value={val(data, "restart_policy")} onChange={restart_policy => patch({ restart_policy })} options={["never", "on_failure", "always"]}/></SettingsField><SettingsField label="Log retention days"><TextInput ariaLabel="Log retention" value={val(data, "log_retention_days")} onChange={log_retention_days => patch({ log_retention_days: Number(log_retention_days) || 0 })}/></SettingsField><SettingsField label="Max task queue size"><TextInput ariaLabel="Max task queue size" value={val(data, "max_task_queue_size")} onChange={max_task_queue_size => patch({ max_task_queue_size: Number(max_task_queue_size) || 0 })}/></SettingsField><SettingsField label="Failure recovery"><SelectInput ariaLabel="Failure recovery" value={val(data, "failure_recovery")} onChange={failure_recovery => patch({ failure_recovery })} options={["resume", "stop", "restart"]}/></SettingsField><SettingsField label="Token budget daily"><TextInput ariaLabel="Token budget" value={val(data, "token_budget_daily")} onChange={token_budget_daily => patch({ token_budget_daily: Number(token_budget_daily) || 0 })}/></SettingsField></SettingsSection></>;
+}
+
+function MemorySettings({ data, patch, stats, setToast, setConfirm, reload }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void; stats: { active: number; deleted: number }; setToast: (t: { kind: "ok" | "danger"; text: string }) => void; setConfirm: (c: { title: string; text: string; required?: string; action: (typed: string) => Promise<void> } | null) => void; reload: () => Promise<void> }) {
+  async function purge() { try { await apiFetch("/settings/memory/purge", { method: "POST", body: JSON.stringify({ confirmation: "PURGE MEMORY" }) }); setToast({ kind: "ok", text: "Memory purged" }); await reload(); } catch (exc) { setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to purge memory" }); } }
+  return <><SettingsSection title="Memory policy" note={`${stats.active} active memories, ${stats.deleted} deleted.`}><SettingsField label="Workspace memory"><Toggle label="Workspace memory" checked={Boolean(data.workspace_memory)} onChange={workspace_memory => patch({ workspace_memory })}/></SettingsField><SettingsField label="Employee memory"><Toggle label="Employee memory" checked={Boolean(data.employee_memory)} onChange={employee_memory => patch({ employee_memory })}/></SettingsField><SettingsField label="User memory"><Toggle label="User memory" checked={Boolean(data.user_memory)} onChange={user_memory => patch({ user_memory })}/></SettingsField><SettingsField label="Retention days"><TextInput ariaLabel="Memory retention" value={val(data, "retention_days")} onChange={retention_days => patch({ retention_days: Number(retention_days) || 0 })}/></SettingsField><SettingsField label="Review required"><Toggle label="Memory review required" checked={Boolean(data.review_required)} onChange={review_required => patch({ review_required })}/></SettingsField><SettingsField label="Auto-save memory"><Toggle label="Auto-save memory" checked={Boolean(data.auto_save)} onChange={auto_save => patch({ auto_save })}/></SettingsField><SettingsField label="Sensitive detection"><Toggle label="Sensitive memory detection" checked={Boolean(data.sensitive_detection)} onChange={sensitive_detection => patch({ sensitive_detection })}/></SettingsField></SettingsSection><SettingsSection title="Memory danger zone"><SettingsField label="Export memory"><button className="btn btn-sm" disabled title="Memory export endpoint is not implemented">Export unavailable</button></SettingsField><SettingsField label="Purge all memory" hint="Requires typed confirmation and writes an audit entry."><button className="btn btn-danger-soft btn-sm" onClick={() => setConfirm({ title: "Purge memory", text: "This soft-deletes all active memory entries in this workspace.", required: "PURGE MEMORY", action: async () => purge() })}>Purge memory</button></SettingsField></SettingsSection></>;
+}
+
+function ToolsSettings({ data, patch, connectors, capabilities }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void; connectors: SettingsOverview["connectors"]; capabilities: SettingsOverview["capabilities"] }) {
+  function update(provider: string, values: Record<string, unknown>) { patch({ [provider]: { ...((data[provider] || {}) as Record<string, unknown>), ...values } }); }
+  return <><SettingsSection title="Connected tools" note="Enable/disable and approval-required states are enforced by the tool broker.">{connectors.length === 0 ? <div className="p-5"><EmptyState title="No tools connected" sub="Connectors appear here after OAuth or local enablement."/></div> : connectors.map(c => { const policy = ((data[c.provider] || c.policy || {}) as Record<string, unknown>); return <div key={c.id} className="px-5 py-4 border-b hairline last:border-b-0"><div className="flex justify-between gap-4"><div><div className="font-medium capitalize">{c.provider}</div><div className="text-[12px]" style={{ color: "var(--text-dim)" }}>{c.account_handle || "Org-level connector"} · {c.status} · last used {c.last_used_at || "never"}</div><div className="mt-2 flex flex-wrap gap-1">{(c.scopes || []).map(scope => <Tag key={scope}>{scope}</Tag>)}<Tag variant={String(policy.risk) === "high" ? "danger" : "info"}>{String(policy.risk || "unknown")} risk</Tag></div></div><div className="flex items-center gap-4"><Toggle label={`${c.provider} enabled`} checked={policy.enabled !== false} onChange={enabled => update(c.provider, { enabled })}/><Toggle label={`${c.provider} approval required`} checked={Boolean(policy.approval_required)} onChange={approval_required => update(c.provider, { approval_required })}/><button className="btn btn-danger-soft btn-sm" disabled title="Disconnect is managed from Connectors until scoped confirmation is added.">Disconnect</button></div></div></div>; })}</SettingsSection><Unavailable reason={capabilities.notification_email_dispatch.reason}/></>;
+}
+
+function ApprovalSettings({ data, patch }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void }) {
+  const thresholds = (data.thresholds || {}) as Record<string, string>;
+  return <SettingsSection title="Approval policy"><SettingsField label="Mode"><SelectInput ariaLabel="Approval mode" value={val(data, "mode")} onChange={mode => patch({ mode })} options={["off", "low-risk auto", "manual", "strict"]}/></SettingsField>{["low", "medium", "high"].map(level => <SettingsField key={level} label={`${level} risk threshold`}><SelectInput ariaLabel={`${level} risk threshold`} value={thresholds[level] || "manual"} onChange={value => patch({ thresholds: { ...thresholds, [level]: value } })} options={["auto", "manual", "strict", "blocked"]}/></SettingsField>)}<SettingsField label="Rule builder"><pre className="text-[12px] overflow-auto max-w-md" style={{ color: "var(--text-muted)" }}>{JSON.stringify(data.rules || [], null, 2)}</pre></SettingsField></SettingsSection>;
+}
+
+function NotificationSettings({ data, patch, capabilities }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void; capabilities: SettingsOverview["capabilities"] }) {
+  return <><Unavailable reason={capabilities.notification_email_dispatch.reason}/><SettingsSection title="Notification categories">{["email", "in_app", "runtime_failure_alerts", "approval_request_alerts", "task_completion_alerts", "weekly_digest", "security_alerts"].map(key => <SettingsField key={key} label={key.replaceAll("_", " ")}><Toggle label={key} checked={Boolean(data[key])} onChange={value => patch({ [key]: value })} disabled={key === "email"}/></SettingsField>)}</SettingsSection></>;
+}
+
+function SecuritySettings({ capabilities, signOut }: { capabilities: SettingsOverview["capabilities"]; signOut: () => void }) {
+  return <><SettingsSection title="Authentication">{["sessions", "password", "two_factor", "api_keys"].map(key => <SettingsField key={key} label={key.replaceAll("_", " ")}><button className="btn btn-sm" disabled>{capabilities[key]?.reason || "Unavailable"}</button></SettingsField>)}<SettingsField label="Current session"><button onClick={signOut} className="btn btn-danger-soft btn-sm">Sign out</button></SettingsField></SettingsSection></>;
+}
+
+function BillingSettings({ overview }: { overview: SettingsOverview }) {
+  return <><Unavailable reason={overview.capabilities.billing.reason}/><SettingsSection title="Read-only usage summary"><SettingsField label="Current plan"><Tag variant="accent">{String(overview.organization.plan || "trial")}</Tag></SettingsField><SettingsField label="Seats"><Tag>{String(overview.organization.seats || 0)}</Tag></SettingsField><SettingsField label="Runtime usage"><Tag>Not metered</Tag></SettingsField><SettingsField label="Token/model usage"><Tag>Not metered</Tag></SettingsField><SettingsField label="Storage usage"><Tag>{overview.memory_stats.active} memory entries</Tag></SettingsField></SettingsSection></>;
 }
 
 function AuditSettings() {
-  const [audit, setAudit] = useState<Array<{ id: string; event_type: string; actor_id?: string; action: string; created_at?: string }>>([]);
-  const [loading, setLoading] = useState(true);
+  const [rows, setRows] = useState<Array<Record<string, unknown>>>([]);
+  const [query, setQuery] = useState("");
+  const [selected, setSelected] = useState<Record<string, unknown> | null>(null);
+  useEffect(() => { apiFetch(`/settings/audit${query ? `?query=${encodeURIComponent(query)}` : ""}`).then(r => r.json()).then(setRows).catch(() => setRows([])); }, [query]);
+  async function exportCsv() {
+    const blob = await (await apiFetch("/settings/audit/export.csv")).blob();
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = "chronos-audit.csv";
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }
+  return <><div className="flex gap-2 mb-4"><TextInput ariaLabel="Search audit logs" value={query} onChange={setQuery}/><button className="btn btn-sm" onClick={() => void exportCsv()}>Export CSV</button></div><div className="surface border border-soft rounded-xl overflow-hidden">{rows.map(row => <button key={String(row.id)} onClick={() => setSelected(row)} className="w-full text-left px-4 py-3 border-b hairline last:border-b-0 hover:bg-[var(--surface-2)]"><div className="font-medium text-[13px]">{String(row.action)}</div><div className="text-[12px]" style={{ color: "var(--text-dim)" }}>{String(row.actor_id || "system")} · {row.created_at ? new Date(String(row.created_at)).toLocaleString() : "—"}</div></button>)}</div>{selected && <div className="mt-4 surface border border-soft rounded-xl p-4"><div className="font-medium mb-2">Audit detail</div><pre className="text-[12px] overflow-auto" style={{ color: "var(--text-muted)" }}>{JSON.stringify(selected, null, 2)}</pre></div>}</>;
+}
 
-  useEffect(() => {
-    apiFetch("/audit/")
-      .then(r => r.json())
-      .then((data: typeof audit) => setAudit(data))
-      .catch(() => {})
-      .finally(() => setLoading(false));
-  }, []);
+function DeveloperSettings({ data, patch, capabilities }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void; capabilities: SettingsOverview["capabilities"] }) {
+  return <><Unavailable reason="Secrets and provider API keys are never exposed in the frontend."/><SettingsSection title="Advanced"><SettingsField label="Environment"><Tag>dev</Tag></SettingsField><SettingsField label="API mode"><SelectInput ariaLabel="API mode" value={val(data, "api_mode")} onChange={api_mode => patch({ api_mode })} options={["local", "staging", "production"]}/></SettingsField><SettingsField label="Debug logging"><Toggle label="Debug logging" checked={Boolean(data.debug_logging)} onChange={debug_logging => patch({ debug_logging })}/></SettingsField><SettingsField label="Experimental features"><Toggle label="Experimental features" checked={Boolean(data.experimental_features)} onChange={experimental_features => patch({ experimental_features })}/></SettingsField><SettingsField label="Webhooks"><button className="btn btn-sm" disabled>{capabilities.webhooks.reason}</button></SettingsField></SettingsSection></>;
+}
 
-  return (
-    <div className="max-w-[800px]">
-      <h1 className="h-page mb-2">Audit log</h1>
-      <p className="text-[14px] mb-6" style={{ color: "var(--text-dim)" }}>Append-only record of every action in this workspace.</p>
+function DangerSettings({ capabilities, setToast }: { capabilities: SettingsOverview["capabilities"]; setToast: (t: { kind: "ok" | "danger"; text: string }) => void }) {
+  return <SettingsSection title="Danger zone" note="Unsupported destructive actions are disabled until backend archival workflows exist."><SettingsField label="Reset workspace settings"><button className="btn btn-danger-soft btn-sm" onClick={() => setToast({ kind: "danger", text: "Reset is not implemented because there is no versioned rollback workflow." })}>Reset unavailable</button></SettingsField><SettingsField label="Delete workspace"><button className="btn btn-danger-soft btn-sm" disabled>{capabilities.delete_workspace.reason}</button></SettingsField><SettingsField label="Leave organization"><button className="btn btn-danger-soft btn-sm" disabled>Leaving the only local workspace is not supported.</button></SettingsField><SettingsField label="Transfer ownership"><button className="btn btn-danger-soft btn-sm" disabled>{capabilities.transfer_ownership.reason}</button></SettingsField></SettingsSection>;
+}
 
-      {loading && <p className="text-[13.5px]" style={{ color: "var(--text-dim)" }}>Loading…</p>}
-      {!loading && audit.length === 0 && (
-        <EmptyState icon={<IC.Audit size={20}/>} title="No audit entries yet" sub="Entries appear as Chronos takes actions."/>
-      )}
-      {audit.length > 0 && (
-        <div className="surface border border-soft rounded-lg overflow-hidden">
-          {audit.slice(0, 50).map((entry, i) => (
-            <div key={entry.id} className={`px-4 py-3 flex items-start gap-3 ${i < audit.length - 1 ? "border-b hairline" : ""}`}>
-              <div className="w-7 h-7 rounded-md flex items-center justify-center flex-shrink-0 mt-0.5"
-                   style={{ background: "var(--surface-2)", color: "var(--text-muted)" }}>
-                <IC.Audit size={13}/>
-              </div>
-              <div className="flex-1 min-w-0">
-                <div className="text-[13.5px]" style={{ color: "var(--text)" }}>
-                  <span className="font-medium">{entry.actor_id ?? "system"}</span> · {entry.action}
-                </div>
-                <div className="text-[12px] mt-0.5 font-mono" style={{ color: "var(--text-dim)" }}>
-                  {entry.event_type} · {entry.created_at ? new Date(entry.created_at).toLocaleString() : "—"}
-                </div>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
+function ConfirmModal({ confirm, onClose }: { confirm: { title: string; text: string; required?: string; action: (typed: string) => Promise<void> }; onClose: () => void }) {
+  const [typed, setTyped] = useState("");
+  const canRun = !confirm.required || typed === confirm.required;
+  return <div className="fixed inset-0 z-[100] flex items-center justify-center" style={{ background: "rgba(0,0,0,.22)" }} role="dialog" aria-modal="true"><div className="surface border border-soft rounded-xl p-5 w-[420px]"><h2 className="text-[16px] font-semibold">{confirm.title}</h2><p className="text-[13px] mt-2" style={{ color: "var(--text-dim)" }}>{confirm.text}</p>{confirm.required && <TextInput ariaLabel="Confirmation text" wide value={typed} onChange={setTyped}/>}<div className="flex justify-end gap-2 mt-5"><button className="btn btn-sm" onClick={onClose}>Cancel</button><button className="btn btn-danger-soft btn-sm" disabled={!canRun} onClick={() => { void confirm.action(typed).then(onClose); }}>Confirm</button></div></div></div>;
 }

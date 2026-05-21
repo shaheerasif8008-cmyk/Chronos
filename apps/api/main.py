@@ -6,7 +6,7 @@ import asyncio
 from jobs import context_update, profile_synthesis
 from core.db import engine, reflect_table
 from runtime.executor import TaskExecutor
-from routers import approvals, auth, chat, connectors, context, memory, tasks
+from routers import approvals, auth, chat, connectors, context, memory, settings, tasks
 
 app = FastAPI(title="Chronos API", version="0.1.0")
 
@@ -18,6 +18,7 @@ app.add_middleware(
         "http://localhost:3001",
         "http://127.0.0.1:3001",
     ],
+    allow_origin_regex=r"http://(localhost|127\.0\.0\.1):30\d{2}",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -30,6 +31,7 @@ app.include_router(connectors.router)
 app.include_router(context.router)
 app.include_router(tasks.router)
 app.include_router(approvals.router)
+app.include_router(settings.router)
 
 
 @app.on_event("startup")
