@@ -39,6 +39,49 @@ async def test_stream_chat_completion_falls_back_after_local_failure(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_stream_chat_completion_uses_selected_fast_model(monkeypatch):
+    from core import llm
+
+    calls = []
+
+    async def fake_completion(**kwargs):
+        calls.append(kwargs)
+
+        async def chunks():
+            yield {"choices": [{"delta": {"content": "fast"}}]}
+
+        return chunks()
+
+    monkeypatch.setattr(llm.litellm, "acompletion", fake_completion)
+    monkeypatch.setattr(llm.settings, "fast_model", "openrouter/minimax/minimax-m2.5:free")
+    monkeypatch.setattr(llm.settings, "openrouter_api_key", "or-test-key")
+
+    tokens = []
+    async for token in llm.stream_completion([{"role": "user", "content": "hi"}], model_id="fast"):
+        tokens.append(token)
+
+    assert tokens == ["fast"]
+    assert len(calls) == 1
+    assert calls[0]["model"] == "openrouter/minimax/minimax-m2.5:free"
+    assert calls[0]["api_key"] == "or-test-key"
+
+
+def test_available_chat_models_include_configured_options(monkeypatch):
+    from core import llm
+
+    monkeypatch.setattr(llm.settings, "local_llm_model", "llama3")
+    monkeypatch.setattr(llm.settings, "openrouter_api_key", "or-test-key")
+    monkeypatch.setattr(llm.settings, "openrouter_model", "openrouter/example/model")
+    monkeypatch.setattr(llm.settings, "fast_model", "openrouter/example/fast")
+
+    models = llm.available_chat_models()
+
+    assert [model["id"] for model in models] == ["auto", "local", "openrouter", "fast"]
+    assert llm.normalize_chat_model("openrouter") == "openrouter"
+    assert llm.normalize_chat_model("does-not-exist") == "auto"
+
+
+@pytest.mark.asyncio
 async def test_stream_chat_completion_reports_provider_unavailable(monkeypatch):
     from core import llm
 

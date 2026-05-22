@@ -36,6 +36,20 @@ type MemoryEntry = { id: string; scope: string; scope_id: string; content: strin
 type Connector = { id: string; provider: string; account_handle?: string | null; status: string; connected_at?: string | null; last_used_at?: string | null };
 type Task = { id: string; status: string; goal: string; current_step: number; plan?: TaskStep[]; result?: Record<string, unknown>; created_at?: string; parent_task_id?: string | null; depth?: number };
 type TaskStep = { id: string; action: string; description: string; tool?: string | null };
+type ChatModel = { id: string; label: string; model: string; description?: string };
+type TaskStreamEvent = {
+  type: string;
+  task_id?: string;
+  ts?: string;
+  task?: Task;
+  step?: TaskStep;
+  step_index?: number;
+  approval_ids?: string[];
+  step_id?: string;
+  error?: string;
+  result?: unknown;
+  attempt?: number;
+};
 type Approval = { id: string; task_id: string; step_id: string; action_type: string; action_payload: Record<string, unknown>; requested_at?: string; status: string };
 type SettingsOverview = {
   member: { id: string; email: string; name?: string | null; role: string; can_admin: boolean };
@@ -165,6 +179,7 @@ function StatusDot({ status }: { status: string }) {
     queued:    { c: "var(--text-faint)" },
     connected: { c: "var(--ok)" },
     available: { c: "var(--text-faint)" },
+    error:     { c: "var(--danger)" },
   };
   const m = map[status] || { c: "var(--text-faint)" };
   return <Dot color={m.c} pulse={!!m.pulse} ring={!!m.ring} />;
@@ -225,6 +240,18 @@ const SKILLS = [
   { id: "sdr-outreach", name: "Sales outreach", description: "Lead research, ICP qualification, personalized cold email drafting." },
 ];
 
+function initialPersonaId() {
+  if (typeof window === "undefined") return PERSONAS[0].id;
+  const personaId = new URLSearchParams(window.location.search).get("persona");
+  return PERSONAS.some(persona => persona.id === personaId) ? personaId! : PERSONAS[0].id;
+}
+
+function initialNewConversationOpen() {
+  if (typeof window === "undefined") return false;
+  const params = new URLSearchParams(window.location.search);
+  return window.location.pathname === "/chat" && params.get("new") === "1";
+}
+
 // ─── Root App ─────────────────────────────────────────────────────────────────
 export default function ChronosApp() {
   const router = useRouter();
@@ -232,6 +259,9 @@ export default function ChronosApp() {
   const [route, setRoute] = useState<Route>(() => routeFromPath(pathname));
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("general");
   const [activeConvoId, setActiveConvoId] = useState<string | null>(null);
+  const [activePersonaId, setActivePersonaId] = useState(() => initialPersonaId());
+  const [newConversationOpen, setNewConversationOpen] = useState(() => initialNewConversationOpen());
+  const newConversationOpenRef = useRef(newConversationOpen);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [pendingApprovals, setPendingApprovals] = useState(0);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -261,6 +291,10 @@ export default function ChronosApp() {
     setRoute(routeFromPath(pathname));
   }, [pathname]);
 
+  useEffect(() => {
+    newConversationOpenRef.current = newConversationOpen;
+  }, [newConversationOpen]);
+
   function navigateRoute(next: Route) {
     setRoute(next);
     router.push(pathForRoute(next));
@@ -270,8 +304,13 @@ export default function ChronosApp() {
     try {
       const data = (await (await apiFetch("/chat/conversations")).json()) as Conversation[];
       setConversations(data);
-      if (selectId) setActiveConvoId(selectId);
-      else if (!activeConvoId && data[0]) setActiveConvoId(data[0].id);
+      if (selectId) {
+        setActiveConvoId(selectId);
+        setNewConversationOpen(false);
+        newConversationOpenRef.current = false;
+      } else if (!activeConvoId && !newConversationOpenRef.current && data[0]) {
+        setActiveConvoId(data[0].id);
+      }
     } catch { /* silently fail */ }
   }
 
@@ -310,8 +349,8 @@ export default function ChronosApp() {
         onNavigate={navigateRoute}
         conversations={conversations}
         activeConvoId={activeConvoId}
-        onSelectConvo={(id) => { setActiveConvoId(id); navigateRoute("chat"); }}
-        onNewConvo={() => { setActiveConvoId(null); navigateRoute("chat"); }}
+        onSelectConvo={(id) => { setActiveConvoId(id); setNewConversationOpen(false); newConversationOpenRef.current = false; navigateRoute("chat"); }}
+        onNewConvo={() => { setActiveConvoId(null); setNewConversationOpen(true); newConversationOpenRef.current = true; navigateRoute("chat"); }}
         onDeleteConvo={deleteConversation}
         pendingApprovals={pendingApprovals}
         onOpenSettings={openSettings}
@@ -319,12 +358,21 @@ export default function ChronosApp() {
       />
 
       <main className="flex-1 min-w-0 flex flex-col" style={{ background: "var(--bg)" }}>
-        {route === "chat"       && <ChatScreen activeConvoId={activeConvoId} onConvoCreated={(id) => loadConversations(id)} />}
+        {route === "chat"       && <ChatScreen activeConvoId={activeConvoId} activePersonaId={activePersonaId} onConvoCreated={(id) => loadConversations(id)} />}
         {route === "activity"   && <ActivityScreen />}
         {route === "approvals"  && <ApprovalsScreen onDecision={loadPendingApprovals} />}
         {route === "memory"     && <MemoryScreen />}
         {route === "connectors" && <ConnectorsScreen />}
-        {route === "assistants" && <AssistantsScreen />}
+        {route === "assistants" && <AssistantsScreen onStartConversation={(personaId) => {
+          const target = `/chat?persona=${encodeURIComponent(personaId)}&new=1`;
+          setActivePersonaId(personaId);
+          setActiveConvoId(null);
+          setNewConversationOpen(true);
+          newConversationOpenRef.current = true;
+          setRoute("chat");
+          if (typeof window !== "undefined") window.location.href = target;
+          else router.push(target);
+        }} />}
         {route === "settings"   && <SettingsScreen tab={settingsTab} setTab={setSettingsTab} theme={theme} setTheme={setTheme} accent={accent} setAccent={setAccent} signOut={signOut} />}
       </main>
     </div>
@@ -564,16 +612,41 @@ function AccountMenu({ onClose, onSettings, onSignOut }: { onClose: () => void; 
 }
 
 // ─── Chat Screen ──────────────────────────────────────────────────────────────
-function ChatScreen({ activeConvoId, onConvoCreated }: { activeConvoId: string | null; onConvoCreated: (id: string) => void }) {
+function ChatScreen({
+  activeConvoId,
+  activePersonaId,
+  onConvoCreated,
+}: {
+  activeConvoId: string | null;
+  activePersonaId: string;
+  onConvoCreated: (id: string) => void;
+}) {
   const [draft, setDraft] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
+  const [chatModels, setChatModels] = useState<ChatModel[]>([]);
+  const [selectedModel, setSelectedModel] = useState("auto");
   const [streaming, setStreaming] = useState(false);
   const [activityOpen, setActivityOpen] = useState(false);
+  const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const isEmpty = !activeConvoId;
 
-  const activePersona = PERSONAS[0];
+  const activePersona = PERSONAS.find(p => p.id === activePersonaId) ?? PERSONAS[0];
+
+  useEffect(() => {
+    apiFetch("/chat/models")
+      .then(r => r.json())
+      .then((data: ChatModel[]) => {
+        setChatModels(data);
+        if (data.length && !data.some(model => model.id === selectedModel)) setSelectedModel(data[0].id);
+      })
+      .catch(() => {
+        setChatModels([{ id: "auto", label: "Auto", model: "auto", description: "Default model routing" }]);
+        setSelectedModel("auto");
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     if (!activeConvoId) { setMessages([]); return; }
@@ -601,7 +674,7 @@ function ChatScreen({ activeConvoId, onConvoCreated }: { activeConvoId: string |
       let convoId = activeConvoId;
       const resp = await apiFetch("/chat/message", {
         method: "POST",
-        body: JSON.stringify({ message: text, conversation_id: convoId }),
+        body: JSON.stringify({ message: text, conversation_id: convoId, model: selectedModel }),
         signal: ab.signal,
       });
 
@@ -633,6 +706,7 @@ function ChatScreen({ activeConvoId, onConvoCreated }: { activeConvoId: string |
                 return updated;
               });
             } else if (ev.type === "task_created" && ev.task_id) {
+              setActiveTaskId(ev.task_id);
               setActivityOpen(true);
             } else if (ev.type === "done") {
               setMessages(prev => {
@@ -723,6 +797,21 @@ function ChatScreen({ activeConvoId, onConvoCreated }: { activeConvoId: string |
                   <button className="btn btn-ghost btn-sm">
                     <IC.Sparkles size={14} style={{ color: "var(--accent)" }}/> Skills · 1
                   </button>
+                  <label className="sr-only" htmlFor="chat-model-select">Model</label>
+                  <select
+                    id="chat-model-select"
+                    aria-label="Model"
+                    value={selectedModel}
+                    onChange={event => setSelectedModel(event.target.value)}
+                    disabled={streaming}
+                    className="surface border border-soft rounded-md px-2 py-1.5 text-[12.5px] outline-none disabled:opacity-60"
+                    style={{ color: "var(--text)" }}
+                    title={chatModels.find(model => model.id === selectedModel)?.model ?? selectedModel}
+                  >
+                    {(chatModels.length ? chatModels : [{ id: "auto", label: "Auto", model: "auto" }]).map(model => (
+                      <option key={model.id} value={model.id}>{model.label}</option>
+                    ))}
+                  </select>
                 </div>
                 <div className="flex items-center gap-2">
                   {streaming ? (
@@ -746,7 +835,7 @@ function ChatScreen({ activeConvoId, onConvoCreated }: { activeConvoId: string |
       </div>
 
       {activityOpen && (
-        <ActivityDrawer onClose={() => setActivityOpen(false)} />
+        <ActivityDrawer taskId={activeTaskId} onClose={() => setActivityOpen(false)} />
       )}
     </div>
   );
@@ -819,22 +908,234 @@ function EmptyChatState({ persona, onSubmit }: { persona: typeof PERSONAS[0]; on
   );
 }
 
-function ActivityDrawer({ onClose }: { onClose: () => void }) {
+function ActivityDrawer({ taskId, onClose }: { taskId: string | null; onClose: () => void }) {
+  const [task, setTask] = useState<Task | null>(null);
+  const [events, setEvents] = useState<TaskStreamEvent[]>([]);
+  const [streamError, setStreamError] = useState("");
+
+  useEffect(() => {
+    if (!taskId) return;
+    const controller = new AbortController();
+
+    async function connect() {
+      setEvents([]);
+      setStreamError("");
+      try {
+        const res = await apiFetch(`/tasks/${taskId}/stream`, { signal: controller.signal });
+        const reader = res.body?.getReader();
+        if (!reader) throw new Error("Task stream did not return a readable body");
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const frames = buffer.split("\n\n");
+          buffer = frames.pop() ?? "";
+
+          for (const frame of frames) {
+            const line = frame.split("\n").find(part => part.startsWith("data: "));
+            if (!line) continue;
+            const event = JSON.parse(line.slice(6)) as TaskStreamEvent;
+            if (event.type === "catch_up" && event.task) setTask(event.task);
+            else {
+              setEvents(prev => [...prev, event]);
+              setTask(prev => mergeTaskEvent(prev, event));
+            }
+          }
+        }
+      } catch (exc) {
+        if ((exc as Error).name !== "AbortError") {
+          setStreamError(exc instanceof Error ? exc.message : "Task stream disconnected");
+        }
+      }
+    }
+
+    void connect();
+    return () => controller.abort();
+  }, [taskId]);
+
+  const steps = task?.plan ?? [];
+  const currentStep = task?.current_step ?? 0;
+  const status = taskStatus(task, events, streamError);
+  const approvalEvent = [...events].reverse().find(event => event.type === "awaiting_approval");
+  const failureEvent = [...events].reverse().find(event => event.type === "task_failed");
+  const completionEvent = [...events].reverse().find(event => event.type === "task_complete");
+
   return (
     <aside className="flex-shrink-0 flex flex-col border-l hairline slidein" style={{ width: 400, background: "var(--bg)" }}>
       <div className="px-5 h-[52px] flex items-center justify-between border-b hairline">
         <div className="flex items-center gap-2.5">
-          <StatusDot status="working"/>
-          <span className="text-[14px] font-semibold">Working…</span>
+          <StatusDot status={status.dot}/>
+          <span className="text-[14px] font-semibold">{status.label}</span>
         </div>
         <button onClick={onClose} className="btn btn-ghost btn-icon"><IC.X size={16}/></button>
       </div>
-      <div className="flex-1 flex flex-col items-center justify-center p-6" style={{ color: "var(--text-dim)" }}>
-        <div className="typing-wave mb-3"><span/><span/><span/></div>
-        <p className="text-[13px]">Chronos is working on your request…</p>
+
+      <div className="flex-1 overflow-y-auto p-5">
+        {!taskId ? (
+          <EmptyState icon={<IC.Activity size={20}/>} title="No active task" sub="A live task view appears here when Chronos starts a job from chat."/>
+        ) : (
+          <div className="space-y-5">
+            <div>
+              <div className="text-[11px] font-semibold uppercase tracking-wider mb-2" style={{ color: "var(--text-dim)" }}>
+                Live task
+              </div>
+              <h2 className="text-[15px] font-semibold leading-snug">{task?.goal ?? "Connecting to task stream..."}</h2>
+              <div className="mt-2 flex items-center gap-2 text-[12px]" style={{ color: "var(--text-dim)" }}>
+                <span className="inline-ref">{taskId.slice(0, 8)}</span>
+                <span>Step {Math.min(currentStep, steps.length)} of {steps.length || "..."}</span>
+              </div>
+            </div>
+
+            {streamError ? (
+              <div className="rounded-lg border px-3 py-2 text-[12.5px]" style={{ borderColor: "var(--danger)", color: "var(--danger)" }}>
+                {streamError}
+              </div>
+            ) : null}
+
+            {approvalEvent ? (
+              <div className="rounded-lg border px-3 py-3" style={{ borderColor: "var(--warn)", background: "var(--warn-soft)" }}>
+                <div className="flex items-center gap-2 text-[13px] font-semibold" style={{ color: "var(--warn)" }}>
+                  <IC.Approvals size={14}/> Waiting for approval
+                </div>
+                <p className="mt-1 text-[12.5px] leading-relaxed" style={{ color: "var(--text-muted)" }}>
+                  {approvalEvent.approval_ids?.length ?? 0} drafts are waiting in Approvals.
+                </p>
+              </div>
+            ) : null}
+
+            {failureEvent ? (
+              <div className="rounded-lg border px-3 py-3" style={{ borderColor: "var(--danger)", background: "var(--danger-soft)" }}>
+                <div className="flex items-center gap-2 text-[13px] font-semibold" style={{ color: "var(--danger)" }}>
+                  <IC.Info size={14}/> Task failed
+                </div>
+                <p className="mt-1 text-[12.5px] leading-relaxed" style={{ color: "var(--danger)" }}>{failureEvent.error}</p>
+              </div>
+            ) : null}
+
+            {completionEvent ? (
+              <div className="rounded-lg border px-3 py-3" style={{ borderColor: "var(--ok)", background: "var(--ok-soft)" }}>
+                <div className="flex items-center gap-2 text-[13px] font-semibold" style={{ color: "var(--ok)" }}>
+                  <IC.Check size={14}/> Task complete
+                </div>
+              </div>
+            ) : null}
+
+            <div className="space-y-2.5">
+              <div className="text-[11px] font-semibold uppercase tracking-wider" style={{ color: "var(--text-dim)" }}>
+                Progress
+              </div>
+              {steps.length === 0 ? (
+                <div className="surface border border-soft rounded-lg px-3 py-3 text-[13px]" style={{ color: "var(--text-dim)" }}>
+                  Connecting to the task plan...
+                </div>
+              ) : steps.map((step, index) => {
+                const state = stepState(step, index, currentStep, task?.status, events);
+                return (
+                  <div key={step.id} className="surface border border-soft rounded-lg px-3 py-3">
+                    <div className="flex items-start gap-3">
+                      <StepIcon state={state}/>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2">
+                          <div className="text-[13.5px] font-medium truncate">{step.description}</div>
+                          {step.tool ? <Tag>{step.tool}</Tag> : null}
+                        </div>
+                        <div className="mt-1 text-[12px]" style={{ color: "var(--text-dim)" }}>
+                          {stepStateLabel(state)}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            <div className="space-y-2.5">
+              <div className="text-[11px] font-semibold uppercase tracking-wider" style={{ color: "var(--text-dim)" }}>
+                Events
+              </div>
+              {events.length === 0 ? (
+                <div className="flex items-center gap-2 text-[13px]" style={{ color: "var(--text-dim)" }}>
+                  <div className="typing-wave"><span/><span/><span/></div>
+                  Waiting for activity...
+                </div>
+              ) : events.slice(-8).reverse().map((event, index) => (
+                <div key={`${event.type}-${event.ts ?? index}`} className="text-[12.5px] leading-relaxed border-l pl-3" style={{ borderColor: eventColor(event), color: "var(--text-muted)" }}>
+                  <span className="font-medium" style={{ color: "var(--text)" }}>{eventLabel(event)}</span>
+                  {event.ts ? <span style={{ color: "var(--text-dim)" }}> · {new Date(event.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span> : null}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
     </aside>
   );
+}
+
+function mergeTaskEvent(task: Task | null, event: TaskStreamEvent): Task | null {
+  if (!task) return task;
+  if (event.type === "step_start" && typeof event.step_index === "number") {
+    return { ...task, status: "running", current_step: event.step_index };
+  }
+  if (event.type === "step_done" && typeof event.step_index === "number") {
+    return { ...task, status: "running", current_step: Math.max(task.current_step, event.step_index + 1) };
+  }
+  if (event.type === "awaiting_approval") return { ...task, status: "awaiting_approval" };
+  if (event.type === "task_failed") return { ...task, status: "failed" };
+  if (event.type === "task_complete") return { ...task, status: "complete", current_step: task.plan?.length ?? task.current_step };
+  return task;
+}
+
+function taskStatus(task: Task | null, events: TaskStreamEvent[], streamError: string) {
+  if (streamError) return { label: "Stream interrupted", dot: "error" };
+  if (!task) return { label: "Connecting...", dot: "working" };
+  if (task.status === "awaiting_approval" || events.some(event => event.type === "awaiting_approval")) return { label: "Waiting on approval", dot: "awaiting" };
+  if (task.status === "failed") return { label: "Stopped", dot: "failed" };
+  if (task.status === "complete") return { label: "Complete", dot: "done" };
+  if (task.status === "pending" || task.status === "planning") return { label: "Queued", dot: "queued" };
+  return { label: "Working...", dot: "working" };
+}
+
+function stepState(step: TaskStep, index: number, currentStep: number, taskStatusValue: string | undefined, events: TaskStreamEvent[]) {
+  if (events.some(event => event.type === "task_failed" && event.step?.id === step.id)) return "failed";
+  if (events.some(event => event.type === "awaiting_approval" && event.step_id === step.id)) return "waiting";
+  if (taskStatusValue === "awaiting_approval" && step.action === "approval_gate" && index === currentStep) return "waiting";
+  if (taskStatusValue === "complete" || index < currentStep) return "done";
+  if (index === currentStep && taskStatusValue === "running") return "active";
+  return "queued";
+}
+
+function StepIcon({ state }: { state: string }) {
+  if (state === "done") return <IC.Check size={16} stroke={2.2} style={{ color: "var(--ok)" }}/>;
+  if (state === "waiting") return <IC.Approvals size={16} style={{ color: "var(--warn)" }}/>;
+  if (state === "failed") return <IC.Info size={16} style={{ color: "var(--danger)" }}/>;
+  if (state === "active") return <Dot color="var(--accent)" size={10} pulse ring/>;
+  return <Dot color="var(--text-faint)" size={8}/>;
+}
+
+function stepStateLabel(state: string) {
+  return ({ done: "Finished", waiting: "Waiting for approval", failed: "Failed", active: "In progress", queued: "Queued" } as Record<string, string>)[state] ?? state;
+}
+
+function eventLabel(event: TaskStreamEvent) {
+  if (event.type === "step_start") return `Started: ${event.step?.description ?? event.step?.id ?? "step"}`;
+  if (event.type === "step_done") return `Finished: ${event.step?.description ?? event.step?.id ?? "step"}`;
+  if (event.type === "step_retry") return `Retry ${event.attempt ?? ""}: ${event.step?.description ?? event.step?.id ?? "step"}`;
+  if (event.type === "awaiting_approval") return "Approval requested";
+  if (event.type === "task_failed") return `Failed: ${event.error ?? "unknown error"}`;
+  if (event.type === "task_complete") return "Task completed";
+  if (event.type === "approval_decided") return "Approval decision recorded";
+  return event.type.replaceAll("_", " ");
+}
+
+function eventColor(event: TaskStreamEvent) {
+  if (event.type === "task_failed") return "var(--danger)";
+  if (event.type === "awaiting_approval") return "var(--warn)";
+  if (event.type === "task_complete" || event.type === "step_done") return "var(--ok)";
+  return "var(--border)";
 }
 
 // ─── Activity Screen ──────────────────────────────────────────────────────────
@@ -967,13 +1268,14 @@ function ApprovalsScreen({ onDecision }: { onDecision: () => void }) {
 
   const active = approvals.find(a => a.id === activeId);
 
-  async function decide(id: string, decision: "approved" | "rejected") {
-    setBusyId(id);
+  async function decide(id: string, decision: "approved" | "rejected", batch = false) {
+    const busyKey = batch ? `batch-${decision}` : id;
+    setBusyId(busyKey);
     setError("");
     try {
-      await apiFetch(`/approvals/${id}/decide`, { method: "POST", body: JSON.stringify({ decision }) });
-      setDecisions(prev => ({ ...prev, [id]: decision }));
-      const nextPending = approvals.find(a => a.id !== id && !decisions[a.id] && a.status === "pending");
+      await apiFetch(`/approvals/${id}/decide`, { method: "POST", body: JSON.stringify({ decision, batch }) });
+      if (!batch) setDecisions(prev => ({ ...prev, [id]: decision }));
+      const nextPending = batch ? null : approvals.find(a => a.id !== id && !decisions[a.id] && a.status === "pending");
       await loadApprovals(nextPending?.id ?? null);
       onDecision();
     } catch (exc) {
@@ -995,6 +1297,24 @@ function ApprovalsScreen({ onDecision }: { onDecision: () => void }) {
           <p className="text-[12.5px] mt-0.5" style={{ color: "var(--text-dim)" }}>
             {pending.length} waiting · approved drafts are created after the batch is decided
           </p>
+          {pending.length > 0 && (
+            <div className="flex items-center gap-2 mt-4">
+              <button
+                onClick={() => void decide(active?.id ?? pending[0].id, "approved", true)}
+                disabled={!!busyId}
+                className="btn btn-ok-soft btn-sm flex-1 justify-center disabled:opacity-50"
+              >
+                <IC.Check size={14} stroke={2.2}/> {busyId === "batch-approved" ? "Approving..." : "Approve all"}
+              </button>
+              <button
+                onClick={() => void decide(active?.id ?? pending[0].id, "rejected", true)}
+                disabled={!!busyId}
+                className="btn btn-danger-soft btn-sm flex-1 justify-center disabled:opacity-50"
+              >
+                <IC.X size={14}/> {busyId === "batch-rejected" ? "Rejecting..." : "Reject all"}
+              </button>
+            </div>
+          )}
           {error && (
             <p className="mt-3 rounded-lg border px-3 py-2 text-[12.5px]" style={{ borderColor: "var(--danger)", color: "var(--danger)" }}>
               {error}
@@ -1349,7 +1669,7 @@ function ConnectorsScreen() {
 }
 
 // ─── Assistants Screen ────────────────────────────────────────────────────────
-function AssistantsScreen() {
+function AssistantsScreen({ onStartConversation }: { onStartConversation: (personaId: string) => void }) {
   const [activePersonaId, setActivePersonaId] = useState<string | null>(null);
   const activePersona = PERSONAS.find(p => p.id === activePersonaId);
 
@@ -1369,7 +1689,7 @@ function AssistantsScreen() {
           </div>
           <div className="ml-auto flex items-center gap-2">
             <button className="btn btn-secondary btn-sm">Edit</button>
-            <button className="btn btn-accent btn-sm">Start a conversation</button>
+            <button onClick={() => onStartConversation(activePersona.id)} className="btn btn-accent btn-sm">Start a conversation</button>
           </div>
         </div>
         <div className="px-10 pb-10 max-w-[820px] space-y-7">

@@ -6,6 +6,56 @@ import litellm
 from core.config import settings
 
 
+def available_chat_models() -> list[dict[str, str]]:
+    models = [
+        {
+            "id": "auto",
+            "label": "Auto",
+            "model": settings.local_llm_model,
+            "description": "Try local first, then fallback provider.",
+        },
+        {
+            "id": "local",
+            "label": "Local",
+            "model": settings.local_llm_model,
+            "description": "Use the configured local model.",
+        },
+    ]
+    if settings.openrouter_api_key:
+        models.append(
+            {
+                "id": "openrouter",
+                "label": "OpenRouter",
+                "model": settings.openrouter_model,
+                "description": "Use the configured OpenRouter chat model.",
+            }
+        )
+    elif settings.backup_api_key:
+        models.append(
+            {
+                "id": "backup",
+                "label": "Backup",
+                "model": settings.backup_model,
+                "description": "Use the configured backup model.",
+            }
+        )
+    models.append(
+        {
+            "id": "fast",
+            "label": "Fast",
+            "model": settings.fast_model,
+            "description": "Use the configured fast model.",
+        }
+    )
+    return models
+
+
+def normalize_chat_model(model_id: str | None) -> str:
+    requested = model_id or "auto"
+    allowed = {model["id"] for model in available_chat_models()}
+    return requested if requested in allowed else "auto"
+
+
 def backup_completion_kwargs(messages: list[dict[str, str]], *, stream: bool = False) -> dict[str, Any]:
     if settings.openrouter_api_key:
         return {
@@ -31,6 +81,22 @@ def model_kwargs(model: str, *, messages: list[dict[str, str]], stream: bool = F
     return kwargs
 
 
+def selected_completion_kwargs(model_id: str, messages: list[dict[str, str]], *, stream: bool = False) -> dict[str, Any]:
+    selected = normalize_chat_model(model_id)
+    if selected == "local":
+        return {
+            "model": settings.local_llm_model,
+            "api_base": settings.local_llm_base_url,
+            "messages": messages,
+            "stream": stream,
+        }
+    if selected in {"openrouter", "backup"}:
+        return backup_completion_kwargs(messages, stream=stream)
+    if selected == "fast":
+        return model_kwargs(settings.fast_model, messages=messages, stream=stream)
+    raise ValueError("auto does not map to one completion request")
+
+
 def _choice_delta_content(chunk: Any) -> str:
     if isinstance(chunk, dict):
         return chunk.get("choices", [{}])[0].get("delta", {}).get("content") or ""
@@ -43,7 +109,24 @@ def _message_content(response: Any) -> str:
     return response.choices[0].message.content or ""
 
 
-async def stream_completion(messages: list[dict[str, str]]):
+async def stream_completion(messages: list[dict[str, str]], *, model_id: str | None = None):
+    selected = normalize_chat_model(model_id)
+    if selected != "auto":
+        try:
+            request = litellm.acompletion(**selected_completion_kwargs(selected, messages, stream=True))
+            if selected == "local":
+                stream = await asyncio.wait_for(request, timeout=settings.local_llm_timeout_seconds)
+            else:
+                stream = await request
+        except Exception:
+            yield "Chronos is connected, but the selected AI provider is unavailable right now. Try Auto or another model."
+            return
+        async for chunk in stream:
+            token = _choice_delta_content(chunk)
+            if token:
+                yield token
+        return
+
     try:
         stream = await asyncio.wait_for(
             litellm.acompletion(

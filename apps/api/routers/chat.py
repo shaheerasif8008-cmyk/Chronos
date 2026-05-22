@@ -11,7 +11,7 @@ from core.auth import get_current_member
 from core.config import settings
 from core.context import assemble_context
 from core.db import engine, reflect_table
-from core.llm import stream_completion
+from core.llm import available_chat_models, normalize_chat_model, stream_completion
 from core.memory_writes import create_memory_entry, extract_explicit_memory_content
 from core.models import Member, RequesterContext
 from memory.extraction import extract_and_save
@@ -23,6 +23,7 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 class ChatRequest(BaseModel):
     message: str
     conversation_id: str | None = None
+    model: str | None = None
 
 
 async def _create_conversation(member: Member, title: str) -> str:
@@ -72,6 +73,12 @@ def _looks_like_task(message: str) -> bool:
 def _is_operator_workflow_proof(message: str) -> bool:
     normalized = " ".join(message.lower().split())
     return "operator workflow proof" in normalized
+
+
+@router.get("/models")
+async def list_chat_models(member: Member = Depends(get_current_member)) -> list[dict[str, str]]:
+    await permissions.check(member, "list_chat_models", settings.org_id)
+    return available_chat_models()
 
 
 @router.get("/conversations")
@@ -136,6 +143,7 @@ async def delete_conversation(conversation_id: str, member: Member = Depends(get
 @router.post("/message")
 async def send_message(req: ChatRequest, member: Member = Depends(get_current_member)) -> StreamingResponse:
     await permissions.check(member, "chat", req.conversation_id or "new_conversation")
+    selected_model = normalize_chat_model(req.model)
     conversation_id = req.conversation_id or await _create_conversation(member, req.message)
     await _save_message(conversation_id, "user", req.message)
     requester_context = RequesterContext.from_member(member)
@@ -188,7 +196,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
     async def stream():
         yield f"data: {json.dumps({'type': 'conversation', 'conversation_id': conversation_id})}\n\n"
         full = ""
-        async for token in stream_completion(context):
+        async for token in stream_completion(context, model_id=selected_model):
             full += token
             yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
             await asyncio.sleep(0)
