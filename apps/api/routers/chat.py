@@ -11,6 +11,7 @@ from core.auth import get_current_member
 from core.config import settings
 from core.context import assemble_context
 from core.db import engine, reflect_table
+from core.intent import classify_intent
 from core.llm import available_chat_models, normalize_chat_model, stream_completion
 from core.memory_writes import create_memory_entry, extract_explicit_memory_content
 from core.models import Member, RequesterContext
@@ -24,6 +25,8 @@ class ChatRequest(BaseModel):
     message: str
     conversation_id: str | None = None
     model: str | None = None
+    persona_id: str | None = None
+    workspace_id: str | None = None
 
 
 async def _create_conversation(member: Member, title: str) -> str:
@@ -61,18 +64,6 @@ async def _save_message(conversation_id: str, role: str, content: str) -> None:
             .where(conversations.c.id == conversation_id)
             .values(updated_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc))
         )
-
-
-def _looks_like_task(message: str) -> bool:
-    lowered = message.lower()
-    task_verbs = ("find ", "research ", "draft ", "create ", "build ", "prepare ", "analyze ", "summarize ")
-    multi_step_markers = (" and ", " then ", " for each", "companies", "leads", "outreach")
-    return any(verb in lowered for verb in task_verbs) and any(marker in lowered for marker in multi_step_markers)
-
-
-def _is_operator_workflow_proof(message: str) -> bool:
-    normalized = " ".join(message.lower().split())
-    return "operator workflow proof" in normalized
 
 
 @router.get("/models")
@@ -147,6 +138,8 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
     conversation_id = req.conversation_id or await _create_conversation(member, req.message)
     await _save_message(conversation_id, "user", req.message)
     requester_context = RequesterContext.from_member(member)
+    requester_context.persona_id = req.persona_id
+    requester_context.workspace_id = req.workspace_id
     explicit_memory = extract_explicit_memory_content(req.message)
 
     if explicit_memory:
@@ -171,14 +164,17 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
 
         return StreamingResponse(explicit_stream(), media_type="text/event-stream")
 
-    if (settings.demo_mode and _looks_like_task(req.message)) or _is_operator_workflow_proof(req.message):
+    intent = await classify_intent(req.message)
+    if intent["mode"] == "task":
         async def task_stream():
             from routers.tasks import create_task_record
 
             task_id = await create_task_record(
-                goal=req.message,
+                goal=intent.get("goal") or req.message,
                 member=member,
                 triggered_by=conversation_id,
+                persona_id=req.persona_id,
+                workspace_id=req.workspace_id,
             )
             asyncio.create_task(TaskExecutor().run(task_id))
             assistant_response = "I started this as an autonomous task. You can watch live progress in Activity and approve drafts in Approvals."
@@ -206,16 +202,6 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
         asyncio.create_task(
             extract_and_save(conversation_id, req.message, assistant_response, requester_context)
         )
-        if _looks_like_task(req.message):
-            from routers.tasks import create_task_record
-
-            task_id = await create_task_record(
-                goal=req.message,
-                member=member,
-                triggered_by=conversation_id,
-            )
-            asyncio.create_task(TaskExecutor().run(task_id))
-            yield f"data: {json.dumps({'type': 'task_created', 'task_id': task_id})}\n\n"
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
     return StreamingResponse(stream(), media_type="text/event-stream")

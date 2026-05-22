@@ -281,10 +281,11 @@ async def test_tool_broker_audits_gmail_draft_without_logging_raw_args(monkeypat
     async def noop_loop(org_id, tool, args_hash):
         return None
 
-    async def fake_route(tool, args, vault_ref):
+    async def fake_route(tool, args, vault_ref, tier):
         assert tool == "gmail.draft"
         assert args["body"] == "Sensitive draft body"
         assert vault_ref == "vlt_safe_ref"
+        assert tier == "live"
         return ToolResult(data={"id": "draft-1"}, summary="Draft created: draft-1")
 
     async def fake_audit_log(*args, **kwargs):
@@ -294,10 +295,14 @@ async def test_tool_broker_audits_gmail_draft_without_logging_raw_args(monkeypat
     async def fake_tool_policy(org_id, provider):
         return {"enabled": True, "approval_required": False}
 
+    async def fake_connector_tier(provider):
+        return "live"
+
     monkeypatch.setattr(permissions, "check", fake_permission)
     monkeypatch.setattr(tool_broker, "_check_rate_limit", noop_rate_limit)
     monkeypatch.setattr(tool_broker, "_check_loop", noop_loop)
     monkeypatch.setattr(tool_broker, "tool_policy", fake_tool_policy)
+    monkeypatch.setattr(tool_broker, "connector_tier", fake_connector_tier)
     monkeypatch.setattr(registry, "get", fake_registry_get)
     monkeypatch.setattr(tool_broker, "_route", fake_route)
     monkeypatch.setattr(tool_broker.audit, "log", fake_audit_log)
@@ -428,3 +433,101 @@ async def test_memory_retrieve_falls_back_to_recent_memories_on_embedding_dimens
 
     assert [entry.content for entry in results] == ["i have a dog"]
     assert audit_events[0][1]["decision"] == "dimension_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_assemble_context_loads_persona_skills_memories_and_task_state(monkeypatch):
+    from core import context
+    from core.models import MemoryEntry, RequesterContext
+
+    async def fake_org_context(org_id):
+        return "Org fact."
+
+    async def fake_find_skills(message):
+        return ["sdr-outreach"]
+
+    async def fake_load_skill(skill_id):
+        return "Use outbound research workflow."
+
+    async def fake_retrieve(message, requester_context):
+        return [
+            MemoryEntry(
+                id="memory-1",
+                organization_id="default",
+                content="ACME uses HubSpot.",
+                source="explicit",
+            )
+        ]
+
+    async def fake_task_context(task_id):
+        return "Goal: draft outreach\nStatus: running\nStep: 1/3"
+
+    class FakeResult:
+        def mappings(self):
+            return self
+
+        def all(self):
+            return []
+
+    class FakeConn:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def execute(self, stmt):
+            return FakeResult()
+
+    class FakeEngine:
+        def begin(self):
+            return FakeConn()
+
+    class FakeColumn:
+        def __eq__(self, other):
+            return ("eq", other)
+
+        def desc(self):
+            return ("desc", self)
+
+    class FakeMessages:
+        class c:
+            role = FakeColumn()
+            content = FakeColumn()
+            conversation_id = FakeColumn()
+            created_at = FakeColumn()
+
+    async def fake_reflect_table(name):
+        return FakeMessages()
+
+    class FakeSelect:
+        def where(self, *args):
+            return self
+
+        def order_by(self, *args):
+            return self
+
+        def limit(self, *args):
+            return self
+
+    monkeypatch.setattr(context, "load_org_context", fake_org_context)
+    monkeypatch.setattr(context, "find_relevant_skills", fake_find_skills)
+    monkeypatch.setattr(context, "load_skill_content", fake_load_skill)
+    monkeypatch.setattr(context.memory, "retrieve", fake_retrieve)
+    monkeypatch.setattr(context, "_load_task_context", fake_task_context)
+    monkeypatch.setattr(context, "reflect_table", fake_reflect_table)
+    monkeypatch.setattr(context, "engine", FakeEngine())
+    monkeypatch.setattr(context, "select", lambda *args: FakeSelect())
+
+    assembled = await context.assemble_context(
+        "conversation-1",
+        "draft outreach to leads",
+        RequesterContext(member_id="member-1", persona_id="sdr-outreach", task_id="task-1"),
+    )
+
+    system = assembled[0]["content"]
+    assert "# Organization Context\nOrg fact." in system
+    assert "# Your Identity\nYou research leads" in system
+    assert "# Skill: sdr-outreach\nUse outbound research workflow." in system
+    assert "# What I Remember\n- ACME uses HubSpot." in system
+    assert "# Current Task\nGoal: draft outreach" in system

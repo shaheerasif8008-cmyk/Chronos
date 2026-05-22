@@ -11,6 +11,7 @@ from sqlalchemy import delete, func, select, update
 
 from core import audit, permissions
 from core.auth import get_current_member
+from core.connector_health import check_connectors
 from core.config import settings
 from core.db import engine, reflect_table
 from core.models import Member
@@ -189,7 +190,12 @@ async def overview(member: Member = Depends(get_current_member)) -> dict[str, An
         "members": await _members(member),
         "connectors": await _connectors(member),
         "memory_stats": await _memory_stats(member),
-        "runtime_health": {"status": "ok", "mode": sections["runtime"]["runtime_mode"], "incomplete_task_recovery": "enabled"},
+        "runtime_health": {
+            "status": "ok",
+            "mode": sections["runtime"]["runtime_mode"],
+            "incomplete_task_recovery": "enabled",
+            "connectors": await check_connectors(),
+        },
         "capabilities": {
             "email_edit": _unsupported("OTP auth does not support email changes."),
             "profile_photo_upload": _unsupported("No file upload service is configured."),

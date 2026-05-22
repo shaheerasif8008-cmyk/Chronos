@@ -9,6 +9,7 @@ import json
 import time
 
 from core import audit, permissions
+from core.connector_health import connector_tier
 from core.config import settings
 from core.exceptions import ApprovalRequired, LoopDetected, RateLimitExceeded, SafetyLimitViolation
 from core.models import AgentContext, ToolResult
@@ -75,17 +76,19 @@ def _check_safety_limits(tool: str, args: dict) -> None:
             raise SafetyLimitViolation(f"{tool}: amount ${amount} exceeds limit of ${_MAX_FINANCIAL_AMOUNT}")
 
 
-async def _route(tool: str, args: dict, vault_ref: str) -> ToolResult:
+async def _route(tool: str, args: dict, vault_ref: str, tier: str = "live") -> ToolResult:
     """Route to the correct connector after all checks pass."""
     provider = tool.split(".")[0]
+    routed_args = dict(args)
+    routed_args["__connector_tier"] = tier
 
     if provider == "gmail":
         from connectors.gmail import gmail_connector
-        return await gmail_connector.execute(tool, args, vault_ref)
+        return await gmail_connector.execute(tool, routed_args, vault_ref)
 
     if provider == "browser":
         from connectors.browser import browser_connector
-        return await browser_connector.execute(tool, args)
+        return await browser_connector.execute(tool, routed_args)
 
     # Unknown provider — fail clearly rather than silently
     raise ValueError(f"No connector registered for provider: {provider}")
@@ -126,19 +129,21 @@ class ToolBroker:
             payload={"args_hash": args_hash},   # never log raw args — they may contain credentials
         )
 
-        # 7. Look up connector record + credentials. Demo mode still routes
-        # through the broker, but avoids requiring live Composio connector rows.
-        if settings.demo_mode:
-            vault_ref = "demo"
-        else:
+        # 7. Resolve the connector tier. Fixture/demo tiers keep tasks usable
+        # when external OAuth or browser dependencies are not configured.
+        provider = tool.split(".")[0]
+        tier = await connector_tier(provider)
+        if tier == "live":
             from connectors.registry import get as registry_get
 
             connector = await registry_get(agent, tool)
             # vault_ref is the only credential identifier that touches logs
             vault_ref = connector.vault_ref
+        else:
+            vault_ref = tier
 
         # 8. Execute via connector
-        result = await _route(tool, args, vault_ref)
+        result = await _route(tool, args, vault_ref, tier)
 
         # 9. Audit: result summary (never log result.data — may contain sensitive content)
         await audit.log(

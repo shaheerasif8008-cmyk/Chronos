@@ -50,11 +50,12 @@ class GmailConnector:
         if tool == "gmail.send":
             raise ApprovalRequired("gmail.send", "use gmail.draft; sending requires an approval record")
 
-        if settings.demo_mode:
+        tier = args.pop("__connector_tier", "live")
+        if settings.demo_mode or tier in {"demo", "fixture"} or vault_ref in {"demo", "fixture"}:
             if tool == "gmail.draft":
                 return await self._create_demo_draft(args)
             if tool == "gmail.read_inbox":
-                return ToolResult(data={"threads": []}, summary="Demo inbox: 0 threads")
+                return ToolResult(data={"threads": [], "tier": tier}, summary="Demo inbox: 0 threads")
 
         credentials = await vault_get(vault_ref)
         entity_id = credentials.get("composio_entity_id")

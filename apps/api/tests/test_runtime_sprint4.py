@@ -452,3 +452,70 @@ async def test_operator_workflow_proof_task_api_reaches_pending_approval(monkeyp
     assert len(task_state["result"]["drafts"]) == 2
     assert approvals == [{"task_id": task_id, "step_id": "proof_approval", "draft_count": 2}]
     assert events[-1] == {"type": "awaiting_approval", "approval_ids": ["approval-1", "approval-2"], "step_id": "proof_approval"}
+
+
+@pytest.mark.asyncio
+async def test_chat_task_intent_routes_to_executor_without_chat_completion(monkeypatch):
+    from core.models import Member
+    from routers import chat
+
+    scheduled = []
+    saved = []
+
+    async def fake_save_message(conversation_id, role, content):
+        saved.append((conversation_id, role, content))
+
+    async def fake_classify(message):
+        return {"mode": "task", "confidence": 0.9, "goal": "research leads and draft outreach"}
+
+    async def fake_create_task_record(*, goal, member, triggered_by, persona_id=None, workspace_id=None):
+        assert goal == "research leads and draft outreach"
+        assert persona_id == "sdr-outreach"
+        assert triggered_by == "conversation-1"
+        return "task-1"
+
+    class FakeExecutor:
+        def run(self, task_id):
+            assert task_id == "task-1"
+            return "run-task-1"
+
+    def fake_create_task(coro):
+        scheduled.append(coro)
+        return coro
+
+    async def fake_stream_completion(*args, **kwargs):
+        raise AssertionError("task-mode request should not stream chat completion")
+        yield ""
+
+    async def fake_audit_log(*args, **kwargs):
+        return "audit-1"
+
+    monkeypatch.setattr(chat, "_save_message", fake_save_message)
+    monkeypatch.setattr(chat, "classify_intent", fake_classify)
+    monkeypatch.setattr(chat, "TaskExecutor", FakeExecutor)
+    monkeypatch.setattr(chat.asyncio, "create_task", fake_create_task)
+    monkeypatch.setattr(chat, "stream_completion", fake_stream_completion)
+    monkeypatch.setattr(chat.audit, "log", fake_audit_log)
+
+    import routers.tasks as tasks_router
+
+    monkeypatch.setattr(tasks_router, "create_task_record", fake_create_task_record)
+
+    response = await chat.send_message(
+        chat.ChatRequest(
+            message="Can you pull together a lead brief and draft outreach?",
+            conversation_id="conversation-1",
+            persona_id="sdr-outreach",
+        ),
+        Member(id="member-1", organization_id="default", region="us", email="operator@example.com"),
+    )
+
+    body = ""
+    async for chunk in response.body_iterator:
+        body += chunk.decode() if isinstance(chunk, bytes) else chunk
+
+    assert "task_created" in body
+    assert "task-1" in body
+    assert scheduled == ["run-task-1"]
+    assert saved[0] == ("conversation-1", "user", "Can you pull together a lead brief and draft outreach?")
+    assert saved[-1][1] == "assistant"

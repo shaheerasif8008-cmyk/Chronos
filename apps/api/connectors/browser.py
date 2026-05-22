@@ -95,11 +95,12 @@ class BrowserConnector:
     async def _search(self, args: dict) -> ToolResult:
         query = args.get("query", "")
         max_results = int(args.get("max_results", 10))
+        tier = args.pop("__connector_tier", "live")
 
-        if settings.demo_mode or args.get("fixture") == "operator_workflow_proof":
+        if settings.demo_mode or tier in {"demo", "fixture"} or args.get("fixture") == "operator_workflow_proof":
             results = _fixture_leads(max_results)
             return ToolResult(
-                data={"query": query, "results": results, "leads": results},
+                data={"query": query, "results": results, "leads": results, "tier": tier},
                 summary=f"Fixture search '{query}': {len(results)} leads",
             )
 
@@ -137,6 +138,12 @@ class BrowserConnector:
         url = args.get("url", "")
         if not url:
             raise ValueError("browser.fetch requires 'url'")
+        tier = args.pop("__connector_tier", "live")
+        if settings.demo_mode or tier in {"demo", "fixture"}:
+            return ToolResult(
+                data={"url": url, "title": "Fixture page", "content": "", "truncated": False, "tier": tier},
+                summary=f"Fixture fetch {url}: 0 chars",
+            )
 
         playwright, browser, context, page = await _new_page()
         try:
@@ -167,6 +174,12 @@ class BrowserConnector:
         url = args.get("url", "")
         if not url:
             raise ValueError("browser.extract_contacts requires 'url'")
+        tier = args.pop("__connector_tier", "live")
+        if settings.demo_mode or tier in {"demo", "fixture"}:
+            return ToolResult(
+                data={"url": url, "emails": [], "phones": [], "people": [], "tier": tier},
+                summary=f"Fixture contacts {url}: 0 emails, 0 people",
+            )
 
         playwright, browser, context, page = await _new_page()
         try:
