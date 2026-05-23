@@ -7,6 +7,7 @@ from typing import Any
 from sqlalchemy import select, update
 
 from core import audit, permissions
+from core.config import settings
 from core.db import engine, reflect_table
 from core.exceptions import ChronosError
 from core.redis import redis_client
@@ -21,8 +22,33 @@ class SubAgentFailed(ChronosError):
     """Raised when a child task fails."""
 
 
+# Module-level semaphore: limits concurrent sub-agents across the whole process.
+# Real multi-org enforcement would need a Redis-backed counter; this is sufficient
+# for single-process Phase 1.
+_spawn_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_semaphore() -> asyncio.Semaphore:
+    global _spawn_semaphore
+    if _spawn_semaphore is None or _spawn_semaphore._value != settings.concurrent_sub_agents:  # type: ignore[attr-defined]
+        _spawn_semaphore = asyncio.Semaphore(settings.concurrent_sub_agents)
+    return _spawn_semaphore
+
+
 class SubAgentManager:
     async def spawn_and_wait(self, parent_task: dict[str, Any], goal: str) -> dict[str, Any]:
+        """Spawn a single child task and block until it completes."""
+        return await self._spawn_one(parent_task, goal)
+
+    async def spawn_many(self, parent_task: dict[str, Any], goals: list[str]) -> list[dict[str, Any]]:
+        """Spawn N child tasks in parallel (bounded by concurrent_sub_agents semaphore)."""
+        async def one(goal: str) -> dict[str, Any]:
+            async with _get_semaphore():
+                return await self._spawn_one(parent_task, goal)
+
+        return list(await asyncio.gather(*[one(g) for g in goals], return_exceptions=False))
+
+    async def _spawn_one(self, parent_task: dict[str, Any], goal: str) -> dict[str, Any]:
         if int(parent_task.get("depth") or 0) >= 3:
             allowed = bool(parent_task.get("allow_deep_spawn")) and await permissions.check(
                 _actor(parent_task),
@@ -40,6 +66,8 @@ class SubAgentManager:
                 )
                 raise DepthLimitExceeded("Max sub-agent depth (3) reached")
 
+        # Context isolation: child starts with ONLY its goal and no parent history.
+        # The model-in-loop executor will seed a fresh history from the goal alone.
         sub_task_id = await insert_task(
             {
                 "organization_id": parent_task["organization_id"],
@@ -51,17 +79,8 @@ class SubAgentManager:
                 "triggered_by_member_id": parent_task.get("triggered_by_member_id"),
                 "status": "pending",
                 "goal": goal,
-                "plan": [
-                    {
-                        "id": "research",
-                        "action": "tool_call",
-                        "description": "Search for candidate companies matching the delegated goal.",
-                        "tool": "browser.search",
-                        "args": {"query": goal, "max_results": 20},
-                        "approval_required": False,
-                        "depends_on": [],
-                    }
-                ],
+                # No pre-baked plan — executor._run_loop will create_plan from goal.
+                # agent_state starts empty so executor seeds a clean history.
                 "agent_state": {"agent_history": [], "pending_agent_approval": False},
                 "current_step": 0,
                 "result": {},
@@ -71,7 +90,12 @@ class SubAgentManager:
 
         await emit_activity(
             parent_task["id"],
-            {"type": "sub_agent_spawned", "sub_task_id": sub_task_id, "goal": goal, "depth": int(parent_task.get("depth") or 0) + 1},
+            {
+                "type": "sub_agent_spawned",
+                "sub_task_id": sub_task_id,
+                "goal": goal,
+                "depth": int(parent_task.get("depth") or 0) + 1,
+            },
         )
 
         from runtime.executor import TaskExecutor
@@ -89,37 +113,53 @@ class SubAgentManager:
                 if not message:
                     task = await get_task(sub_task_id)
                     if task and task.get("status") == "complete":
-                        profile = await self._save_sub_agent_profile(sub_task_id)
-                        result = dict(task.get("result") or {})
-                        result["sub_agent_profile"] = profile
-                        return result
+                        return await self._summarize_result(sub_task_id, task)
                     if task and task.get("status") == "failed":
                         raise SubAgentFailed(task.get("error") or "sub-agent failed")
                     await asyncio.sleep(0)
                     continue
                 event = json.loads(message["data"])
+                # Forward nested events to parent's activity stream.
                 await emit_activity(
                     parent_task_id,
                     {"type": "sub_agent_event", "sub_task_id": sub_task_id, "event": event},
                 )
                 if event.get("type") == "task_complete":
-                    profile = await self._save_sub_agent_profile(sub_task_id)
-                    result = dict(event.get("result") or {})
-                    result["sub_agent_profile"] = profile
-                    return result
+                    task = await get_task(sub_task_id)
+                    return await self._summarize_result(sub_task_id, task or {})
                 if event.get("type") == "task_failed":
                     raise SubAgentFailed(event.get("error", "sub-agent failed"))
         finally:
             await pubsub.unsubscribe(channel)
             await pubsub.close()
 
-    async def _save_sub_agent_profile(self, sub_task_id: str) -> dict[str, Any]:
-        task = await get_task(sub_task_id)
+    async def _summarize_result(self, sub_task_id: str, task: dict[str, Any]) -> dict[str, Any]:
+        """Return a structured summary (not the full transcript) to the parent's loop history."""
+        raw = dict(task.get("result") or {})
+        profile = await self._save_sub_agent_profile(sub_task_id, task)
+
+        # Build a compact summary — what the parent model needs to continue.
+        summary: dict[str, Any] = {
+            "sub_task_id": sub_task_id,
+            "goal": task.get("goal", ""),
+            "status": "complete",
+            "profile": profile,
+        }
+        # Surface important keys (leads, drafts, findings, answer) at the top level.
+        for key in ("leads", "drafts", "findings", "answer", "summary"):
+            if key in raw:
+                summary[key] = raw[key]
+        # Attach a token-efficient text summary if the model left one.
+        if isinstance(raw.get("answer"), str):
+            summary["answer"] = raw["answer"]
+        return summary
+
+    async def _save_sub_agent_profile(self, sub_task_id: str, task: dict[str, Any]) -> dict[str, Any]:
         profile = {
             "task_id": sub_task_id,
-            "goal": task["goal"] if task else "",
+            "goal": task.get("goal", ""),
             "promotable": True,
-            "result_keys": list((task.get("result") or {}).keys()) if task else [],
+            "result_keys": list((task.get("result") or {}).keys()),
         }
         tasks = await reflect_table("tasks")
         async with engine.begin() as conn:

@@ -35,6 +35,22 @@ class Settings(BaseSettings):
     minio_secure: bool = False
     minio_bucket: str = "chronos"
 
+    # Sub-agent concurrency
+    concurrent_sub_agents: int = 5
+
+    # Context budgeting (category 7)
+    max_context_tokens: int = 120_000   # conservative for frontier models
+    response_reserve_tokens: int = 4_000
+
+    # Per-org token budget guard (category 9) — 0 means unlimited
+    per_org_daily_token_limit: int = 0
+
+    # Observability (category 10)
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
+    langfuse_host: str = "https://cloud.langfuse.com"
+    sentry_dsn: str = ""
+
     model_config = SettingsConfigDict(env_file=(".env", "../../.env"), extra="ignore")
 
 

@@ -27,6 +27,8 @@ def load_skill_index() -> list[dict[str, Any]]:
                 "name": str(meta.get("name") or skill_id),
                 "description": str(meta.get("description") or ""),
                 "path": str(meta_path.parent),
+                "requires_connectors": list(meta.get("requires_connectors") or []),
+                "spawns_sub_agent": bool(meta.get("spawns_sub_agent", False)),
             }
         )
     return index

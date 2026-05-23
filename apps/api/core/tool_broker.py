@@ -76,6 +76,33 @@ def _check_safety_limits(tool: str, args: dict) -> None:
             raise SafetyLimitViolation(f"{tool}: amount ${amount} exceeds limit of ${_MAX_FINANCIAL_AMOUNT}")
 
 
+async def _check_token_budget(org_id: str) -> None:
+    """Enforce the per-org daily token budget by checking a Redis counter.
+
+    The counter is incremented by `record_tokens_used` after each model call.
+    This function just reads the current total and raises if over budget.
+    """
+    import datetime
+
+    day = datetime.date.today().isoformat()
+    key = f"tokens:{org_id}:{day}"
+    raw = await redis_client.get(key)
+    used = int(raw) if raw else 0
+    if used >= settings.per_org_daily_token_limit:
+        raise RateLimitExceeded(org_id, used, settings.per_org_daily_token_limit)
+
+
+async def record_tokens_used(org_id: str, tokens: int) -> None:
+    """Increment the per-org daily token counter. Call after each model completion."""
+    import datetime
+
+    day = datetime.date.today().isoformat()
+    key = f"tokens:{org_id}:{day}"
+    count = await redis_client.incrby(key, tokens)
+    if count == tokens:  # first write today — set TTL to 25 hours
+        await redis_client.expire(key, 90_000)
+
+
 async def _route(agent: AgentContext, tool: str, args: dict, vault_ref: str, tier: str = "live") -> ToolResult:
     """Route to the correct connector after all checks pass."""
     provider = tool.split(".")[0]
@@ -119,6 +146,10 @@ class ToolBroker:
         # 2. Rate limiting (per org, Redis-backed — survives restarts)
         if not (settings.demo_mode and tool == "gmail.draft"):
             await _check_rate_limit(agent.org_id)
+
+        # 2b. Per-org daily token budget guard (Category 9).
+        if settings.per_org_daily_token_limit > 0:
+            await _check_token_budget(agent.org_id)
 
         # 3. Loop detection
         await _check_loop(agent.org_id, tool, args_hash)

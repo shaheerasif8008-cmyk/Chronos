@@ -1,16 +1,24 @@
 from pathlib import Path
 import asyncio
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from core import memory
 from core.config import settings
 from core.db import engine, reflect_table
 from core.models import RequesterContext
 from core.personas import get_persona_prompt
-from skills.loader import find_relevant_skills, load_skill_content
+from skills.loader import find_relevant_skills, load_skill_content, skill_connector_warning
+from skills.registry import load_skill_index
 
 ROOT = Path(__file__).resolve().parents[3]
+
+# Category 7: rough token estimation (4 chars ≈ 1 token for English prose).
+_CHARS_PER_TOKEN = 4
+
+
+def _estimate_tokens(text: str) -> int:
+    return max(1, len(text) // _CHARS_PER_TOKEN)
 
 
 def load_base_system_prompt() -> str:
@@ -30,26 +38,102 @@ async def load_org_context(org_id: str) -> str:
     return "\n\n".join(parts)
 
 
+async def _compact_history(
+    conversation_id: str,
+    *,
+    budget_tokens: int,
+    verbatim_turns: int = 6,
+) -> list[dict[str, str]]:
+    """Load conversation history, compacting oldest messages if they exceed budget.
+
+    Always keeps the most recent `verbatim_turns` pairs verbatim.
+    Summarizes older turns into a single synthetic 'assistant' entry.
+    """
+    messages_table = await reflect_table("messages")
+    async with engine.begin() as conn:
+        rows = (
+            await conn.execute(
+                select(messages_table.c.role, messages_table.c.content)
+                .where(messages_table.c.conversation_id == conversation_id)
+                .order_by(messages_table.c.created_at.desc())
+                .limit(200)  # hard ceiling; compaction handles the rest
+            )
+        ).mappings().all()
+
+    all_messages = [{"role": row["role"], "content": row["content"]} for row in reversed(rows)]
+
+    if not all_messages:
+        return []
+
+    # Always keep the last verbatim_turns messages verbatim.
+    verbatim = all_messages[-verbatim_turns:] if len(all_messages) > verbatim_turns else all_messages
+    older = all_messages[: len(all_messages) - len(verbatim)]
+
+    # If everything fits in budget, return as-is.
+    total_chars = sum(len(m["content"]) for m in all_messages)
+    if _estimate_tokens(total_chars * _CHARS_PER_TOKEN) <= budget_tokens or not older:
+        return all_messages
+
+    # Summarize the older block using the fast model.
+    try:
+        from core.llm import complete_text
+
+        older_text = "\n".join(f"{m['role'].upper()}: {m['content'][:300]}" for m in older)
+        summary_text = await complete_text(
+            f"Summarize this conversation history in 3-5 sentences, preserving key facts and decisions:\n\n{older_text}",
+            model=settings.fast_model,
+        )
+        history: list[dict[str, str]] = [
+            {"role": "assistant", "content": f"[Earlier conversation summary]: {summary_text}"}
+        ]
+    except Exception:
+        # If summarization fails, just drop the oldest messages.
+        history = []
+
+    return history + verbatim
+
+
 async def assemble_context(
     conversation_id: str,
     message: str,
     requester_context: RequesterContext,
 ) -> list[dict[str, str]]:
+    # ── Category 7: establish token budget ──────────────────────────────────
+    budget = settings.max_context_tokens - settings.response_reserve_tokens
+    # Reserve half the budget for history; the system layers get the other half.
+    system_budget = budget // 2
+    history_budget = budget - system_budget
+
+    # ── Layer 1: base system prompt ─────────────────────────────────────────
     base = load_base_system_prompt()
+
+    # ── Layer 2: org context ────────────────────────────────────────────────
     org_context = await load_org_context(requester_context.org_id)
-    if org_context:
+    if org_context and _estimate_tokens(base + org_context) <= system_budget:
         base += f"\n\n# Organization Context\n{org_context}"
 
+    # ── Layer 3: persona ────────────────────────────────────────────────────
     persona_prompt = await get_persona_prompt(requester_context.persona_id)
-    if persona_prompt:
+    if persona_prompt and _estimate_tokens(base + persona_prompt) <= system_budget:
         base += f"\n\n# Your Identity\n{persona_prompt}"
 
+    # ── Layer 4: skills (Category 6: connector-aware, progressive) ──────────
     skill_ids = await find_relevant_skills(message)
+    skill_index = {s["id"]: s for s in load_skill_index()}
     for skill_id in skill_ids:
-        content = await load_skill_content(skill_id)
-        if content:
+        skill_meta = skill_index.get(skill_id, {})
+        # Category 6: warn if required connectors are missing.
+        warning = await skill_connector_warning(skill_meta)
+        content = await load_skill_content(skill_id, progressive=True)
+        if content and _estimate_tokens(base + content) <= system_budget:
             base += f"\n\n# Skill: {skill_id}\n{content}"
+            if warning:
+                base += f"\n\n{warning}"
+        elif warning:
+            # Even if the skill doesn't fit, show the setup prompt.
+            base += f"\n\n{warning}"
 
+    # ── Layer 5: memory ─────────────────────────────────────────────────────
     try:
         memories = await asyncio.wait_for(
             memory.retrieve(message, requester_context),
@@ -58,26 +142,18 @@ async def assemble_context(
     except (Exception, asyncio.TimeoutError):
         memories = []
     if memories:
-        base += "\n\n# What I Remember\n" + "\n".join(f"- {m.content}" for m in memories)
+        mem_block = "\n".join(f"- {m.content}" for m in memories)
+        if _estimate_tokens(base + mem_block) <= system_budget:
+            base += "\n\n# What I Remember\n" + mem_block
 
+    # ── Layer 6: task state ─────────────────────────────────────────────────
     if requester_context.task_id:
         task_context = await _load_task_context(requester_context.task_id)
         if task_context:
             base += f"\n\n# Current Task\n{task_context}"
 
-    history: list[dict[str, str]] = []
-    messages = await reflect_table("messages")
-    async with engine.begin() as conn:
-        rows = (
-            await conn.execute(
-                select(messages.c.role, messages.c.content)
-                .where(messages.c.conversation_id == conversation_id)
-                .order_by(messages.c.created_at.desc())
-                .limit(20)
-            )
-        ).mappings().all()
-    for row in reversed(rows):
-        history.append({"role": row["role"], "content": row["content"]})
+    # ── Layer 7: conversation history (with compaction) ─────────────────────
+    history = await _compact_history(conversation_id, budget_tokens=history_budget)
 
     return [{"role": "system", "content": base}, *history, {"role": "user", "content": message}]
 

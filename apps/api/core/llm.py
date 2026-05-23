@@ -1,10 +1,41 @@
 import json
+import logging
+import random
 from typing import Any
 
 import asyncio
 import litellm
 
 from core.config import settings
+
+logger = logging.getLogger(__name__)
+
+# Retry/backoff configuration (Category 10).
+_MAX_RETRIES = 3
+_BASE_BACKOFF_SECONDS = 1.0
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+async def _with_retry(coro_factory, *, max_retries: int = _MAX_RETRIES) -> Any:
+    """Execute an async callable with exponential backoff on retryable errors.
+
+    coro_factory: a zero-argument async callable that returns the coroutine to retry.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            return await coro_factory()
+        except litellm.RateLimitError as exc:
+            last_exc = exc
+            if attempt == max_retries:
+                break
+            delay = _BASE_BACKOFF_SECONDS * (2 ** attempt) + random.uniform(0, 0.5)
+            logger.warning("LLM rate limit (attempt %d/%d), retrying in %.1fs", attempt + 1, max_retries, delay)
+            await asyncio.sleep(delay)
+        except Exception as exc:
+            # Non-retryable error — raise immediately.
+            raise
+    raise last_exc  # type: ignore[misc]
 
 
 def available_chat_models() -> list[dict[str, str]]:
@@ -176,24 +207,27 @@ async def stream_completion(messages: list[dict[str, str]], *, model_id: str | N
 
 
 async def complete_json(prompt: str, *, model: str | None = None) -> str:
-    """Complete with JSON response format, falling back through selected → agent → error."""
-    messages = [{"role": "user", "content": prompt}]
+    """Complete with JSON response format, falling back through selected → agent → error.
 
+    Retries on rate-limit errors with exponential backoff before falling back.
+    """
+    messages = [{"role": "user", "content": prompt}]
     selected = model or settings.fast_model
+
     try:
         kwargs = model_kwargs(selected, messages=messages, stream=False)
         kwargs["response_format"] = {"type": "json_object"}
-        response = await litellm.acompletion(**kwargs)
+        response = await _with_retry(lambda: litellm.acompletion(**kwargs))
         return _message_content(response)
     except Exception:
         pass
 
-    # Selected model failed (rate limit, misconfiguration, etc.) — fall back to primary agent model.
-    # Don't use response_format since some providers don't support it; rely on prompt instruction.
+    # Selected model failed — fall back to primary agent model.
+    # Omit response_format since some providers don't support it; rely on prompt instruction.
     if selected != settings.agent_model:
         try:
             kwargs = agent_completion_kwargs(messages, stream=False)
-            response = await litellm.acompletion(**kwargs)
+            response = await _with_retry(lambda: litellm.acompletion(**kwargs))
             return _message_content(response)
         except Exception:
             pass
@@ -204,19 +238,19 @@ async def complete_json(prompt: str, *, model: str | None = None) -> str:
 async def complete_text(prompt: str, *, model: str | None = None) -> str:
     """Complete with plain text response, falling back through selected → agent → error."""
     messages = [{"role": "user", "content": prompt}]
-
     selected = model or settings.fast_model
+
     try:
-        response = await litellm.acompletion(
-            **model_kwargs(selected, messages=messages, stream=False)
-        )
+        kwargs = model_kwargs(selected, messages=messages, stream=False)
+        response = await _with_retry(lambda: litellm.acompletion(**kwargs))
         return _message_content(response)
     except Exception:
         pass
 
     if selected != settings.agent_model:
         try:
-            response = await litellm.acompletion(**agent_completion_kwargs(messages, stream=False))
+            kwargs = agent_completion_kwargs(messages, stream=False)
+            response = await _with_retry(lambda: litellm.acompletion(**kwargs))
             return _message_content(response)
         except Exception:
             pass
@@ -225,12 +259,15 @@ async def complete_text(prompt: str, *, model: str | None = None) -> str:
 
 
 async def tool_call(messages: list[dict[str, Any]], tools: list[dict[str, Any]], *, model: str | None = None) -> dict[str, Any]:
-    """Ask the agent model for the next tool call or final response."""
+    """Ask the agent model for the next tool call or final response.
+
+    Uses retry/backoff on rate-limit errors before giving up.
+    """
     selected = model or settings.agent_model or settings.openrouter_model
     kwargs = model_kwargs(selected, messages=messages, stream=False)
     kwargs["tools"] = tools
     kwargs["tool_choice"] = "auto"
-    response = await litellm.acompletion(**kwargs)
+    response = await _with_retry(lambda: litellm.acompletion(**kwargs))
     message = _message(response)
     calls = _tool_calls(message)
     if calls:

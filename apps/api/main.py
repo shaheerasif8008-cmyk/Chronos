@@ -6,7 +6,7 @@ import asyncio
 from jobs import context_update, profile_synthesis
 from core.db import engine, reflect_table
 from runtime.executor import TaskExecutor
-from routers import approvals, auth, chat, connectors, context, memory, settings, tasks, workflows
+from routers import approvals, artifacts, auth, chat, connectors, context, memory, settings, tasks, workflows
 
 app = FastAPI(title="Chronos API", version="0.1.0")
 
@@ -31,8 +31,47 @@ app.include_router(connectors.router)
 app.include_router(context.router)
 app.include_router(tasks.router)
 app.include_router(approvals.router)
+app.include_router(artifacts.router)
 app.include_router(settings.router)
 app.include_router(workflows.router)
+
+
+def _init_observability() -> None:
+    """Wire Langfuse callback and Sentry SDK if keys are configured (Category 10)."""
+    from core.config import settings as cfg
+
+    # Langfuse — LiteLLM has a built-in Langfuse callback.
+    if cfg.langfuse_public_key and cfg.langfuse_secret_key:
+        try:
+            import litellm
+
+            litellm.success_callback = list(set(getattr(litellm, "success_callback", []) + ["langfuse"]))
+            litellm.failure_callback = list(set(getattr(litellm, "failure_callback", []) + ["langfuse"]))
+            import os
+            os.environ.setdefault("LANGFUSE_PUBLIC_KEY", cfg.langfuse_public_key)
+            os.environ.setdefault("LANGFUSE_SECRET_KEY", cfg.langfuse_secret_key)
+            os.environ.setdefault("LANGFUSE_HOST", cfg.langfuse_host)
+        except Exception:
+            pass  # Langfuse is optional
+
+    # Sentry
+    if cfg.sentry_dsn:
+        try:
+            import sentry_sdk  # type: ignore[import]
+            from sentry_sdk.integrations.fastapi import FastApiIntegration  # type: ignore[import]
+            from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration  # type: ignore[import]
+
+            sentry_sdk.init(
+                dsn=cfg.sentry_dsn,
+                integrations=[FastApiIntegration(), SqlalchemyIntegration()],
+                traces_sample_rate=0.1,
+                environment=getattr(cfg, "forge_env", "development"),
+            )
+        except Exception:
+            pass  # Sentry is optional
+
+
+_init_observability()
 
 
 @app.on_event("startup")
@@ -75,5 +114,51 @@ async def stop_schedulers() -> None:
 
 
 @app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok"}
+async def health() -> dict:
+    """Deep health check — verifies all critical dependencies."""
+    import time
+
+    checks: dict[str, str] = {}
+
+    # Postgres
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(select(1))  # type: ignore[arg-type]
+        checks["postgres"] = "ok"
+    except Exception as exc:
+        checks["postgres"] = f"error: {exc}"
+
+    # Redis
+    try:
+        from core.redis import redis_client
+        await redis_client.ping()
+        checks["redis"] = "ok"
+    except Exception as exc:
+        checks["redis"] = f"error: {exc}"
+
+    # MinIO
+    try:
+        from core.config import settings as cfg
+        from miniopy_async import Minio  # type: ignore[import]
+        client = Minio(cfg.minio_endpoint, access_key=cfg.minio_access_key,
+                       secret_key=cfg.minio_secret_key, secure=cfg.minio_secure)
+        await client.bucket_exists(cfg.minio_bucket)
+        checks["minio"] = "ok"
+    except Exception as exc:
+        checks["minio"] = f"error: {exc}"
+
+    # Model reachability (quick probe — no retries)
+    try:
+        import litellm
+        from core.config import settings as cfg
+        from core.llm import model_kwargs
+        probe = await litellm.acompletion(
+            **model_kwargs(cfg.fast_model, messages=[{"role": "user", "content": "ping"}], stream=False),
+            max_tokens=1,
+        )
+        checks["model"] = "ok"
+    except Exception as exc:
+        checks["model"] = f"degraded: {exc!r:.120}"
+
+    overall = "ok" if all(v == "ok" for v in checks.values()) else "degraded"
+    return {"status": overall, "checks": checks, "ts": time.time()}
