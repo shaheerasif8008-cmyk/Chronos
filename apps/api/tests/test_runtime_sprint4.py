@@ -319,6 +319,54 @@ async def test_planner_falls_back_to_demo_plan_when_model_fails(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_planner_falls_back_to_research_plan_for_market_brief(monkeypatch):
+    from runtime import planner
+
+    async def fake_complete_json(prompt):
+        raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(planner, "complete_json", fake_complete_json)
+    monkeypatch.setattr(planner.settings, "demo_mode", False)
+
+    plan = await planner.create_plan(
+        "Research the data observability market — top 5 players and how they compare.",
+        {"triggered_by": "test"},
+        "default",
+    )
+
+    assert [step["action"] for step in plan] == ["tool_call", "think"]
+    assert plan[0]["tool"] == "browser.search"
+    assert plan[1]["id"] == "synthesize"
+
+
+@pytest.mark.asyncio
+async def test_spawn_sub_agent_step_is_not_retried(monkeypatch):
+    from runtime import executor
+
+    attempts = []
+    events = []
+
+    async def fake_execute_step(self, task, step):
+        attempts.append(step["id"])
+        raise RuntimeError("child failed")
+
+    async def fake_emit(task_id, event, **kwargs):
+        events.append(event)
+
+    monkeypatch.setattr(executor.TaskExecutor, "_execute_step", fake_execute_step)
+    monkeypatch.setattr(executor, "emit_activity", fake_emit)
+
+    with pytest.raises(executor.TaskExecutionError, match="after 1 attempts"):
+        await executor.TaskExecutor()._execute_with_retries(
+            {"id": "task-1"},
+            {"id": "research", "action": "spawn_sub_agent"},
+        )
+
+    assert attempts == ["research"]
+    assert len(events) == 1
+
+
+@pytest.mark.asyncio
 async def test_browser_search_operator_workflow_fixture_avoids_live_duckduckgo(monkeypatch):
     from connectors import browser
 
@@ -335,6 +383,35 @@ async def test_browser_search_operator_workflow_fixture_avoids_live_duckduckgo(m
     assert result.summary == "Fixture search 'operator workflow proof: draft approvals': 3 leads"
     assert len(result.data["leads"]) == 3
     assert result.data["leads"][0]["domain"] == "demosaas01.example.com"
+
+
+@pytest.mark.asyncio
+async def test_browser_search_falls_back_to_fixture_results_on_live_timeout(monkeypatch):
+    from connectors import browser
+
+    class FakePage:
+        async def goto(self, *args, **kwargs):
+            raise RuntimeError("duckduckgo timeout")
+
+    class FakeClosable:
+        async def close(self):
+            return None
+
+    class FakePlaywright:
+        async def stop(self):
+            return None
+
+    async def fake_new_page():
+        return FakePlaywright(), FakeClosable(), FakeClosable(), FakePage()
+
+    monkeypatch.setattr(browser.settings, "demo_mode", False)
+    monkeypatch.setattr(browser, "_new_page", fake_new_page)
+
+    result = await browser.browser_connector._search({"query": "data observability market", "max_results": 2})
+
+    assert result.summary == "Browser search fallback 'data observability market': 2 fixture results"
+    assert result.data["tier"] == "fixture"
+    assert len(result.data["results"]) == 2
 
 
 @pytest.mark.asyncio

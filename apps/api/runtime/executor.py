@@ -185,7 +185,8 @@ class TaskExecutor:
 
     async def _execute_with_retries(self, task: dict[str, Any], step: dict[str, Any]) -> dict[str, Any] | None:
         last_exc: Exception | None = None
-        for attempt in range(1, 4):
+        max_attempts = 1 if step.get("action") == "spawn_sub_agent" else 3
+        for attempt in range(1, max_attempts + 1):
             try:
                 return await self._execute_step(task, step)
             except _PausedForApproval:
@@ -197,7 +198,7 @@ class TaskExecutor:
                     {"type": "step_retry", "step": step, "attempt": attempt, "error": str(exc)},
                 )
                 await asyncio.sleep(0)
-        raise TaskExecutionError(f"Step {step.get('id')} failed after 3 attempts: {last_exc}")
+        raise TaskExecutionError(f"Step {step.get('id')} failed after {max_attempts} attempts: {last_exc}")
 
     async def _execute_step(self, task: dict[str, Any], step: dict[str, Any]) -> dict[str, Any] | None:
         actor = Member(
@@ -235,7 +236,40 @@ class TaskExecutor:
         should_draft = "draft" in step.get("description", "").lower()
         if should_draft and (settings.demo_mode or result.get("leads")):
             return {"leads": leads, "drafts": _drafts_from_leads(leads)}
+        research = self._research_findings(result)
+        if research:
+            return research
         return {"note": step.get("description", "completed")}
+
+    def _research_findings(self, result: dict[str, Any]) -> dict[str, Any] | None:
+        search = result.get("research")
+        if isinstance(search, dict):
+            data = search.get("data") if isinstance(search.get("data"), dict) else {}
+            raw_results = data.get("results") or data.get("leads") or []
+        else:
+            raw_results = result.get("results") or []
+        if not isinstance(raw_results, list) or not raw_results:
+            return None
+
+        findings = []
+        for item in raw_results[:5]:
+            if not isinstance(item, dict):
+                continue
+            title = item.get("title") or item.get("company") or item.get("url") or "Research result"
+            snippet = item.get("snippet") or item.get("hiring_signal") or item.get("content") or ""
+            findings.append(
+                {
+                    "title": title,
+                    "summary": snippet,
+                    "url": item.get("url"),
+                }
+            )
+        if not findings:
+            return None
+        return {
+            "findings": findings,
+            "summary": "Compiled research findings from the browser search results.",
+        }
 
     async def _handle_approval_gate(self, task: dict[str, Any], step: dict[str, Any]) -> dict[str, Any] | None:
         approvals = await reflect_table("approvals")

@@ -61,6 +61,29 @@ def _demo_plan(goal: str) -> list[dict[str, Any]]:
     ]
 
 
+def _research_plan(goal: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": "research",
+            "action": "tool_call",
+            "description": "Search for source material relevant to the requested research brief.",
+            "tool": "browser.search",
+            "args": {"query": goal, "max_results": 8},
+            "approval_required": False,
+            "depends_on": [],
+        },
+        {
+            "id": "synthesize",
+            "action": "think",
+            "description": "Summarize the research findings and compare the main players.",
+            "tool": None,
+            "args": {},
+            "approval_required": False,
+            "depends_on": ["research"],
+        },
+    ]
+
+
 def _operator_workflow_proof_plan(goal: str) -> list[dict[str, Any]]:
     return [
         {
@@ -98,12 +121,22 @@ def _is_operator_workflow_proof(goal: str) -> bool:
     return "operator workflow proof" in normalized
 
 
+def _is_outreach_goal(goal: str) -> bool:
+    normalized = goal.lower()
+    return any(term in normalized for term in ("lead", "leads", "outreach", "draft", "email", "gmail", "sdr"))
+
+
+def _is_research_goal(goal: str) -> bool:
+    normalized = goal.lower()
+    return any(term in normalized for term in ("research", "brief", "compare", "comparison", "market", "players", "analyze", "analysis"))
+
+
 async def create_plan(goal: str, context: dict[str, Any] | None, org_id: str) -> list[dict[str, Any]]:
     if _is_operator_workflow_proof(goal):
         return _operator_workflow_proof_plan(goal)
 
     if settings.demo_mode:
-        return _demo_plan(goal)
+        return _demo_plan(goal) if _is_outreach_goal(goal) else _research_plan(goal)
 
     prompt = f"""
 You are Chronos, an enterprise autonomous task planner.
@@ -118,7 +151,7 @@ Goal: {goal}
     try:
         parsed = json.loads(await complete_json(prompt))
     except Exception:
-        return _demo_plan(goal)
+        return _demo_plan(goal) if _is_outreach_goal(goal) else _research_plan(goal)
 
     raw_steps = parsed.get("steps", parsed if isinstance(parsed, list) else None)
     if not isinstance(raw_steps, list) or not raw_steps:

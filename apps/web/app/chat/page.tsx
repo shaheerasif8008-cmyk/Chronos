@@ -34,7 +34,7 @@ type Message = {
 type ToolTrace = { id: string; tool: string; summary: string; status: MessageStatus };
 type MemoryEntry = { id: string; scope: string; scope_id: string; content: string; source: string; created_by?: string | null; created_at?: string };
 type Connector = { id: string; provider: string; account_handle?: string | null; status: string; connected_at?: string | null; last_used_at?: string | null };
-type Task = { id: string; status: string; goal: string; current_step: number; plan?: TaskStep[]; result?: Record<string, unknown>; created_at?: string; parent_task_id?: string | null; depth?: number };
+type Task = { id: string; status: string; goal: string; current_step: number; plan?: TaskStep[]; result?: Record<string, unknown>; error?: string | null; created_at?: string; parent_task_id?: string | null; depth?: number };
 type TaskStep = { id: string; action: string; description: string; tool?: string | null };
 type ChatModel = { id: string; label: string; model: string; description?: string };
 type TaskStreamEvent = {
@@ -1144,6 +1144,8 @@ function eventColor(event: TaskStreamEvent) {
 function ActivityScreen() {
   const [mode, setMode] = useState<"jobs" | "actions">("jobs");
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
+  const [activeTask, setActiveTask] = useState<Task | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -1154,6 +1156,14 @@ function ActivityScreen() {
       .catch(() => {})
       .finally(() => setLoading(false));
   }, []);
+
+  useEffect(() => {
+    if (!activeTaskId) { setActiveTask(null); return; }
+    apiFetch(`/tasks/${activeTaskId}`)
+      .then(r => r.json())
+      .then((data: Task) => setActiveTask(data))
+      .catch(() => setActiveTask(null));
+  }, [activeTaskId]);
 
   const jobFilters = [
     { id: "all", label: "All", count: tasks.length },
@@ -1208,23 +1218,32 @@ function ActivityScreen() {
               const sl = statusLabel[t.status] ?? t.status;
               const statusColor = { running: "var(--accent-text)", awaiting_approval: "var(--warn)", failed: "var(--danger)", complete: "var(--ok)" }[t.status] ?? "var(--text-muted)";
               return (
-                <div key={t.id} className="surface border border-soft rounded-lg p-4 smooth hover:border-[var(--border)] cursor-pointer flex items-center gap-4">
-                  <div className="flex-shrink-0">
-                    {t.status === "running"             && <Dot color="var(--accent)" size={10} pulse ring/>}
-                    {t.status === "awaiting_approval"   && <Dot color="var(--warn)" size={10}/>}
-                    {t.status === "complete"            && <IC.Check size={16} stroke={2.2} style={{ color: "var(--ok)" }}/>}
-                    {t.status === "failed"              && <IC.Info size={16} style={{ color: "var(--danger)" }}/>}
-                    {t.status === "pending"             && <Dot color="var(--text-faint)" size={8}/>}
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="text-[14.5px] font-medium mb-1 truncate">{t.goal}</div>
-                    <div className="flex items-center gap-2 text-[12.5px]" style={{ color: "var(--text-dim)" }}>
-                      <span style={{ color: statusColor }}>{sl}</span>
-                      <span>·</span>
-                      <span>Step {t.current_step}</span>
+                <div key={t.id} className="surface border border-soft rounded-lg overflow-hidden">
+                  <button onClick={() => setActiveTaskId(activeTaskId === t.id ? null : t.id)} className="w-full p-4 smooth hover:bg-[var(--surface-2)] cursor-pointer flex items-center gap-4 text-left">
+                    <div className="flex-shrink-0">
+                      {t.status === "running"             && <Dot color="var(--accent)" size={10} pulse ring/>}
+                      {t.status === "awaiting_approval"   && <Dot color="var(--warn)" size={10}/>}
+                      {t.status === "complete"            && <IC.Check size={16} stroke={2.2} style={{ color: "var(--ok)" }}/>}
+                      {t.status === "failed"              && <IC.Info size={16} style={{ color: "var(--danger)" }}/>}
+                      {t.status === "pending"             && <Dot color="var(--text-faint)" size={8}/>}
                     </div>
-                  </div>
-                  <IC.Chevron size={16} style={{ color: "var(--text-faint)" }}/>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-[14.5px] font-medium mb-1 truncate">{t.goal}</div>
+                      <div className="flex items-center gap-2 text-[12.5px]" style={{ color: "var(--text-dim)" }}>
+                        <span style={{ color: statusColor }}>{sl}</span>
+                        <span>·</span>
+                        <span>Step {t.current_step}</span>
+                      </div>
+                    </div>
+                    <IC.Chevron size={16} style={{ color: "var(--text-faint)", transform: activeTaskId === t.id ? "rotate(90deg)" : "none" }}/>
+                  </button>
+                  {activeTaskId === t.id && (
+                    <div className="border-t hairline px-5 py-4 space-y-3">
+                      {activeTask?.error && <div className="text-[12.5px]" style={{ color: "var(--danger)" }}>{activeTask.error}</div>}
+                      <TaskSteps task={activeTask || t}/>
+                      <TaskResult task={activeTask || t}/>
+                    </div>
+                  )}
                 </div>
               );
             })}
@@ -1239,6 +1258,24 @@ function ActivityScreen() {
       )}
     </div>
   );
+}
+
+function TaskSteps({ task }: { task: Task }) {
+  const steps = Array.isArray(task.plan) ? task.plan : [];
+  if (!steps.length) return <div className="text-[12.5px]" style={{ color: "var(--text-muted)" }}>No execution plan recorded.</div>;
+  return <div className="space-y-1.5">{steps.map((step, index) => <div key={step.id || index} className="flex items-center gap-2 text-[12.5px]"><Tag variant={index < task.current_step ? "ok" : index === task.current_step ? "info" : "default"}>{index + 1}</Tag><span className="font-medium">{step.action}</span><span style={{ color: "var(--text-dim)" }}>{step.description}</span>{step.tool && <Tag>{step.tool}</Tag>}</div>)}</div>;
+}
+
+function TaskResult({ task }: { task: Task }) {
+  const result = task.result || {};
+  const findings = Array.isArray(result.findings) ? result.findings as Array<Record<string, unknown>> : [];
+  if (findings.length) {
+    return <div className="space-y-2">{findings.map((finding, index) => <div key={index} className="text-[12.5px]"><div className="font-medium">{String(finding.title || "Finding")}</div><div style={{ color: "var(--text-dim)" }}>{String(finding.summary || "")}</div></div>)}</div>;
+  }
+  if (Object.keys(result).length) {
+    return <pre className="text-[11.5px] max-h-56 overflow-auto rounded-md p-3" style={{ background: "var(--surface-2)", color: "var(--text-muted)" }}>{JSON.stringify(result, null, 2)}</pre>;
+  }
+  return <div className="text-[12.5px]" style={{ color: "var(--text-muted)" }}>No result has been recorded yet.</div>;
 }
 
 // ─── Approvals Screen ─────────────────────────────────────────────────────────

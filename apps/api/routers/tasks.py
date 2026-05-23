@@ -76,6 +76,7 @@ async def create_task(req: CreateTaskRequest, member: Member = Depends(get_curre
 @router.get("/")
 async def list_tasks(
     status: str | None = Query(default=None),
+    include_children: bool = Query(default=False),
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     member: Member = Depends(get_current_member),
@@ -83,6 +84,8 @@ async def list_tasks(
     await permissions.check(member, "list_tasks", settings.org_id)
     tasks = await reflect_table("tasks")
     stmt = select(tasks).where(tasks.c.organization_id == member.organization_id)
+    if not include_children:
+        stmt = stmt.where(tasks.c.parent_task_id.is_(None))
     if status:
         stmt = stmt.where(tasks.c.status == status)
     stmt = stmt.order_by(tasks.c.created_at.desc()).limit(limit).offset(offset)

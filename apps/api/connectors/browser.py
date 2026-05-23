@@ -129,6 +129,12 @@ class BrowserConnector:
                 data={"query": query, "results": trimmed},
                 summary=f"Search '{query}': {len(trimmed)} results",
             )
+        except Exception as exc:
+            results = _fixture_search_results(query, max_results)
+            return ToolResult(
+                data={"query": query, "results": results, "tier": "fixture", "fallback_reason": str(exc)},
+                summary=f"Browser search fallback '{query}': {len(results)} fixture results",
+            )
         finally:
             await context.close()
             await browser.close()
@@ -248,3 +254,14 @@ def _fixture_leads(max_results: int) -> list[dict[str, Any]]:
         }
         for i in range(1, 21)
     ][:max_results]
+
+
+def _fixture_search_results(query: str, max_results: int) -> list[dict[str, Any]]:
+    return [
+        {
+            "title": f"Fixture research result {i}: {query}",
+            "snippet": "Live browser search was unavailable, so Chronos recorded a deterministic fallback result for this research step.",
+            "url": f"https://example.com/research/{i}",
+        }
+        for i in range(1, max_results + 1)
+    ]
