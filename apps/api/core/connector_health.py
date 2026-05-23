@@ -62,6 +62,24 @@ async def check_connectors(*, refresh: bool = False) -> ConnectorHealth:
             "reason": browser_reason,
             "setup": None if browser_status == "live" else "pip install playwright && playwright install chromium",
         },
+        "fs": {
+            "status": "live",
+            "tier": "live",
+            "reason": "Task workspace filesystem tools are available with a per-task path jail.",
+            "setup": None,
+        },
+        "code": {
+            "status": "live",
+            "tier": "live",
+            "reason": "Restricted Python subprocess execution is available with timeout and resource limits.",
+            "setup": None,
+        },
+        "mcp": {
+            "status": "available",
+            "tier": "live",
+            "reason": "MCP servers can be registered and discovered; execution requires a reachable local or remote JSON-RPC MCP server.",
+            "setup": "Register an MCP server under Connectors before using mcp.<server_id>.<tool>.",
+        },
     }
     _CACHE = (now, health)
     return health

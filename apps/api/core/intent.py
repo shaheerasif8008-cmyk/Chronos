@@ -4,6 +4,7 @@ import json
 import re
 from typing import Any
 
+from core.config import settings
 from core.llm import complete_json
 
 
@@ -75,7 +76,7 @@ Message:
 {message}
 """
     try:
-        parsed = json.loads(await complete_json(prompt))
+        parsed = json.loads(await complete_json(prompt, model=settings.fast_model))
     except Exception:
         return _heuristic_intent(message)
 

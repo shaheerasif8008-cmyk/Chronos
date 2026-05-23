@@ -218,6 +218,133 @@ def test_approved_approval_without_draft_result_is_ready_for_execution():
 
 
 @pytest.mark.asyncio
+async def test_agent_loop_uses_model_decisions_and_broker_checkpoint(monkeypatch):
+    from core.models import ToolResult
+    from runtime import executor
+
+    tasks = {
+        "task-agent-loop": {
+            "id": "task-agent-loop",
+            "organization_id": "default",
+            "region": "us",
+            "triggered_by_member_id": "member-1",
+            "workspace_id": "default",
+            "persona_id": None,
+            "status": "pending",
+            "goal": "Search and summarize",
+            "plan": {
+                "suggested_steps": [
+                    {"id": "search", "action": "tool_call", "tool": "browser.search", "args": {"query": "acme"}, "description": "Search"}
+                ],
+                "agent_history": [],
+            },
+            "current_step": 0,
+            "result": {},
+            "iteration_count": 0,
+            "started_at": None,
+            "depth": 0,
+        }
+    }
+    updates = []
+    calls = []
+    decisions = [
+        {"type": "tool_call", "tool": "browser.search", "args": {"query": "acme"}},
+        {"type": "final", "result": {"answer": "done"}},
+    ]
+
+    async def fake_get_task(task_id):
+        return dict(tasks[task_id])
+
+    async def fake_update_task(task_id, **values):
+        updates.append(values)
+        tasks[task_id].update(values)
+
+    async def fake_emit(task_id, event, actor_id="chronos"):
+        return None
+
+    async def fake_tool_call(messages, tools, model=None):
+        assert tools
+        return decisions.pop(0)
+
+    async def fake_execute(agent, tool, args):
+        calls.append((tool, args))
+        return ToolResult(summary="searched", data={"results": [{"title": "Acme"}]})
+
+    monkeypatch.setattr(executor, "get_task", fake_get_task)
+    monkeypatch.setattr(executor, "update_task", fake_update_task)
+    monkeypatch.setattr(executor, "emit_activity", fake_emit)
+    monkeypatch.setattr(executor.llm, "tool_call", fake_tool_call)
+    monkeypatch.setattr(executor.tool_broker, "execute", fake_execute)
+
+    await executor.TaskExecutor()._run_loop("task-agent-loop")
+
+    assert calls == [("browser.search", {"query": "acme"})]
+    assert tasks["task-agent-loop"]["status"] == "complete"
+    assert tasks["task-agent-loop"]["result"] == {"answer": "done"}
+    checkpoint = tasks["task-agent-loop"]["plan"]["agent_history"]
+    assert any(message.get("role") == "tool" for message in checkpoint)
+    assert tasks["task-agent-loop"]["iteration_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_pauses_and_checkpoints_on_approval(monkeypatch):
+    from core.exceptions import ApprovalRequired
+    from runtime import executor
+
+    tasks = {
+        "task-approval-loop": {
+            "id": "task-approval-loop",
+            "organization_id": "default",
+            "region": "us",
+            "triggered_by_member_id": "member-1",
+            "workspace_id": "default",
+            "persona_id": None,
+            "status": "pending",
+            "goal": "Send email",
+            "plan": {"suggested_steps": [], "agent_history": []},
+            "current_step": 0,
+            "result": {},
+            "iteration_count": 0,
+            "started_at": None,
+            "depth": 0,
+        }
+    }
+    approval_calls = []
+
+    async def fake_get_task(task_id):
+        return dict(tasks[task_id])
+
+    async def fake_update_task(task_id, **values):
+        tasks[task_id].update(values)
+
+    async def fake_emit(task_id, event, actor_id="chronos"):
+        return None
+
+    async def fake_tool_call(messages, tools, model=None):
+        return {"type": "tool_call", "tool": "gmail.send", "args": {"to": ["a@example.com"], "subject": "Hi", "body": "Hello"}}
+
+    async def fake_execute(agent, tool, args):
+        raise ApprovalRequired(tool, "needs approval")
+
+    async def fake_open_approval(self, task, decision, history):
+        approval_calls.append((task["id"], decision["tool"], list(history)))
+        await fake_update_task(task["id"], status="awaiting_approval", plan={**task["plan"], "agent_history": history})
+
+    monkeypatch.setattr(executor, "get_task", fake_get_task)
+    monkeypatch.setattr(executor, "update_task", fake_update_task)
+    monkeypatch.setattr(executor, "emit_activity", fake_emit)
+    monkeypatch.setattr(executor.llm, "tool_call", fake_tool_call)
+    monkeypatch.setattr(executor.tool_broker, "execute", fake_execute)
+    monkeypatch.setattr(executor.TaskExecutor, "_open_approval_checkpoint", fake_open_approval)
+
+    await executor.TaskExecutor()._run_loop("task-approval-loop")
+
+    assert tasks["task-approval-loop"]["status"] == "awaiting_approval"
+    assert approval_calls[0][1] == "gmail.send"
+    assert tasks["task-approval-loop"]["plan"]["agent_history"]
+
+
+@pytest.mark.asyncio
 async def test_approval_gate_waits_for_all_pending_decisions_before_drafting(monkeypatch):
     from runtime import executor
 
@@ -306,7 +433,8 @@ async def test_approval_gate_waits_for_all_pending_decisions_before_drafting(mon
 async def test_planner_falls_back_to_demo_plan_when_model_fails(monkeypatch):
     from runtime import planner
 
-    async def fake_complete_json(prompt):
+    async def fake_complete_json(prompt, model=None):
+        assert model == planner.settings.agent_model
         raise RuntimeError("provider unavailable")
 
     monkeypatch.setattr(planner, "complete_json", fake_complete_json)
@@ -322,7 +450,8 @@ async def test_planner_falls_back_to_demo_plan_when_model_fails(monkeypatch):
 async def test_planner_falls_back_to_research_plan_for_market_brief(monkeypatch):
     from runtime import planner
 
-    async def fake_complete_json(prompt):
+    async def fake_complete_json(prompt, model=None):
+        assert model == planner.settings.agent_model
         raise RuntimeError("provider unavailable")
 
     monkeypatch.setattr(planner, "complete_json", fake_complete_json)

@@ -30,6 +30,7 @@ class MemoryCreate(BaseModel):
 
 class MemoryUpdate(BaseModel):
     content: str
+    importance_score: float | None = None
 
 
 @router.get("/")
@@ -45,12 +46,15 @@ async def list_memory(
 @router.post("/")
 async def add_memory(req: MemoryCreate, member: Member = Depends(get_current_member)) -> dict:
     await permissions.check(member, "create_memory", settings.org_id)
+    scope_id = req.scope_id
+    if scope_id is None:
+        scope_id = member.id if req.scope in {"personal", "restricted"} else member.organization_id
     entry_id = await create_memory_entry(
         content=req.content,
         requester_context=RequesterContext.from_member(member),
         source="explicit",
         scope=req.scope,
-        scope_id=req.scope_id or member.organization_id,
+        scope_id=scope_id,
         importance_score=req.importance_score,
         created_by=member.id,
     )
@@ -60,7 +64,7 @@ async def add_memory(req: MemoryCreate, member: Member = Depends(get_current_mem
 @router.patch("/{memory_id}")
 async def update_memory(memory_id: str, req: MemoryUpdate, member: Member = Depends(get_current_member)) -> dict:
     await permissions.check(member, "update_memory", memory_id)
-    if not await update_memory_entry(memory_id, req.content, member):
+    if not await update_memory_entry(memory_id, req.content, member, importance_score=req.importance_score):
         raise HTTPException(status_code=404, detail="Memory not found")
     await audit.log(
         "memory_write",

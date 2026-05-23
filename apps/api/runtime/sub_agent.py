@@ -62,6 +62,7 @@ class SubAgentManager:
                         "depends_on": [],
                     }
                 ],
+                "agent_state": {"agent_history": [], "pending_agent_approval": False},
                 "current_step": 0,
                 "result": {},
                 "depth": int(parent_task.get("depth") or 0) + 1,

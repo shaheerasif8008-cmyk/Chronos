@@ -1,4 +1,5 @@
 from pydantic import BaseModel
+from datetime import datetime
 
 
 class Member(BaseModel):
@@ -62,6 +63,7 @@ class MemoryEntry(BaseModel):
     importance_score: float = 0.5
     is_deleted: bool = False
     created_by: str | None = None
+    created_at: datetime | None = None
 
 
 class ToolResult(BaseModel):

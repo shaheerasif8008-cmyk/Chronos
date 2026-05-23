@@ -149,7 +149,7 @@ Context JSON: {json.dumps(context or {}, default=str)}
 Goal: {goal}
 """
     try:
-        parsed = json.loads(await complete_json(prompt))
+        parsed = json.loads(await complete_json(prompt, model=settings.agent_model))
     except Exception:
         return _demo_plan(goal) if _is_outreach_goal(goal) else _research_plan(goal)
 

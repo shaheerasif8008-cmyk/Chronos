@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from connectors.mcp_client import MCPTransportError, call_mcp
+
 
 class MCPDiscoveryService:
     def __init__(self, repo: Any) -> None:
@@ -12,11 +14,12 @@ class MCPDiscoveryService:
         if not server:
             result = {"status": "error", "message": "MCP server not found", "tools_discovered": 0}
         else:
-            result = {
-                "status": "error",
-                "message": "MCP transport discovery is registered but execution transport is not implemented",
-                "tools_discovered": 0,
-            }
+            try:
+                discovered = await call_mcp(server, "tools/list", {})
+                tools = discovered.get("tools") or []
+                result = {"status": "healthy", "message": f"Discovered {len(tools)} MCP tools", "tools_discovered": len(tools), "tools": tools}
+            except (MCPTransportError, OSError, TimeoutError, ValueError) as exc:
+                result = {"status": "error", "message": str(exc), "tools_discovered": 0}
         await self.repo.log_mcp_discovery(
             tenant_id=tenant_id,
             server_id=server_id,

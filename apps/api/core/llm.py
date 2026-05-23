@@ -1,3 +1,4 @@
+import json
 from typing import Any
 
 import asyncio
@@ -8,6 +9,12 @@ from core.config import settings
 
 def available_chat_models() -> list[dict[str, str]]:
     models = [
+        {
+            "id": "agent",
+            "label": "Primary",
+            "model": settings.agent_model,
+            "description": "Use the configured primary agent model.",
+        },
         {
             "id": "auto",
             "label": "Auto",
@@ -51,9 +58,9 @@ def available_chat_models() -> list[dict[str, str]]:
 
 
 def normalize_chat_model(model_id: str | None) -> str:
-    requested = model_id or "auto"
+    requested = model_id or "agent"
     allowed = {model["id"] for model in available_chat_models()}
-    return requested if requested in allowed else "auto"
+    return requested if requested in allowed else "agent"
 
 
 def backup_completion_kwargs(messages: list[dict[str, str]], *, stream: bool = False) -> dict[str, Any]:
@@ -73,6 +80,10 @@ def backup_completion_kwargs(messages: list[dict[str, str]], *, stream: bool = F
     }
 
 
+def agent_completion_kwargs(messages: list[dict[str, str]], *, stream: bool = False) -> dict[str, Any]:
+    return model_kwargs(settings.agent_model, messages=messages, stream=stream)
+
+
 def model_kwargs(model: str, *, messages: list[dict[str, str]], stream: bool = False) -> dict[str, Any]:
     kwargs: dict[str, Any] = {"model": model, "messages": messages, "stream": stream}
     if model.startswith("openrouter/") or settings.openrouter_api_key:
@@ -83,6 +94,8 @@ def model_kwargs(model: str, *, messages: list[dict[str, str]], stream: bool = F
 
 def selected_completion_kwargs(model_id: str, messages: list[dict[str, str]], *, stream: bool = False) -> dict[str, Any]:
     selected = normalize_chat_model(model_id)
+    if selected == "agent":
+        return agent_completion_kwargs(messages, stream=stream)
     if selected == "local":
         return {
             "model": settings.local_llm_model,
@@ -107,6 +120,18 @@ def _message_content(response: Any) -> str:
     if isinstance(response, dict):
         return response.get("choices", [{}])[0].get("message", {}).get("content") or ""
     return response.choices[0].message.content or ""
+
+
+def _message(response: Any) -> Any:
+    if isinstance(response, dict):
+        return response.get("choices", [{}])[0].get("message", {})
+    return response.choices[0].message
+
+
+def _tool_calls(message: Any) -> list[Any]:
+    if isinstance(message, dict):
+        return message.get("tool_calls") or []
+    return getattr(message, "tool_calls", None) or []
 
 
 async def stream_completion(messages: list[dict[str, str]], *, model_id: str | None = None):
@@ -151,24 +176,23 @@ async def stream_completion(messages: list[dict[str, str]], *, model_id: str | N
 
 
 async def complete_json(prompt: str, *, model: str | None = None) -> str:
-    """Complete with JSON response format, falling back through fast → main → error."""
+    """Complete with JSON response format, falling back through selected → agent → error."""
     messages = [{"role": "user", "content": prompt}]
 
-    # Try fast model first
-    fast = model or settings.fast_model
+    selected = model or settings.fast_model
     try:
-        kwargs = model_kwargs(fast, messages=messages, stream=False)
+        kwargs = model_kwargs(selected, messages=messages, stream=False)
         kwargs["response_format"] = {"type": "json_object"}
         response = await litellm.acompletion(**kwargs)
         return _message_content(response)
     except Exception:
         pass
 
-    # Fast model failed (rate limit, misconfiguration, etc.) — fall back to main model
-    # Don't use response_format since some models don't support it; rely on prompt instruction
-    if fast != settings.openrouter_model:
+    # Selected model failed (rate limit, misconfiguration, etc.) — fall back to primary agent model.
+    # Don't use response_format since some providers don't support it; rely on prompt instruction.
+    if selected != settings.agent_model:
         try:
-            kwargs = backup_completion_kwargs(messages, stream=False)
+            kwargs = agent_completion_kwargs(messages, stream=False)
             response = await litellm.acompletion(**kwargs)
             return _message_content(response)
         except Exception:
@@ -178,23 +202,58 @@ async def complete_json(prompt: str, *, model: str | None = None) -> str:
 
 
 async def complete_text(prompt: str, *, model: str | None = None) -> str:
-    """Complete with plain text response, falling back through fast → main → error."""
+    """Complete with plain text response, falling back through selected → agent → error."""
     messages = [{"role": "user", "content": prompt}]
 
-    fast = model or settings.fast_model
+    selected = model or settings.fast_model
     try:
         response = await litellm.acompletion(
-            **model_kwargs(fast, messages=messages, stream=False)
+            **model_kwargs(selected, messages=messages, stream=False)
         )
         return _message_content(response)
     except Exception:
         pass
 
-    if fast != settings.openrouter_model:
+    if selected != settings.agent_model:
         try:
-            response = await litellm.acompletion(**backup_completion_kwargs(messages, stream=False))
+            response = await litellm.acompletion(**agent_completion_kwargs(messages, stream=False))
             return _message_content(response)
         except Exception:
             pass
 
     raise RuntimeError("All models failed for complete_text — check OPENROUTER_API_KEY and model config")
+
+
+async def tool_call(messages: list[dict[str, Any]], tools: list[dict[str, Any]], *, model: str | None = None) -> dict[str, Any]:
+    """Ask the agent model for the next tool call or final response."""
+    selected = model or settings.agent_model or settings.openrouter_model
+    kwargs = model_kwargs(selected, messages=messages, stream=False)
+    kwargs["tools"] = tools
+    kwargs["tool_choice"] = "auto"
+    response = await litellm.acompletion(**kwargs)
+    message = _message(response)
+    calls = _tool_calls(message)
+    if calls:
+        call = calls[0]
+        if isinstance(call, dict):
+            function = call.get("function") or {}
+            name = function.get("name")
+            raw_args = function.get("arguments") or "{}"
+        else:
+            function = call.function
+            name = function.name
+            raw_args = function.arguments or "{}"
+        try:
+            args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+        except json.JSONDecodeError:
+            args = {}
+        return {"type": "tool_call", "tool": name, "args": args if isinstance(args, dict) else {}}
+
+    content = _message_content(response)
+    try:
+        parsed = json.loads(content)
+        if isinstance(parsed, dict) and parsed.get("type") in {"final", "tool_call"}:
+            return parsed
+    except Exception:
+        pass
+    return {"type": "final", "result": {"answer": content}}

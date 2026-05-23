@@ -334,7 +334,7 @@ async def test_planner_execution_stops_at_approval_checkpoint():
 
 
 @pytest.mark.asyncio
-async def test_mcp_discovery_records_unsupported_transport_truthfully():
+async def test_mcp_discovery_records_transport_error_truthfully():
     from connectors.framework.mcp import MCPDiscoveryService
     from connectors.framework.repository import InMemoryConnectorRepository
 
@@ -349,7 +349,7 @@ async def test_mcp_discovery_records_unsupported_transport_truthfully():
     result = await MCPDiscoveryService(repo).discover(server["id"], tenant_id="default")
 
     assert result["status"] == "error"
-    assert "not implemented" in result["message"]
+    assert result["message"]
     logs = await repo.list_mcp_discovery_logs(tenant_id="default")
     assert logs[0]["server_id"] == server["id"]
 

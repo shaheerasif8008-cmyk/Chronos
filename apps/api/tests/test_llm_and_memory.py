@@ -1,4 +1,6 @@
 import json
+import sys
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -6,36 +8,33 @@ from core.models import RequesterContext
 
 
 @pytest.mark.asyncio
-async def test_stream_chat_completion_falls_back_after_local_failure(monkeypatch):
+async def test_stream_chat_completion_defaults_to_agent_model(monkeypatch):
     from core import llm
 
     calls = []
 
     async def fake_completion(**kwargs):
         calls.append(kwargs)
-        if len(calls) == 1:
-            raise RuntimeError("local unavailable")
 
         async def chunks():
-            yield {"choices": [{"delta": {"content": "fallback "}}]}
+            yield {"choices": [{"delta": {"content": "agent "}}]}
             yield {"choices": [{"delta": {"content": "works"}}]}
 
         return chunks()
 
     monkeypatch.setattr(llm.litellm, "acompletion", fake_completion)
     monkeypatch.setattr(llm.settings, "openrouter_api_key", "or-test-key")
-    monkeypatch.setattr(llm.settings, "openrouter_model", "openrouter/nvidia/nemotron-3-super-120b-a12b:free")
+    monkeypatch.setattr(llm.settings, "agent_model", "openrouter/deepseek/deepseek-v4-pro")
 
     tokens = []
     async for token in llm.stream_completion([{"role": "user", "content": "hi"}]):
         tokens.append(token)
 
-    assert tokens == ["fallback ", "works"]
-    assert calls[0]["api_base"] == llm.settings.local_llm_base_url
-    assert calls[0]["model"] == llm.settings.local_llm_model
-    assert calls[1]["api_key"] == "or-test-key"
-    assert calls[1]["api_base"] == "https://openrouter.ai/api/v1"
-    assert calls[1]["model"] == "openrouter/nvidia/nemotron-3-super-120b-a12b:free"
+    assert tokens == ["agent ", "works"]
+    assert len(calls) == 1
+    assert calls[0]["api_key"] == "or-test-key"
+    assert calls[0]["api_base"] == "https://openrouter.ai/api/v1"
+    assert calls[0]["model"] == "openrouter/deepseek/deepseek-v4-pro"
 
 
 @pytest.mark.asyncio
@@ -72,13 +71,16 @@ def test_available_chat_models_include_configured_options(monkeypatch):
     monkeypatch.setattr(llm.settings, "local_llm_model", "llama3")
     monkeypatch.setattr(llm.settings, "openrouter_api_key", "or-test-key")
     monkeypatch.setattr(llm.settings, "openrouter_model", "openrouter/example/model")
+    monkeypatch.setattr(llm.settings, "agent_model", "openrouter/example/agent")
     monkeypatch.setattr(llm.settings, "fast_model", "openrouter/example/fast")
 
     models = llm.available_chat_models()
 
-    assert [model["id"] for model in models] == ["auto", "local", "openrouter", "fast"]
+    assert [model["id"] for model in models] == ["agent", "auto", "local", "openrouter", "fast"]
+    assert llm.normalize_chat_model(None) == "agent"
+    assert llm.normalize_chat_model("agent") == "agent"
     assert llm.normalize_chat_model("openrouter") == "openrouter"
-    assert llm.normalize_chat_model("does-not-exist") == "auto"
+    assert llm.normalize_chat_model("does-not-exist") == "agent"
 
 
 @pytest.mark.asyncio
@@ -95,7 +97,7 @@ async def test_stream_chat_completion_reports_provider_unavailable(monkeypatch):
         tokens.append(token)
 
     assert tokens == [
-        "Chronos is connected, but the AI provider is unavailable right now. The local runtime, memory, task, approval, and connector tools are still available."
+        "Chronos is connected, but the selected AI provider is unavailable right now. Try Auto or another model."
     ]
 
 
@@ -117,7 +119,7 @@ async def test_complete_json_falls_back_to_main_model_after_fast_failure(monkeyp
 
     monkeypatch.setattr(llm.litellm, "acompletion", fake_completion)
     monkeypatch.setattr(llm.settings, "fast_model", "openrouter/minimax/minimax-m2.5:free")
-    monkeypatch.setattr(llm.settings, "openrouter_model", "openrouter/nvidia/nemotron-3-super-120b-a12b:free")
+    monkeypatch.setattr(llm.settings, "agent_model", "openrouter/deepseek/deepseek-v4-pro")
     monkeypatch.setattr(llm.settings, "openrouter_api_key", "or-test-key")
 
     result = await llm.complete_json("Return JSON")
@@ -125,7 +127,7 @@ async def test_complete_json_falls_back_to_main_model_after_fast_failure(monkeyp
     assert result == '{"mode":"chat"}'
     assert calls[0]["model"] == "openrouter/minimax/minimax-m2.5:free"
     assert calls[0]["response_format"] == {"type": "json_object"}
-    assert calls[1]["model"] == "openrouter/nvidia/nemotron-3-super-120b-a12b:free"
+    assert calls[1]["model"] == "openrouter/deepseek/deepseek-v4-pro"
 
 
 @pytest.mark.asyncio
@@ -174,7 +176,8 @@ async def test_extract_and_save_filters_embeds_and_publishes(monkeypatch):
         async def publish(self, channel, payload):
             published.append((channel, json.loads(payload)))
 
-    async def fake_complete_json(prompt):
+    async def fake_complete_json(prompt, model=None):
+        assert model == extraction.settings.fast_model
         return json.dumps(
             {
                 "memories": [
@@ -214,6 +217,166 @@ def test_extract_explicit_memory_content_handles_supported_phrases():
     assert extract_explicit_memory_content("remember that ACME uses HubSpot") == "ACME uses HubSpot"
     assert extract_explicit_memory_content("Please remember: Alex hates pricing-first outbound") == "Alex hates pricing-first outbound"
     assert extract_explicit_memory_content("what do you remember?") is None
+
+
+@pytest.mark.asyncio
+async def test_intent_classification_uses_fast_model(monkeypatch):
+    from core import intent
+
+    async def fake_complete_json(prompt, model=None):
+        assert model == intent.settings.fast_model
+        return json.dumps({"mode": "task", "confidence": 0.91, "goal": "research a market"})
+
+    monkeypatch.setattr(intent, "complete_json", fake_complete_json)
+
+    classified = await intent.classify_intent("Can you research a market?")
+
+    assert classified["mode"] == "task"
+    assert classified["confidence"] == 0.91
+
+
+@pytest.mark.asyncio
+async def test_skill_selection_uses_fast_model(monkeypatch):
+    from skills import loader
+
+    async def fake_complete_json(prompt, model=None):
+        assert model == loader.settings.fast_model
+        return json.dumps({"relevant_skill_ids": ["general"]})
+
+    monkeypatch.setattr(loader, "load_skill_index", lambda: [{"id": "general", "name": "General", "description": "general help"}])
+    monkeypatch.setattr(loader, "complete_json", fake_complete_json)
+
+    assert await loader.find_relevant_skills("general help") == ["general"]
+
+
+def test_memory_scope_authorization_and_hybrid_rerank():
+    from core import memory
+
+    context = RequesterContext(
+        org_id="default",
+        member_id="member-a",
+        workspace_id="workspace-1",
+        persona_id="persona-1",
+        role="user",
+    )
+
+    pairs = memory._authorized_scope_pairs(context)
+    assert ("org", "default") in pairs
+    assert ("workspace", "workspace-1") in pairs
+    assert ("persona", "persona-1") in pairs
+    assert ("personal", "member-a") in pairs
+    assert ("personal", "member-b") not in pairs
+
+    now = datetime.now(timezone.utc)
+    rows = [
+        {"id": "close-stale", "distance": 0.05, "importance_score": 0.1, "created_at": now - timedelta(days=365)},
+        {"id": "important-recent", "distance": 0.20, "importance_score": 1.0, "created_at": now},
+    ]
+    ranked = memory._rank_memory_rows(rows, now=now)
+    assert ranked[0]["id"] == "important-recent"
+
+
+@pytest.mark.asyncio
+async def test_filesystem_connector_jails_task_workspace(tmp_path, monkeypatch):
+    from connectors import filesystem
+
+    monkeypatch.setattr(filesystem, "WORKSPACE_ROOT", tmp_path)
+
+    write = await filesystem.filesystem_connector.execute(
+        "fs.write",
+        {"path": "notes/result.txt", "content": "hello", "__org_id": "default", "__task_id": "task-1"},
+    )
+    assert write.data["bytes"] == 5
+
+    read = await filesystem.filesystem_connector.execute(
+        "fs.read",
+        {"path": "notes/result.txt", "__org_id": "default", "__task_id": "task-1"},
+    )
+    assert read.data["content"] == "hello"
+
+    with pytest.raises(ValueError, match="escapes"):
+        await filesystem.filesystem_connector.execute(
+            "fs.read",
+            {"path": "../secret.txt", "__org_id": "default", "__task_id": "task-1"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_code_connector_runs_restricted_python(tmp_path, monkeypatch):
+    from connectors import code as code_connector_module
+
+    monkeypatch.setattr(code_connector_module, "WORKSPACE_ROOT", tmp_path)
+
+    result = await code_connector_module.code_connector.execute(
+        "code.python",
+        {"code": "print(sum([1, 2, 3]))", "__org_id": "default", "__task_id": "task-1"},
+    )
+    assert result.data["status"] == "success"
+    assert result.data["stdout"].strip() == "6"
+
+    with pytest.raises(ValueError, match="unsafe"):
+        await code_connector_module.code_connector.execute(
+            "code.python",
+            {"code": "import socket\nprint('no')", "__org_id": "default", "__task_id": "task-1"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_mcp_discovery_uses_real_stdio_protocol(tmp_path):
+    from connectors.framework.mcp import MCPDiscoveryService
+    from connectors.framework.repository import InMemoryConnectorRepository
+
+    server_script = tmp_path / "mcp_server.py"
+    server_script.write_text(
+        r'''
+import json, sys
+
+def read_message():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if line in (b"\r\n", b"\n", b""):
+            break
+        key, value = line.decode().split(":", 1)
+        headers[key.lower()] = value.strip()
+    length = int(headers.get("content-length", "0"))
+    if not length:
+        return None
+    return json.loads(sys.stdin.buffer.read(length).decode())
+
+def send(payload):
+    body = json.dumps(payload).encode()
+    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+    sys.stdout.buffer.flush()
+
+while True:
+    msg = read_message()
+    if msg is None:
+        break
+    if msg.get("method") == "notifications/initialized":
+        continue
+    if msg.get("method") == "initialize":
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": {"capabilities": {"tools": {}}}})
+    elif msg.get("method") == "tools/list":
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": {"tools": [{"name": "echo", "inputSchema": {"type": "object"}}]}})
+    else:
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
+''',
+        encoding="utf-8",
+    )
+    repo = InMemoryConnectorRepository()
+    server = await repo.register_mcp_server(
+        tenant_id="default",
+        name="Local Echo",
+        transport="local",
+        command=f"{sys.executable} {server_script}",
+    )
+
+    result = await MCPDiscoveryService(repo).discover(server["id"], tenant_id="default")
+
+    assert result["status"] == "healthy"
+    assert result["tools_discovered"] == 1
+    assert result["tools"][0]["name"] == "echo"
 
 
 def test_memory_router_has_audit_available_for_mutations():
@@ -270,7 +433,7 @@ async def test_tool_broker_audits_gmail_draft_without_logging_raw_args(monkeypat
     async def noop_loop(org_id, tool, args_hash):
         return None
 
-    async def fake_route(tool, args, vault_ref, tier):
+    async def fake_route(agent, tool, args, vault_ref, tier):
         assert tool == "gmail.draft"
         assert args["body"] == "Sensitive draft body"
         assert vault_ref == "vlt_safe_ref"

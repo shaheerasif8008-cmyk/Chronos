@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import insert, select, update
 
-from core import audit, permissions, tool_broker
+from core import audit, llm, permissions, tool_broker
 from core.config import settings
+from core.exceptions import ApprovalRequired
 from core.db import engine, reflect_table
 from core.models import AgentContext, Member
 from core.redis import redis_client
@@ -17,6 +19,9 @@ from runtime.planner import create_plan
 
 class TaskExecutionError(Exception):
     """Raised when a task step exhausts retries."""
+
+
+AGENT_LOOP_APPROVAL_STEP_ID = "agent_loop"
 
 
 def now_utc() -> datetime:
@@ -63,8 +68,30 @@ async def insert_task(values: dict[str, Any]) -> str:
 def _plan_steps(task: dict[str, Any]) -> list[dict[str, Any]]:
     plan = task.get("plan") or []
     if isinstance(plan, dict):
-        plan = plan.get("steps", [])
+        plan = plan.get("suggested_steps") or plan.get("steps", [])
     return plan if isinstance(plan, list) else []
+
+
+def _task_plan(task: dict[str, Any]) -> dict[str, Any]:
+    plan = task.get("plan") or {}
+    if isinstance(plan, dict):
+        return dict(plan)
+    if isinstance(plan, list):
+        return {"suggested_steps": plan, "agent_history": []}
+    return {"suggested_steps": [], "agent_history": []}
+
+
+def _task_agent_state(task: dict[str, Any]) -> dict[str, Any]:
+    state = task.get("agent_state")
+    if isinstance(state, dict):
+        return dict(state)
+    plan = task.get("plan")
+    if isinstance(plan, dict):
+        return {
+            "agent_history": plan.get("agent_history") or [],
+            "pending_agent_approval": bool(plan.get("pending_agent_approval")),
+        }
+    return {"agent_history": [], "pending_agent_approval": False}
 
 
 def approvals_ready_for_drafting(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -118,6 +145,8 @@ def _drafts_from_leads(leads: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 class TaskExecutor:
+    MAX_ITERATIONS = 40
+
     async def run(self, task_id: str) -> None:
         task = await get_task(task_id)
         if not task:
@@ -125,7 +154,7 @@ class TaskExecutor:
         if not _plan_steps(task):
             await update_task(task_id, status="planning")
             plan = await create_plan(task["goal"], {"task_id": task_id}, task["organization_id"])
-            await update_task(task_id, plan=plan, current_step=0, status="pending")
+            await update_task(task_id, plan=plan, agent_state={"agent_history": [], "pending_agent_approval": False}, current_step=0, status="pending")
         await self._run_loop(task_id)
 
     async def resume(self, task_id: str) -> None:
@@ -139,49 +168,412 @@ class TaskExecutor:
         if task["status"] in {"complete", "failed", "cancelled"}:
             return
 
-        await update_task(task_id, status="running", started_at=task.get("started_at") or now_utc(), error=None)
-        steps = _plan_steps(task)
-        current_step = int(task.get("current_step") or 0)
+        if "agent_state" not in task and isinstance(task.get("plan"), list):
+            await self._run_legacy_plan(task)
+            return
 
-        while current_step < len(steps):
+        await update_task(task_id, status="running", started_at=task.get("started_at") or now_utc(), error=None)
+        history = await self._seed_history(task)
+        tools = await self._available_tool_schemas(task)
+
+        while int((task.get("iteration_count") or 0)) < self.MAX_ITERATIONS:
             task = await get_task(task_id)
             if not task:
                 raise TaskExecutionError(f"Task not found: {task_id}")
-            current_step = int(task.get("current_step") or current_step)
-            step = steps[current_step]
-            await update_task(task_id, current_step=current_step)
-            await emit_activity(task_id, {"type": "step_start", "step_index": current_step, "step": step})
+            if task["status"] in {"complete", "failed", "cancelled"}:
+                return
+            plan_state = _task_agent_state(task)
+            history = plan_state.get("agent_history") or history
+            iteration = int(task.get("iteration_count") or 0)
+
+            if plan_state.get("pending_agent_approval"):
+                processed_approval = await self._process_agent_loop_approvals(task, history)
+                if processed_approval:
+                    continue
+                if await self._has_pending_agent_loop_approval(task):
+                    await update_task(task_id, status="awaiting_approval")
+                    return
 
             try:
-                result = await self._execute_with_retries(task, step)
+                decision = await self._next_decision(task, history, tools)
             except _PausedForApproval:
                 return
             except Exception as exc:
-                await update_task(task_id, status="failed", error=str(exc), completed_at=now_utc())
-                await emit_activity(task_id, {"type": "task_failed", "error": str(exc)})
+                try:
+                    decision = await self._fallback_plan_decision(task, history)
+                except _PausedForApproval:
+                    return
+
+            if decision.get("type") == "final":
+                result = decision.get("result") if isinstance(decision.get("result"), dict) else {"answer": str(decision.get("result") or "")}
+                history.append({"role": "assistant", "content": json.dumps(result, default=str)})
+                await self._checkpoint_history(task, history, iteration + 1)
+                await update_task(task_id, status="complete", result=result, completed_at=now_utc())
+                await emit_activity(task_id, {"type": "task_complete", "result": result})
                 return
 
-            merged = dict(task.get("result") or {})
-            if result is not None:
-                merged[step["id"]] = result
-                if isinstance(result, dict):
-                    if "leads" in result:
-                        merged["leads"] = result["leads"]
-                    if "drafts" in result:
-                        merged["drafts"] = result["drafts"]
-                    data = result.get("data")
-                    if isinstance(data, dict):
-                        if "leads" in data:
-                            merged["leads"] = data["leads"]
-                        if "drafts" in data:
-                            merged["drafts"] = data["drafts"]
-            current_step += 1
-            await update_task(task_id, result=merged, current_step=current_step)
-            await emit_activity(task_id, {"type": "step_done", "step_index": current_step - 1, "step": step, "result": result})
+            if decision.get("type") != "tool_call":
+                await update_task(task_id, status="failed", error="Agent returned an unsupported decision", completed_at=now_utc())
+                await emit_activity(task_id, {"type": "task_failed", "error": "Agent returned an unsupported decision"})
+                return
 
-        final_task = await get_task(task_id) or {}
-        await update_task(task_id, status="complete", completed_at=now_utc())
-        await emit_activity(task_id, {"type": "task_complete", "result": final_task.get("result") or {}})
+            tool = self._normalize_tool_name(str(decision.get("tool") or ""))
+            args = decision.get("args") if isinstance(decision.get("args"), dict) else {}
+            history.append({"role": "assistant", "content": "", "tool_calls": [{"function": {"name": tool, "arguments": json.dumps(args, default=str)}}]})
+            await emit_activity(task_id, {"type": "tool_call", "tool": tool, "args_preview": self._args_preview(args), "iteration": iteration + 1})
+            try:
+                result = await tool_broker.execute(AgentContext.from_task(task), tool, args)
+            except ApprovalRequired:
+                await self._open_approval_checkpoint(task, decision, history)
+                return
+            except Exception as exc:
+                history.append({"role": "tool", "name": tool, "content": json.dumps({"error": str(exc)}, default=str)})
+                await self._checkpoint_history(task, history, iteration + 1)
+                await emit_activity(task_id, {"type": "tool_error", "tool": tool, "error": str(exc)})
+                continue
+
+            tool_payload = {"summary": result.summary, "data": result.data}
+            history.append({"role": "tool", "name": tool, "content": json.dumps(tool_payload, default=str)})
+            merged = self._merge_tool_result(task.get("result") or {}, f"iteration_{iteration + 1}", tool_payload)
+            step_progress = self._step_progress_after_tool(task, tool)
+            update_values: dict[str, Any] = {"result": merged}
+            if step_progress is not None:
+                update_values["current_step"] = step_progress
+            await update_task(task_id, **update_values)
+            await self._checkpoint_history(task, history, iteration + 1)
+            await emit_activity(task_id, {"type": "tool_result", "tool": tool, "summary": result.summary, "iteration": iteration + 1})
+
+        await update_task(task_id, status="failed", error="max_iterations_exceeded", completed_at=now_utc())
+        await emit_activity(task_id, {"type": "task_failed", "error": "max_iterations_exceeded"})
+
+    async def _run_legacy_plan(self, task: dict[str, Any]) -> None:
+        task_id = task["id"]
+        await update_task(task_id, status="running", started_at=task.get("started_at") or now_utc(), error=None)
+        try:
+            decision = await self._fallback_plan_decision(task, [])
+        except _PausedForApproval:
+            return
+        if decision.get("type") == "final":
+            result = decision.get("result") if isinstance(decision.get("result"), dict) else {"answer": str(decision.get("result") or "")}
+            await update_task(task_id, status="complete", result=result, completed_at=now_utc())
+            await emit_activity(task_id, {"type": "task_complete", "result": result})
+
+    async def _seed_history(self, task: dict[str, Any]) -> list[dict[str, Any]]:
+        plan = _task_plan(task)
+        state = _task_agent_state(task)
+        history = state.get("agent_history")
+        if isinstance(history, list) and history:
+            return history
+        suggested = _plan_steps(task)
+        seed = [
+            {
+                "role": "system",
+                "content": (
+                    "You are Chronos running an autonomous enterprise task. "
+                    "Pick one tool call at a time, inspect results, and adapt. "
+                    "When the task is done, return a final answer. Every external action is governed by the broker."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps({"goal": task["goal"], "suggested_plan": suggested}, default=str),
+            },
+        ]
+        await self._checkpoint_history(task, seed, int(task.get("iteration_count") or 0))
+        return seed
+
+    async def _available_tool_schemas(self, task: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "browser__search",
+                    "description": "Search the web and return structured results.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}, "fixture": {"type": "string"}},
+                        "required": ["query"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "browser__fetch",
+                    "description": "Fetch and parse a web page.",
+                    "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "browser__extract_contacts",
+                    "description": "Extract public contact information from a page.",
+                    "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "gmail__draft",
+                    "description": "Create an approved Gmail draft. Must only be called after an approval checkpoint.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"to": {"type": "string"}, "subject": {"type": "string"}, "body": {"type": "string"}},
+                        "required": ["to", "subject", "body"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "fs__list",
+                    "description": "List files in the current task workspace.",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": []},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "fs__read",
+                    "description": "Read a UTF-8 text file from the current task workspace.",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "fs__write",
+                    "description": "Write a UTF-8 text file inside the current task workspace.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                        "required": ["path", "content"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "code__python",
+                    "description": "Run restricted Python code in the current task workspace. Use for computation over local task artifacts, not network access.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"code": {"type": "string"}, "timeout_seconds": {"type": "integer"}},
+                        "required": ["code"],
+                    },
+                },
+            },
+        ]
+
+    async def _next_decision(self, task: dict[str, Any], history: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
+        return await llm.tool_call(history, tools, model=settings.agent_model)
+
+    async def _fallback_plan_decision(self, task: dict[str, Any], history: list[dict[str, Any]]) -> dict[str, Any]:
+        steps = _plan_steps(task)
+        current_step = int(task.get("current_step") or 0)
+        if current_step >= len(steps):
+            return {"type": "final", "result": task.get("result") or {"status": "complete"}}
+        step = steps[current_step]
+        await emit_activity(task["id"], {"type": "step_start", "step_index": current_step, "step": step, "mode": "fallback"})
+        try:
+            result = await self._execute_with_retries(task, step)
+        except _PausedForApproval:
+            raise
+        merged = self._merge_tool_result(task.get("result") or {}, step["id"], result or {})
+        await update_task(task["id"], current_step=current_step + 1, result=merged)
+        await emit_activity(task["id"], {"type": "step_done", "step_index": current_step, "step": step, "result": result})
+        if current_step + 1 >= len(steps):
+            return {"type": "final", "result": merged}
+        return await self._fallback_plan_decision({**task, "current_step": current_step + 1, "result": merged}, history)
+
+    async def _checkpoint_history(self, task: dict[str, Any], history: list[dict[str, Any]], iteration_count: int) -> None:
+        state = _task_agent_state(task)
+        state["agent_history"] = history
+        values: dict[str, Any] = {"agent_state": state, "iteration_count": iteration_count}
+        if task.get("agent_state") is None and isinstance(task.get("plan"), dict):
+            values["plan"] = {**task["plan"], "agent_history": history}
+        await update_task(task["id"], **values)
+
+    async def _open_approval_checkpoint(self, task: dict[str, Any], decision: dict[str, Any], history: list[dict[str, Any]]) -> None:
+        approvals = await reflect_table("approvals")
+        tool = self._normalize_tool_name(str(decision.get("tool") or ""))
+        args = decision.get("args") if isinstance(decision.get("args"), dict) else {}
+        args_hash = self._args_hash(args)
+
+        async with engine.begin() as conn:
+            rows = (
+                await conn.execute(
+                    select(approvals).where(
+                        approvals.c.task_id == task["id"],
+                        approvals.c.step_id == AGENT_LOOP_APPROVAL_STEP_ID,
+                        approvals.c.status == "pending",
+                    )
+                )
+            ).mappings().all()
+            approval_ids = [
+                str(row["id"])
+                for row in rows
+                if (row.get("action_payload") or {}).get("args_hash") == args_hash
+                and (row.get("action_payload") or {}).get("tool") == tool
+            ]
+            if not approval_ids:
+                payload = {
+                    "tool": tool,
+                    "args": args,
+                    "args_hash": args_hash,
+                    "agent_loop": True,
+                    "justification": decision.get("justification") or f"Chronos requested permission to run {tool}.",
+                }
+                result = await conn.execute(
+                    insert(approvals)
+                    .values(
+                        organization_id=task["organization_id"],
+                        region=task["region"],
+                        task_id=task["id"],
+                        step_id=AGENT_LOOP_APPROVAL_STEP_ID,
+                        action_type=tool,
+                        action_payload=payload,
+                        expires_at=now_utc() + timedelta(hours=24),
+                    )
+                    .returning(approvals.c.id)
+                )
+                approval_ids = [str(result.scalar_one())]
+
+        state = _task_agent_state(task)
+        state["agent_history"] = history
+        state["pending_agent_approval"] = True
+        values: dict[str, Any] = {"agent_state": state, "iteration_count": int(task.get("iteration_count") or 0) + 1}
+        if task.get("agent_state") is None and isinstance(task.get("plan"), dict):
+            values["plan"] = {**task["plan"], "agent_history": history, "pending_agent_approval": True}
+        await update_task(task["id"], **values)
+        await update_task(task["id"], status="awaiting_approval")
+        await emit_activity(
+            task["id"],
+            {
+                "type": "awaiting_approval",
+                "approval_ids": approval_ids,
+                "step_id": AGENT_LOOP_APPROVAL_STEP_ID,
+                "tool": tool,
+                "args_preview": self._args_preview(args),
+            },
+        )
+        raise _PausedForApproval()
+
+    async def _process_agent_loop_approvals(self, task: dict[str, Any], history: list[dict[str, Any]]) -> bool:
+        approvals = await reflect_table("approvals")
+        async with engine.begin() as conn:
+            rows = (
+                await conn.execute(
+                    select(approvals).where(
+                        approvals.c.task_id == task["id"],
+                        approvals.c.step_id == AGENT_LOOP_APPROVAL_STEP_ID,
+                    )
+                )
+            ).mappings().all()
+
+        processed = False
+        for row in [dict(row) for row in rows]:
+            payload = dict(row.get("action_payload") or {})
+            if payload.get("execution_result") or payload.get("execution_error") or payload.get("rejection_result"):
+                continue
+            status = row.get("status")
+            if status not in {"approved", "rejected"}:
+                continue
+
+            tool = self._normalize_tool_name(str(payload.get("tool") or row.get("action_type") or ""))
+            if status == "rejected":
+                rejection = {"status": "rejected", "approval_id": row["id"], "reason": row.get("decision_note")}
+                history.append({"role": "tool", "name": tool, "content": json.dumps(rejection, default=str)})
+                await self._mark_agent_loop_approval(row["id"], {**payload, "rejection_result": rejection})
+                await emit_activity(task["id"], {"type": "approval_rejected", "approval_id": row["id"], "tool": tool})
+                processed = True
+                continue
+
+            args = payload.get("args") if isinstance(payload.get("args"), dict) else {}
+            try:
+                result = await tool_broker.execute(AgentContext.from_task(task), tool, {**args, "__approved_by_gate": True})
+            except Exception as exc:
+                error = {"status": "failed", "approval_id": row["id"], "error": str(exc)}
+                history.append({"role": "tool", "name": tool, "content": json.dumps(error, default=str)})
+                await self._mark_agent_loop_approval(row["id"], {**payload, "execution_error": error})
+                await emit_activity(task["id"], {"type": "tool_error", "tool": tool, "approval_id": row["id"], "error": str(exc)})
+                processed = True
+                continue
+
+            tool_payload = {"summary": result.summary, "data": result.data, "approval_id": row["id"]}
+            history.append({"role": "tool", "name": tool, "content": json.dumps(tool_payload, default=str)})
+            merged = self._merge_tool_result(task.get("result") or {}, f"approval_{row['id']}", tool_payload)
+            await update_task(task["id"], result=merged)
+            await self._mark_agent_loop_approval(row["id"], {**payload, "execution_result": tool_payload})
+            await emit_activity(task["id"], {"type": "tool_result", "tool": tool, "approval_id": row["id"], "summary": result.summary})
+            processed = True
+
+        if processed:
+            refreshed = await get_task(task["id"]) or task
+            await self._checkpoint_history(refreshed, history, int(refreshed.get("iteration_count") or 0) + 1)
+            state = _task_agent_state(refreshed)
+            state["agent_history"] = history
+            state["pending_agent_approval"] = False
+            await update_task(task["id"], agent_state=state)
+            await update_task(task["id"], status="running")
+        return processed
+
+    async def _has_pending_agent_loop_approval(self, task: dict[str, Any]) -> bool:
+        approvals = await reflect_table("approvals")
+        async with engine.begin() as conn:
+            row = (
+                await conn.execute(
+                    select(approvals.c.id).where(
+                        approvals.c.task_id == task["id"],
+                        approvals.c.step_id == AGENT_LOOP_APPROVAL_STEP_ID,
+                        approvals.c.status == "pending",
+                    )
+                )
+            ).first()
+        return row is not None
+
+    async def _mark_agent_loop_approval(self, approval_id: str, payload: dict[str, Any]) -> None:
+        approvals = await reflect_table("approvals")
+        async with engine.begin() as conn:
+            await conn.execute(update(approvals).where(approvals.c.id == approval_id).values(action_payload=payload))
+
+    def _normalize_tool_name(self, tool: str) -> str:
+        if "__" in tool and "." not in tool:
+            return tool.replace("__", ".", 1)
+        return tool
+
+    def _args_hash(self, args: dict[str, Any]) -> str:
+        return hashlib.sha256(json.dumps(args, sort_keys=True, default=str).encode()).hexdigest()
+
+    def _step_progress_after_tool(self, task: dict[str, Any], tool: str) -> int | None:
+        steps = _plan_steps(task)
+        current_step = int(task.get("current_step") or 0)
+        if current_step >= len(steps):
+            return None
+        step = steps[current_step]
+        if step.get("action") == "tool_call" and step.get("tool") == tool:
+            return current_step + 1
+        return None
+
+    def _args_preview(self, args: dict[str, Any]) -> dict[str, Any]:
+        return {key: ("[omitted]" if key.lower() in {"body", "content"} else value) for key, value in args.items()}
+
+    def _merge_tool_result(self, existing: dict[str, Any], key: str, result: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(existing)
+        merged[key] = result
+        if isinstance(result, dict):
+            if "leads" in result:
+                merged["leads"] = result["leads"]
+            if "drafts" in result:
+                merged["drafts"] = result["drafts"]
+            data = result.get("data")
+            if isinstance(data, dict):
+                if "leads" in data:
+                    merged["leads"] = data["leads"]
+                if "drafts" in data:
+                    merged["drafts"] = data["drafts"]
+        return merged
 
     async def _execute_with_retries(self, task: dict[str, Any], step: dict[str, Any]) -> dict[str, Any] | None:
         last_exc: Exception | None = None

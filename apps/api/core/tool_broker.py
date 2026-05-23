@@ -76,11 +76,13 @@ def _check_safety_limits(tool: str, args: dict) -> None:
             raise SafetyLimitViolation(f"{tool}: amount ${amount} exceeds limit of ${_MAX_FINANCIAL_AMOUNT}")
 
 
-async def _route(tool: str, args: dict, vault_ref: str, tier: str = "live") -> ToolResult:
+async def _route(agent: AgentContext, tool: str, args: dict, vault_ref: str, tier: str = "live") -> ToolResult:
     """Route to the correct connector after all checks pass."""
     provider = tool.split(".")[0]
     routed_args = dict(args)
     routed_args["__connector_tier"] = tier
+    routed_args["__org_id"] = agent.org_id
+    routed_args["__task_id"] = agent.task_id or agent.id
 
     if provider == "gmail":
         from connectors.gmail import gmail_connector
@@ -89,6 +91,18 @@ async def _route(tool: str, args: dict, vault_ref: str, tier: str = "live") -> T
     if provider == "browser":
         from connectors.browser import browser_connector
         return await browser_connector.execute(tool, routed_args)
+
+    if provider == "fs":
+        from connectors.filesystem import filesystem_connector
+        return await filesystem_connector.execute(tool, routed_args)
+
+    if provider == "code":
+        from connectors.code import code_connector
+        return await code_connector.execute(tool, routed_args)
+
+    if provider == "mcp":
+        from connectors.mcp_client import mcp_connector
+        return await mcp_connector.execute(tool, routed_args, agent)
 
     # Unknown provider — fail clearly rather than silently
     raise ValueError(f"No connector registered for provider: {provider}")
@@ -113,7 +127,7 @@ class ToolBroker:
         _check_safety_limits(tool, args)
 
         # 5. Approval gate — check always-approval set first
-        if tool in _ALWAYS_APPROVAL_TOOLS:
+        if tool in _ALWAYS_APPROVAL_TOOLS and not approved_by_gate:
             raise ApprovalRequired(tool, "tool requires an approval record (none exists in Phase 1)")
         policy = await tool_policy(agent.org_id, tool.split(".")[0])
         if policy.get("enabled") is False:
@@ -143,7 +157,7 @@ class ToolBroker:
             vault_ref = tier
 
         # 8. Execute via connector
-        result = await _route(tool, args, vault_ref, tier)
+        result = await _route(agent, tool, args, vault_ref, tier)
 
         # 9. Audit: result summary (never log result.data — may contain sensitive content)
         await audit.log(

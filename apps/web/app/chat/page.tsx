@@ -32,7 +32,7 @@ type Message = {
   tool_traces?: ToolTrace[];
 };
 type ToolTrace = { id: string; tool: string; summary: string; status: MessageStatus };
-type MemoryEntry = { id: string; scope: string; scope_id: string; content: string; source: string; created_by?: string | null; created_at?: string };
+type MemoryEntry = { id: string; scope: string; scope_id: string; content: string; source: string; importance_score?: number; created_by?: string | null; created_at?: string };
 type Connector = {
   id: string;
   name?: string;
@@ -699,7 +699,7 @@ function ChatScreen({
       .then(r => r.json())
       .then((data: ChatModel[]) => {
         setChatModels(data);
-        const preferred = data.find(model => model.id === "openrouter") ?? data.find(model => model.id === "backup") ?? data.find(model => model.id === "fast") ?? data[0];
+        const preferred = data.find(model => model.id === "agent") ?? data.find(model => model.id === "openrouter") ?? data.find(model => model.id === "backup") ?? data.find(model => model.id === "fast") ?? data[0];
         if (preferred && (!data.some(model => model.id === selectedModel) || selectedModel === "auto")) setSelectedModel(preferred.id);
       })
       .catch(() => {
@@ -1518,7 +1518,7 @@ function MemoryScreen() {
   const [adding, setAdding] = useState(false);
   const [newContent, setNewContent] = useState("");
 
-  useEffect(() => {
+  const loadMemories = useCallback(() => {
     setLoading(true);
     apiFetch("/memory/")
       .then(r => r.json())
@@ -1526,6 +1526,10 @@ function MemoryScreen() {
       .catch(() => {})
       .finally(() => setLoading(false));
   }, []);
+
+  useEffect(() => {
+    loadMemories();
+  }, [loadMemories]);
 
   const scopes = Array.from(new Set(memories.map(m => m.scope))).filter(Boolean);
   const [scopeFilter, setScopeFilter] = useState("all");
@@ -1541,14 +1545,23 @@ function MemoryScreen() {
   async function addMemory() {
     if (!newContent.trim()) return;
     try {
-      const entry = await (await apiFetch("/memory/", {
+      await apiFetch("/memory/", {
         method: "POST",
         body: JSON.stringify({ content: newContent, scope: "org", scope_id: "default", source: "manual" }),
-      })).json() as MemoryEntry;
-      setMemories(prev => [entry, ...prev]);
+      });
+      await loadMemories();
       setAdding(false);
       setNewContent("");
     } catch { /* silently */ }
+  }
+
+  async function updateMemory(id: string, content: string, importance_score?: number) {
+    const res = await apiFetch(`/memory/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ content, importance_score }),
+    });
+    if (!res.ok) throw new Error("Unable to update memory");
+    setMemories(prev => prev.map(memory => memory.id === id ? { ...memory, content, importance_score } : memory));
   }
 
   async function deleteMemory(id: string) {
@@ -1627,16 +1640,31 @@ function MemoryScreen() {
                       sub={memories.length === 0 ? "Chronos saves memories automatically during conversations. You can also add them manually." : "No memories match your current filter."}/>
         )}
 
-        {filtered.map(m => <MemoryCard key={m.id} m={m} onDelete={deleteMemory}/>)}
+        {filtered.map(m => <MemoryCard key={m.id} m={m} onDelete={deleteMemory} onUpdate={updateMemory}/>)}
       </div>
     </div>
   );
 }
 
-function MemoryCard({ m, onDelete }: { m: MemoryEntry; onDelete: (id: string) => void }) {
+function MemoryCard({ m, onDelete, onUpdate }: { m: MemoryEntry; onDelete: (id: string) => void; onUpdate: (id: string, content: string, importance_score?: number) => Promise<void> }) {
   const [hover, setHover] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(m.content);
+  const [saving, setSaving] = useState(false);
   const isPrivate = m.scope === "restricted";
   const isAuto = m.source === "autonomous";
+
+  async function save() {
+    const next = draft.trim();
+    if (!next) return;
+    setSaving(true);
+    try {
+      await onUpdate(m.id, next, m.importance_score);
+      setEditing(false);
+    } finally {
+      setSaving(false);
+    }
+  }
 
   return (
     <div className="mem-card p-4" onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)}>
@@ -1646,16 +1674,32 @@ function MemoryCard({ m, onDelete }: { m: MemoryEntry; onDelete: (id: string) =>
           {isPrivate ? <IC.Lock size={13}/> : <IC.Memory size={13}/>}
         </div>
         <div className="flex-1 min-w-0">
-          <div className="text-[14.5px] leading-relaxed" style={{ color: "var(--text)" }}>{m.content}</div>
+          {editing ? (
+            <div>
+              <textarea value={draft} onChange={e => setDraft(e.target.value)} rows={3} autoFocus
+                        className="w-full bg-transparent outline-none text-[14.5px] leading-relaxed resize-none border border-soft rounded-md p-2"
+                        style={{ color: "var(--text)" }}/>
+              <div className="mt-2 flex items-center gap-2">
+                <button onClick={() => { setDraft(m.content); setEditing(false); }} className="btn btn-ghost btn-sm">Cancel</button>
+                <button onClick={() => void save()} disabled={saving || !draft.trim()} className="btn btn-accent btn-sm">{saving ? "Saving..." : "Save"}</button>
+              </div>
+            </div>
+          ) : (
+            <div className="text-[14.5px] leading-relaxed" style={{ color: "var(--text)" }}>{m.content}</div>
+          )}
           <div className="flex items-center gap-2.5 mt-2 text-[12px]" style={{ color: "var(--text-dim)" }}>
             <span className="inline-flex items-center gap-1">
               {isAuto ? <><IC.Sparkles size={11}/> Saved by Chronos</> : <><IC.Pencil size={11}/> Saved by you</>}
             </span>
             {m.scope && <><span>·</span><span>{m.scope}</span></>}
+            {typeof m.importance_score === "number" && <><span>·</span><span>{Math.round(m.importance_score * 100)}% importance</span></>}
             {m.created_by && <><span>·</span><span>by {m.created_by}</span></>}
           </div>
         </div>
         <div className="flex items-center gap-1 flex-shrink-0" style={{ opacity: hover ? 1 : 0, transition: "opacity 0.15s" }}>
+          <button onClick={() => setEditing(true)} className="btn btn-ghost btn-sm btn-icon" title="Edit">
+            <IC.Pencil size={13}/>
+          </button>
           <button onClick={() => onDelete(m.id)} className="btn btn-ghost btn-sm btn-icon" title="Delete">
             <IC.Trash size={13}/>
           </button>

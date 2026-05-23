@@ -61,6 +61,14 @@ async def create_workflow(req: WorkflowCreateRequest, member: Member = Depends(g
     await permissions.check(member, "create_workflow", req.workspace_id)
     if not req.steps:
         raise HTTPException(status_code=400, detail="Workflow requires at least one step")
+    for index, step in enumerate(req.steps):
+        if not step.get("id"):
+            raise HTTPException(status_code=400, detail=f"Step at index {index} is missing 'id'")
+        if not step.get("tool_name"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Step '{step.get('id', index)}' is missing 'tool_name' (format: connector_id__action_name)",
+            )
     repo = await repository()
     return await runtime(repo).create_workflow(
         tenant_id=member.organization_id,

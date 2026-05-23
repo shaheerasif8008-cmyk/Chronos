@@ -51,6 +51,7 @@ async def create_task_record(
                 status="pending",
                 goal=goal,
                 plan=plan,
+                agent_state={"agent_history": [], "pending_agent_approval": False},
                 current_step=0,
                 result={},
                 depth=0,

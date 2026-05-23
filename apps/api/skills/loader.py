@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 
+from core.config import settings
 from core.llm import complete_json
 from skills.registry import SKILLS_ROOT, load_skill_index
 
@@ -31,7 +32,7 @@ User message:
 {message}
 """
     try:
-        parsed = json.loads(await complete_json(prompt))
+        parsed = json.loads(await complete_json(prompt, model=settings.fast_model))
         selected = parsed.get("relevant_skill_ids", [])
         known = {skill["id"] for skill in index}
         return [sid for sid in selected if sid in known][:top_k]

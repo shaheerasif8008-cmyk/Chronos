@@ -119,13 +119,16 @@ async def list_memory_records(member: Member, *, limit: int = 50, offset: int = 
     return [dict(row) for row in rows]
 
 
-async def update_memory_entry(memory_id: str, content: str, member: Member) -> bool:
+async def update_memory_entry(memory_id: str, content: str, member: Member, *, importance_score: float | None = None) -> bool:
     embedding = await embedding_literal_for_memory(
         content,
         actor_id=member.id,
         action="memory.update",
     )
     memory_entries = await reflect_table("memory_entries")
+    values = {"content": content, "embedding": embedding, "updated_at": func.now()}
+    if importance_score is not None:
+        values["importance_score"] = max(0.0, min(float(importance_score), 1.0))
     async with engine.begin() as conn:
         result = await conn.execute(
             update(memory_entries)
@@ -134,7 +137,7 @@ async def update_memory_entry(memory_id: str, content: str, member: Member) -> b
                 memory_entries.c.organization_id == member.organization_id,
                 memory_entries.c.is_deleted.is_(False),
             )
-            .values(content=content, embedding=embedding, updated_at=func.now())
+            .values(**values)
             .returning(memory_entries.c.id)
         )
         return result.scalar_one_or_none() is not None

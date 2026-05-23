@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from core import audit
+from core.config import settings
 from core.llm import complete_json
 from core.memory_writes import create_memory_entry
 from core.models import RequesterContext
@@ -32,7 +33,7 @@ User: {user_message}
 Assistant: {assistant_response}
 """
     try:
-        extraction_json = await complete_json(prompt)
+        extraction_json = await complete_json(prompt, model=settings.fast_model)
         candidates = json.loads(extraction_json).get("memories", [])
     except json.JSONDecodeError:
         candidates = []
