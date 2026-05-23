@@ -33,7 +33,65 @@ type Message = {
 };
 type ToolTrace = { id: string; tool: string; summary: string; status: MessageStatus };
 type MemoryEntry = { id: string; scope: string; scope_id: string; content: string; source: string; created_by?: string | null; created_at?: string };
-type Connector = { id: string; provider: string; account_handle?: string | null; status: string; connected_at?: string | null; last_used_at?: string | null };
+type Connector = {
+  id: string;
+  name?: string;
+  provider: string;
+  description?: string;
+  type?: string;
+  category?: string;
+  auth_type?: string;
+  scopes?: string[];
+  actions?: string[];
+  account_handle?: string | null;
+  status: string;
+  connected_at?: string | null;
+  last_used_at?: string | null;
+};
+type ConnectorAction = {
+  name: string;
+  description: string;
+  parameters_schema: Record<string, unknown>;
+  required_permissions: string[];
+  risk_level: string;
+  approval_required: boolean;
+};
+type ConnectorExecutionLog = {
+  id: string;
+  connector_id: string;
+  action_name: string;
+  arguments_redacted: Record<string, unknown>;
+  result_status: string;
+  error_message?: string | null;
+  duration_ms: number;
+  created_at?: string | null;
+};
+type ConnectorHealth = {
+  connector_id: string;
+  status: string;
+  latency_ms?: number;
+  failure_rate?: number;
+  timeout_rate?: number;
+  updated_at?: string | null;
+};
+type ConnectorTrace = {
+  id: string;
+  connector_id: string;
+  action_name: string;
+  status: string;
+  duration_ms?: number;
+  started_at?: string | null;
+};
+type ConnectorApproval = {
+  id: string;
+  connector_id: string;
+  action_name: string;
+  risk_level: string;
+  status: string;
+  approval_mode: string;
+  justification?: string;
+  created_at?: string | null;
+};
 type Task = { id: string; status: string; goal: string; current_step: number; plan?: TaskStep[]; result?: Record<string, unknown>; error?: string | null; created_at?: string; parent_task_id?: string | null; depth?: number };
 type TaskStep = { id: string; action: string; description: string; tool?: string | null };
 type ChatModel = { id: string; label: string; model: string; description?: string };
@@ -641,7 +699,8 @@ function ChatScreen({
       .then(r => r.json())
       .then((data: ChatModel[]) => {
         setChatModels(data);
-        if (data.length && !data.some(model => model.id === selectedModel)) setSelectedModel(data[0].id);
+        const preferred = data.find(model => model.id === "openrouter") ?? data.find(model => model.id === "backup") ?? data.find(model => model.id === "fast") ?? data[0];
+        if (preferred && (!data.some(model => model.id === selectedModel) || selectedModel === "auto")) setSelectedModel(preferred.id);
       })
       .catch(() => {
         setChatModels([{ id: "auto", label: "Auto", model: "auto", description: "Default model routing" }]);
@@ -1609,99 +1668,188 @@ function MemoryCard({ m, onDelete }: { m: MemoryEntry; onDelete: (id: string) =>
 // ─── Connectors Screen ────────────────────────────────────────────────────────
 function ConnectorsScreen() {
   const [connectors, setConnectors] = useState<Connector[]>([]);
+  const [actions, setActions] = useState<Record<string, ConnectorAction[]>>({});
+  const [logs, setLogs] = useState<ConnectorExecutionLog[]>([]);
+  const [health, setHealth] = useState<Record<string, ConnectorHealth>>({});
+  const [traces, setTraces] = useState<ConnectorTrace[]>([]);
+  const [approvals, setApprovals] = useState<ConnectorApproval[]>([]);
+  const [busy, setBusy] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [message, setMessage] = useState("");
 
-  useEffect(() => {
-    apiFetch("/connectors/")
-      .then(r => r.json())
-      .then((data: Connector[]) => setConnectors(data))
-      .catch(() => {})
-      .finally(() => setLoading(false));
-  }, []);
+  async function load() {
+    setLoading(true);
+    try {
+      const data = (await (await apiFetch("/connectors/")).json()) as Connector[];
+      setConnectors(data);
+      const actionEntries = await Promise.all(data.map(async c => [c.id, await (await apiFetch(`/connectors/${c.id}/actions`)).json()] as const));
+      setActions(Object.fromEntries(actionEntries));
+      setLogs((await (await apiFetch("/connectors/execution-logs")).json()) as ConnectorExecutionLog[]);
+      const healthRows = (await (await apiFetch("/connectors/health")).json()) as ConnectorHealth[];
+      setHealth(Object.fromEntries(healthRows.map(row => [row.connector_id, row])));
+      setTraces((await (await apiFetch("/connectors/execution-traces")).json()) as ConnectorTrace[]);
+      setApprovals((await (await apiFetch("/connectors/approvals?limit=20")).json()) as ConnectorApproval[]);
+    } catch {
+      setMessage("Unable to load connectors.");
+    } finally {
+      setLoading(false);
+    }
+  }
 
-  const meta: Record<string, { icon: ReactNode; bg: string; color: string; label: string; note: string }> = {
-    gmail:    { icon: <IC.Mail size={20}/>,       bg: "oklch(0.95 0.04 25)",  color: "oklch(0.50 0.18 25)",  label: "Gmail",    note: "Read, draft, and send email (sending always asks you first)." },
-    browser:  { icon: <IC.Globe size={20}/>,      bg: "oklch(0.95 0.04 240)", color: "oklch(0.50 0.16 240)", label: "Web",      note: "A sandboxed browser that captures screenshots of every page it visits." },
-    calendar: { icon: <IC.Clock size={20}/>,      bg: "oklch(0.95 0.04 150)", color: "oklch(0.50 0.16 150)", label: "Calendar", note: "Schedule meetings, find time, send invites." },
-    hubspot:  { icon: <IC.Briefcase size={20}/>,  bg: "oklch(0.95 0.04 50)",  color: "oklch(0.50 0.18 50)",  label: "HubSpot",  note: "Read and write to your CRM." },
-    slack:    { icon: <IC.Chat size={20}/>,        bg: "oklch(0.95 0.04 320)", color: "oklch(0.50 0.16 320)", label: "Slack",    note: "Read mentions, post messages (with approval)." },
-    drive:    { icon: <IC.Folder size={20}/>,     bg: "oklch(0.95 0.04 100)", color: "oklch(0.50 0.16 100)", label: "Drive",    note: "Read your shared drive, create documents." },
-  };
+  useEffect(() => { void load(); }, []);
 
-  const connected = connectors.filter(c => c.status === "active" || c.status === "connected");
-  const available = ["calendar", "hubspot", "slack", "drive"].filter(p => !connectors.find(c => c.provider === p && (c.status === "active" || c.status === "connected")));
+  async function install(connector: Connector) {
+    setBusy(connector.id);
+    setMessage("");
+    try {
+      const res = await apiFetch(`/connectors/${connector.id}/install`, { method: "POST", body: JSON.stringify({ workspace_id: "default" }) });
+      if (!res.ok) throw new Error(await res.text());
+      setMessage(`${connector.name || connector.id} installed.`);
+      await load();
+    } catch (exc) {
+      setMessage(exc instanceof Error ? exc.message : "Install failed.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function disable(connector: Connector) {
+    setBusy(connector.id);
+    setMessage("");
+    try {
+      const res = await apiFetch(`/connectors/${connector.id}/disable`, { method: "POST" });
+      if (!res.ok) throw new Error(await res.text());
+      setMessage(`${connector.name || connector.id} disabled.`);
+      await load();
+    } catch (exc) {
+      setMessage(exc instanceof Error ? exc.message : "Disable failed.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function runAction(connector: Connector, action: ConnectorAction) {
+    setBusy(`${connector.id}:${action.name}`);
+    setMessage("");
+    const args = connector.id === "internal_echo" ? { message: "Connector execution proof" } : {};
+    try {
+      const res = await apiFetch(`/connectors/${connector.id}/actions/${action.name}/execute`, {
+        method: "POST",
+        body: JSON.stringify({ workspace_id: "default", arguments: args }),
+      });
+      const payload = await res.json();
+      if (!res.ok || !["queued", "success"].includes(payload.status)) throw new Error(payload.error || JSON.stringify(payload));
+      setMessage(`${connector.name || connector.id}.${action.name} ${payload.status === "queued" ? "queued for isolated worker execution" : "executed"}.`);
+      await load();
+    } catch (exc) {
+      setMessage(exc instanceof Error ? exc.message : "Execution failed.");
+      await load();
+    } finally {
+      setBusy(null);
+    }
+  }
 
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-y-auto">
-      <PageHeader title="Connectors" subtitle="The apps Chronos can use on your behalf. Connect more anytime."/>
+      <PageHeader title="Connectors" subtitle="Registry-backed connector actions available to Chronos."/>
 
-      <div className="px-10 pb-6">
-        <h2 className="text-[13px] uppercase tracking-wider mb-3" style={{ color: "var(--text-dim)" }}>Connected</h2>
+      <div className="px-10 pb-10 space-y-6">
+        {message && <div className="surface border border-soft rounded-lg px-4 py-3 text-[13px]" style={{ color: "var(--text-muted)" }}>{message}</div>}
         {loading && <p className="text-[13.5px]" style={{ color: "var(--text-dim)" }}>Loading…</p>}
-        {!loading && connected.length === 0 && (
-          <p className="text-[13.5px]" style={{ color: "var(--text-dim)" }}>No connectors connected yet.</p>
-        )}
+        {!loading && connectors.length === 0 && <EmptyState icon={<IC.Connectors size={20}/>} title="No connectors registered" sub="The backend registry has not returned any executable connectors."/>}
         <div className="grid grid-cols-2 gap-3">
-          {connected.map(c => {
-            const m = meta[c.provider] ?? { icon: <IC.Connectors size={20}/>, bg: "var(--surface-2)", color: "var(--text-muted)", label: c.provider, note: "" };
-            return (
-              <div key={c.id} className="surface border border-soft rounded-xl p-5 smooth hover:border-[var(--border)]">
-                <div className="flex items-start gap-4">
-                  <div className="w-12 h-12 rounded-lg flex items-center justify-center flex-shrink-0"
-                       style={{ background: m.bg, color: m.color }}>{m.icon}</div>
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2 mb-1">
-                      <h3 className="text-[15.5px] font-semibold">{m.label}</h3>
-                      <Tag variant="ok"><Dot color="var(--ok)" size={6}/> Connected</Tag>
-                    </div>
-                    {c.account_handle && (
-                      <div className="text-[12.5px] mb-2 font-mono" style={{ color: "var(--text-muted)" }}>{c.account_handle}</div>
-                    )}
-                    <p className="text-[13px] mb-3" style={{ color: "var(--text-muted)" }}>{m.note}</p>
-                    <div className="flex items-baseline justify-between">
-                      <span className="text-[12px]" style={{ color: "var(--text-dim)" }}>
-                        {c.last_used_at ? `Used ${new Date(c.last_used_at).toLocaleDateString()}` : "Never used"}
-                      </span>
-                      <button className="btn btn-ghost btn-sm">Manage</button>
-                    </div>
+          {connectors.map(connector => (
+            <div key={connector.id} className="surface border border-soft rounded-xl p-5">
+              <div className="flex items-start justify-between gap-4 mb-4">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 mb-1">
+                    <h2 className="text-[15.5px] font-semibold">{connector.name || connector.id}</h2>
+                    <Tag variant={connector.status === "installed" ? "ok" : connector.status === "disabled" ? "danger" : "info"}>{connector.status}</Tag>
+                    {health[connector.id] && <Tag variant={health[connector.id].status === "healthy" ? "ok" : "warn"}>{health[connector.id].status}</Tag>}
+                  </div>
+                  <p className="text-[13px]" style={{ color: "var(--text-muted)" }}>{connector.description}</p>
+                  <div className="mt-2 flex flex-wrap gap-1">
+                    <Tag>{connector.category || "Internal"}</Tag>
+                    <Tag>{connector.type || "native"}</Tag>
+                    <Tag>{connector.auth_type || "none"}</Tag>
+                    {(connector.scopes || []).map(scope => <Tag key={scope}>{scope}</Tag>)}
                   </div>
                 </div>
-              </div>
-            );
-          })}
-        </div>
-      </div>
-
-      <div className="px-10 pb-10">
-        <h2 className="text-[13px] uppercase tracking-wider mb-3" style={{ color: "var(--text-dim)" }}>Available</h2>
-        <div className="grid grid-cols-3 gap-3 mb-8">
-          {available.map(provider => {
-            const m = meta[provider] ?? { icon: <IC.Connectors size={18}/>, bg: "var(--surface-2)", color: "var(--text-muted)", label: provider, note: "" };
-            return (
-              <div key={provider} className="surface border border-soft rounded-xl p-4 smooth hover:border-[var(--border)]">
-                <div className="flex items-start gap-3">
-                  <div className="w-10 h-10 rounded-lg flex items-center justify-center flex-shrink-0"
-                       style={{ background: m.bg, color: m.color, opacity: 0.7 }}>{m.icon}</div>
-                  <div className="flex-1 min-w-0">
-                    <h3 className="text-[14.5px] font-semibold mb-1">{m.label}</h3>
-                    <p className="text-[12.5px] mb-3" style={{ color: "var(--text-muted)" }}>{m.note}</p>
-                    <button className="btn btn-secondary btn-sm w-full justify-center">Connect</button>
-                  </div>
+                <div className="flex gap-2">
+                  {connector.status !== "installed" && <button disabled={busy === connector.id} onClick={() => void install(connector)} className="btn btn-accent btn-sm disabled:opacity-50">Install</button>}
+                  {connector.status === "installed" && <button disabled={busy === connector.id} onClick={() => void disable(connector)} className="btn btn-danger-soft btn-sm disabled:opacity-50">Disable</button>}
                 </div>
               </div>
-            );
-          })}
+              <div className="space-y-2">
+                {(actions[connector.id] || []).map(action => (
+                  <div key={action.name} className="border-t hairline pt-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <div className="font-medium text-[13.5px]">{action.name}</div>
+                        <div className="text-[12.5px]" style={{ color: "var(--text-dim)" }}>{action.description}</div>
+                        <div className="mt-2 flex flex-wrap gap-1">
+                          <Tag variant={action.risk_level === "read" ? "info" : "warn"}>{action.risk_level}</Tag>
+                          {(action.approval_required || ["write", "destructive", "financial", "external_message"].includes(action.risk_level)) && <Tag variant="warn">approval checkpoint</Tag>}
+                          {action.required_permissions.map(permission => <Tag key={permission}>{permission}</Tag>)}
+                        </div>
+                      </div>
+                      <button disabled={connector.status !== "installed" || busy === `${connector.id}:${action.name}`} onClick={() => void runAction(connector, action)} className="btn btn-secondary btn-sm disabled:opacity-50">Run</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
         </div>
 
-        <div className="surface border border-soft rounded-lg p-5 max-w-[720px]">
-          <div className="flex items-center gap-2 mb-2">
-            <IC.Lock size={15} style={{ color: "var(--text-muted)" }}/>
-            <h3 className="text-[14px] font-semibold">How permissions work</h3>
+        <section>
+          <h2 className="text-[13px] uppercase tracking-wider mb-3" style={{ color: "var(--text-dim)" }}>Execution logs</h2>
+          <div className="surface border border-soft rounded-xl overflow-hidden">
+            {logs.length === 0 && <div className="p-5"><EmptyState title="No executions yet" sub="Run an installed connector action to create an execution log."/></div>}
+            {logs.map(log => <div key={log.id} className="px-4 py-3 border-b hairline last:border-b-0">
+              <div className="flex items-center justify-between gap-3">
+                <div className="font-medium text-[13.5px]">{log.connector_id}.{log.action_name}</div>
+                <Tag variant={log.result_status === "success" ? "ok" : "danger"}>{log.result_status}</Tag>
+              </div>
+              <div className="text-[12px] mt-1" style={{ color: "var(--text-dim)" }}>{log.created_at ? new Date(log.created_at).toLocaleString() : "unknown time"} · {log.duration_ms}ms</div>
+              {log.error_message && <div className="text-[12px] mt-1" style={{ color: "var(--danger)" }}>{log.error_message}</div>}
+              <details className="mt-2 text-[12px]" style={{ color: "var(--text-dim)" }}>
+                <summary className="cursor-pointer">Redacted arguments</summary>
+                <pre className="mt-2 overflow-x-auto rounded-md p-2" style={{ background: "var(--surface-2)" }}>{JSON.stringify(log.arguments_redacted ?? {}, null, 2)}</pre>
+              </details>
+            </div>)}
           </div>
-          <p className="text-[13.5px] leading-relaxed" style={{ color: "var(--text-muted)" }}>
-            Chronos always asks before sending email, posting on your behalf, or moving money. Connecting an app gives Chronos read access by default — anything more is one approval at a time.
-          </p>
-        </div>
+        </section>
+
+        <section className="grid grid-cols-2 gap-3">
+          <div>
+            <h2 className="text-[13px] uppercase tracking-wider mb-3" style={{ color: "var(--text-dim)" }}>Approval queue</h2>
+            <div className="surface border border-soft rounded-xl overflow-hidden">
+              {approvals.length === 0 && <div className="p-5"><EmptyState title="No connector approvals" sub="Risky connector actions create approval requests before execution."/></div>}
+              {approvals.map(approval => <div key={approval.id} className="px-4 py-3 border-b hairline last:border-b-0">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="font-medium text-[13.5px]">{approval.connector_id}.{approval.action_name}</div>
+                  <Tag variant={approval.status === "pending" ? "warn" : approval.status === "approved" ? "ok" : "danger"}>{approval.status}</Tag>
+                </div>
+                <div className="text-[12px] mt-1" style={{ color: "var(--text-dim)" }}>{approval.risk_level} · {approval.approval_mode}</div>
+              </div>)}
+            </div>
+          </div>
+
+          <div>
+            <h2 className="text-[13px] uppercase tracking-wider mb-3" style={{ color: "var(--text-dim)" }}>Execution traces</h2>
+            <div className="surface border border-soft rounded-xl overflow-hidden">
+              {traces.length === 0 && <div className="p-5"><EmptyState title="No traces yet" sub="The connector worker records traces when it executes queued jobs."/></div>}
+              {traces.slice(0, 8).map(trace => <div key={trace.id} className="px-4 py-3 border-b hairline last:border-b-0">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="font-medium text-[13.5px]">{trace.connector_id}.{trace.action_name}</div>
+                  <Tag variant={trace.status === "success" ? "ok" : trace.status === "running" ? "info" : "danger"}>{trace.status}</Tag>
+                </div>
+                <div className="text-[12px] mt-1" style={{ color: "var(--text-dim)" }}>{trace.started_at ? new Date(trace.started_at).toLocaleString() : "unknown time"}</div>
+              </div>)}
+            </div>
+          </div>
+        </section>
       </div>
     </div>
   );

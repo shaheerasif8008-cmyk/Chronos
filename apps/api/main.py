@@ -6,7 +6,7 @@ import asyncio
 from jobs import context_update, profile_synthesis
 from core.db import engine, reflect_table
 from runtime.executor import TaskExecutor
-from routers import approvals, auth, chat, connectors, context, memory, settings, tasks
+from routers import approvals, auth, chat, connectors, context, memory, settings, tasks, workflows
 
 app = FastAPI(title="Chronos API", version="0.1.0")
 
@@ -32,6 +32,7 @@ app.include_router(context.router)
 app.include_router(tasks.router)
 app.include_router(approvals.router)
 app.include_router(settings.router)
+app.include_router(workflows.router)
 
 
 @app.on_event("startup")
@@ -40,6 +41,7 @@ async def start_schedulers() -> None:
         if not scheduler.running:
             scheduler.start()
     await recover_incomplete_tasks()
+    await recover_incomplete_workflows()
 
 
 async def recover_incomplete_tasks() -> list[str]:
@@ -55,6 +57,14 @@ async def recover_incomplete_tasks() -> list[str]:
     for task_id in task_ids:
         asyncio.create_task(TaskExecutor().resume(task_id))
     return task_ids
+
+
+async def recover_incomplete_workflows() -> list[str]:
+    from connectors.framework.queue_factory import connector_execution_queue
+    from connectors.framework.repository import DatabaseConnectorRepository
+    from connectors.framework.workflows import WorkflowRuntime
+
+    return await WorkflowRuntime(DatabaseConnectorRepository(), connector_execution_queue()).recover_interrupted_runs(tenant_id="default")
 
 
 @app.on_event("shutdown")

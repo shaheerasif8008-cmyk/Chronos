@@ -100,6 +100,35 @@ async def test_stream_chat_completion_reports_provider_unavailable(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_complete_json_falls_back_to_main_model_after_fast_failure(monkeypatch):
+    from core import llm
+
+    calls = []
+
+    async def fake_completion(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise llm.litellm.RateLimitError(
+                message="temporarily rate-limited upstream",
+                llm_provider="openrouter",
+                model=kwargs["model"],
+            )
+        return {"choices": [{"message": {"content": '{"mode":"chat"}'}}]}
+
+    monkeypatch.setattr(llm.litellm, "acompletion", fake_completion)
+    monkeypatch.setattr(llm.settings, "fast_model", "openrouter/minimax/minimax-m2.5:free")
+    monkeypatch.setattr(llm.settings, "openrouter_model", "openrouter/nvidia/nemotron-3-super-120b-a12b:free")
+    monkeypatch.setattr(llm.settings, "openrouter_api_key", "or-test-key")
+
+    result = await llm.complete_json("Return JSON")
+
+    assert result == '{"mode":"chat"}'
+    assert calls[0]["model"] == "openrouter/minimax/minimax-m2.5:free"
+    assert calls[0]["response_format"] == {"type": "json_object"}
+    assert calls[1]["model"] == "openrouter/nvidia/nemotron-3-super-120b-a12b:free"
+
+
+@pytest.mark.asyncio
 async def test_embed_uses_redis_cache(monkeypatch):
     from core import embeddings
 
@@ -194,67 +223,27 @@ def test_memory_router_has_audit_available_for_mutations():
 
 
 @pytest.mark.asyncio
-async def test_connector_proof_routes_gmail_draft_through_tool_broker(monkeypatch):
-    from core.models import Member, ToolResult
+async def test_connector_proof_uses_internal_echo_runtime(monkeypatch):
+    from core.models import Member
     from routers import connectors
+    from connectors.framework.repository import InMemoryConnectorRepository
 
-    calls = []
+    repository = InMemoryConnectorRepository()
 
-    async def fake_execute(agent, tool, args):
-        calls.append((agent, tool, args))
-        return ToolResult(data={"id": "draft-1"}, summary="Draft created: draft-1")
+    def fake_repo():
+        return repository
 
-    async def noop_mark(connector_id):
-        return None
-
-    async def noop_audit(**kwargs):
-        return None
-
-    monkeypatch.setattr(connectors.tool_broker, "execute", fake_execute)
-    monkeypatch.setattr(connectors, "_mark_connector_used", noop_mark)
-    monkeypatch.setattr(connectors, "_audit_connector_proof", noop_audit)
+    monkeypatch.setattr(connectors, "repo", fake_repo)
 
     result = await connectors.execute_connector_proof(
         connector_id="connector-1",
-        provider="gmail",
+        provider="internal",
         member=Member(id="member-1", organization_id="default", email="admin@example.com"),
     )
 
-    assert result == {"status": "ok", "detail": "Draft created: draft-1", "tool": "gmail.draft"}
-    assert calls[0][1] == "gmail.draft"
-    assert calls[0][2]["subject"] == "Chronos connector proof"
-
-
-@pytest.mark.asyncio
-async def test_connector_proof_routes_browser_fetch_through_tool_broker(monkeypatch):
-    from core.models import Member, ToolResult
-    from routers import connectors
-
-    calls = []
-
-    async def fake_execute(agent, tool, args):
-        calls.append((agent, tool, args))
-        return ToolResult(data={"title": "Example Domain"}, summary="Fetched https://example.com: 120 chars")
-
-    async def noop_mark(connector_id):
-        return None
-
-    async def noop_audit(**kwargs):
-        return None
-
-    monkeypatch.setattr(connectors.tool_broker, "execute", fake_execute)
-    monkeypatch.setattr(connectors, "_mark_connector_used", noop_mark)
-    monkeypatch.setattr(connectors, "_audit_connector_proof", noop_audit)
-
-    result = await connectors.execute_connector_proof(
-        connector_id="connector-1",
-        provider="browser",
-        member=Member(id="member-1", organization_id="default", email="admin@example.com"),
-    )
-
-    assert result == {"status": "ok", "detail": "Fetched https://example.com: 120 chars", "tool": "browser.fetch"}
-    assert calls[0][1] == "browser.fetch"
-    assert calls[0][2] == {"url": "https://example.com"}
+    assert result == {"status": "success", "detail": {"message": "Chronos connector proof"}, "tool": "internal_echo.echo"}
+    logs = await repository.list_execution_logs(tenant_id="default", connector_id="internal_echo")
+    assert logs[0]["result_status"] == "success"
 
 
 @pytest.mark.asyncio

@@ -25,6 +25,7 @@ trap cleanup EXIT INT TERM
 
 cd "$ROOT/apps/api"
 "$PYTHON_BIN" -m uvicorn main:app --reload --port "${API_PORT:-8000}" &
+"$PYTHON_BIN" -m connectors.worker_main &
 
 cd "$ROOT/apps/web"
 "$NODE_BIN" node_modules/next/dist/bin/next dev --webpack --port "${WEB_PORT:-3000}" &

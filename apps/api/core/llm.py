@@ -151,16 +151,50 @@ async def stream_completion(messages: list[dict[str, str]], *, model_id: str | N
 
 
 async def complete_json(prompt: str, *, model: str | None = None) -> str:
+    """Complete with JSON response format, falling back through fast → main → error."""
     messages = [{"role": "user", "content": prompt}]
-    kwargs = model_kwargs(model or settings.fast_model, messages=messages, stream=False)
-    kwargs["response_format"] = {"type": "json_object"}
-    response = await litellm.acompletion(**kwargs)
-    return _message_content(response)
+
+    # Try fast model first
+    fast = model or settings.fast_model
+    try:
+        kwargs = model_kwargs(fast, messages=messages, stream=False)
+        kwargs["response_format"] = {"type": "json_object"}
+        response = await litellm.acompletion(**kwargs)
+        return _message_content(response)
+    except Exception:
+        pass
+
+    # Fast model failed (rate limit, misconfiguration, etc.) — fall back to main model
+    # Don't use response_format since some models don't support it; rely on prompt instruction
+    if fast != settings.openrouter_model:
+        try:
+            kwargs = backup_completion_kwargs(messages, stream=False)
+            response = await litellm.acompletion(**kwargs)
+            return _message_content(response)
+        except Exception:
+            pass
+
+    raise RuntimeError("All models failed for complete_json — check OPENROUTER_API_KEY and model config")
 
 
 async def complete_text(prompt: str, *, model: str | None = None) -> str:
+    """Complete with plain text response, falling back through fast → main → error."""
     messages = [{"role": "user", "content": prompt}]
-    response = await litellm.acompletion(
-        **model_kwargs(model or settings.fast_model, messages=messages, stream=False)
-    )
-    return _message_content(response)
+
+    fast = model or settings.fast_model
+    try:
+        response = await litellm.acompletion(
+            **model_kwargs(fast, messages=messages, stream=False)
+        )
+        return _message_content(response)
+    except Exception:
+        pass
+
+    if fast != settings.openrouter_model:
+        try:
+            response = await litellm.acompletion(**backup_completion_kwargs(messages, stream=False))
+            return _message_content(response)
+        except Exception:
+            pass
+
+    raise RuntimeError("All models failed for complete_text — check OPENROUTER_API_KEY and model config")

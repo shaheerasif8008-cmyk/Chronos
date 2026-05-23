@@ -1,342 +1,542 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import RedirectResponse
-from pydantic import BaseModel
-from sqlalchemy import delete, insert, select, update
-from sqlalchemy.sql import func
+from __future__ import annotations
 
-from connectors import vault
-from connectors.gmail import oauth_finish, oauth_start_url
-from core import audit, permissions, tool_broker
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
+
+from connectors.framework.adapters import adapter_registry
+from connectors.framework.approvals import ApprovalService
+from connectors.framework.mcp import MCPDiscoveryService
+from connectors.framework.planner import ToolOrchestrationPlanner
+from connectors.framework.queue_factory import connector_execution_queue
+from connectors.framework.queued_runtime import QueuedConnectorExecutionService
+from connectors.framework.repository import DatabaseConnectorRepository
+from connectors.framework.runtime import ConnectorExecutionService
+from connectors.framework.seed import seed_builtin_connectors
+from connectors.framework.tool_calling import execute_tool_call, get_available_tools_for_employee
+from core import permissions
 from core.auth import get_current_member
 from core.config import settings
-from core.db import engine, reflect_table
-from core.models import AgentContext, Member, ToolResult
+from core.models import AgentContext, Member
 
 router = APIRouter(prefix="/connectors", tags=["connectors"])
 
 
-class ConnectorOut(BaseModel):
-    id: str
-    provider: str
-    account_handle: str | None
-    status: str
-    connected_at: str | None
-    last_used_at: str | None
+class InstallConnectorRequest(BaseModel):
+    workspace_id: str = "default"
+
+
+class PermissionRequest(BaseModel):
+    workspace_id: str = "default"
+    employee_id: str
+    user_id: str | None = None
+    action_name: str
+    allowed_scopes: list[str] = Field(default_factory=list)
+    approval_required: bool = False
+
+
+class ExecuteConnectorRequest(BaseModel):
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    workspace_id: str = "default"
+    employee_id: str | None = None
+
+
+class ToolCallRequest(BaseModel):
+    tool_call: dict[str, Any]
+    workspace_id: str = "default"
+    employee_id: str | None = None
 
 
 class ConnectorProofRequest(BaseModel):
-    to: str = "operator@example.com"
-    subject: str = "Chronos connector proof"
-    body: str = "This draft proves Gmail actions route through the Chronos tool broker."
-    url: str = "https://example.com"
+    message: str = "Chronos connector proof"
 
 
-async def _row_to_out(row: dict) -> ConnectorOut:
-    return ConnectorOut(
-        id=row["id"],
-        provider=row["provider"],
-        account_handle=row.get("account_handle"),
-        status=row["status"],
-        connected_at=str(row["connected_at"]) if row.get("connected_at") else None,
-        last_used_at=str(row["last_used_at"]) if row.get("last_used_at") else None,
-    )
+class ResolveApprovalRequest(BaseModel):
+    approved: bool
+    note: str | None = None
 
 
-def _proof_tool_args(provider: str, req: ConnectorProofRequest) -> tuple[str, dict]:
-    if provider == "gmail":
-        return "gmail.draft", {
-            "to": req.to,
-            "subject": req.subject,
-            "body": req.body,
+class RegisterMCPServerRequest(BaseModel):
+    name: str
+    transport: str = Field(pattern="^(local|remote)$")
+    command: str | None = None
+    server_url: str | None = None
+
+
+class PlanRequest(BaseModel):
+    goal: str
+    workspace_id: str = "default"
+    employee_id: str | None = None
+
+
+class ExecutePlanRequest(BaseModel):
+    plan: dict[str, Any]
+    workspace_id: str = "default"
+    employee_id: str | None = None
+
+
+class PolicyRequest(BaseModel):
+    workspace_id: str | None = None
+    employee_id: str | None = None
+    role: str | None = None
+    connector_id: str | None = None
+    action_name: str | None = None
+    risk_level: str | None = None
+    decision: str = Field(pattern="^(allow|deny|require_approval)$")
+    approval_mode: str = Field(default="single", pattern="^(single|admin|multi)$")
+    conditions: dict[str, Any] = Field(default_factory=dict)
+    priority: int = 0
+    enabled: bool = True
+
+
+def repo() -> DatabaseConnectorRepository:
+    return DatabaseConnectorRepository()
+
+
+async def ensure_registry() -> DatabaseConnectorRepository:
+    repository = repo()
+    await seed_builtin_connectors(repository, tenant_id=settings.org_id)
+    return repository
+
+
+def clean_connector(row: dict[str, Any]) -> dict[str, Any]:
+    category = "Internal" if row.get("provider") == "internal" else "Productivity"
+    return {
+        "id": row["id"],
+        "name": {"internal_echo": "Runtime Diagnostics", "internal_time": "System Clock"}.get(row["id"], row.get("name") or row["id"]),
+        "provider": row.get("provider"),
+        "description": row.get("description") or "",
+        "type": row.get("type") or "native",
+        "category": category,
+        "status": row.get("status") or "available",
+        "auth_type": row.get("auth_type") or "none",
+        "scopes": row.get("scopes") or [],
+        "actions": row.get("actions") or [],
+        "created_at": str(row["created_at"]) if row.get("created_at") else None,
+        "updated_at": str(row["updated_at"]) if row.get("updated_at") else None,
+    }
+
+
+def clean_action(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "name": row["name"],
+        "description": row["description"],
+        "parameters_schema": row["parameters_schema"],
+        "output_schema": row.get("output_schema"),
+        "required_permissions": row.get("required_permissions") or [],
+        "risk_level": row["risk_level"],
+        "approval_required": bool(row.get("approval_required")),
+    }
+
+
+@router.get("/")
+async def list_connectors(member: Member = Depends(get_current_member)) -> list[dict[str, Any]]:
+    await permissions.check(member, "list_connectors", member.organization_id)
+    repository = await ensure_registry()
+    rows = await repository.list_connectors(tenant_id=member.organization_id)
+    return [clean_connector(row) for row in rows if row.get("actions")]
+
+
+@router.get("/execution-logs")
+async def list_connector_execution_logs(
+    connector_id: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=100),
+    member: Member = Depends(get_current_member),
+) -> list[dict[str, Any]]:
+    await permissions.check(member, "list_connector_execution_logs", member.organization_id)
+    repository = await ensure_registry()
+    rows = await repository.list_execution_logs(tenant_id=member.organization_id, connector_id=connector_id, limit=limit)
+    return [
+        {
+            **dict(row),
+            "created_at": str(row["created_at"]) if row.get("created_at") else None,
         }
-    if provider == "browser":
-        return "browser.fetch", {"url": req.url}
-    raise ValueError(f"No proof action for provider: {provider}")
+        for row in rows
+    ]
 
 
-async def _mark_connector_used(connector_id: str) -> None:
-    connectors = await reflect_table("connectors")
-    async with engine.begin() as conn:
-        await conn.execute(
-            update(connectors)
-            .where(connectors.c.id == connector_id)
-            .values(last_used_at=func.now())
+@router.get("/approvals")
+async def list_connector_approvals(
+    status: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=100),
+    member: Member = Depends(get_current_member),
+) -> list[dict[str, Any]]:
+    await permissions.check(member, "list_connector_approvals", member.organization_id)
+    repository = await ensure_registry()
+    rows = await repository.list_approval_requests(tenant_id=member.organization_id, status=status, limit=limit)
+    return [{**dict(row), "created_at": str(row.get("created_at")) if row.get("created_at") else None, "resolved_at": str(row.get("resolved_at")) if row.get("resolved_at") else None} for row in rows]
+
+
+@router.post("/approvals/{approval_id}/resolve")
+async def resolve_connector_approval(approval_id: str, req: ResolveApprovalRequest, member: Member = Depends(get_current_member)) -> dict[str, Any]:
+    await permissions.check(member, "resolve_connector_approval", approval_id)
+    repository = await ensure_registry()
+    try:
+        if req.approved:
+            return await ApprovalService(repository).approve_and_enqueue(
+                approval_id,
+                tenant_id=member.organization_id,
+                actor_id=member.id,
+                queue=connector_execution_queue(),
+                note=req.note,
+            )
+        row = await ApprovalService(repository).resolve(
+            approval_id,
+            tenant_id=member.organization_id,
+            actor_id=member.id,
+            approved=False,
+            note=req.note,
         )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return dict(row)
 
 
-async def _audit_connector_proof(
-    *,
-    member_id: str,
-    tool: str | None,
-    connector_id: str,
-    status: str,
-) -> None:
-    await audit.log(
-        "connector_proof",
-        member_id,
-        tool or "connector.proof",
-        resource_type="connectors",
-        resource_id=connector_id,
-        payload={"tool": tool},
-        decision=status,
+@router.get("/health")
+async def list_connector_health(member: Member = Depends(get_current_member)) -> list[dict[str, Any]]:
+    await permissions.check(member, "list_connector_health", member.organization_id)
+    repository = await ensure_registry()
+    rows = await repository.list_connector_health(tenant_id=member.organization_id)
+    return [{**dict(row), "updated_at": str(row.get("updated_at")) if row.get("updated_at") else None} for row in rows]
+
+
+@router.get("/execution-traces")
+async def list_connector_execution_traces(
+    limit: int = Query(default=50, ge=1, le=100),
+    member: Member = Depends(get_current_member),
+) -> list[dict[str, Any]]:
+    await permissions.check(member, "list_connector_execution_traces", member.organization_id)
+    repository = await ensure_registry()
+    rows = await repository.list_execution_traces(tenant_id=member.organization_id, limit=limit)
+    return [{**dict(row), "started_at": str(row.get("started_at")) if row.get("started_at") else None, "completed_at": str(row.get("completed_at")) if row.get("completed_at") else None} for row in rows]
+
+
+@router.get("/execution-jobs")
+async def list_connector_execution_jobs(
+    status: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=100),
+    member: Member = Depends(get_current_member),
+) -> list[dict[str, Any]]:
+    await permissions.check(member, "list_connector_execution_jobs", member.organization_id)
+    repository = await ensure_registry()
+    rows = await repository.list_execution_jobs(tenant_id=member.organization_id, status=status, limit=limit)
+    return [{**dict(row), "created_at": str(row.get("created_at")) if row.get("created_at") else None, "updated_at": str(row.get("updated_at")) if row.get("updated_at") else None} for row in rows]
+
+
+@router.post("/execution-jobs/{job_id}/cancel")
+async def cancel_connector_execution_job(job_id: str, member: Member = Depends(get_current_member)) -> dict[str, Any]:
+    await permissions.check(member, "cancel_connector_execution_job", job_id)
+    repository = await ensure_registry()
+    try:
+        return await repository.cancel_execution_job(job_id, tenant_id=member.organization_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/execution-traces/{trace_id}")
+async def get_connector_execution_trace(trace_id: str, member: Member = Depends(get_current_member)) -> dict[str, Any]:
+    await permissions.check(member, "get_connector_execution_trace", trace_id)
+    repository = await ensure_registry()
+    traces = await repository.list_execution_traces(tenant_id=member.organization_id, limit=100)
+    trace = next((row for row in traces if row["id"] == trace_id), None)
+    if not trace:
+        raise HTTPException(status_code=404, detail="Trace not found")
+    return {"trace": dict(trace), "steps": await repository.list_trace_steps(trace_id)}
+
+
+@router.post("/plans")
+async def create_connector_plan(req: PlanRequest, member: Member = Depends(get_current_member)) -> dict[str, Any]:
+    await permissions.check(member, "create_connector_plan", req.workspace_id)
+    repository = await ensure_registry()
+    plan = await ToolOrchestrationPlanner(repository).create_plan(
+        req.goal,
+        tenant_id=member.organization_id,
+        workspace_id=req.workspace_id,
+        employee_id=req.employee_id or member.id,
+    )
+    return {"id": plan.id, "goal": plan.goal, "steps": [step.__dict__ for step in plan.steps]}
+
+
+@router.post("/plans/execute")
+async def execute_connector_plan(req: ExecutePlanRequest, member: Member = Depends(get_current_member)) -> dict[str, Any]:
+    from connectors.framework.planner import ToolExecutionPlan, ToolExecutionStep
+
+    await permissions.check(member, "execute_connector_plan", req.workspace_id)
+    repository = await ensure_registry()
+    raw_steps = req.plan.get("steps") or []
+    plan = ToolExecutionPlan(
+        id=req.plan.get("id") or "ad_hoc_plan",
+        goal=req.plan.get("goal") or "",
+        steps=[
+            ToolExecutionStep(
+                id=step.get("id") or f"step-{index + 1}",
+                tool_name=step["tool_name"],
+                arguments=step.get("arguments") or {},
+                dependencies=step.get("dependencies") or [],
+                approval_required=bool(step.get("approval_required")),
+                parallel_safe=bool(step.get("parallel_safe")),
+            )
+            for index, step in enumerate(raw_steps)
+        ],
+    )
+    return await ToolOrchestrationPlanner(repository).execute_plan(
+        plan,
+        tenant_id=member.organization_id,
+        workspace_id=req.workspace_id,
+        employee_id=req.employee_id or member.id,
+        user_id=member.id,
+        queue=connector_execution_queue(),
     )
 
 
+@router.get("/mcp")
+async def list_mcp_servers(member: Member = Depends(get_current_member)) -> dict[str, Any]:
+    await permissions.check(member, "list_mcp_servers", member.organization_id)
+    repository = await ensure_registry()
+    return {
+        "servers": await repository.list_mcp_servers(tenant_id=member.organization_id),
+        "discovery_logs": await repository.list_mcp_discovery_logs(tenant_id=member.organization_id),
+    }
+
+
+@router.post("/mcp/register")
+async def register_mcp_server(req: RegisterMCPServerRequest, member: Member = Depends(get_current_member)) -> dict[str, Any]:
+    await permissions.check(member, "register_mcp_server", member.organization_id)
+    if req.transport == "local" and not req.command:
+        raise HTTPException(status_code=400, detail="Local MCP servers require a command")
+    if req.transport == "remote" and not req.server_url:
+        raise HTTPException(status_code=400, detail="Remote MCP servers require a server_url")
+    repository = await ensure_registry()
+    return await repository.register_mcp_server(
+        tenant_id=member.organization_id,
+        name=req.name,
+        transport=req.transport,
+        command=req.command,
+        server_url=req.server_url,
+    )
+
+
+@router.post("/mcp/{server_id}/discover")
+async def discover_mcp_server(server_id: str, member: Member = Depends(get_current_member)) -> dict[str, Any]:
+    await permissions.check(member, "discover_mcp_server", server_id)
+    repository = await ensure_registry()
+    return await MCPDiscoveryService(repository).discover(server_id, tenant_id=member.organization_id)
+
+
+@router.get("/policies")
+async def list_connector_policies(member: Member = Depends(get_current_member)) -> list[dict[str, Any]]:
+    await permissions.check(member, "list_connector_policies", member.organization_id)
+    repository = await ensure_registry()
+    return await repository.list_policies(tenant_id=member.organization_id)
+
+
+@router.post("/policies")
+async def create_connector_policy(req: PolicyRequest, member: Member = Depends(get_current_member)) -> dict[str, Any]:
+    await permissions.check(member, "create_connector_policy", member.organization_id)
+    repository = await ensure_registry()
+    return await repository.create_policy(
+        tenant_id=member.organization_id,
+        workspace_id=req.workspace_id,
+        employee_id=req.employee_id,
+        role=req.role,
+        connector_id=req.connector_id,
+        action_name=req.action_name,
+        risk_level=req.risk_level,
+        decision=req.decision,
+        approval_mode=req.approval_mode,
+        conditions=req.conditions,
+        priority=req.priority,
+        enabled=req.enabled,
+    )
+
+
+@router.delete("/policies/{policy_id}")
+async def delete_connector_policy(policy_id: str, member: Member = Depends(get_current_member)) -> dict[str, Any]:
+    await permissions.check(member, "delete_connector_policy", policy_id)
+    repository = await ensure_registry()
+    await repository.delete_policy(policy_id, tenant_id=member.organization_id)
+    return {"id": policy_id, "deleted": True}
+
+
+@router.get("/tools")
+async def list_available_tools(
+    employee_id: str,
+    workspace_id: str = Query(default="default"),
+    member: Member = Depends(get_current_member),
+) -> list[dict[str, Any]]:
+    await permissions.check(member, "list_connector_tools", workspace_id)
+    repository = await ensure_registry()
+    return await get_available_tools_for_employee(
+        repository,
+        employee_id=employee_id,
+        workspace_id=workspace_id,
+        tenant_id=member.organization_id,
+    )
+
+
+@router.post("/tool-call")
+async def execute_connector_tool_call(req: ToolCallRequest, member: Member = Depends(get_current_member)) -> dict[str, Any]:
+    await permissions.check(member, "execute_connector_tool_call", req.workspace_id)
+    repository = await ensure_registry()
+    return await execute_tool_call(
+        repository,
+        req.tool_call,
+        AgentContext(
+            id=req.employee_id or member.id,
+            org_id=member.organization_id,
+            member_id=member.id,
+            workspace_id=req.workspace_id,
+        ),
+    )
+
+
+@router.post("/{connector_id}/install")
+async def install_connector(connector_id: str, req: InstallConnectorRequest, member: Member = Depends(get_current_member)) -> dict[str, Any]:
+    await permissions.check(member, "install_connector", connector_id)
+    repository = await ensure_registry()
+    connector = await repository.get_connector(connector_id, tenant_id=member.organization_id)
+    if not connector:
+        raise HTTPException(status_code=404, detail="Connector not found")
+    if connector.get("type") == "mcp":
+        raise HTTPException(status_code=501, detail="MCP transport is not implemented for production execution")
+
+    installed = await repository.install_connector(
+        connector_id,
+        tenant_id=member.organization_id,
+        workspace_id=req.workspace_id,
+        installed_by=member.id,
+    )
+    for action in await repository.list_actions(connector_id):
+        await repository.grant_permission(
+            tenant_id=member.organization_id,
+            workspace_id=req.workspace_id,
+            employee_id=member.id,
+            user_id=member.id,
+            connector_id=connector_id,
+            action_name=action["name"],
+            allowed_scopes=action.get("required_permissions") or [],
+            approval_required=bool(action.get("approval_required")),
+        )
+    return clean_connector(installed)
+
+
+@router.post("/{connector_id}/disable")
+async def disable_connector(connector_id: str, member: Member = Depends(get_current_member)) -> dict[str, Any]:
+    await permissions.check(member, "disable_connector", connector_id)
+    repository = await ensure_registry()
+    if not await repository.get_connector(connector_id, tenant_id=member.organization_id):
+        raise HTTPException(status_code=404, detail="Connector not found")
+    await repository.disable_connector(connector_id, tenant_id=member.organization_id)
+    return {"id": connector_id, "status": "disabled"}
+
+
+@router.get("/{connector_id}/actions")
+async def list_connector_actions(connector_id: str, member: Member = Depends(get_current_member)) -> list[dict[str, Any]]:
+    await permissions.check(member, "list_connector_actions", connector_id)
+    repository = await ensure_registry()
+    if not await repository.get_connector(connector_id, tenant_id=member.organization_id):
+        raise HTTPException(status_code=404, detail="Connector not found")
+    return [clean_action(row) for row in await repository.list_actions(connector_id)]
+
+
+@router.post("/{connector_id}/permissions")
+async def grant_connector_permission(connector_id: str, req: PermissionRequest, member: Member = Depends(get_current_member)) -> dict[str, Any]:
+    await permissions.check(member, "grant_connector_permission", connector_id)
+    repository = await ensure_registry()
+    action = await repository.get_action(connector_id, req.action_name)
+    if not action:
+        raise HTTPException(status_code=404, detail="Connector action not found")
+    return await repository.grant_permission(
+        tenant_id=member.organization_id,
+        workspace_id=req.workspace_id,
+        employee_id=req.employee_id,
+        user_id=req.user_id,
+        connector_id=connector_id,
+        action_name=req.action_name,
+        allowed_scopes=req.allowed_scopes,
+        approval_required=req.approval_required,
+    )
+
+
+@router.delete("/{connector_id}/permissions/{action_name}")
+async def revoke_connector_permission(
+    connector_id: str,
+    action_name: str,
+    workspace_id: str = Query(default="default"),
+    employee_id: str = Query(...),
+    member: Member = Depends(get_current_member),
+) -> dict[str, Any]:
+    await permissions.check(member, "revoke_connector_permission", connector_id)
+    repository = await ensure_registry()
+    await repository.revoke_permission(
+        tenant_id=member.organization_id,
+        workspace_id=workspace_id,
+        employee_id=employee_id,
+        connector_id=connector_id,
+        action_name=action_name,
+    )
+    return {"connector_id": connector_id, "action_name": action_name, "revoked": True}
+
+
+@router.post("/{connector_id}/actions/{action_name}/execute")
+async def execute_connector_action(
+    connector_id: str,
+    action_name: str,
+    req: ExecuteConnectorRequest,
+    member: Member = Depends(get_current_member),
+) -> dict[str, Any]:
+    await permissions.check(member, "execute_connector_action", connector_id)
+    repository = await ensure_registry()
+    result = await QueuedConnectorExecutionService(repository, connector_execution_queue()).enqueue(
+        connector_id=connector_id,
+        action_name=action_name,
+        arguments=req.arguments,
+        context=AgentContext(
+            id=req.employee_id or member.id,
+            org_id=member.organization_id,
+            member_id=member.id,
+            workspace_id=req.workspace_id,
+        ),
+    )
+    return {
+        "status": result.status,
+        "output": result.output,
+        "error": result.error,
+        "duration_ms": result.duration_ms,
+    }
+
+
+# Compatibility helper retained for old tests only. It now routes through the
+# real internal connector framework instead of claiming Gmail/browser support.
 async def execute_connector_proof(
     *,
     connector_id: str,
     provider: str,
     member: Member,
     req: ConnectorProofRequest | None = None,
-) -> dict:
-    proof_req = req or ConnectorProofRequest()
-    try:
-        tool, args = _proof_tool_args(provider, proof_req)
-    except ValueError as exc:
-        return {"status": "unknown_provider", "detail": str(exc), "tool": None}
-
-    agent = AgentContext(id=f"connector-proof:{member.id}", org_id=member.organization_id, member_id=member.id)
-    try:
-        result = await tool_broker.execute(agent, tool, args)
-        status = "ok"
-        detail = result.summary
-    except Exception as exc:
-        status = "error"
-        detail = str(exc)
-
-    await _mark_connector_used(connector_id)
-    await _audit_connector_proof(
-        member_id=member.id,
-        tool=tool,
-        connector_id=connector_id,
-        status=status,
+) -> dict[str, Any]:
+    repository = await ensure_registry()
+    installed = await repository.install_connector(
+        "internal_echo",
+        tenant_id=member.organization_id,
+        workspace_id="default",
+        installed_by=member.id,
     )
-    return {"status": status, "detail": detail, "tool": tool}
-
-
-@router.get("/")
-async def list_connectors(member: Member = Depends(get_current_member)) -> list[ConnectorOut]:
-    await permissions.check(member, "list_connectors", member.organization_id)
-    connectors = await reflect_table("connectors")
-    async with engine.begin() as conn:
-        rows = (
-            await conn.execute(
-                select(
-                    connectors.c.id,
-                    connectors.c.provider,
-                    connectors.c.account_handle,
-                    connectors.c.status,
-                    connectors.c.connected_at,
-                    connectors.c.last_used_at,
-                ).where(connectors.c.organization_id == member.organization_id)
-                .order_by(connectors.c.connected_at.desc())
-            )
-        ).mappings().all()
-    return [await _row_to_out(dict(r)) for r in rows]
-
-
-@router.get("/{connector_id}")
-async def get_connector(connector_id: str, member: Member = Depends(get_current_member)) -> ConnectorOut:
-    await permissions.check(member, "read_connector", connector_id)
-    connectors = await reflect_table("connectors")
-    async with engine.begin() as conn:
-        row = (
-            await conn.execute(
-                select(
-                    connectors.c.id,
-                    connectors.c.provider,
-                    connectors.c.account_handle,
-                    connectors.c.status,
-                    connectors.c.connected_at,
-                    connectors.c.last_used_at,
-                ).where(
-                    connectors.c.id == connector_id,
-                    connectors.c.organization_id == member.organization_id,
-                )
-            )
-        ).mappings().first()
-    if row is None:
-        raise HTTPException(status_code=404, detail="Connector not found")
-    return await _row_to_out(dict(row))
-
-
-@router.delete("/{connector_id}")
-async def disconnect_connector(connector_id: str, member: Member = Depends(get_current_member)) -> dict:
-    await permissions.check(member, "delete_connector", connector_id)
-    connectors = await reflect_table("connectors")
-    async with engine.begin() as conn:
-        row = (
-            await conn.execute(
-                select(connectors.c.vault_ref).where(
-                    connectors.c.id == connector_id,
-                    connectors.c.organization_id == member.organization_id,
-                )
-            )
-        ).scalar_one_or_none()
-        if row is None:
-            raise HTTPException(status_code=404, detail="Connector not found")
-        vault_ref = row
-        await conn.execute(
-            delete(connectors).where(connectors.c.id == connector_id)
-        )
-
-    # Invalidate vault cache
-    await vault.delete(vault_ref, actor_id=member.id, org_id=member.organization_id)
-    await audit.log("connector_delete", member.id, "connector.disconnect",
-                    resource_type="connectors", resource_id=connector_id)
-    return {"id": connector_id, "disconnected": True}
-
-
-@router.post("/{connector_id}/test")
-async def test_connector(
-    connector_id: str,
-    req: ConnectorProofRequest | None = None,
-    member: Member = Depends(get_current_member),
-) -> dict:
-    await permissions.check(member, "test_connector", connector_id)
-    connectors = await reflect_table("connectors")
-    async with engine.begin() as conn:
-        row = (
-            await conn.execute(
-                select(connectors.c.provider).where(
-                    connectors.c.id == connector_id,
-                    connectors.c.organization_id == member.organization_id,
-                )
-            )
-        ).mappings().first()
-    if row is None:
-        raise HTTPException(status_code=404, detail="Connector not found")
-
-    return await execute_connector_proof(
-        connector_id=connector_id,
-        provider=row["provider"],
-        member=member,
-        req=req,
+    await repository.grant_permission(
+        tenant_id=member.organization_id,
+        workspace_id="default",
+        employee_id=member.id,
+        user_id=member.id,
+        connector_id=installed["id"],
+        action_name="echo",
+        allowed_scopes=["internal.echo"],
+        approval_required=False,
     )
-
-
-@router.post("/browser/enable")
-async def enable_browser_connector(member: Member = Depends(get_current_member)) -> ConnectorOut:
-    await permissions.check(member, "connect_browser", member.organization_id)
-    connectors = await reflect_table("connectors")
-    async with engine.begin() as conn:
-        existing = (
-            await conn.execute(
-                select(
-                    connectors.c.id,
-                    connectors.c.provider,
-                    connectors.c.account_handle,
-                    connectors.c.status,
-                    connectors.c.connected_at,
-                    connectors.c.last_used_at,
-                ).where(
-                    connectors.c.organization_id == member.organization_id,
-                    connectors.c.provider == "browser",
-                    connectors.c.status == "active",
-                )
-            )
-        ).mappings().first()
-        if existing is not None:
-            return await _row_to_out(dict(existing))
-
-        result = await conn.execute(
-            insert(connectors).values(
-                organization_id=member.organization_id,
-                region=member.region,
-                provider="browser",
-                account_handle="local browser sandbox",
-                vault_ref="browser:local",
-                status="active",
-                scopes=["browser.fetch", "browser.search", "browser.extract_contacts"],
-            ).returning(
-                connectors.c.id,
-                connectors.c.provider,
-                connectors.c.account_handle,
-                connectors.c.status,
-                connectors.c.connected_at,
-                connectors.c.last_used_at,
-            )
-        )
-        row = result.mappings().first()
-
-    await audit.log(
-        "connector_connected",
-        member.id,
-        "connector.browser.enabled",
-        resource_type="connectors",
-        resource_id=row["id"] if row else "browser",
+    result = await ConnectorExecutionService(repository, adapter_registry()).execute(
+        connector_id="internal_echo",
+        action_name="echo",
+        arguments={"message": (req.message if req else "Chronos connector proof")},
+        context=AgentContext(id=member.id, org_id=member.organization_id, member_id=member.id, workspace_id="default"),
     )
-    return await _row_to_out(dict(row))
-
-
-# ---------------------------------------------------------------------------
-# Gmail OAuth flow
-# ---------------------------------------------------------------------------
-
-@router.get("/gmail/oauth-start")
-async def gmail_oauth_start(member: Member = Depends(get_current_member)) -> RedirectResponse:
-    await permissions.check(member, "connect_gmail", member.organization_id)
-    try:
-        url = await oauth_start_url(member_id=member.id, org_id=member.organization_id)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    await audit.log("connector_oauth_start", member.id, "connector.gmail.oauth_start",
-                    resource_type="connectors", resource_id="gmail")
-    return RedirectResponse(url=url)
-
-
-@router.get("/gmail/oauth-url")
-async def gmail_oauth_url(member: Member = Depends(get_current_member)) -> dict:
-    await permissions.check(member, "connect_gmail", member.organization_id)
-    try:
-        url = await oauth_start_url(member_id=member.id, org_id=member.organization_id)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    await audit.log("connector_oauth_start", member.id, "connector.gmail.oauth_start",
-                    resource_type="connectors", resource_id="gmail")
-    return {"url": url}
-
-
-@router.get("/gmail/oauth-callback")
-async def gmail_oauth_callback(
-    code: str = Query(default=""),
-    state: str = Query(default=""),   # member_id passed through Composio state
-    error: str = Query(default=""),
-) -> dict:
-    if error:
-        raise HTTPException(status_code=400, detail=f"OAuth error: {error}")
-
-    org_id = settings.org_id   # Phase 1: single-tenant
-    member_id = state or "unknown"
-
-    try:
-        credentials = await oauth_finish(code=code, state=state, org_id=org_id)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-
-    # Store credentials in vault
-    vault_ref = await vault.store(
-        connector_id=f"gmail:{member_id}",
-        credentials=credentials,
-        org_id=org_id,
-    )
-
-    # Persist connector record
-    connectors = await reflect_table("connectors")
-    async with engine.begin() as conn:
-        result = await conn.execute(
-            insert(connectors).values(
-                organization_id=org_id,
-                provider="gmail",
-                account_handle=member_id,
-                vault_ref=vault_ref,
-                status="active",
-                scopes=["gmail.read", "gmail.compose", "gmail.send"],
-            ).returning(connectors.c.id)
-        )
-        connector_id = result.scalar_one()
-
-    await audit.log("connector_connected", member_id, "connector.gmail.connected",
-                    resource_type="connectors", resource_id=str(connector_id))
-
-    return {"status": "connected", "connector_id": str(connector_id), "provider": "gmail"}
+    return {"status": result.status, "detail": result.output or result.error, "tool": "internal_echo.echo"}
