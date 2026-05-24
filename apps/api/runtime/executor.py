@@ -65,7 +65,11 @@ class TaskExecutor:
         task = await get_task(task_id)
         if not task:
             raise RuntimeError(f"Task not found: {task_id}")
-        if task["status"] in {"complete", "failed", "cancelled"}:
+        # awaiting_approval / paused are NOT restartable here — resuming them must
+        # go through resume_after_approval() so the pending approval calls are
+        # consumed. Restarting via run_loop() would clear the pause and let the
+        # model advance without the human decision.
+        if task["status"] in {"complete", "failed", "cancelled", "awaiting_approval", "paused"}:
             return
         await run_loop(task)
 

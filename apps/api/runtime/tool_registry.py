@@ -213,6 +213,8 @@ def to_broker_name(registry_name: str) -> str:
     gmail__draft     →  gmail.draft
     spawn__subagent  →  spawn__subagent  (handled before reaching broker)
     """
+    if registry_name == _SUBAGENT_TOOL_NAME:
+        return registry_name
     if "__" in registry_name:
         return registry_name.replace("__", ".", 1)
     return registry_name
