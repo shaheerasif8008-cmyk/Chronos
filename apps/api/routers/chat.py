@@ -18,6 +18,7 @@ from core.memory_writes import create_memory_entry, extract_explicit_memory_cont
 from core.models import Member, RequesterContext
 from core.redis import redis_client
 from memory.extraction import extract_and_save
+from runtime.agent_loop import format_task_answer
 from runtime.executor import TaskExecutor, activity_channel
 
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -66,70 +67,6 @@ async def _save_message(conversation_id: str, role: str, content: str) -> None:
             .where(conversations.c.id == conversation_id)
             .values(updated_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc))
         )
-
-
-def _format_task_result(result: dict[str, Any]) -> str:
-    """Convert a task result dict to a readable markdown string for the chat."""
-    if not result:
-        return "Task completed."
-
-    # Direct answer string from agent loop
-    answer = result.get("answer")
-    if answer and isinstance(answer, str) and answer.strip():
-        return answer.strip()
-
-    parts: list[str] = []
-
-    # Research findings
-    findings = result.get("findings")
-    if isinstance(findings, list) and findings:
-        for item in findings:
-            if not isinstance(item, dict):
-                continue
-            title = item.get("title", "")
-            summary = item.get("summary") or item.get("snippet", "")
-            url = item.get("url", "")
-            if title:
-                parts.append(f"**{title}**" + (f"  \n{url}" if url else ""))
-            if summary:
-                parts.append(f"{summary}\n")
-
-    # Leads list
-    leads = result.get("leads")
-    if isinstance(leads, list) and leads:
-        parts.append(f"**{len(leads)} leads found:**\n")
-        for lead in leads[:10]:
-            if isinstance(lead, dict):
-                company = lead.get("company", "Unknown")
-                stage = lead.get("stage", "")
-                signal = lead.get("hiring_signal", "")
-                score = lead.get("score")
-                line = f"- **{company}**"
-                if stage:
-                    line += f" ({stage})"
-                if score is not None:
-                    line += f" · score {score}"
-                if signal:
-                    line += f"  \n  {signal}"
-                parts.append(line)
-
-    # Drafts summary
-    drafts = result.get("drafts")
-    if isinstance(drafts, list) and drafts:
-        parts.append(f"\n✅ **{len(drafts)} email drafts** created and waiting in Approvals.")
-
-    # Tool result summary from last iteration
-    if not parts:
-        # Walk iteration keys in order and take the last summary
-        for key in reversed(list(result.keys())):
-            val = result[key]
-            if isinstance(val, dict):
-                summary = val.get("summary", "")
-                if summary:
-                    return summary
-        return "Task completed."
-
-    return "\n".join(parts)
 
 
 @router.get("/models")
@@ -272,7 +209,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
 
                     elif event_type == "task_complete":
                         result = event.get("result") or {}
-                        final_answer = _format_task_result(result)
+                        final_answer = format_task_answer(result)
                         break
 
                     elif event_type == "task_failed":
@@ -283,10 +220,10 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
                 await pubsub.unsubscribe(activity_channel(task_id))
                 await pubsub.close()
 
-            # Stream the final answer as tokens so it appears in the chat bubble.
+            # Stream the final answer for live display only. The agent loop
+            # already persisted it to the conversation (source of truth), so we
+            # do NOT save here — avoids duplicates and survives disconnects.
             if final_answer:
-                await _save_message(conversation_id, "assistant", final_answer)
-                await audit.log("chat_response", member.id, "chat.task_result", resource_id=conversation_id)
                 chunk_size = 40
                 for i in range(0, len(final_answer), chunk_size):
                     yield f"data: {json.dumps({'type': 'token', 'content': final_answer[i:i + chunk_size]})}\n\n"

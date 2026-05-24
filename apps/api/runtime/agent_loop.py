@@ -66,6 +66,126 @@ async def save_task(task_id: str, **values: Any) -> None:
         await conn.execute(update(tasks).where(tasks.c.id == task_id).values(**values))
 
 
+# ── Conversation persistence (source of truth, independent of SSE) ────────────
+
+_UUID_RE = __import__("re").compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", __import__("re").IGNORECASE
+)
+
+
+def _conversation_id_for(task: dict[str, Any]) -> str | None:
+    """Return the conversation UUID this task should post to, or None.
+
+    Only top-level tasks (depth 0) triggered directly by a conversation post
+    a result message. Sub-agents (triggered_by 'task:...') and manual/API
+    tasks (triggered_by 'manual') do not.
+    """
+    if int(task.get("depth") or 0) != 0:
+        return None
+    triggered_by = str(task.get("triggered_by") or "")
+    if _UUID_RE.match(triggered_by):
+        return triggered_by
+    return None
+
+
+def format_task_answer(result: dict[str, Any]) -> str:
+    """Convert a task result dict to a readable message string for the chat.
+
+    Canonical formatter shared by the agent loop (persistence) and the chat
+    router (live streaming) so the saved message and the streamed text match.
+    """
+    if not result:
+        return "Task completed."
+
+    answer = result.get("answer")
+    if isinstance(answer, str) and answer.strip():
+        return answer.strip()
+
+    parts: list[str] = []
+
+    findings = result.get("findings")
+    if isinstance(findings, list) and findings:
+        for item in findings:
+            if not isinstance(item, dict):
+                continue
+            title = item.get("title", "")
+            summary = item.get("summary") or item.get("snippet", "")
+            url = item.get("url", "")
+            if title:
+                parts.append(f"**{title}**" + (f"  \n{url}" if url else ""))
+            if summary:
+                parts.append(f"{summary}\n")
+
+    leads = result.get("leads")
+    if isinstance(leads, list) and leads:
+        parts.append(f"**{len(leads)} leads found:**\n")
+        for lead in leads[:10]:
+            if isinstance(lead, dict):
+                company = lead.get("company", "Unknown")
+                stage = lead.get("stage", "")
+                signal = lead.get("hiring_signal", "")
+                line = f"- **{company}**" + (f" ({stage})" if stage else "")
+                if signal:
+                    line += f"  \n  {signal}"
+                parts.append(line)
+
+    drafts = result.get("drafts")
+    if isinstance(drafts, list) and drafts:
+        parts.append(f"\n{len(drafts)} email drafts created and waiting in Approvals.")
+
+    if not parts:
+        for key in reversed(list(result.keys())):
+            val = result[key]
+            if isinstance(val, dict) and val.get("summary"):
+                return str(val["summary"])
+        return "Task completed."
+
+    return "\n".join(parts)
+
+
+async def _persist_to_conversation(task: dict[str, Any], content: str) -> None:
+    """Persist a final message to the task's conversation if applicable. Never raises."""
+    conv_id = _conversation_id_for(task)
+    if not conv_id:
+        return
+    try:
+        await _save_assistant_message(conv_id, content, task)
+    except Exception as exc:  # persistence must never break the loop
+        logger.warning("Failed to persist message to conversation: %s", exc)
+
+
+async def _save_assistant_message(conversation_id: str, content: str, task: dict[str, Any]) -> None:
+    """Insert the task's final answer as an assistant message in the conversation.
+
+    This is the source of truth — it runs in the agent loop's background task,
+    so the result survives even if the chat SSE connection was closed.
+    """
+    messages = await reflect_table("messages")
+    conversations = await reflect_table("conversations")
+    async with engine.begin() as conn:
+        # Guard: conversation must exist (manual tasks may reference nothing).
+        exists = (
+            await conn.execute(select(conversations.c.id).where(conversations.c.id == conversation_id))
+        ).first()
+        if not exists:
+            return
+        await conn.execute(
+            insert(messages).values(
+                organization_id=task.get("organization_id", "default"),
+                region=task.get("region", "us"),
+                conversation_id=conversation_id,
+                role="assistant",
+                content=content,
+                token_count=len(content.split()),
+            )
+        )
+        await conn.execute(
+            update(conversations)
+            .where(conversations.c.id == conversation_id)
+            .values(updated_at=datetime.now(timezone.utc))
+        )
+
+
 # ── Activity emission ─────────────────────────────────────────────────────────
 
 def activity_channel(task_id: str) -> str:
@@ -486,6 +606,7 @@ async def run_loop(
         except Exception as exc:
             logger.error("LLM error in agent loop for task %s: %s", task_id, exc)
             await save_task(task_id, status="failed", error=str(exc))
+            await _persist_to_conversation(task, f"The task stopped due to a model error: {exc}")
             await emit_activity(task_id, {"type": "task_failed", "error": f"LLM error: {exc}"})
             return {"error": str(exc)}
 
@@ -496,6 +617,9 @@ async def run_loop(
             await _checkpoint(task_id, history, iteration + 1,
                               status="complete", result=result,
                               completed_at=datetime.now(timezone.utc))
+            # Persist the answer to the conversation (source of truth, survives
+            # SSE disconnects). Only top-level conversation-triggered tasks.
+            await _persist_to_conversation(task, format_task_answer(result))
             await emit_activity(task_id, {"type": "task_complete", "result": result})
             return result
 
@@ -547,5 +671,9 @@ async def run_loop(
     # Max iterations exceeded
     error = "max_iterations_exceeded"
     await save_task(task_id, status="failed", error=error, completed_at=datetime.now(timezone.utc))
+    await _persist_to_conversation(
+        task, "The task ran for the maximum number of steps without finishing. "
+        "Try narrowing the goal or breaking it into smaller requests."
+    )
     await emit_activity(task_id, {"type": "task_failed", "error": error})
     return {"error": error}
