@@ -1057,12 +1057,16 @@ function ArtifactCard({ artifact }: { artifact: ArtifactRef }) {
   }
 
   async function handleOpen() {
+    // Open the tab synchronously (inside the click gesture) so popup blockers
+    // don't kill it, then point it at the blob once fetched.
+    const tab = window.open("about:blank", "_blank", "noopener,noreferrer");
     setBusy(true);
     const blob = await fetchBlob();
     setBusy(false);
-    if (!blob) return;
+    if (!blob) { tab?.close(); return; }
     const url = URL.createObjectURL(blob);
-    window.open(url, "_blank", "noopener,noreferrer");
+    if (tab) tab.location.href = url;
+    else window.open(url, "_blank", "noopener,noreferrer");  // fallback
     setTimeout(() => URL.revokeObjectURL(url), 60_000);
   }
 

@@ -221,6 +221,16 @@ async def emit_activity(
     await redis_client.publish(activity_channel(task_id), json.dumps(payload, default=str))
 
 
+async def publish_activity(task_id: str, event: dict[str, Any]) -> None:
+    """Publish a transient activity event to Redis WITHOUT writing audit_log.
+
+    Used for high-frequency heartbeats (e.g. 'thinking') that should drive the
+    live UI but must not bloat the append-only audit table.
+    """
+    payload = {"task_id": task_id, "ts": datetime.now(timezone.utc).isoformat(), **event}
+    await redis_client.publish(activity_channel(task_id), json.dumps(payload, default=str))
+
+
 # ── Message history ───────────────────────────────────────────────────────────
 
 def _agent_system_message() -> dict[str, Any]:
@@ -693,8 +703,9 @@ async def run_loop(
         # ── Ask the LLM ────────────────────────────────────────────────────
         # Heartbeat: the completion is non-streaming and can take many seconds
         # (e.g. generating a whole file in tool args). Tell the UI we're working
-        # so it shows "Thinking…" instead of a frozen caret.
-        await emit_activity(task_id, {"type": "thinking"})
+        # so it shows "Thinking…" instead of a frozen caret. Publish-only — this
+        # high-frequency signal must not bloat the append-only audit_log.
+        await publish_activity(task_id, {"type": "thinking"})
         try:
             final_text, calls = await _llm_step(history, effective_tools, effective_model)
         except Exception as exc:
