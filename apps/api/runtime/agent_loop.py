@@ -158,10 +158,13 @@ async def _save_assistant_message(conversation_id: str, content: str, task: dict
     """Insert the task's final answer as an assistant message in the conversation.
 
     This is the source of truth — it runs in the agent loop's background task,
-    so the result survives even if the chat SSE connection was closed.
+    so the result survives even if the chat SSE connection was closed. Any
+    artifacts this task produced are linked to the new message so they reload
+    on refresh.
     """
     messages = await reflect_table("messages")
     conversations = await reflect_table("conversations")
+    artifacts = await reflect_table("artifacts")
     async with engine.begin() as conn:
         # Guard: conversation must exist (manual tasks may reference nothing).
         exists = (
@@ -169,8 +172,9 @@ async def _save_assistant_message(conversation_id: str, content: str, task: dict
         ).first()
         if not exists:
             return
-        await conn.execute(
-            insert(messages).values(
+        result = await conn.execute(
+            insert(messages)
+            .values(
                 organization_id=task.get("organization_id", "default"),
                 region=task.get("region", "us"),
                 conversation_id=conversation_id,
@@ -178,11 +182,19 @@ async def _save_assistant_message(conversation_id: str, content: str, task: dict
                 content=content,
                 token_count=len(content.split()),
             )
+            .returning(messages.c.id)
         )
+        message_id = str(result.scalar_one())
         await conn.execute(
             update(conversations)
             .where(conversations.c.id == conversation_id)
             .values(updated_at=datetime.now(timezone.utc))
+        )
+        # Link this task's artifacts to the message for refresh-time grouping.
+        await conn.execute(
+            update(artifacts)
+            .where(artifacts.c.task_id == task["id"], artifacts.c.message_id.is_(None))
+            .values(message_id=message_id)
         )
 
 
@@ -370,6 +382,11 @@ async def _execute_tool(
             "tool": tool_name,
             "summary": result.summary,
         })
+        # A file write of a renderable type becomes a user-facing artifact.
+        if tool_name == "fs__write":
+            artifact = await _maybe_create_artifact(task, args)
+            if artifact:
+                await emit_activity(task_id, {"type": "artifact", **artifact})
     except ApprovalRequired:
         raise  # propagate — caller decides whether to gate
     except Exception as exc:
@@ -378,6 +395,66 @@ async def _execute_tool(
         await emit_activity(task_id, {"type": "tool_error", "tool": tool_name, "error": str(exc)})
 
     return {"role": "tool", "tool_call_id": call["id"], "name": tool_name, "content": content}
+
+
+# Renderable file extensions → (artifact kind, mime type).
+_RENDERABLE_EXT: dict[str, tuple[str, str]] = {
+    ".html": ("html", "text/html"),
+    ".htm": ("html", "text/html"),
+    ".md": ("markdown", "text/markdown"),
+    ".markdown": ("markdown", "text/markdown"),
+    ".css": ("code", "text/css"),
+    ".js": ("code", "text/javascript"),
+    ".json": ("data", "application/json"),
+    ".csv": ("data", "text/csv"),
+    ".svg": ("image", "image/svg+xml"),
+    ".py": ("code", "text/plain"),
+    ".txt": ("text", "text/plain"),
+}
+
+
+async def _maybe_create_artifact(task: dict[str, Any], args: dict[str, Any]) -> dict[str, Any] | None:
+    """Persist a renderable fs__write as a downloadable/openable artifact.
+
+    Returns an event payload {artifact_id, title, kind, mime_type, size_bytes}
+    for the activity stream, or None if the file is not a renderable type.
+    """
+    import os
+
+    path = str(args.get("path") or "")
+    file_content = args.get("content")
+    if not path or not isinstance(file_content, str):
+        return None
+    ext = os.path.splitext(path)[1].lower()
+    mapping = _RENDERABLE_EXT.get(ext)
+    if not mapping:
+        return None
+    kind, mime = mapping
+
+    from core.artifacts import save_artifact
+
+    try:
+        artifact_id = await save_artifact(
+            file_content,
+            kind=kind,
+            title=os.path.basename(path),
+            conversation_id=_conversation_id_for(task),
+            task_id=task["id"],
+            org_id=task.get("organization_id", "default"),
+            region=task.get("region", "us"),
+            mime_type=mime,
+        )
+    except Exception as exc:
+        logger.warning("Artifact creation failed for %s: %s", path, exc)
+        return None
+
+    return {
+        "artifact_id": artifact_id,
+        "title": os.path.basename(path),
+        "kind": kind,
+        "mime_type": mime,
+        "size_bytes": len(file_content.encode("utf-8")),
+    }
 
 
 async def _run_subagent(

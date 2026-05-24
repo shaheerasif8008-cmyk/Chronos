@@ -30,8 +30,10 @@ type Message = {
   status?: MessageStatus;
   created_at?: string;
   tool_traces?: ToolTrace[];
+  artifacts?: ArtifactRef[];
 };
 type ToolTrace = { id: string; tool: string; summary: string; status: MessageStatus };
+type ArtifactRef = { id: string; title: string; kind: string; mime_type?: string; size_bytes?: number };
 type MemoryEntry = { id: string; scope: string; scope_id: string; content: string; source: string; importance_score?: number; created_by?: string | null; created_at?: string };
 type Connector = {
   id: string;
@@ -711,9 +713,21 @@ function ChatScreen({
 
   useEffect(() => {
     if (!activeConvoId) { setMessages([]); return; }
-    apiFetch(`/chat/conversations/${activeConvoId}/messages`)
-      .then(r => r.json())
-      .then((data: Message[]) => setMessages(data))
+    // Load messages and artifacts together so artifacts reappear on refresh,
+    // grouped under the assistant message that produced them.
+    Promise.all([
+      apiFetch(`/chat/conversations/${activeConvoId}/messages`).then(r => r.json()),
+      apiFetch(`/artifacts?conversation_id=${activeConvoId}`).then(r => r.json()).catch(() => []),
+    ])
+      .then(([msgs, arts]: [Message[], Array<{ id: string; message_id?: string | null; title?: string; kind: string; mime_type?: string; size_bytes?: number }>]) => {
+        const byMessage = new Map<string, ArtifactRef[]>();
+        for (const a of arts || []) {
+          if (!a.message_id) continue;
+          const ref: ArtifactRef = { id: a.id, title: a.title ?? "artifact", kind: a.kind, mime_type: a.mime_type, size_bytes: a.size_bytes };
+          byMessage.set(a.message_id, [...(byMessage.get(a.message_id) ?? []), ref]);
+        }
+        setMessages(msgs.map(m => (m.id && byMessage.has(m.id) ? { ...m, artifacts: byMessage.get(m.id) } : m)));
+      })
       .catch(() => {});
   }, [activeConvoId]);
 
@@ -755,7 +769,8 @@ function ChatScreen({
           try {
             const ev = JSON.parse(line.slice(6)) as {
               type: string; content?: string; conversation_id?: string; task_id?: string;
-              event?: { type: string; tool?: string; summary?: string; error?: string; args_preview?: Record<string, unknown>; step?: { description?: string }; approval_ids?: string[] };
+              event?: { type: string; tool?: string; summary?: string; error?: string; args_preview?: Record<string, unknown>; step?: { description?: string }; approval_ids?: string[]; goal?: string };
+              artifact?: { artifact_id: string; title?: string; kind?: string; mime_type?: string; size_bytes?: number };
             };
             if (ev.type === "conversation" && ev.conversation_id) {
               convoId = ev.conversation_id;
@@ -793,6 +808,15 @@ function ChatScreen({
               } else if (traceType === "awaiting_approval") {
                 summary = `Waiting for approval on ${te.approval_ids?.length ?? 0} item(s)`;
                 traceStatus = "approval_pending";
+              } else if (traceType === "thinking") {
+                summary = te.summary ?? "Thinking…";
+                traceStatus = "streaming";
+              } else if (traceType === "sub_agent_spawned") {
+                summary = `Sub-agent: ${te.goal ?? "working"}`;
+                traceStatus = "streaming";
+              } else if (traceType === "sub_agent_complete") {
+                summary = `Sub-agent finished`;
+                traceStatus = "complete";
               }
               const traceId = `${traceType}-${tool}-${Date.now()}`;
               setMessages(prev => {
@@ -821,6 +845,23 @@ function ChatScreen({
                   }
                 }
                 return [...updated.slice(0, -1), { ...last, tool_traces: [...existing, { id: traceId, tool, summary, status: traceStatus }] }];
+              });
+            } else if (ev.type === "artifact" && ev.artifact) {
+              const a = ev.artifact;
+              const ref: ArtifactRef = {
+                id: a.artifact_id,
+                title: a.title ?? "artifact",
+                kind: a.kind ?? "file",
+                mime_type: a.mime_type,
+                size_bytes: a.size_bytes,
+              };
+              setMessages(prev => {
+                const updated = [...prev];
+                const last = updated[updated.length - 1];
+                if (last?.role !== "assistant") return updated;
+                const existing = last.artifacts ?? [];
+                if (existing.some(x => x.id === ref.id)) return updated;
+                return [...updated.slice(0, -1), { ...last, artifacts: [...existing, ref] }];
               });
             } else if (ev.type === "task_created" && ev.task_id) {
               setActiveTaskId(ev.task_id);
@@ -882,7 +923,7 @@ function ChatScreen({
               {messages.map((m, i) => (
                 m.role === "user"
                   ? <UserMessage key={i} content={m.content}/>
-                  : <AssistantMessage key={i} content={m.content} status={m.status ?? "complete"} persona={activePersona} toolTraces={m.tool_traces}/>
+                  : <AssistantMessage key={i} content={m.content} status={m.status ?? "complete"} persona={activePersona} toolTraces={m.tool_traces} artifacts={m.artifacts}/>
               ))}
               {streaming && messages[messages.length - 1]?.role !== "assistant" && (
                 <div className="flex gap-4">
@@ -996,7 +1037,68 @@ function TraceRow({ trace }: { trace: ToolTrace }) {
   );
 }
 
-function AssistantMessage({ content, status, persona, toolTraces }: { content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[] }) {
+function ArtifactCard({ artifact }: { artifact: ArtifactRef }) {
+  const [busy, setBusy] = useState(false);
+  const mime = artifact.mime_type ?? "";
+  const isOpenable = mime.startsWith("text/html") || mime.includes("svg") || mime.startsWith("image/");
+  const sizeLabel = artifact.size_bytes ? `${(artifact.size_bytes / 1024).toFixed(1)} KB` : "";
+
+  async function fetchBlob(): Promise<Blob | null> {
+    try {
+      const res = await apiFetch(`/artifacts/${artifact.id}/content`);
+      return await res.blob();
+    } catch { return null; }
+  }
+
+  async function handleOpen() {
+    setBusy(true);
+    const blob = await fetchBlob();
+    setBusy(false);
+    if (!blob) return;
+    const url = URL.createObjectURL(blob);
+    window.open(url, "_blank", "noopener,noreferrer");
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  }
+
+  async function handleDownload() {
+    setBusy(true);
+    const blob = await fetchBlob();
+    setBusy(false);
+    if (!blob) return;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = artifact.title;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5_000);
+  }
+
+  return (
+    <div className="rounded-xl border flex items-center gap-3 px-3.5 py-3"
+         style={{ borderColor: "var(--border)", background: "var(--surface)" }}>
+      <div className="w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0"
+           style={{ background: "var(--accent-soft)", color: "var(--accent-text)" }}>
+        <IC.Folder size={18}/>
+      </div>
+      <div className="flex-1 min-w-0">
+        <div className="text-[13.5px] font-medium truncate">{artifact.title}</div>
+        <div className="text-[11.5px]" style={{ color: "var(--text-dim)" }}>
+          {artifact.kind}{sizeLabel ? ` · ${sizeLabel}` : ""}
+        </div>
+      </div>
+      {isOpenable && (
+        <button onClick={handleOpen} disabled={busy} className="btn btn-secondary btn-sm">
+          <IC.External size={13}/> Open
+        </button>
+      )}
+      <button onClick={handleDownload} disabled={busy} className="btn btn-ghost btn-sm">Download</button>
+    </div>
+  );
+}
+
+function AssistantMessage({ content, status, persona, toolTraces, artifacts }: { content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[]; artifacts?: ArtifactRef[] }) {
   return (
     <div className="flex gap-4 fadein">
       <PersonaAvatar name={persona.name} color={persona.color} size={28}/>
@@ -1020,6 +1122,13 @@ function AssistantMessage({ content, status, persona, toolTraces }: { content: s
             {status === "streaming" && !content && toolTraces && toolTraces.length > 0
               ? null  /* traces visible; no extra caret until tokens arrive */
               : status === "streaming" && <span className="caret ml-0.5" style={{ borderLeft: "2px solid var(--text)" }}>&nbsp;</span>}
+          </div>
+        )}
+
+        {/* Artifacts — openable / downloadable files Chronos produced */}
+        {artifacts && artifacts.length > 0 && (
+          <div className="mt-3 space-y-2">
+            {artifacts.map(a => <ArtifactCard key={a.id} artifact={a} />)}
           </div>
         )}
 

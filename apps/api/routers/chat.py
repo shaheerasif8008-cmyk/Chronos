@@ -191,7 +191,10 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
 
             # Relay activity events as traces; stream the final answer as tokens.
             # Trace event types that are forwarded inline to the chat.
-            TRACE_TYPES = {"tool_call", "tool_result", "tool_error", "step_start", "step_done", "awaiting_approval"}
+            TRACE_TYPES = {
+                "tool_call", "tool_result", "tool_error", "step_start", "step_done",
+                "awaiting_approval", "sub_agent_spawned", "sub_agent_complete", "thinking",
+            }
             final_answer: str | None = None
 
             try:
@@ -206,6 +209,9 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
 
                     if event_type in TRACE_TYPES:
                         yield f"data: {json.dumps({'type': 'trace', 'event': event})}\n\n"
+
+                    elif event_type == "artifact":
+                        yield f"data: {json.dumps({'type': 'artifact', 'artifact': event})}\n\n"
 
                     elif event_type == "task_complete":
                         result = event.get("result") or {}
