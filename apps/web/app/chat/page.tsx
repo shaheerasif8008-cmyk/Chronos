@@ -2043,6 +2043,7 @@ function ConnectorsScreen() {
   const [busy, setBusy] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState("");
+  const [directoryOpen, setDirectoryOpen] = useState(false);
 
   async function load() {
     setLoading(true);
@@ -2118,7 +2119,12 @@ function ConnectorsScreen() {
 
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-y-auto">
-      <PageHeader title="Connectors" subtitle="Registry-backed connector actions available to Chronos."/>
+      <PageHeader
+        title="Connectors"
+        subtitle="Registry-backed connector actions available to Chronos."
+        right={<button onClick={() => setDirectoryOpen(true)} className="btn btn-accent btn-sm">Browse directory</button>}
+      />
+      {directoryOpen && <ConnectorDirectory onClose={() => setDirectoryOpen(false)} />}
 
       <div className="px-10 pb-10 space-y-6">
         {message && <div className="surface border border-soft rounded-lg px-4 py-3 text-[13px]" style={{ color: "var(--text-muted)" }}>{message}</div>}
@@ -2217,6 +2223,133 @@ function ConnectorsScreen() {
             </div>
           </div>
         </section>
+      </div>
+    </div>
+  );
+}
+
+// ─── Connector Directory (OAuth connect) ──────────────────────────────────────
+type DirectoryProvider = {
+  provider: string;
+  name: string;
+  description: string;
+  icon: string;
+  configured: boolean;
+  connected: boolean;
+  connector_id: string | null;
+  account_handle: string | null;
+  scopes?: string[];
+};
+
+function ConnectorDirectory({ onClose }: { onClose: () => void }) {
+  const [providers, setProviders] = useState<DirectoryProvider[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [note, setNote] = useState("");
+
+  async function load() {
+    setLoading(true);
+    try {
+      const data = await (await apiFetch("/connectors/directory")).json();
+      setProviders((data.providers ?? []) as DirectoryProvider[]);
+    } catch {
+      setNote("Unable to load the directory.");
+    } finally {
+      setLoading(false);
+    }
+  }
+  useEffect(() => { void load(); }, []);
+
+  // The OAuth popup signs in at the provider, then our callback page posts back
+  // here and closes itself. Only trust messages from the API origin.
+  useEffect(() => {
+    function onMsg(e: MessageEvent) {
+      if (e.origin !== apiBase()) return;
+      const d = e.data as { type?: string; ok?: boolean; provider?: string; message?: string };
+      if (d?.type !== "chronos:oauth") return;
+      if (d.ok) { setNote(`Connected ${d.provider ?? ""}.`); void load(); }
+      else { setNote(`Connection failed${d.message ? `: ${d.message}` : ""}.`); }
+    }
+    window.addEventListener("message", onMsg);
+    return () => window.removeEventListener("message", onMsg);
+  }, []);
+
+  async function connect(p: DirectoryProvider) {
+    setBusy(p.provider); setNote("");
+    try {
+      const res = await apiFetch(`/connectors/${p.provider}/connect`, { method: "POST" });
+      if (!res.ok) throw new Error(await res.text());
+      const { authorize_url } = await res.json();
+      // Keep the opener reference so the callback can postMessage back.
+      window.open(authorize_url, "chronos-oauth", "width=520,height=680");
+    } catch (e) {
+      setNote(e instanceof Error ? e.message : "Could not start the connection.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function disconnect(p: DirectoryProvider) {
+    if (!p.connector_id) return;
+    setBusy(p.provider); setNote("");
+    try {
+      const res = await apiFetch(`/connectors/${p.connector_id}/disconnect`, { method: "POST" });
+      if (!res.ok) throw new Error(await res.text());
+      setNote(`Disconnected ${p.name}.`);
+      await load();
+    } catch (e) {
+      setNote(e instanceof Error ? e.message : "Disconnect failed.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-6" style={{ background: "rgba(0,0,0,0.45)" }} onClick={onClose}>
+      <div
+        className="w-full max-w-3xl max-h-[82vh] overflow-hidden rounded-2xl border flex flex-col"
+        style={{ background: "var(--surface)", borderColor: "var(--border)" }}
+        onClick={e => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between px-6 py-4 border-b" style={{ borderColor: "var(--border)" }}>
+          <div>
+            <h2 className="text-[18px] font-semibold">Directory</h2>
+            <p className="text-[12.5px]" style={{ color: "var(--text-dim)" }}>Official connectors — sign in to connect.</p>
+          </div>
+          <button onClick={onClose} className="btn btn-ghost btn-sm">Close</button>
+        </div>
+        {note && <div className="px-6 pt-3 text-[12.5px]" style={{ color: "var(--text-muted)" }}>{note}</div>}
+        <div className="overflow-y-auto px-6 py-5">
+          {loading ? (
+            <p className="text-[13px]" style={{ color: "var(--text-dim)" }}>Loading…</p>
+          ) : (
+            <div className="grid grid-cols-2 gap-3">
+              {providers.map(p => (
+                <div key={p.provider} className="rounded-xl border p-4 flex flex-col gap-2" style={{ borderColor: "var(--border)" }}>
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="text-[14.5px] font-medium">{p.name}</span>
+                      {p.connected && <Tag variant="ok">Connected</Tag>}
+                    </div>
+                    <p className="text-[12.5px] mt-0.5" style={{ color: "var(--text-dim)" }}>{p.description}</p>
+                    {p.connected && p.account_handle && (
+                      <p className="text-[11.5px] mt-1" style={{ color: "var(--text-dim)" }}>{p.account_handle}</p>
+                    )}
+                  </div>
+                  <div className="mt-auto pt-1">
+                    {p.connected ? (
+                      <button disabled={busy === p.provider} onClick={() => void disconnect(p)} className="btn btn-danger-soft btn-sm disabled:opacity-50">Disconnect</button>
+                    ) : p.configured ? (
+                      <button disabled={busy === p.provider} onClick={() => void connect(p)} className="btn btn-accent btn-sm disabled:opacity-50">Connect</button>
+                    ) : (
+                      <button disabled title="This provider's OAuth credentials are not configured on the server." className="btn btn-secondary btn-sm opacity-60 cursor-not-allowed">Configure credentials</button>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
