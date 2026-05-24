@@ -1043,40 +1043,124 @@ function TraceRow({ trace }: { trace: ToolTrace }) {
   );
 }
 
+// How an artifact should be previewed inline, or null if it isn't renderable.
+type RenderMode = "html" | "image" | "text";
+function artifactRenderMode(artifact: ArtifactRef): RenderMode | null {
+  const mime = (artifact.mime_type ?? "").toLowerCase();
+  const kind = (artifact.kind ?? "").toLowerCase();
+  if (mime === "text/html" || kind === "html") return "html";
+  if (mime.startsWith("image/")) return "image";  // incl. svg — <img> never runs scripts
+  if (
+    mime.startsWith("text/") || mime === "application/json" ||
+    kind === "markdown" || kind === "code" || kind === "data" || kind === "text"
+  ) return "text";
+  return null;
+}
+
+// Injected into every sandboxed preview so it can report its content height to
+// the parent. The iframe runs in an opaque origin (no allow-same-origin), so it
+// can postMessage but cannot touch the app's DOM, cookies, or token.
+const _HEIGHT_REPORTER =
+  "<scr" + "ipt>(function(){function p(){try{var h=Math.max(" +
+  "document.documentElement.scrollHeight||0,document.body?document.body.scrollHeight:0);" +
+  "parent.postMessage({type:'chronos:artifact-height',height:h},'*');}catch(e){}}" +
+  "try{new ResizeObserver(p).observe(document.documentElement);}catch(e){}" +
+  "window.addEventListener('load',p);setTimeout(p,60);setTimeout(p,400);})();</scr" + "ipt>";
+
+function _escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+function _textShell(text: string): string {
+  return (
+    "<!doctype html><meta charset='utf-8'>" +
+    "<style>body{margin:0;padding:14px;color:#1f2328;background:#fff;" +
+    "font:13px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;" +
+    "white-space:pre-wrap;word-break:break-word;}</style><pre>" +
+    _escapeHtml(text) + "</pre>" + _HEIGHT_REPORTER
+  );
+}
+
+// Renders an artifact inline. HTML is shown in a sandboxed iframe (scripts run,
+// but in an opaque origin with no access to the parent). Images render via a
+// blob <img> (never executes scripts). Text/code/markdown/data render as escaped
+// monospace inside the same sandbox.
+function ArtifactInline({ artifact, mode }: { artifact: ArtifactRef; mode: RenderMode }) {
+  const [srcDoc, setSrcDoc] = useState<string | null>(null);
+  const [imgUrl, setImgUrl] = useState<string | null>(null);
+  const [error, setError] = useState(false);
+  const [height, setHeight] = useState(320);
+  const frameRef = useRef<HTMLIFrameElement>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    let objectUrl: string | null = null;
+    (async () => {
+      try {
+        const res = await apiFetch(`/artifacts/${artifact.id}/content`);
+        if (mode === "image") {
+          const url = URL.createObjectURL(await res.blob());
+          objectUrl = url;
+          if (!cancelled) setImgUrl(url);
+        } else {
+          const text = await res.text();
+          if (!cancelled) setSrcDoc(mode === "html" ? text + _HEIGHT_REPORTER : _textShell(text));
+        }
+      } catch {
+        if (!cancelled) setError(true);
+      }
+    })();
+    return () => { cancelled = true; if (objectUrl) URL.revokeObjectURL(objectUrl); };
+  }, [artifact.id, mode]);
+
+  // Trust only the numeric height from our own frame, and clamp it.
+  useEffect(() => {
+    function onMsg(e: MessageEvent) {
+      if (!frameRef.current || e.source !== frameRef.current.contentWindow) return;
+      const data = e.data as { type?: string; height?: unknown };
+      if (data?.type !== "chronos:artifact-height") return;
+      const h = Number(data.height);
+      if (Number.isFinite(h)) setHeight(Math.min(1400, Math.max(120, Math.ceil(h))));
+    }
+    window.addEventListener("message", onMsg);
+    return () => window.removeEventListener("message", onMsg);
+  }, []);
+
+  if (error) {
+    return <div className="text-[12px] px-1 py-1.5" style={{ color: "var(--text-dim)" }}>Couldn&apos;t load preview — try Download.</div>;
+  }
+  if (mode === "image") {
+    return imgUrl
+      ? <img src={imgUrl} alt={artifact.title} style={{ maxWidth: "100%", display: "block", borderRadius: 8 }} />
+      : <div className="shimmer-text text-[12px] px-1 py-2" style={{ color: "var(--text-dim)" }}>Loading preview…</div>;
+  }
+  if (srcDoc === null) {
+    return <div className="shimmer-text text-[12px] px-1 py-2" style={{ color: "var(--text-dim)" }}>Loading preview…</div>;
+  }
+  return (
+    <iframe
+      ref={frameRef}
+      title={artifact.title}
+      srcDoc={srcDoc}
+      sandbox="allow-scripts"
+      style={{ width: "100%", height, border: "none", borderRadius: 8, background: "#fff" }}
+    />
+  );
+}
+
 function ArtifactCard({ artifact }: { artifact: ArtifactRef }) {
   const [busy, setBusy] = useState(false);
-  const mime = artifact.mime_type ?? "";
-  // Only open raster images inline. HTML and SVG are model/tool-generated and
-  // untrusted; opening them via a same-origin blob URL would execute their
-  // scripts under the app origin (e.g. exfiltrating the bearer token from
-  // localStorage). Those remain downloadable, just not openable in-tab.
-  const isOpenable = mime.startsWith("image/") && !mime.includes("svg");
+  const mode = artifactRenderMode(artifact);
+  // Auto-expand the high-impact visual kinds; keep code/data behind a toggle.
+  const [open, setOpen] = useState(mode === "html" || mode === "image");
   const sizeLabel = artifact.size_bytes ? `${(artifact.size_bytes / 1024).toFixed(1)} KB` : "";
-
-  async function fetchBlob(): Promise<Blob | null> {
-    try {
-      const res = await apiFetch(`/artifacts/${artifact.id}/content`);
-      return await res.blob();
-    } catch { return null; }
-  }
-
-  async function handleOpen() {
-    // Open the tab synchronously (inside the click gesture) so popup blockers
-    // don't kill it, then point it at the blob once fetched.
-    const tab = window.open("about:blank", "_blank", "noopener,noreferrer");
-    setBusy(true);
-    const blob = await fetchBlob();
-    setBusy(false);
-    if (!blob) { tab?.close(); return; }
-    const url = URL.createObjectURL(blob);
-    if (tab) tab.location.href = url;
-    else window.open(url, "_blank", "noopener,noreferrer");  // fallback
-    setTimeout(() => URL.revokeObjectURL(url), 60_000);
-  }
 
   async function handleDownload() {
     setBusy(true);
-    const blob = await fetchBlob();
+    let blob: Blob | null = null;
+    try {
+      const res = await apiFetch(`/artifacts/${artifact.id}/content`);
+      blob = await res.blob();
+    } catch { /* ignore */ }
     setBusy(false);
     if (!blob) return;
     const url = URL.createObjectURL(blob);
@@ -1090,24 +1174,31 @@ function ArtifactCard({ artifact }: { artifact: ArtifactRef }) {
   }
 
   return (
-    <div className="rounded-xl border flex items-center gap-3 px-3.5 py-3"
+    <div className="rounded-xl border overflow-hidden"
          style={{ borderColor: "var(--border)", background: "var(--surface)" }}>
-      <div className="w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0"
-           style={{ background: "var(--accent-soft)", color: "var(--accent-text)" }}>
-        <IC.Folder size={18}/>
-      </div>
-      <div className="flex-1 min-w-0">
-        <div className="text-[13.5px] font-medium truncate">{artifact.title}</div>
-        <div className="text-[11.5px]" style={{ color: "var(--text-dim)" }}>
-          {artifact.kind}{sizeLabel ? ` · ${sizeLabel}` : ""}
+      <div className="flex items-center gap-3 px-3.5 py-3">
+        <div className="w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0"
+             style={{ background: "var(--accent-soft)", color: "var(--accent-text)" }}>
+          <IC.Folder size={18}/>
         </div>
+        <div className="flex-1 min-w-0">
+          <div className="text-[13.5px] font-medium truncate">{artifact.title}</div>
+          <div className="text-[11.5px]" style={{ color: "var(--text-dim)" }}>
+            {artifact.kind}{sizeLabel ? ` · ${sizeLabel}` : ""}
+          </div>
+        </div>
+        {mode && (
+          <button onClick={() => setOpen(o => !o)} className="btn btn-ghost btn-sm">
+            <IC.Eye size={13}/> {open ? "Hide" : "Preview"}
+          </button>
+        )}
+        <button onClick={handleDownload} disabled={busy} className="btn btn-ghost btn-sm">Download</button>
       </div>
-      {isOpenable && (
-        <button onClick={handleOpen} disabled={busy} className="btn btn-secondary btn-sm">
-          <IC.External size={13}/> Open
-        </button>
+      {open && mode && (
+        <div className="px-2.5 pb-2.5 pt-0.5 border-t" style={{ borderColor: "var(--border)" }}>
+          <ArtifactInline artifact={artifact} mode={mode}/>
+        </div>
       )}
-      <button onClick={handleDownload} disabled={busy} className="btn btn-ghost btn-sm">Download</button>
     </div>
   );
 }
