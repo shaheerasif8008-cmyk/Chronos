@@ -15,7 +15,6 @@ from core.db import engine, reflect_table
 from core.models import Member
 from core.redis import redis_client
 from runtime.executor import TaskExecutor, activity_channel
-from runtime.planner import create_plan
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
@@ -35,8 +34,8 @@ async def create_task_record(
     persona_id: str | None = None,
     workspace_id: str | None = None,
 ) -> str:
+    """Insert a task row.  No upfront plan — the native agent loop plans dynamically."""
     await permissions.check(member, "create_task", workspace_id or "default")
-    plan = await create_plan(goal, {"triggered_by": triggered_by}, member.organization_id)
     tasks = await reflect_table("tasks")
     async with engine.begin() as conn:
         result = await conn.execute(
@@ -50,8 +49,8 @@ async def create_task_record(
                 triggered_by_member_id=member.id,
                 status="pending",
                 goal=goal,
-                plan=plan,
-                agent_state={"agent_history": [], "pending_agent_approval": False},
+                plan={},                              # agent loop builds plan dynamically
+                agent_state={"agent_history": [], "iteration_count": 0},
                 current_step=0,
                 result={},
                 depth=0,

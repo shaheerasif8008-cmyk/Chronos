@@ -1,0 +1,551 @@
+"""
+Native agent loop — mirrors Claude Code's approach.
+
+No upfront plan. The LLM emits tool_use blocks, Chronos executes them
+via the ToolBroker, results come back as tool messages, and the LLM
+decides the next move. Loop continues until the LLM emits a final text
+response (no tool calls) or MAX_ITERATIONS is hit.
+
+Multiple tool calls in a single LLM response are executed in parallel
+via asyncio.gather(), matching Claude Code's native parallel tool use.
+
+State stored in tasks.agent_state:
+    {
+        "agent_history": [...],   # full message list for resume
+        "iteration_count": int,
+        "pending_approval_calls": [...],   # set while awaiting_approval
+    }
+
+The tasks table still exists for persistence and observability — it stores
+loop state (messages + tool results) rather than a pre-generated JSON plan.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+import litellm
+from sqlalchemy import insert, select, update
+
+from core import audit, permissions, tool_broker
+from core.config import settings
+from core.db import engine, reflect_table
+from core.exceptions import ApprovalRequired
+from core.llm import _message_content, _message, _tool_calls, _with_retry, model_kwargs
+from core.models import AgentContext
+from core.redis import redis_client
+from runtime.tool_registry import (
+    ALL_TOOLS,
+    ALWAYS_APPROVAL_TOOL_NAMES,
+    SUBAGENT_TOOLS,
+    _SUBAGENT_TOOL_NAME,
+    to_broker_name,
+)
+
+logger = logging.getLogger(__name__)
+
+MAX_ITERATIONS = 40
+MAX_DEPTH = 3
+
+
+# ── DB helpers ────────────────────────────────────────────────────────────────
+
+async def get_task(task_id: str) -> dict[str, Any] | None:
+    tasks = await reflect_table("tasks")
+    async with engine.begin() as conn:
+        row = (await conn.execute(select(tasks).where(tasks.c.id == task_id))).mappings().first()
+    return dict(row) if row else None
+
+
+async def save_task(task_id: str, **values: Any) -> None:
+    tasks = await reflect_table("tasks")
+    async with engine.begin() as conn:
+        await conn.execute(update(tasks).where(tasks.c.id == task_id).values(**values))
+
+
+# ── Activity emission ─────────────────────────────────────────────────────────
+
+def activity_channel(task_id: str) -> str:
+    return f"activity:{task_id}"
+
+
+async def emit_activity(
+    task_id: str,
+    event: dict[str, Any],
+    actor_id: str | None = "chronos",
+) -> None:
+    payload = {"task_id": task_id, "ts": datetime.now(timezone.utc).isoformat(), **event}
+    await audit.log(
+        "activity",
+        actor_id,
+        payload.get("type", "activity"),
+        resource_type="tasks",
+        resource_id=task_id,
+        payload=payload,
+    )
+    await redis_client.publish(activity_channel(task_id), json.dumps(payload, default=str))
+
+
+# ── Message history ───────────────────────────────────────────────────────────
+
+def _agent_system_message() -> dict[str, Any]:
+    return {
+        "role": "system",
+        "content": (
+            "You are Chronos running an autonomous enterprise task. "
+            "Use the available tools to accomplish the goal. "
+            "You may call multiple independent tools in parallel in a single response. "
+            "When you have gathered enough information to fully answer the goal, respond with "
+            "a clear final answer — do not make unnecessary additional tool calls. "
+            "All external actions are governed by the broker; some require human approval. "
+            "Be direct and operational."
+        ),
+    }
+
+
+def _load_history(task: dict[str, Any]) -> list[dict[str, Any]]:
+    state = task.get("agent_state") or {}
+    if isinstance(state, dict):
+        history = state.get("agent_history") or []
+        if isinstance(history, list) and history:
+            return list(history)
+    # Fresh start
+    return [
+        _agent_system_message(),
+        {"role": "user", "content": str(task["goal"])},
+    ]
+
+
+async def _checkpoint(task_id: str, history: list[dict[str, Any]], iteration: int, **extra: Any) -> None:
+    state = {"agent_history": history, "iteration_count": iteration}
+    await save_task(task_id, agent_state=state, iteration_count=iteration, **extra)
+
+
+# ── LLM step ──────────────────────────────────────────────────────────────────
+
+async def _llm_step(
+    history: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    model: str,
+) -> tuple[str | None, list[dict[str, Any]]]:
+    """Call the LLM and return (final_text | None, list_of_tool_calls).
+
+    Returns:
+        final_text: The text response if the LLM is done calling tools.
+        tool_calls: Normalised list of tool call dicts if the LLM wants to act.
+    """
+    kwargs = model_kwargs(model, messages=history, stream=False)
+    kwargs["tools"] = tools
+    kwargs["tool_choice"] = "auto"
+    response = await _with_retry(lambda: litellm.acompletion(**kwargs))
+
+    msg = _message(response)
+    raw_calls = _tool_calls(msg)
+    text = _message_content(response)
+
+    if raw_calls:
+        return None, _normalise_calls(raw_calls)
+    return (text or ""), []
+
+
+def _normalise_calls(raw_calls: list[Any]) -> list[dict[str, Any]]:
+    """Normalise litellm tool_call objects into plain dicts."""
+    result: list[dict[str, Any]] = []
+    for i, call in enumerate(raw_calls):
+        if isinstance(call, dict):
+            fn = call.get("function") or {}
+            result.append({
+                "id": call.get("id") or f"call_{i}",
+                "name": fn.get("name") or "",
+                "args_str": fn.get("arguments") or "{}",
+            })
+        else:
+            result.append({
+                "id": getattr(call, "id", f"call_{i}"),
+                "name": call.function.name,
+                "args_str": call.function.arguments or "{}",
+            })
+    return result
+
+
+def _serialise_assistant(raw_calls: list[dict[str, Any]], text: str | None) -> dict[str, Any]:
+    """Build a JSON-serialisable assistant message with tool_calls."""
+    msg: dict[str, Any] = {"role": "assistant", "content": text or ""}
+    if raw_calls:
+        msg["tool_calls"] = [
+            {
+                "id": c["id"],
+                "type": "function",
+                "function": {"name": c["name"], "arguments": c["args_str"]},
+            }
+            for c in raw_calls
+        ]
+    return msg
+
+
+def _parse_args(args_str: str | dict) -> dict[str, Any]:
+    if isinstance(args_str, dict):
+        return args_str
+    try:
+        parsed = json.loads(args_str)
+        return parsed if isinstance(parsed, dict) else {}
+    except (json.JSONDecodeError, ValueError):
+        return {}
+
+
+def _args_preview(args: dict[str, Any]) -> dict[str, Any]:
+    sensitive = {"body", "content", "code", "password", "token", "secret"}
+    return {k: "[omitted]" if k.lower() in sensitive else v for k, v in args.items()}
+
+
+# ── Tool execution ────────────────────────────────────────────────────────────
+
+async def _execute_tool(
+    call: dict[str, Any],
+    task: dict[str, Any],
+    agent: AgentContext,
+) -> dict[str, Any]:
+    """Execute one tool call.  Returns a tool-role message for the history.
+
+    Raises ApprovalRequired if the broker gates the call.
+    """
+    tool_name = call["name"]
+    args = _parse_args(call["args_str"])
+    task_id = task["id"]
+    depth = int(task.get("depth") or 0)
+
+    await emit_activity(task_id, {
+        "type": "tool_call",
+        "tool": tool_name,
+        "args_preview": _args_preview(args),
+    })
+
+    # spawn__subagent is handled here, not via the broker
+    if tool_name == _SUBAGENT_TOOL_NAME:
+        try:
+            result_data = await _run_subagent(task, args, depth)
+            content = json.dumps(result_data, default=str)
+            await emit_activity(task_id, {
+                "type": "tool_result",
+                "tool": tool_name,
+                "summary": f"Sub-agent finished: {str(args.get('goal', ''))[:60]}",
+            })
+        except Exception as exc:
+            logger.warning("Sub-agent failed: %s", exc)
+            content = json.dumps({"error": str(exc)})
+            await emit_activity(task_id, {"type": "tool_error", "tool": tool_name, "error": str(exc)})
+        return {"role": "tool", "tool_call_id": call["id"], "name": tool_name, "content": content}
+
+    # All other tools go through the ToolBroker
+    broker_name = to_broker_name(tool_name)
+    try:
+        result = await tool_broker.execute(agent, broker_name, args)
+        payload = {"summary": result.summary, "data": result.data}
+        content = json.dumps(payload, default=str)
+        await emit_activity(task_id, {
+            "type": "tool_result",
+            "tool": tool_name,
+            "summary": result.summary,
+        })
+    except ApprovalRequired:
+        raise  # propagate — caller decides whether to gate
+    except Exception as exc:
+        logger.warning("Tool %s error: %s", tool_name, exc)
+        content = json.dumps({"error": str(exc)})
+        await emit_activity(task_id, {"type": "tool_error", "tool": tool_name, "error": str(exc)})
+
+    return {"role": "tool", "tool_call_id": call["id"], "name": tool_name, "content": content}
+
+
+async def _run_subagent(
+    parent_task: dict[str, Any],
+    args: dict[str, Any],
+    parent_depth: int,
+) -> dict[str, Any]:
+    """Create a child task and run a nested agent loop for it."""
+    if parent_depth >= MAX_DEPTH:
+        raise ValueError(f"Sub-agent depth limit ({MAX_DEPTH}) reached — cannot spawn further.")
+
+    goal = str(args.get("goal") or "No goal specified")
+    model_tier = str(args.get("model") or "agent")
+    child_model = settings.agent_model if model_tier == "agent" else settings.fast_model
+
+    tasks = await reflect_table("tasks")
+    now = datetime.now(timezone.utc)
+    async with engine.begin() as conn:
+        result = await conn.execute(
+            insert(tasks)
+            .values(
+                organization_id=parent_task["organization_id"],
+                region=parent_task.get("region", "us"),
+                parent_task_id=parent_task["id"],
+                triggered_by=f"task:{parent_task['id']}",
+                triggered_by_member_id=parent_task.get("triggered_by_member_id"),
+                status="running",
+                goal=goal,
+                plan={},
+                agent_state={"agent_history": [], "iteration_count": 0},
+                current_step=0,
+                result={},
+                depth=parent_depth + 1,
+                started_at=now,
+            )
+            .returning(tasks.c.id)
+        )
+        child_id = str(result.scalar_one())
+
+    child_task = await get_task(child_id)
+    if not child_task:
+        raise RuntimeError("Failed to create child task")
+
+    await emit_activity(parent_task["id"], {
+        "type": "sub_agent_spawned",
+        "sub_task_id": child_id,
+        "goal": goal,
+    })
+
+    final_result = await run_loop(child_task, tools=SUBAGENT_TOOLS, model=child_model)
+
+    await emit_activity(parent_task["id"], {
+        "type": "sub_agent_complete",
+        "sub_task_id": child_id,
+        "result": final_result,
+    })
+    return final_result
+
+
+# ── Approval gating ───────────────────────────────────────────────────────────
+
+def _needs_approval(tool_name: str) -> bool:
+    return tool_name in ALWAYS_APPROVAL_TOOL_NAMES
+
+
+async def _open_approval_gate(
+    task: dict[str, Any],
+    pending_calls: list[dict[str, Any]],
+    history: list[dict[str, Any]],
+    iteration: int,
+) -> None:
+    """Persist state and create approval records; set task to awaiting_approval."""
+    task_id = task["id"]
+    approvals = await reflect_table("approvals")
+    now = datetime.now(timezone.utc)
+    approval_ids: list[str] = []
+
+    async with engine.begin() as conn:
+        for call in pending_calls:
+            broker_name = to_broker_name(call["name"])
+            args = _parse_args(call["args_str"])
+            payload = {
+                "tool": broker_name,
+                "args": args,
+                "call_id": call["id"],
+                "agent_loop": True,
+                "justification": f"Chronos requested permission to call {broker_name}.",
+            }
+            row = await conn.execute(
+                insert(approvals)
+                .values(
+                    organization_id=task["organization_id"],
+                    region=task.get("region", "us"),
+                    task_id=task_id,
+                    step_id="agent_loop",
+                    action_type=broker_name,
+                    action_payload=payload,
+                    expires_at=now + timedelta(hours=24),
+                )
+                .returning(approvals.c.id)
+            )
+            approval_ids.append(str(row.scalar_one()))
+
+    state = {
+        "agent_history": history,
+        "iteration_count": iteration,
+        "pending_approval_calls": pending_calls,
+    }
+    await save_task(task_id, agent_state=state, iteration_count=iteration, status="awaiting_approval")
+    await emit_activity(task_id, {
+        "type": "awaiting_approval",
+        "approval_ids": approval_ids,
+        "step_id": "agent_loop",
+    })
+
+
+# ── Resume after approval ─────────────────────────────────────────────────────
+
+async def resume_after_approval(task_id: str) -> None:
+    """Resume a loop that paused for approval.  Called by the approvals router."""
+    task = await get_task(task_id)
+    if not task:
+        return
+    if task["status"] not in {"awaiting_approval", "paused"}:
+        return
+
+    state = task.get("agent_state") or {}
+    history = state.get("agent_history") or _load_history(task)
+    iteration = int(state.get("iteration_count") or 0)
+    pending_calls: list[dict[str, Any]] = state.get("pending_approval_calls") or []
+    agent = AgentContext.from_task(task)
+
+    # Load approval rows
+    approvals = await reflect_table("approvals")
+    async with engine.begin() as conn:
+        rows = (
+            await conn.execute(
+                select(approvals).where(
+                    approvals.c.task_id == task_id,
+                    approvals.c.step_id == "agent_loop",
+                )
+            )
+        ).mappings().all()
+    rows = [dict(r) for r in rows]
+
+    pending = [r for r in rows if r["status"] == "pending"]
+    if pending:
+        return  # still waiting on a human
+
+    # Process each approval decision
+    for row in rows:
+        payload = dict(row.get("action_payload") or {})
+        if payload.get("execution_result") or payload.get("execution_error") or payload.get("rejection_result"):
+            continue  # already processed
+
+        broker_name = payload.get("tool") or row["action_type"]
+        call_id = payload.get("call_id") or row["id"]
+        args = payload.get("args") or {}
+
+        if row["status"] == "rejected":
+            content = json.dumps({"status": "rejected", "reason": row.get("decision_note")})
+            history.append({"role": "tool", "tool_call_id": call_id, "name": broker_name, "content": content})
+            await _mark_approval(row["id"], {**payload, "rejection_result": True}, approvals)
+            await emit_activity(task_id, {"type": "approval_rejected", "approval_id": row["id"]})
+            continue
+
+        # approved → execute
+        try:
+            result = await tool_broker.execute(agent, broker_name, {**args, "__approved_by_gate": True})
+            result_data = {"summary": result.summary, "data": result.data}
+            content = json.dumps(result_data, default=str)
+            await _mark_approval(row["id"], {**payload, "execution_result": result_data}, approvals)
+            await emit_activity(task_id, {"type": "tool_result", "tool": broker_name, "summary": result.summary})
+        except Exception as exc:
+            content = json.dumps({"error": str(exc)})
+            await _mark_approval(row["id"], {**payload, "execution_error": str(exc)}, approvals)
+            await emit_activity(task_id, {"type": "tool_error", "tool": broker_name, "error": str(exc)})
+
+        history.append({"role": "tool", "tool_call_id": call_id, "name": broker_name, "content": content})
+
+    # Clear pending state and continue
+    new_state = {"agent_history": history, "iteration_count": iteration}
+    await save_task(task_id, agent_state=new_state, status="running")
+    refreshed = await get_task(task_id)
+    if refreshed:
+        await run_loop(refreshed)
+
+
+async def _mark_approval(approval_id: str, payload: dict[str, Any], approvals_table: Any) -> None:
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(approvals_table).where(approvals_table.c.id == approval_id).values(action_payload=payload)
+        )
+
+
+# ── Core loop ─────────────────────────────────────────────────────────────────
+
+async def run_loop(
+    task: dict[str, Any],
+    *,
+    tools: list[dict[str, Any]] | None = None,
+    model: str | None = None,
+) -> dict[str, Any]:
+    """
+    Native agent loop.  Runs until the LLM delivers a final text answer
+    or MAX_ITERATIONS is exceeded.  Returns the final result dict.
+
+    - tools: defaults to ALL_TOOLS (sub-agents pass SUBAGENT_TOOLS)
+    - model: defaults to settings.agent_model
+    """
+    task_id = task["id"]
+    effective_tools = tools if tools is not None else ALL_TOOLS
+    effective_model = model or settings.agent_model
+    agent = AgentContext.from_task(task)
+
+    history = _load_history(task)
+    iteration = int(task.get("iteration_count") or 0)
+
+    await save_task(task_id, status="running",
+                    started_at=task.get("started_at") or datetime.now(timezone.utc))
+
+    while iteration < MAX_ITERATIONS:
+        # ── Ask the LLM ────────────────────────────────────────────────────
+        try:
+            final_text, calls = await _llm_step(history, effective_tools, effective_model)
+        except Exception as exc:
+            logger.error("LLM error in agent loop for task %s: %s", task_id, exc)
+            await save_task(task_id, status="failed", error=str(exc))
+            await emit_activity(task_id, {"type": "task_failed", "error": f"LLM error: {exc}"})
+            return {"error": str(exc)}
+
+        # ── Final answer ────────────────────────────────────────────────────
+        if not calls:
+            result = {"answer": final_text or ""}
+            history.append({"role": "assistant", "content": final_text or ""})
+            await _checkpoint(task_id, history, iteration + 1,
+                              status="complete", result=result,
+                              completed_at=datetime.now(timezone.utc))
+            await emit_activity(task_id, {"type": "task_complete", "result": result})
+            return result
+
+        iteration += 1
+
+        # Append assistant message with tool_calls to history
+        history.append(_serialise_assistant(calls, None))
+
+        # ── Check for always-approval tools ────────────────────────────────
+        approval_needed = [c for c in calls if _needs_approval(c["name"])]
+        if approval_needed:
+            await _open_approval_gate(task, approval_needed, history, iteration)
+            return {"status": "awaiting_approval"}
+
+        # ── Execute tool calls (parallel if multiple) ───────────────────────
+        if len(calls) == 1:
+            try:
+                tool_msg = await _execute_tool(calls[0], task, agent)
+            except ApprovalRequired:
+                await _open_approval_gate(task, calls, history, iteration)
+                return {"status": "awaiting_approval"}
+            history.append(tool_msg)
+        else:
+            # Parallel execution — gather all results concurrently
+            raw_results = await asyncio.gather(
+                *[_execute_tool(c, task, agent) for c in calls],
+                return_exceptions=True,
+            )
+            approval_hit = next(
+                (r for r in raw_results if isinstance(r, ApprovalRequired)), None
+            )
+            if approval_hit:
+                await _open_approval_gate(task, calls, history, iteration)
+                return {"status": "awaiting_approval"}
+            for r in raw_results:
+                if isinstance(r, Exception):
+                    history.append({
+                        "role": "tool",
+                        "tool_call_id": "error",
+                        "name": "error",
+                        "content": json.dumps({"error": str(r)}),
+                    })
+                else:
+                    history.append(r)
+
+        # Persist after every iteration
+        await _checkpoint(task_id, history, iteration, current_step=iteration)
+
+    # Max iterations exceeded
+    error = "max_iterations_exceeded"
+    await save_task(task_id, status="failed", error=error, completed_at=datetime.now(timezone.utc))
+    await emit_activity(task_id, {"type": "task_failed", "error": error})
+    return {"error": error}
