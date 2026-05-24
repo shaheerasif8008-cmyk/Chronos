@@ -109,7 +109,9 @@ async def test_complete_json_falls_back_to_main_model_after_fast_failure(monkeyp
 
     async def fake_completion(**kwargs):
         calls.append(kwargs)
-        if len(calls) == 1:
+        # The fast model is rate-limited on every attempt (exhausting _with_retry's
+        # backoff retries); the agent model succeeds on fallback.
+        if kwargs["model"] == "openrouter/minimax/minimax-m2.5:free":
             raise llm.litellm.RateLimitError(
                 message="temporarily rate-limited upstream",
                 llm_provider="openrouter",
@@ -117,7 +119,11 @@ async def test_complete_json_falls_back_to_main_model_after_fast_failure(monkeyp
             )
         return {"choices": [{"message": {"content": '{"mode":"chat"}'}}]}
 
+    async def no_sleep(*args, **kwargs):
+        return None
+
     monkeypatch.setattr(llm.litellm, "acompletion", fake_completion)
+    monkeypatch.setattr(llm.asyncio, "sleep", no_sleep)  # don't actually back off
     monkeypatch.setattr(llm.settings, "fast_model", "openrouter/minimax/minimax-m2.5:free")
     monkeypatch.setattr(llm.settings, "agent_model", "openrouter/deepseek/deepseek-v4-pro")
     monkeypatch.setattr(llm.settings, "openrouter_api_key", "or-test-key")
@@ -127,7 +133,8 @@ async def test_complete_json_falls_back_to_main_model_after_fast_failure(monkeyp
     assert result == '{"mode":"chat"}'
     assert calls[0]["model"] == "openrouter/minimax/minimax-m2.5:free"
     assert calls[0]["response_format"] == {"type": "json_object"}
-    assert calls[1]["model"] == "openrouter/deepseek/deepseek-v4-pro"
+    # After the fast model exhausts its retries, complete_json falls back to the agent model.
+    assert calls[-1]["model"] == "openrouter/deepseek/deepseek-v4-pro"
 
 
 @pytest.mark.asyncio
@@ -598,7 +605,7 @@ async def test_assemble_context_loads_persona_skills_memories_and_task_state(mon
     async def fake_find_skills(message):
         return ["sdr-outreach"]
 
-    async def fake_load_skill(skill_id):
+    async def fake_load_skill(skill_id, progressive=False):
         return "Use outbound research workflow."
 
     async def fake_retrieve(message, requester_context):
