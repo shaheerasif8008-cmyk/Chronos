@@ -1,5 +1,6 @@
 import asyncio
 import json
+from typing import Any
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
@@ -15,8 +16,10 @@ from core.intent import classify_intent
 from core.llm import available_chat_models, normalize_chat_model, stream_completion
 from core.memory_writes import create_memory_entry, extract_explicit_memory_content
 from core.models import Member, RequesterContext
+from core.redis import redis_client
 from memory.extraction import extract_and_save
-from runtime.executor import TaskExecutor
+from runtime.agent_loop import format_task_answer
+from runtime.executor import TaskExecutor, activity_channel
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -175,14 +178,64 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
                 triggered_by=conversation_id,
                 persona_id=req.persona_id,
                 workspace_id=req.workspace_id,
+                model=req.model,
             )
+
+            # Subscribe BEFORE firing executor to guarantee no events are missed.
+            pubsub = redis_client.pubsub()
+            await pubsub.subscribe(activity_channel(task_id))
+
             asyncio.create_task(TaskExecutor().run(task_id))
-            assistant_response = "I started this as an autonomous task. You can watch live progress in Activity and approve drafts in Approvals."
-            await _save_message(conversation_id, "assistant", assistant_response)
-            await audit.log("chat_response", member.id, "chat.message", resource_id=conversation_id)
+
             yield f"data: {json.dumps({'type': 'conversation', 'conversation_id': conversation_id})}\n\n"
-            yield f"data: {json.dumps({'type': 'token', 'content': assistant_response})}\n\n"
             yield f"data: {json.dumps({'type': 'task_created', 'task_id': task_id})}\n\n"
+
+            # Relay activity events as traces; stream the final answer as tokens.
+            # Trace event types that are forwarded inline to the chat.
+            TRACE_TYPES = {
+                "tool_call", "tool_result", "tool_error", "step_start", "step_done",
+                "awaiting_approval", "sub_agent_spawned", "sub_agent_complete", "thinking",
+            }
+            final_answer: str | None = None
+
+            try:
+                while True:
+                    message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=60.0)
+                    if message is None:
+                        await asyncio.sleep(0.05)
+                        continue
+
+                    event: dict[str, Any] = json.loads(message["data"])
+                    event_type = event.get("type", "")
+
+                    if event_type in TRACE_TYPES:
+                        yield f"data: {json.dumps({'type': 'trace', 'event': event})}\n\n"
+
+                    elif event_type == "artifact":
+                        yield f"data: {json.dumps({'type': 'artifact', 'artifact': event})}\n\n"
+
+                    elif event_type == "task_complete":
+                        result = event.get("result") or {}
+                        final_answer = format_task_answer(result)
+                        break
+
+                    elif event_type == "task_failed":
+                        error = event.get("error") or "unknown error"
+                        final_answer = f"The task stopped: {error}"
+                        break
+            finally:
+                await pubsub.unsubscribe(activity_channel(task_id))
+                await pubsub.close()
+
+            # Stream the final answer for live display only. The agent loop
+            # already persisted it to the conversation (source of truth), so we
+            # do NOT save here — avoids duplicates and survives disconnects.
+            if final_answer:
+                chunk_size = 40
+                for i in range(0, len(final_answer), chunk_size):
+                    yield f"data: {json.dumps({'type': 'token', 'content': final_answer[i:i + chunk_size]})}\n\n"
+                    await asyncio.sleep(0)
+
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
         return StreamingResponse(task_stream(), media_type="text/event-stream")

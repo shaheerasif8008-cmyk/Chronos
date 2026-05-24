@@ -94,6 +94,21 @@ def normalize_chat_model(model_id: str | None) -> str:
     return requested if requested in allowed else "agent"
 
 
+def resolve_agent_model(model_id: str | None) -> str:
+    """Map a chat-model id (agent/fast/local/openrouter/backup/auto) to the
+    concrete litellm model string the agent loop should use for tool calling.
+    """
+    mid = normalize_chat_model(model_id)
+    if mid == "fast":
+        return settings.fast_model
+    if mid == "local":
+        return settings.local_llm_model
+    if mid in {"openrouter", "backup"}:
+        return settings.openrouter_model if settings.openrouter_api_key else settings.backup_model
+    # "agent" and "auto" both resolve to the primary agent model (tool-capable).
+    return settings.agent_model
+
+
 def backup_completion_kwargs(messages: list[dict[str, str]], *, stream: bool = False) -> dict[str, Any]:
     if settings.openrouter_api_key:
         return {
