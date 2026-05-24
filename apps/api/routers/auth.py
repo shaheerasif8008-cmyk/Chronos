@@ -76,7 +76,7 @@ async def cognito_authorize() -> dict[str, str]:
     params = urlencode({
         "client_id": settings.cognito_app_client_id,
         "response_type": "code",
-        "scope": "openid email profile",
+        "scope": "openid email",
         "redirect_uri": settings.cognito_callback_url,
         "state": state,
     })
