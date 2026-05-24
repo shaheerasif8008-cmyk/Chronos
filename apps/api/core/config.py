@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     vault_encryption_key: str = ""   # 32-byte hex string; required outside dev
     composio_api_key: str = ""
     composio_callback_base_url: str = "http://localhost:8000"
+    # Public base URL of this API, used to build the OAuth redirect_uri that
+    # providers redirect back to. Must match what each provider's OAuth app has
+    # registered. e.g. https://novatech.cognisiatech.com
+    public_base_url: str = "http://localhost:8000"
     demo_mode: bool = False
     # MinIO
     minio_endpoint: str = "localhost:9000"

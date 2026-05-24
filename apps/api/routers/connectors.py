@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import json
+import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import select, update
 
 from connectors.framework.adapters import adapter_registry
 from connectors.framework.approvals import ApprovalService
@@ -15,10 +19,14 @@ from connectors.framework.repository import DatabaseConnectorRepository
 from connectors.framework.runtime import ConnectorExecutionService
 from connectors.framework.seed import seed_builtin_connectors
 from connectors.framework.tool_calling import execute_tool_call, get_available_tools_for_employee
+from connectors import oauth, vault
 from core import permissions
 from core.auth import get_current_member
 from core.config import settings
+from core.db import engine, reflect_table
 from core.models import AgentContext, Member
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/connectors", tags=["connectors"])
 
@@ -136,6 +144,111 @@ async def list_connectors(member: Member = Depends(get_current_member)) -> list[
     repository = await ensure_registry()
     rows = await repository.list_connectors(tenant_id=member.organization_id)
     return [clean_connector(row) for row in rows if row.get("actions")]
+
+
+@router.get("/directory")
+async def connector_directory(member: Member = Depends(get_current_member)) -> dict[str, Any]:
+    """The connector directory: the official provider catalog + this org's connected state."""
+    await permissions.check(member, "list_connectors", member.organization_id)
+    providers = oauth.list_providers()
+
+    connectors_t = await reflect_table("connectors")
+    async with engine.begin() as conn:
+        rows = (
+            await conn.execute(
+                select(
+                    connectors_t.c.id,
+                    connectors_t.c.provider,
+                    connectors_t.c.account_handle,
+                ).where(
+                    connectors_t.c.organization_id == member.organization_id,
+                    connectors_t.c.status == "active",
+                )
+            )
+        ).mappings().all()
+
+    connected: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        connected.setdefault(
+            row["provider"],
+            {"connector_id": str(row["id"]), "account_handle": row.get("account_handle")},
+        )
+    for p in providers:
+        link = connected.get(p["provider"])
+        p["connected"] = link is not None
+        p["connector_id"] = link["connector_id"] if link else None
+        p["account_handle"] = link["account_handle"] if link else None
+
+    return {"redirect_uri": oauth.redirect_uri(), "providers": providers}
+
+
+@router.post("/{provider}/connect")
+async def connect_provider(provider: str, member: Member = Depends(get_current_member)) -> dict[str, str]:
+    """Begin an OAuth connect: returns the provider authorize URL to open in a popup."""
+    await permissions.check(member, "connect_connector", provider)
+    try:
+        url = await oauth.build_authorize_url(provider, member_id=str(member.id), org_id=member.organization_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"authorize_url": url}
+
+
+def _callback_html(ok: bool, message: str, provider: str | None = None) -> str:
+    """Tiny page that notifies the opener window and closes itself (claude.ai UX)."""
+    payload = json.dumps({"type": "chronos:oauth", "ok": ok, "provider": provider, "message": message})
+    headline = "Connected — you can close this window." if ok else f"Connection failed: {message}"
+    return (
+        "<!doctype html><meta charset='utf-8'><title>Connector</title>"
+        "<body style='font-family:system-ui;padding:28px;color:#1f2328'>"
+        f"<p>{headline}</p>"
+        f"<script>try{{window.opener&&window.opener.postMessage({payload},'*');}}catch(e){{}}"
+        "setTimeout(function(){window.close();},400);</script></body>"
+    )
+
+
+@router.get("/oauth/callback")
+async def oauth_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+) -> HTMLResponse:
+    """Public OAuth redirect target. The member is identified by the signed state."""
+    if error:
+        return HTMLResponse(_callback_html(False, error))
+    if not code or not state:
+        return HTMLResponse(_callback_html(False, "Missing code or state"))
+    try:
+        payload = oauth.verify_state(state)
+        result = await oauth.complete_connection(payload["provider"], code, state)
+    except Exception as exc:  # never leak details to the browser
+        logger.warning("OAuth callback failed: %s", exc)
+        return HTMLResponse(_callback_html(False, "Could not complete the connection"))
+    return HTMLResponse(_callback_html(True, "ok", provider=result["provider"]))
+
+
+@router.post("/{connector_id}/disconnect")
+async def disconnect_provider(connector_id: str, member: Member = Depends(get_current_member)) -> dict[str, str]:
+    """Revoke a connected provider: mark the row revoked and delete its vault entry."""
+    await permissions.check(member, "disconnect_connector", connector_id)
+    connectors_t = await reflect_table("connectors")
+    async with engine.begin() as conn:
+        row = (
+            await conn.execute(
+                select(connectors_t.c.vault_ref, connectors_t.c.organization_id).where(
+                    connectors_t.c.id == connector_id
+                )
+            )
+        ).mappings().first()
+        if not row or str(row["organization_id"]) != str(member.organization_id):
+            raise HTTPException(status_code=404, detail="Connector not found")
+        await conn.execute(
+            update(connectors_t).where(connectors_t.c.id == connector_id).values(status="revoked")
+        )
+    try:
+        await vault.delete(row["vault_ref"], actor_id=str(member.id), org_id=member.organization_id)
+    except Exception as exc:
+        logger.warning("Vault delete failed for %s: %s", connector_id, exc)
+    return {"status": "disconnected"}
 
 
 @router.get("/execution-logs")
