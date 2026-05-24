@@ -753,7 +753,10 @@ function ChatScreen({
         for (const line of chunk.split("\n")) {
           if (!line.startsWith("data: ")) continue;
           try {
-            const ev = JSON.parse(line.slice(6)) as { type: string; content?: string; conversation_id?: string; task_id?: string };
+            const ev = JSON.parse(line.slice(6)) as {
+              type: string; content?: string; conversation_id?: string; task_id?: string;
+              event?: { type: string; tool?: string; summary?: string; error?: string; args_preview?: Record<string, unknown>; step?: { description?: string }; approval_ids?: string[] };
+            };
             if (ev.type === "conversation" && ev.conversation_id) {
               convoId = ev.conversation_id;
               onConvoCreated(ev.conversation_id);
@@ -766,9 +769,62 @@ function ChatScreen({
                 if (last?.role === "assistant") updated[updated.length - 1] = { ...last, content: partial };
                 return updated;
               });
+            } else if (ev.type === "trace" && ev.event) {
+              const te = ev.event;
+              const traceType = te.type ?? "";
+              const tool = te.tool ?? (traceType === "step_start" ? "think" : traceType === "awaiting_approval" ? "approval" : "");
+              let summary = te.summary ?? "";
+              let traceStatus: MessageStatus = "complete";
+              if (traceType === "tool_call") {
+                summary = `${tool.replace(/[._]/g, " ")}…`;
+                traceStatus = "streaming";
+              } else if (traceType === "tool_result") {
+                summary = te.summary ?? `${tool} done`;
+                traceStatus = "complete";
+              } else if (traceType === "tool_error") {
+                summary = te.error ?? `${tool} failed`;
+                traceStatus = "error";
+              } else if (traceType === "step_start") {
+                summary = te.step?.description ?? "Thinking…";
+                traceStatus = "streaming";
+              } else if (traceType === "step_done") {
+                summary = te.summary ?? "Step complete";
+                traceStatus = "complete";
+              } else if (traceType === "awaiting_approval") {
+                summary = `Waiting for approval on ${te.approval_ids?.length ?? 0} item(s)`;
+                traceStatus = "approval_pending";
+              }
+              const traceId = `${traceType}-${tool}-${Date.now()}`;
+              setMessages(prev => {
+                const updated = [...prev];
+                const last = updated[updated.length - 1];
+                if (last?.role !== "assistant") return updated;
+                const existing = last.tool_traces ?? [];
+                // tool_result / tool_error updates the matching pending tool_call trace
+                if (traceType === "tool_result" || traceType === "tool_error") {
+                  const idx = [...existing].reverse().findIndex(t => t.tool === tool && t.status === "streaming");
+                  if (idx >= 0) {
+                    const actualIdx = existing.length - 1 - idx;
+                    const newTraces = [...existing];
+                    newTraces[actualIdx] = { ...newTraces[actualIdx], summary, status: traceStatus };
+                    return [...updated.slice(0, -1), { ...last, tool_traces: newTraces }];
+                  }
+                }
+                // step_done closes matching step_start
+                if (traceType === "step_done") {
+                  const idx = [...existing].reverse().findIndex(t => t.tool === "think" && t.status === "streaming");
+                  if (idx >= 0) {
+                    const actualIdx = existing.length - 1 - idx;
+                    const newTraces = [...existing];
+                    newTraces[actualIdx] = { ...newTraces[actualIdx], summary, status: "complete" };
+                    return [...updated.slice(0, -1), { ...last, tool_traces: newTraces }];
+                  }
+                }
+                return [...updated.slice(0, -1), { ...last, tool_traces: [...existing, { id: traceId, tool, summary, status: traceStatus }] }];
+              });
             } else if (ev.type === "task_created" && ev.task_id) {
               setActiveTaskId(ev.task_id);
-              setActivityOpen(true);
+              // Don't open drawer — we now stream the result inline
             } else if (ev.type === "done") {
               setMessages(prev => {
                 const updated = [...prev];
@@ -826,7 +882,7 @@ function ChatScreen({
               {messages.map((m, i) => (
                 m.role === "user"
                   ? <UserMessage key={i} content={m.content}/>
-                  : <AssistantMessage key={i} content={m.content} status={m.status ?? "complete"} persona={activePersona}/>
+                  : <AssistantMessage key={i} content={m.content} status={m.status ?? "complete"} persona={activePersona} toolTraces={m.tool_traces}/>
               ))}
               {streaming && messages[messages.length - 1]?.role !== "assistant" && (
                 <div className="flex gap-4">
@@ -916,7 +972,31 @@ function UserMessage({ content }: { content: string }) {
   );
 }
 
-function AssistantMessage({ content, status, persona }: { content: string; status: MessageStatus; persona: typeof PERSONAS[0] }) {
+function TraceRow({ trace }: { trace: ToolTrace }) {
+  const [open, setOpen] = useState(false);
+  const isRunning = trace.status === "streaming";
+  const isError = trace.status === "error";
+  const isPending = trace.status === "approval_pending";
+  const dotColor = isRunning ? "var(--accent)" : isError ? "var(--danger)" : isPending ? "var(--warn)" : "var(--ok)";
+  const toolLabel = trace.tool.replace(/[_]/g, ".").replace(/\./g, " › ");
+
+  return (
+    <div className="rounded-lg border overflow-hidden" style={{ borderColor: "var(--border-soft)" }}>
+      <button
+        className="w-full flex items-center gap-2.5 px-3 py-2 text-left smooth hover:bg-[var(--surface-2)]"
+        style={{ background: "var(--surface)", color: "var(--text-muted)" }}
+        onClick={() => setOpen(o => !o)}
+      >
+        <Dot color={dotColor} size={6} pulse={isRunning} ring={isRunning} />
+        <span className="font-mono text-[11px]" style={{ color: "var(--text-dim)" }}>{toolLabel}</span>
+        <span className="flex-1 text-[12.5px] truncate" style={{ color: "var(--text-muted)" }}>{trace.summary}</span>
+        <IC.ChevronDown size={12} style={{ color: "var(--text-dim)", transform: open ? "rotate(180deg)" : undefined, transition: "transform .15s", flexShrink: 0 }}/>
+      </button>
+    </div>
+  );
+}
+
+function AssistantMessage({ content, status, persona, toolTraces }: { content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[] }) {
   return (
     <div className="flex gap-4 fadein">
       <PersonaAvatar name={persona.name} color={persona.color} size={28}/>
@@ -925,10 +1005,28 @@ function AssistantMessage({ content, status, persona }: { content: string; statu
           <span className="text-[14px] font-semibold">{persona.name}</span>
           {status === "error" && <Tag variant="danger">Error</Tag>}
         </div>
-        <div className="prose-body" style={{ color: "var(--text)" }}>
-          {content}
-          {status === "streaming" && <span className="caret ml-0.5" style={{ borderLeft: "2px solid var(--text)" }}>&nbsp;</span>}
-        </div>
+
+        {/* Inline tool traces — like Claude's tool use steps */}
+        {toolTraces && toolTraces.length > 0 && (
+          <div className="mb-3 space-y-1.5">
+            {toolTraces.map(trace => <TraceRow key={trace.id} trace={trace} />)}
+          </div>
+        )}
+
+        {/* Answer */}
+        {(content || status === "streaming") && (
+          <div className="prose-body" style={{ color: "var(--text)" }}>
+            {content}
+            {status === "streaming" && !content && toolTraces && toolTraces.length > 0
+              ? null  /* traces visible; no extra caret until tokens arrive */
+              : status === "streaming" && <span className="caret ml-0.5" style={{ borderLeft: "2px solid var(--text)" }}>&nbsp;</span>}
+          </div>
+        )}
+
+        {/* Typing wave: streaming, no content yet, no traces */}
+        {status === "streaming" && !content && (!toolTraces || toolTraces.length === 0) && (
+          <div className="typing-wave mt-2"><span/><span/><span/></div>
+        )}
       </div>
     </div>
   );
