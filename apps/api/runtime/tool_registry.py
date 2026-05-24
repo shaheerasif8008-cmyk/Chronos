@@ -148,6 +148,47 @@ CODE_PYTHON = _fn(
     ["code"],
 )
 
+# ── Artifacts (conversation-scoped, versioned) ─────────────────────────────────
+
+ARTIFACT_LIST = _fn(
+    "artifact__list",
+    "List the artifacts in this conversation (documents, web pages, code, or data files "
+    "you or an earlier task produced). Returns each artifact's key, title, kind, and current "
+    "version. Use it to discover what already exists before creating something new.",
+    {},
+    [],
+)
+
+ARTIFACT_READ = _fn(
+    "artifact__read",
+    "Read the current content of a conversation artifact by its key. Use this to load an "
+    "existing artifact before revising it — e.g. to iterate on a report or web page created "
+    "in an earlier turn or task. Unlike fs__read, this reaches artifacts across the whole "
+    "conversation, not just the current task's isolated workspace.",
+    {"key": {"type": "string", "description": "The artifact key, e.g. 'game.html'."}},
+    ["key"],
+)
+
+ARTIFACT_WRITE = _fn(
+    "artifact__write",
+    "Create or update a conversation artifact under a stable key. Writing to an existing key "
+    "creates a new version (preserving history) rather than a duplicate — this is how you "
+    "iterate on an output across turns. Use it for deliverables the user keeps (reports, web "
+    "pages, code, data). Prefer a descriptive key with an extension (e.g. 'landing.html', "
+    "'analysis.md') so it renders correctly.",
+    {
+        "key": {"type": "string", "description": "Stable artifact key, ideally with a file extension."},
+        "content": {"type": "string", "description": "Full artifact content (replaces the prior version)."},
+        "title": {"type": "string", "description": "Human-friendly title (optional)."},
+        "kind": {
+            "type": "string",
+            "description": "Artifact kind; inferred from the key extension when omitted.",
+            "enum": ["html", "markdown", "code", "data", "text"],
+        },
+    },
+    ["key", "content"],
+)
+
 # ── Sub-agent ─────────────────────────────────────────────────────────────────
 
 SPAWN_SUBAGENT = _fn(
@@ -183,6 +224,9 @@ ALL_TOOLS: list[dict[str, Any]] = [
     FS_LIST,
     FS_READ,
     FS_WRITE,
+    ARTIFACT_LIST,
+    ARTIFACT_READ,
+    ARTIFACT_WRITE,
     CODE_PYTHON,
     SPAWN_SUBAGENT,
 ]
@@ -195,12 +239,20 @@ SUBAGENT_TOOLS: list[dict[str, Any]] = [
     FS_LIST,
     FS_READ,
     FS_WRITE,
+    ARTIFACT_LIST,
+    ARTIFACT_READ,
+    ARTIFACT_WRITE,
     CODE_PYTHON,
 ]
 
 #: Names that always need explicit human approval before execution.
 ALWAYS_APPROVAL_TOOL_NAMES: frozenset[str] = frozenset(
     {"gmail__send", "twitter__post", "linkedin__post", "website__publish"}
+)
+
+#: Internal tools handled directly by the agent loop (not via the broker).
+ARTIFACT_TOOL_NAMES: frozenset[str] = frozenset(
+    {"artifact__list", "artifact__read", "artifact__write"}
 )
 
 _SUBAGENT_TOOL_NAME = "spawn__subagent"

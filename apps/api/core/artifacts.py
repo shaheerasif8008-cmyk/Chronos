@@ -24,7 +24,7 @@ import json
 import uuid
 from typing import Any
 
-from sqlalchemy import insert, select
+from sqlalchemy import and_, insert, or_, select, update
 
 from core.config import settings
 from core.db import engine, reflect_table
@@ -53,6 +53,7 @@ async def save_artifact(
     *,
     kind: str,
     title: str | None = None,
+    key: str | None = None,
     conversation_id: str | None = None,
     task_id: str | None = None,
     message_id: str | None = None,
@@ -60,9 +61,14 @@ async def save_artifact(
     region: str = "us",
     mime_type: str | None = None,
 ) -> str:
-    """Persist an artifact to MinIO and record metadata in the artifacts table.
+    """Persist an artifact and record its metadata. Returns the new row's id.
 
-    Returns the artifact UUID string.
+    When ``key`` is given the artifact is *versioned*: the first write under a
+    key (within its conversation/task scope) is version 1, and each later write
+    under the same key supersedes the prior current row and increments the
+    version — so iterating on the same logical artifact across tasks of a
+    conversation builds a version history. Without a key the artifact is a
+    standalone version-1 row keyed by its own id (legacy behaviour).
     """
     artifact_id = str(uuid.uuid4())
 
@@ -71,11 +77,37 @@ async def save_artifact(
         mime_type = _infer_mime(kind, content)
 
     raw: bytes = content.encode() if isinstance(content, str) else content
-    size = len(raw)
 
+    minio_path = await _store_artifact_bytes(artifact_id, raw, org_id, mime_type)
+
+    # Versioning scope: the conversation if present (so iteration spans tasks),
+    # otherwise the task. A keyless write is standalone and self-keyed.
+    scope_id = conversation_id or task_id
+    current = await _current_artifact_row(org_id, scope_id, key) if key else None
+    version = (int(current["version"]) + 1) if current else 1
+
+    values = {
+        "id": artifact_id,
+        "organization_id": org_id,
+        "region": region,
+        "conversation_id": conversation_id,
+        "task_id": task_id,
+        "message_id": message_id,
+        "kind": kind,
+        "title": title,
+        "minio_path": minio_path,
+        "mime_type": mime_type,
+        "size_bytes": len(raw),
+        "artifact_key": key or artifact_id,
+        "version": version,
+        "is_current": True,
+    }
+    return await _insert_artifact_version(values, supersede_id=current["id"] if current else None)
+
+
+async def _store_artifact_bytes(artifact_id: str, raw: bytes, org_id: str, mime_type: str) -> str:
+    """Upload bytes to MinIO, falling back to the local scratch dir. Returns the path."""
     minio_path = f"artifacts/{org_id}/{artifact_id}"
-
-    # --- Upload to MinIO ---
     try:
         client = await _minio_client()
         await _ensure_bucket(client)
@@ -83,35 +115,95 @@ async def save_artifact(
             settings.minio_bucket,
             minio_path,
             io.BytesIO(raw),
-            length=size,
+            length=len(raw),
             content_type=mime_type,
         )
+        return minio_path
     except Exception:
         # MinIO may not be available in all environments (tests, CI).
-        # Fall back to local filesystem in the scratch dir.
-        minio_path = await _local_fallback(artifact_id, raw, org_id)
+        return await _local_fallback(artifact_id, raw, org_id)
 
-    # --- Insert metadata row ---
+
+def _scope_clause(artifacts: Any, scope_id: str | None):
+    """Match rows in the same versioning scope as ``scope_id``.
+
+    ``scope_id`` is a conversation id when one exists, else a task id. Rows
+    written within a conversation carry that conversation_id; task-scoped rows
+    carry a null conversation_id and the task_id.
+    """
+    return or_(
+        artifacts.c.conversation_id == scope_id,
+        and_(artifacts.c.conversation_id.is_(None), artifacts.c.task_id == scope_id),
+    )
+
+
+async def get_current_artifact(org_id: str, scope_id: str | None, key: str) -> dict[str, Any] | None:
+    """Return the current (latest) artifact row for (org, scope, key), or None."""
     artifacts = await reflect_table("artifacts")
     async with engine.begin() as conn:
-        result = await conn.execute(
-            insert(artifacts)
-            .values(
-                id=artifact_id,
-                organization_id=org_id,
-                region=region,
-                conversation_id=conversation_id,
-                task_id=task_id,
-                message_id=message_id,
-                kind=kind,
-                title=title,
-                minio_path=minio_path,
-                mime_type=mime_type,
-                size_bytes=size,
-            )
-            .returning(artifacts.c.id)
+        q = select(artifacts).where(
+            artifacts.c.organization_id == org_id,
+            artifacts.c.artifact_key == key,
+            artifacts.c.is_current.is_(True),
+            _scope_clause(artifacts, scope_id),
         )
+        row = (await conn.execute(q)).mappings().first()
+    return dict(row) if row else None
+
+
+async def _current_artifact_row(org_id: str, scope_id: str | None, key: str) -> dict[str, Any] | None:
+    return await get_current_artifact(org_id, scope_id, key)
+
+
+async def _insert_artifact_version(values: dict[str, Any], supersede_id: str | None) -> str:
+    """Insert a new version row, demoting the prior current row (if any) first."""
+    artifacts = await reflect_table("artifacts")
+    async with engine.begin() as conn:
+        if supersede_id:
+            await conn.execute(
+                update(artifacts).where(artifacts.c.id == supersede_id).values(is_current=False)
+            )
+        result = await conn.execute(insert(artifacts).values(**values).returning(artifacts.c.id))
         return str(result.scalar_one())
+
+
+async def list_current_artifacts(org_id: str, scope_id: str | None) -> list[dict[str, Any]]:
+    """List the current version of every artifact in a conversation/task scope."""
+    artifacts = await reflect_table("artifacts")
+    async with engine.begin() as conn:
+        q = (
+            select(artifacts)
+            .where(
+                artifacts.c.organization_id == org_id,
+                artifacts.c.is_current.is_(True),
+                _scope_clause(artifacts, scope_id),
+            )
+            .order_by(artifacts.c.created_at.desc())
+            .limit(100)
+        )
+        rows = (await conn.execute(q)).mappings().all()
+    return [dict(r) for r in rows]
+
+
+async def get_artifact_versions(artifact_id: str) -> list[dict[str, Any]]:
+    """Return every version of the artifact (resolved by its key+scope), oldest first."""
+    meta = await get_artifact(artifact_id)
+    if not meta:
+        return []
+    scope_id = meta.get("conversation_id") or meta.get("task_id")
+    artifacts = await reflect_table("artifacts")
+    async with engine.begin() as conn:
+        q = (
+            select(artifacts)
+            .where(
+                artifacts.c.organization_id == meta["organization_id"],
+                artifacts.c.artifact_key == meta["artifact_key"],
+                _scope_clause(artifacts, scope_id),
+            )
+            .order_by(artifacts.c.version.asc())
+        )
+        rows = (await conn.execute(q)).mappings().all()
+    return [dict(r) for r in rows]
 
 
 async def get_artifact(artifact_id: str) -> dict[str, Any] | None:

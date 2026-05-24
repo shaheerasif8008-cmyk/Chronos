@@ -30,7 +30,7 @@ from typing import Any
 import litellm
 from sqlalchemy import insert, select, update
 
-from core import audit, tool_broker
+from core import artifacts as artifact_store, audit, tool_broker
 from core.config import settings
 from core.db import engine, reflect_table
 from core.exceptions import ApprovalRequired
@@ -41,6 +41,7 @@ from core.token_budget import compact_agent_history, estimate_tokens, estimate_m
 from runtime.tool_registry import (
     ALL_TOOLS,
     ALWAYS_APPROVAL_TOOL_NAMES,
+    ARTIFACT_TOOL_NAMES,
     SUBAGENT_TOOLS,
     _SUBAGENT_TOOL_NAME,
     to_broker_name,
@@ -474,6 +475,18 @@ async def _execute_tool(
             await emit_activity(task_id, {"type": "tool_error", "tool": tool_name, "error": str(exc)})
         return _tool_message(call["id"], tool_name, content)
 
+    # artifact__* tools are internal (DB/object storage, conversation-scoped),
+    # handled here rather than via the broker — like spawn__subagent.
+    if tool_name in ARTIFACT_TOOL_NAMES:
+        try:
+            content, summary = await _execute_artifact_tool(tool_name, task, args)
+            await emit_activity(task_id, {"type": "tool_result", "tool": tool_name, "summary": summary})
+        except Exception as exc:
+            logger.warning("Artifact tool %s error: %s", tool_name, exc)
+            content = json.dumps({"error": str(exc)})
+            await emit_activity(task_id, {"type": "tool_error", "tool": tool_name, "error": str(exc)})
+        return _tool_message(call["id"], tool_name, content)
+
     # All other tools go through the ToolBroker
     broker_name = to_broker_name(tool_name)
     try:
@@ -534,13 +547,12 @@ async def _maybe_create_artifact(task: dict[str, Any], args: dict[str, Any]) -> 
         return None
     kind, mime = mapping
 
-    from core.artifacts import save_artifact
-
     try:
-        artifact_id = await save_artifact(
+        artifact_id = await artifact_store.save_artifact(
             file_content,
             kind=kind,
             title=os.path.basename(path),
+            key=path,  # same path re-written in a conversation → a new version
             conversation_id=_conversation_id_for(task),
             task_id=task["id"],
             org_id=task.get("organization_id", settings.org_id),
@@ -558,6 +570,79 @@ async def _maybe_create_artifact(task: dict[str, Any], args: dict[str, Any]) -> 
         "mime_type": mime,
         "size_bytes": len(file_content.encode("utf-8")),
     }
+
+
+def _kind_from_key(key: str) -> str:
+    """Infer an artifact kind from a key/filename extension (default 'text')."""
+    import os
+
+    ext = os.path.splitext(key)[1].lower()
+    mapping = _RENDERABLE_EXT.get(ext)
+    return mapping[0] if mapping else "text"
+
+
+async def _execute_artifact_tool(
+    tool_name: str, task: dict[str, Any], args: dict[str, Any]
+) -> tuple[str, str]:
+    """Run an artifact__* tool. Returns (json_content_for_history, activity_summary).
+
+    Artifacts are scoped to the conversation when the task has one (so later
+    tasks in the same conversation can read and revise them) and otherwise to
+    the task itself.
+    """
+    org_id = task.get("organization_id", settings.org_id)
+    conv_id = _conversation_id_for(task)
+    scope_id = conv_id or task["id"]
+
+    if tool_name == "artifact__list":
+        items = await artifact_store.list_current_artifacts(org_id, scope_id)
+        listing = [
+            {
+                "key": i.get("artifact_key"),
+                "title": i.get("title"),
+                "kind": i.get("kind"),
+                "version": i.get("version"),
+                "artifact_id": str(i.get("id")),
+            }
+            for i in items
+        ]
+        return json.dumps({"artifacts": listing}, default=str), f"Listed {len(listing)} artifact(s)"
+
+    if tool_name == "artifact__read":
+        key = str(args.get("key") or "")
+        meta = await artifact_store.get_current_artifact(org_id, scope_id, key)
+        if not meta:
+            return json.dumps({"error": f"No artifact found for key '{key}'"}), f"Artifact '{key}' not found"
+        raw = await artifact_store.read_artifact_content(str(meta["id"]))
+        text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else (raw or "")
+        body = {"key": key, "version": meta.get("version"), "kind": meta.get("kind"), "content": text}
+        return json.dumps(body, default=str), f"Read artifact '{key}' (v{meta.get('version')})"
+
+    if tool_name == "artifact__write":
+        key = str(args.get("key") or "")
+        if not key:
+            return json.dumps({"error": "key is required"}), "artifact__write missing key"
+        content = str(args.get("content") or "")
+        kind = str(args.get("kind") or _kind_from_key(key))
+        title = str(args.get("title") or key)
+        new_id = await artifact_store.save_artifact(
+            content,
+            kind=kind,
+            key=key,
+            title=title,
+            conversation_id=conv_id,
+            task_id=task["id"],
+            org_id=org_id,
+            region=task.get("region", settings.region),
+        )
+        meta = await artifact_store.get_artifact(new_id)
+        version = (meta or {}).get("version", 1)
+        return (
+            json.dumps({"artifact_id": new_id, "key": key, "version": version}, default=str),
+            f"Saved artifact '{key}' (v{version})",
+        )
+
+    return json.dumps({"error": f"unknown artifact tool {tool_name}"}), "unknown artifact tool"
 
 
 async def _run_subagent(
