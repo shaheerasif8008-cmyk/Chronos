@@ -30,7 +30,7 @@ from typing import Any
 import litellm
 from sqlalchemy import insert, select, update
 
-from core import audit, permissions, tool_broker
+from core import audit, tool_broker
 from core.config import settings
 from core.db import engine, reflect_table
 from core.exceptions import ApprovalRequired
