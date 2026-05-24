@@ -49,6 +49,16 @@ class Settings(BaseSettings):
     # Per-org token budget guard (category 9) — 0 means unlimited
     per_org_daily_token_limit: int = 0
 
+    # Amazon Cognito (Hosted UI auth)
+    cognito_region: str = ""
+    cognito_user_pool_id: str = ""
+    cognito_app_client_id: str = ""
+    cognito_app_client_secret: str = ""
+    # e.g. https://your-pool.auth.us-east-1.amazoncognito.com  (no trailing slash)
+    cognito_domain: str = ""
+    # Must match what's registered in the Cognito App Client. Frontend callback URL.
+    cognito_callback_url: str = "http://localhost:3000/login/callback"
+
     # Observability (category 10)
     langfuse_public_key: str = ""
     langfuse_secret_key: str = ""
