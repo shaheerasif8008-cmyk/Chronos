@@ -605,7 +605,7 @@ async def test_assemble_context_loads_persona_skills_memories_and_task_state(mon
     async def fake_find_skills(message):
         return ["sdr-outreach"]
 
-    async def fake_load_skill(skill_id, progressive=False):
+    async def fake_load_skill(skill_id, *, progressive=True):
         return "Use outbound research workflow."
 
     async def fake_retrieve(message, requester_context):
