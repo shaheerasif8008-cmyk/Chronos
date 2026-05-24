@@ -99,8 +99,8 @@ def _verify_cognito_token_sync(id_token: str) -> dict[str, Any]:
         options={"verify_exp": True},
     )
 
-    if claims.get("token_use") not in ("id", None):
-        raise ValueError("Expected an ID token, got access token")
+    if claims.get("token_use") != "id":
+        raise ValueError("Expected an ID token (token_use='id'), got something else")
 
     return claims
 

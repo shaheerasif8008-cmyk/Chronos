@@ -64,11 +64,37 @@ async def test_verify_cognito_token_raises_on_bad_token(monkeypatch):
         await auth_mod.verify_cognito_token("bad.token")
 
 
+# ── _build_state / _verify_state ──────────────────────────────────────────────
+
+def test_state_roundtrip_verifies():
+    """A freshly built state must verify successfully."""
+    from routers.auth import _build_state, _verify_state
+
+    state = _build_state()
+    assert _verify_state(state) is True
+
+
+def test_state_tampered_does_not_verify():
+    """Modifying any part of the state must cause verification to fail."""
+    from routers.auth import _build_state, _verify_state
+
+    state = _build_state()
+    # Flip a character in the nonce portion
+    tampered = ("x" if state[0] != "x" else "y") + state[1:]
+    assert _verify_state(tampered) is False
+
+
+def test_state_missing_dot_does_not_verify():
+    from routers.auth import _verify_state
+
+    assert _verify_state("nodothere") is False
+
+
 # ── GET /auth/cognito/authorize ────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_cognito_authorize_returns_url(monkeypatch):
-    """Authorize URL is built from settings and contains required OAuth params."""
+async def test_cognito_authorize_returns_url_and_state(monkeypatch):
+    """Authorize URL contains required OAuth params and a signed state value."""
     import routers.auth as auth_router_mod
     from core import config as cfg_mod
 
@@ -78,15 +104,19 @@ async def test_cognito_authorize_returns_url(monkeypatch):
     cfg_mod.get_settings.cache_clear()
     monkeypatch.setattr(auth_router_mod, "settings", cfg_mod.get_settings())
 
-    from routers.auth import cognito_authorize
+    from routers.auth import _verify_state, cognito_authorize
 
     body = await cognito_authorize()
 
     assert "authorize_url" in body
+    assert "state" in body
     assert "response_type=code" in body["authorize_url"]
     assert "test-client" in body["authorize_url"]
     assert "openid" in body["authorize_url"]
     assert "example.auth.us-east-2.amazoncognito.com" in body["authorize_url"]
+    assert "state=" in body["authorize_url"]
+    # The returned state must pass HMAC verification
+    assert _verify_state(body["state"]) is True
 
 
 # ── POST /auth/cognito/callback ────────────────────────────────────────────────
@@ -151,14 +181,43 @@ async def test_cognito_callback_full_flow(monkeypatch):
     monkeypatch.setattr(auth_router, "reflect_table", AsyncMock(return_value=fake_table))
     monkeypatch.setattr(auth_router, "engine", FakeEngine())
 
-    from routers.auth import CognitoCallbackRequest, cognito_callback
+    from routers.auth import CognitoCallbackRequest, _build_state, cognito_callback
 
+    valid_state = _build_state()
     response = Response()
-    result = await cognito_callback(CognitoCallbackRequest(code="auth-code-xyz"), response)
+    result = await cognito_callback(
+        CognitoCallbackRequest(code="auth-code-xyz", state=valid_state), response
+    )
 
     assert "access_token" in result
     assert result["member_id"] == "member-uuid-001"
     assert result["token_type"] == "bearer"
+
+
+@pytest.mark.asyncio
+async def test_cognito_callback_rejects_tampered_state(monkeypatch):
+    """A tampered state must cause the callback to return 400 before code exchange."""
+    from fastapi import HTTPException
+
+    import routers.auth as auth_router
+    from core import config as cfg_mod
+
+    cfg_mod.get_settings.cache_clear()
+    monkeypatch.setenv("COGNITO_DOMAIN", "https://example.auth.us-east-2.amazoncognito.com")
+    cfg_mod.get_settings.cache_clear()
+    monkeypatch.setattr(auth_router, "settings", cfg_mod.get_settings())
+
+    from fastapi import Response
+    from routers.auth import CognitoCallbackRequest, cognito_callback
+
+    with pytest.raises(HTTPException) as exc_info:
+        await cognito_callback(
+            CognitoCallbackRequest(code="code", state="tampered.invalidsig"),
+            Response(),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "state" in exc_info.value.detail.lower()
 
 
 @pytest.mark.asyncio
@@ -168,7 +227,7 @@ async def test_cognito_callback_rejects_missing_code(monkeypatch):
     from routers.auth import CognitoCallbackRequest
 
     with pytest.raises((ValidationError, TypeError)):
-        CognitoCallbackRequest()  # type: ignore[call-arg]
+        CognitoCallbackRequest(state="x")  # type: ignore[call-arg]
 
 
 # ── OTP endpoints disabled when Cognito is configured ─────────────────────────

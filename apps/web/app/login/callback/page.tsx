@@ -3,29 +3,13 @@
 /**
  * /login/callback
  *
- * Cognito redirects here after sign-in with ?code=<auth_code>.
- * This page sends the code to the backend, stores the returned JWT, then
- * navigates to /chat.
- *
- * On error it falls back to /login with a query-string error message so the
- * login page can surface it.
+ * Cognito redirects here after sign-in with ?code=<auth_code>&state=<state>.
+ * The state value is read from sessionStorage (stored by the login page) and
+ * forwarded to the backend for CSRF verification before the code is exchanged.
  */
-import { useEffect, useRef, useState } from "react";
+import { Suspense, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Suspense } from "react";
-
-const CONFIGURED_API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
-
-function apiBase() {
-  if (CONFIGURED_API_BASE) return CONFIGURED_API_BASE;
-  if (typeof window !== "undefined") {
-    const webPort = Number(window.location.port || "3000");
-    if (Number.isFinite(webPort) && webPort >= 3000 && webPort < 3100) {
-      return `http://${window.location.hostname}:${8000 + (webPort - 3000)}`;
-    }
-  }
-  return "http://localhost:8000";
-}
+import { apiBase } from "@/lib/api";
 
 function CallbackHandler() {
   const router = useRouter();
@@ -39,12 +23,12 @@ function CallbackHandler() {
     ran.current = true;
 
     const code = searchParams.get("code");
+    const stateFromUrl = searchParams.get("state");
     const errorParam = searchParams.get("error");
     const errorDesc = searchParams.get("error_description");
 
     if (errorParam) {
-      const msg = errorDesc ?? errorParam;
-      setErrorMsg(msg);
+      setErrorMsg(errorDesc ?? errorParam);
       setStatus("error");
       return;
     }
@@ -55,12 +39,30 @@ function CallbackHandler() {
       return;
     }
 
+    // Retrieve the state we stored before the Cognito redirect.
+    const storedState = sessionStorage.getItem("cognito_oauth_state");
+    sessionStorage.removeItem("cognito_oauth_state");
+
+    if (!storedState) {
+      setErrorMsg("OAuth state missing from session — please try signing in again.");
+      setStatus("error");
+      return;
+    }
+
+    // Client-side check: state echoed by Cognito must match what we sent.
+    if (stateFromUrl && stateFromUrl !== storedState) {
+      setErrorMsg("OAuth state mismatch — possible CSRF attempt.");
+      setStatus("error");
+      return;
+    }
+
     (async () => {
       try {
         const res = await fetch(`${apiBase()}/auth/cognito/callback`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ code }),
+          // Forward state to the backend for server-side HMAC verification.
+          body: JSON.stringify({ code, state: storedState }),
         });
 
         if (!res.ok) {
@@ -108,13 +110,15 @@ function CallbackHandler() {
 
 export default function CallbackPage() {
   return (
-    <Suspense fallback={
-      <main className="min-h-screen bg-[#f6f7f9]">
-        <section className="flex min-h-screen items-center justify-center">
-          <span className="h-6 w-6 animate-spin rounded-full border-2 border-[#15171a] border-t-transparent" />
-        </section>
-      </main>
-    }>
+    <Suspense
+      fallback={
+        <main className="min-h-screen bg-[#f6f7f9]">
+          <section className="flex min-h-screen items-center justify-center">
+            <span className="h-6 w-6 animate-spin rounded-full border-2 border-[#15171a] border-t-transparent" />
+          </section>
+        </main>
+      }
+    >
       <CallbackHandler />
     </Suspense>
   );

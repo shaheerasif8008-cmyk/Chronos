@@ -12,7 +12,10 @@ Provides two authentication paths:
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import random
+import secrets
 from urllib.parse import urlencode
 
 import httpx
@@ -31,29 +34,61 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 _otp_store: dict[str, str] = {}
 
 
+# ── OAuth state (CSRF protection) ─────────────────────────────────────────────
+#
+# State is a signed nonce: `<nonce>.<HMAC-SHA256(nonce, jwt_secret)>`.
+# No server-side storage is required — the signature is self-verifying.
+# The frontend stores the raw state string in sessionStorage between the
+# authorize redirect and the callback page, then forwards it to the backend.
+
+def _build_state() -> str:
+    """Return a cryptographically random, HMAC-signed state value."""
+    nonce = secrets.token_urlsafe(32)
+    sig = hmac.new(settings.jwt_secret.encode(), nonce.encode(), hashlib.sha256).hexdigest()
+    return f"{nonce}.{sig}"
+
+
+def _verify_state(state: str) -> bool:
+    """Return True iff state was signed by us and hasn't been tampered with."""
+    try:
+        nonce, sig = state.rsplit(".", 1)
+    except ValueError:
+        return False
+    expected = hmac.new(settings.jwt_secret.encode(), nonce.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(sig, expected)
+
+
 # ── Cognito Hosted UI ──────────────────────────────────────────────────────────
 
 @router.get("/cognito/authorize")
 async def cognito_authorize() -> dict[str, str]:
-    """Return the Cognito Hosted UI sign-in URL.
+    """Return the Cognito Hosted UI sign-in URL with a CSRF-protection state.
 
-    The frontend redirects the browser here; Cognito handles sign-in and
-    redirects back to ``/login/callback?code=…``.
+    The frontend stores the returned ``state`` in ``sessionStorage``, then
+    redirects the browser to ``authorize_url``.  Cognito echoes the state back
+    in the callback; the frontend forwards it to ``POST /cognito/callback`` for
+    server-side HMAC verification before the code is exchanged.
     """
     if not settings.cognito_domain:
         raise HTTPException(status_code=503, detail="Cognito is not configured")
 
+    state = _build_state()
     params = urlencode({
         "client_id": settings.cognito_app_client_id,
         "response_type": "code",
         "scope": "openid email profile",
         "redirect_uri": settings.cognito_callback_url,
+        "state": state,
     })
-    return {"authorize_url": f"{settings.cognito_domain}/oauth2/authorize?{params}"}
+    return {
+        "authorize_url": f"{settings.cognito_domain}/oauth2/authorize?{params}",
+        "state": state,
+    }
 
 
 class CognitoCallbackRequest(BaseModel):
     code: str
+    state: str  # CSRF guard — must match the value from /cognito/authorize
 
 
 @router.post("/cognito/callback")
@@ -61,15 +96,20 @@ async def cognito_callback(req: CognitoCallbackRequest, response: Response) -> d
     """Exchange the Cognito authorization code for a Chronos session.
 
     Steps:
-    1. POST the code to Cognito's token endpoint.
-    2. Verify the returned ID token (RS256, JWKS).
-    3. Find or auto-create the member row (first login creates the account).
-    4. Issue a Chronos HS256 JWT and set an httpOnly session cookie.
+    1. Verify the OAuth state to prevent CSRF.
+    2. POST the code to Cognito's token endpoint.
+    3. Verify the returned ID token (RS256, JWKS).
+    4. Find or auto-create the member row (first login creates the account).
+    5. Issue a Chronos HS256 JWT and set an httpOnly session cookie.
     """
     if not settings.cognito_domain:
         raise HTTPException(status_code=503, detail="Cognito is not configured")
 
-    # ── 1. Exchange code for tokens ────────────────────────────────────────────
+    # ── 1. CSRF — verify state ─────────────────────────────────────────────────
+    if not _verify_state(req.state):
+        raise HTTPException(status_code=400, detail="Invalid or tampered OAuth state — possible CSRF")
+
+    # ── 2. Exchange code for tokens ────────────────────────────────────────────
     token_url = f"{settings.cognito_domain}/oauth2/token"
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -88,8 +128,10 @@ async def cognito_callback(req: CognitoCallbackRequest, response: Response) -> d
             tokens = resp.json()
     except httpx.HTTPStatusError as exc:
         raise HTTPException(status_code=502, detail=f"Cognito token exchange failed: {exc}") from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"Could not reach Cognito: {exc}") from exc
 
-    # ── 2. Verify ID token ─────────────────────────────────────────────────────
+    # ── 3. Verify ID token ─────────────────────────────────────────────────────
     id_token = tokens.get("id_token")
     if not id_token:
         raise HTTPException(status_code=502, detail="Cognito did not return an ID token")
@@ -104,7 +146,7 @@ async def cognito_callback(req: CognitoCallbackRequest, response: Response) -> d
         raise HTTPException(status_code=401, detail="Cognito ID token missing email claim")
     email = email.lower()
 
-    # ── 3. Find or create member ───────────────────────────────────────────────
+    # ── 4. Find or create member ───────────────────────────────────────────────
     members = await reflect_table("members")
     async with engine.begin() as conn:
         row = (
@@ -133,7 +175,7 @@ async def cognito_callback(req: CognitoCallbackRequest, response: Response) -> d
 
     member_id = str(row["id"])
 
-    # ── 4. Issue Chronos session ───────────────────────────────────────────────
+    # ── 5. Issue Chronos session ───────────────────────────────────────────────
     chronos_token = create_access_token(member_id)
     await audit.log("cognito_login", member_id, "auth.cognito_callback")
     response.set_cookie("chronos_session", chronos_token, httponly=True, samesite="lax")

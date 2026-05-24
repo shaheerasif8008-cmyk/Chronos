@@ -2,19 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-
-const CONFIGURED_API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
-
-function apiBase() {
-  if (CONFIGURED_API_BASE) return CONFIGURED_API_BASE;
-  if (typeof window !== "undefined") {
-    const webPort = Number(window.location.port || "3000");
-    if (Number.isFinite(webPort) && webPort >= 3000 && webPort < 3100) {
-      return `http://${window.location.hostname}:${8000 + (webPort - 3000)}`;
-    }
-  }
-  return "http://localhost:8000";
-}
+import { apiBase } from "@/lib/api";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -36,7 +24,10 @@ export default function LoginPage() {
         setError(body.detail ?? "Failed to reach the auth service.");
         return;
       }
-      const { authorize_url } = await res.json();
+      const { authorize_url, state } = await res.json();
+      // Persist the signed state so the callback page can forward it to the
+      // backend for CSRF verification.
+      sessionStorage.setItem("cognito_oauth_state", state);
       // Full-page redirect to Cognito Hosted UI.
       window.location.href = authorize_url;
     } catch {
