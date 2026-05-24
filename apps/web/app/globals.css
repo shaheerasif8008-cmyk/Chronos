@@ -552,5 +552,12 @@ textarea {
 .typing-wave span:nth-child(2) { animation-delay: 0.14s; }
 .typing-wave span:nth-child(3) { animation-delay: 0.28s; }
 
+/* Shimmering "Thinking…" label */
+@keyframes shimmer-text {
+  0%, 100% { opacity: 0.45; }
+  50% { opacity: 1; }
+}
+.shimmer-text { animation: shimmer-text 1.4s ease-in-out infinite; }
+
 /* Range slider */
 input[type="range"] { accent-color: var(--accent); }

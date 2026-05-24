@@ -691,6 +691,10 @@ async def run_loop(
 
     while iteration < MAX_ITERATIONS:
         # ── Ask the LLM ────────────────────────────────────────────────────
+        # Heartbeat: the completion is non-streaming and can take many seconds
+        # (e.g. generating a whole file in tool args). Tell the UI we're working
+        # so it shows "Thinking…" instead of a frozen caret.
+        await emit_activity(task_id, {"type": "thinking"})
         try:
             final_text, calls = await _llm_step(history, effective_tools, effective_model)
         except Exception as exc:

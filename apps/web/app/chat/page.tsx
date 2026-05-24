@@ -31,6 +31,7 @@ type Message = {
   created_at?: string;
   tool_traces?: ToolTrace[];
   artifacts?: ArtifactRef[];
+  thinking?: boolean;
 };
 type ToolTrace = { id: string; tool: string; summary: string; status: MessageStatus };
 type ArtifactRef = { id: string; title: string; kind: string; mime_type?: string; size_bytes?: number };
@@ -781,7 +782,15 @@ function ChatScreen({
               setMessages(prev => {
                 const updated = [...prev];
                 const last = updated[updated.length - 1];
-                if (last?.role === "assistant") updated[updated.length - 1] = { ...last, content: partial };
+                if (last?.role === "assistant") updated[updated.length - 1] = { ...last, content: partial, thinking: false };
+                return updated;
+              });
+            } else if (ev.type === "trace" && ev.event && ev.event.type === "thinking") {
+              // Heartbeat — show "Thinking…" while the model generates (non-streaming).
+              setMessages(prev => {
+                const updated = [...prev];
+                const last = updated[updated.length - 1];
+                if (last?.role === "assistant") updated[updated.length - 1] = { ...last, thinking: true };
                 return updated;
               });
             } else if (ev.type === "trace" && ev.event) {
@@ -808,9 +817,6 @@ function ChatScreen({
               } else if (traceType === "awaiting_approval") {
                 summary = `Waiting for approval on ${te.approval_ids?.length ?? 0} item(s)`;
                 traceStatus = "approval_pending";
-              } else if (traceType === "thinking") {
-                summary = te.summary ?? "Thinking…";
-                traceStatus = "streaming";
               } else if (traceType === "sub_agent_spawned") {
                 summary = `Sub-agent: ${te.goal ?? "working"}`;
                 traceStatus = "streaming";
@@ -831,7 +837,7 @@ function ChatScreen({
                     const actualIdx = existing.length - 1 - idx;
                     const newTraces = [...existing];
                     newTraces[actualIdx] = { ...newTraces[actualIdx], summary, status: traceStatus };
-                    return [...updated.slice(0, -1), { ...last, tool_traces: newTraces }];
+                    return [...updated.slice(0, -1), { ...last, tool_traces: newTraces, thinking: false }];
                   }
                 }
                 // step_done closes matching step_start
@@ -841,10 +847,10 @@ function ChatScreen({
                     const actualIdx = existing.length - 1 - idx;
                     const newTraces = [...existing];
                     newTraces[actualIdx] = { ...newTraces[actualIdx], summary, status: "complete" };
-                    return [...updated.slice(0, -1), { ...last, tool_traces: newTraces }];
+                    return [...updated.slice(0, -1), { ...last, tool_traces: newTraces, thinking: false }];
                   }
                 }
-                return [...updated.slice(0, -1), { ...last, tool_traces: [...existing, { id: traceId, tool, summary, status: traceStatus }] }];
+                return [...updated.slice(0, -1), { ...last, tool_traces: [...existing, { id: traceId, tool, summary, status: traceStatus }], thinking: false }];
               });
             } else if (ev.type === "artifact" && ev.artifact) {
               const a = ev.artifact;
@@ -923,7 +929,7 @@ function ChatScreen({
               {messages.map((m, i) => (
                 m.role === "user"
                   ? <UserMessage key={i} content={m.content}/>
-                  : <AssistantMessage key={i} content={m.content} status={m.status ?? "complete"} persona={activePersona} toolTraces={m.tool_traces} artifacts={m.artifacts}/>
+                  : <AssistantMessage key={i} content={m.content} status={m.status ?? "complete"} persona={activePersona} toolTraces={m.tool_traces} artifacts={m.artifacts} thinking={m.thinking}/>
               ))}
               {streaming && messages[messages.length - 1]?.role !== "assistant" && (
                 <div className="flex gap-4">
@@ -1098,7 +1104,9 @@ function ArtifactCard({ artifact }: { artifact: ArtifactRef }) {
   );
 }
 
-function AssistantMessage({ content, status, persona, toolTraces, artifacts }: { content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[]; artifacts?: ArtifactRef[] }) {
+function AssistantMessage({ content, status, persona, toolTraces, artifacts, thinking }: { content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[]; artifacts?: ArtifactRef[]; thinking?: boolean }) {
+  const hasTraces = !!(toolTraces && toolTraces.length > 0);
+  const isStreaming = status === "streaming";
   return (
     <div className="flex gap-4 fadein">
       <PersonaAvatar name={persona.name} color={persona.color} size={28}/>
@@ -1109,19 +1117,28 @@ function AssistantMessage({ content, status, persona, toolTraces, artifacts }: {
         </div>
 
         {/* Inline tool traces — like Claude's tool use steps */}
-        {toolTraces && toolTraces.length > 0 && (
+        {hasTraces && (
           <div className="mb-3 space-y-1.5">
-            {toolTraces.map(trace => <TraceRow key={trace.id} trace={trace} />)}
+            {toolTraces!.map(trace => <TraceRow key={trace.id} trace={trace} />)}
+          </div>
+        )}
+
+        {/* Thinking indicator — shown during the (non-streaming) model call */}
+        {isStreaming && thinking && !content && (
+          <div className="flex items-center gap-2 text-[13px] shimmer-text" style={{ color: "var(--text-dim)" }}>
+            <Dot color="var(--accent)" size={6} pulse ring /> Thinking…
           </div>
         )}
 
         {/* Answer */}
-        {(content || status === "streaming") && (
+        {(content || (isStreaming && !thinking)) && (
           <div className="prose-body" style={{ color: "var(--text)" }}>
             {content}
-            {status === "streaming" && !content && toolTraces && toolTraces.length > 0
+            {isStreaming && !content && hasTraces
               ? null  /* traces visible; no extra caret until tokens arrive */
-              : status === "streaming" && <span className="caret ml-0.5" style={{ borderLeft: "2px solid var(--text)" }}>&nbsp;</span>}
+              : isStreaming && !content && thinking
+              ? null  /* thinking indicator is showing */
+              : isStreaming && <span className="caret ml-0.5" style={{ borderLeft: "2px solid var(--text)" }}>&nbsp;</span>}
           </div>
         )}
 
@@ -1132,8 +1149,8 @@ function AssistantMessage({ content, status, persona, toolTraces, artifacts }: {
           </div>
         )}
 
-        {/* Typing wave: streaming, no content yet, no traces */}
-        {status === "streaming" && !content && (!toolTraces || toolTraces.length === 0) && (
+        {/* Typing wave: streaming, nothing else to show yet */}
+        {isStreaming && !content && !hasTraces && !thinking && (
           <div className="typing-wave mt-2"><span/><span/><span/></div>
         )}
       </div>
