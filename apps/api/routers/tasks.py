@@ -24,6 +24,7 @@ class CreateTaskRequest(BaseModel):
     conversation_id: str | None = None
     persona_id: str | None = None
     workspace_id: str | None = None
+    model: str | None = None
 
 
 async def create_task_record(
@@ -33,9 +34,17 @@ async def create_task_record(
     triggered_by: str,
     persona_id: str | None = None,
     workspace_id: str | None = None,
+    model: str | None = None,
 ) -> str:
-    """Insert a task row.  No upfront plan — the native agent loop plans dynamically."""
+    """Insert a task row.  No upfront plan — the native agent loop plans dynamically.
+
+    `model` is the chat-model id chosen in the UI; it is resolved to a concrete
+    litellm model string and stored in agent_state so the loop honours the picker.
+    """
+    from core.llm import resolve_agent_model
+
     await permissions.check(member, "create_task", workspace_id or "default")
+    resolved_model = resolve_agent_model(model)
     tasks = await reflect_table("tasks")
     async with engine.begin() as conn:
         result = await conn.execute(
@@ -50,7 +59,7 @@ async def create_task_record(
                 status="pending",
                 goal=goal,
                 plan={},                              # agent loop builds plan dynamically
-                agent_state={"agent_history": [], "iteration_count": 0},
+                agent_state={"agent_history": [], "iteration_count": 0, "model": resolved_model},
                 current_step=0,
                 result={},
                 depth=0,
@@ -68,6 +77,7 @@ async def create_task(req: CreateTaskRequest, member: Member = Depends(get_curre
         triggered_by=req.conversation_id or "manual",
         persona_id=req.persona_id,
         workspace_id=req.workspace_id,
+        model=req.model,
     )
     asyncio.create_task(TaskExecutor().run(task_id))
     return {"task_id": task_id}

@@ -251,8 +251,12 @@ def _load_history(task: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-async def _checkpoint(task_id: str, history: list[dict[str, Any]], iteration: int, **extra: Any) -> None:
-    state = {"agent_history": history, "iteration_count": iteration}
+async def _checkpoint(
+    task_id: str, history: list[dict[str, Any]], iteration: int, *, model: str | None = None, **extra: Any
+) -> None:
+    state: dict[str, Any] = {"agent_history": history, "iteration_count": iteration}
+    if model:
+        state["model"] = model  # preserve the UI-chosen model across resume
     await save_task(task_id, agent_state=state, iteration_count=iteration, **extra)
 
 
@@ -525,6 +529,7 @@ async def _open_approval_gate(
     pending_calls: list[dict[str, Any]],
     history: list[dict[str, Any]],
     iteration: int,
+    model: str | None = None,
 ) -> None:
     """Persist state and create approval records; set task to awaiting_approval."""
     task_id = task["id"]
@@ -558,11 +563,13 @@ async def _open_approval_gate(
             )
             approval_ids.append(str(row.scalar_one()))
 
-    state = {
+    state: dict[str, Any] = {
         "agent_history": history,
         "iteration_count": iteration,
         "pending_approval_calls": pending_calls,
     }
+    if model:
+        state["model"] = model
     await save_task(task_id, agent_state=state, iteration_count=iteration, status="awaiting_approval")
     await emit_activity(task_id, {
         "type": "awaiting_approval",
@@ -635,8 +642,11 @@ async def resume_after_approval(task_id: str) -> None:
 
         history.append({"role": "tool", "tool_call_id": call_id, "name": broker_name, "content": content})
 
-    # Clear pending state and continue
-    new_state = {"agent_history": history, "iteration_count": iteration}
+    # Clear pending state and continue (preserve the UI-chosen model).
+    new_state: dict[str, Any] = {"agent_history": history, "iteration_count": iteration}
+    chosen_model = state.get("model")
+    if chosen_model:
+        new_state["model"] = chosen_model
     await save_task(task_id, agent_state=new_state, status="running")
     refreshed = await get_task(task_id)
     if refreshed:
@@ -667,7 +677,10 @@ async def run_loop(
     """
     task_id = task["id"]
     effective_tools = tools if tools is not None else ALL_TOOLS
-    effective_model = model or settings.agent_model
+    # Precedence: explicit arg (sub-agents) > model chosen in the UI (stored in
+    # agent_state) > default agent model.
+    stored_model = (task.get("agent_state") or {}).get("model") if isinstance(task.get("agent_state"), dict) else None
+    effective_model = model or stored_model or settings.agent_model
     agent = AgentContext.from_task(task)
 
     history = _load_history(task)
@@ -691,7 +704,7 @@ async def run_loop(
         if not calls:
             result = {"answer": final_text or ""}
             history.append({"role": "assistant", "content": final_text or ""})
-            await _checkpoint(task_id, history, iteration + 1,
+            await _checkpoint(task_id, history, iteration + 1, model=effective_model,
                               status="complete", result=result,
                               completed_at=datetime.now(timezone.utc))
             # Persist the answer to the conversation (source of truth, survives
@@ -708,7 +721,7 @@ async def run_loop(
         # ── Check for always-approval tools ────────────────────────────────
         approval_needed = [c for c in calls if _needs_approval(c["name"])]
         if approval_needed:
-            await _open_approval_gate(task, approval_needed, history, iteration)
+            await _open_approval_gate(task, approval_needed, history, iteration, model=effective_model)
             return {"status": "awaiting_approval"}
 
         # ── Execute tool calls (parallel if multiple) ───────────────────────
@@ -716,7 +729,7 @@ async def run_loop(
             try:
                 tool_msg = await _execute_tool(calls[0], task, agent)
             except ApprovalRequired:
-                await _open_approval_gate(task, calls, history, iteration)
+                await _open_approval_gate(task, calls, history, iteration, model=effective_model)
                 return {"status": "awaiting_approval"}
             history.append(tool_msg)
         else:
@@ -729,7 +742,7 @@ async def run_loop(
                 (r for r in raw_results if isinstance(r, ApprovalRequired)), None
             )
             if approval_hit:
-                await _open_approval_gate(task, calls, history, iteration)
+                await _open_approval_gate(task, calls, history, iteration, model=effective_model)
                 return {"status": "awaiting_approval"}
             for r in raw_results:
                 if isinstance(r, Exception):
@@ -743,7 +756,7 @@ async def run_loop(
                     history.append(r)
 
         # Persist after every iteration
-        await _checkpoint(task_id, history, iteration, current_step=iteration)
+        await _checkpoint(task_id, history, iteration, model=effective_model, current_step=iteration)
 
     # Max iterations exceeded
     error = "max_iterations_exceeded"

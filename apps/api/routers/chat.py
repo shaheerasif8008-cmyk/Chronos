@@ -178,6 +178,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
                 triggered_by=conversation_id,
                 persona_id=req.persona_id,
                 workspace_id=req.workspace_id,
+                model=req.model,
             )
 
             # Subscribe BEFORE firing executor to guarantee no events are missed.
