@@ -1046,7 +1046,11 @@ function TraceRow({ trace }: { trace: ToolTrace }) {
 function ArtifactCard({ artifact }: { artifact: ArtifactRef }) {
   const [busy, setBusy] = useState(false);
   const mime = artifact.mime_type ?? "";
-  const isOpenable = mime.startsWith("text/html") || mime.includes("svg") || mime.startsWith("image/");
+  // Only open raster images inline. HTML and SVG are model/tool-generated and
+  // untrusted; opening them via a same-origin blob URL would execute their
+  // scripts under the app origin (e.g. exfiltrating the bearer token from
+  // localStorage). Those remain downloadable, just not openable in-tab.
+  const isOpenable = mime.startsWith("image/") && !mime.includes("svg");
   const sizeLabel = artifact.size_bytes ? `${(artifact.size_bytes / 1024).toFixed(1)} KB` : "";
 
   async function fetchBlob(): Promise<Blob | null> {
