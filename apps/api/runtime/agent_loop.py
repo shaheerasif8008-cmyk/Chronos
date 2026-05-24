@@ -734,9 +734,32 @@ async def run_loop(
         history.append(_serialise_assistant(calls, None))
 
         # ── Check for always-approval tools ────────────────────────────────
+        # If the batch mixes always-approval tools with normal ones, execute the
+        # normal siblings now and append their results, then gate only what needs
+        # approval. Otherwise their tool_calls would be orphaned on resume, since
+        # resume_after_approval() only appends results for approval rows.
         approval_needed = [c for c in calls if _needs_approval(c["name"])]
         if approval_needed:
-            await _open_approval_gate(task, approval_needed, history, iteration, model=effective_model)
+            siblings = [c for c in calls if not _needs_approval(c["name"])]
+            gate_calls = list(approval_needed)
+            if siblings:
+                raw_results = await asyncio.gather(
+                    *[_execute_tool(c, task, agent) for c in siblings],
+                    return_exceptions=True,
+                )
+                for call, r in zip(siblings, raw_results):
+                    if isinstance(r, ApprovalRequired):
+                        gate_calls.append(call)  # broker-gated sibling joins the gate
+                    elif isinstance(r, Exception):
+                        history.append({
+                            "role": "tool",
+                            "tool_call_id": call["id"],
+                            "name": call["name"],
+                            "content": json.dumps({"error": str(r)}),
+                        })
+                    else:
+                        history.append(r)
+            await _open_approval_gate(task, gate_calls, history, iteration, model=effective_model)
             return {"status": "awaiting_approval"}
 
         # ── Execute tool calls (parallel if multiple) ───────────────────────
