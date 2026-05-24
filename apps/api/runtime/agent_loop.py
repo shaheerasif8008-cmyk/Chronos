@@ -34,9 +34,10 @@ from core import audit, tool_broker
 from core.config import settings
 from core.db import engine, reflect_table
 from core.exceptions import ApprovalRequired
-from core.llm import _message_content, _message, _tool_calls, _with_retry, model_kwargs
+from core.llm import _message_content, _message, _tool_calls, _with_retry, complete_text, model_kwargs
 from core.models import AgentContext
 from core.redis import redis_client
+from core.token_budget import compact_agent_history, estimate_tokens, estimate_messages_tokens
 from runtime.tool_registry import (
     ALL_TOOLS,
     ALWAYS_APPROVAL_TOOL_NAMES,
@@ -175,8 +176,8 @@ async def _save_assistant_message(conversation_id: str, content: str, task: dict
         result = await conn.execute(
             insert(messages)
             .values(
-                organization_id=task.get("organization_id", "default"),
-                region=task.get("region", "us"),
+                organization_id=task.get("organization_id", settings.org_id),
+                region=task.get("region", settings.region),
                 conversation_id=conversation_id,
                 role="assistant",
                 content=content,
@@ -270,6 +271,54 @@ async def _checkpoint(
     await save_task(task_id, agent_state=state, iteration_count=iteration, **extra)
 
 
+# ── Context budgeting (Category 7) ──────────────────────────────────────────────
+
+async def _summarize(text: str) -> str:
+    """Summarize old task turns with the fast model for compaction."""
+    return await complete_text(
+        "Summarize this autonomous-task history into 4-6 sentences. Preserve key "
+        "facts discovered, decisions made, tool results, and anything needed to "
+        "continue the task. Be concrete:\n\n" + text,
+        model=settings.fast_model,
+    )
+
+
+# Never let the computed history budget collapse to ~0 (e.g. a tiny configured
+# window or an oversized tool schema), which would make compaction fire every
+# iteration to no effect. Floor it so compaction stays meaningful.
+_MIN_HISTORY_BUDGET = 8_000
+
+
+def _history_budget(tools: list[dict[str, Any]]) -> int:
+    """Tokens available for message history, after reserving for the response and tool schemas."""
+    tool_tokens = estimate_tokens(json.dumps(tools, default=str))
+    budget = settings.max_context_tokens - settings.response_reserve_tokens - tool_tokens
+    return max(budget, _MIN_HISTORY_BUDGET)
+
+
+async def _maybe_compact(
+    task_id: str,
+    history: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Compact history if it would overflow the model window before the next call.
+
+    Turn-aware (preserves tool_call/tool_result pairing). Emits an activity event
+    when compaction actually fires so the timeline reflects it.
+    """
+    budget = _history_budget(tools)
+    if estimate_messages_tokens(history) <= budget:
+        return history
+    before = len(history)
+    compacted = await compact_agent_history(history, budget_tokens=budget, summarizer=_summarize)
+    if len(compacted) != before:
+        await emit_activity(task_id, {
+            "type": "context_compacted",
+            "summary": f"Compacted context: {before} → {len(compacted)} messages to stay within the model window.",
+        })
+    return compacted
+
+
 # ── LLM step ──────────────────────────────────────────────────────────────────
 
 async def _llm_step(
@@ -342,12 +391,52 @@ def _parse_args(args_str: str | dict) -> dict[str, Any]:
         return {}
 
 
+# Substrings that mark a key as credential-shaped (api_key, access_token,
+# client_secret, …). Matched anywhere in the lowercased key name.
+_SECRET_FRAGMENTS = ("password", "token", "secret", "key", "credential", "auth", "bearer")
+# Large opaque fields we omit from the audit preview for noise, not secrecy.
+_BULKY_KEYS = {"body", "content", "code"}
+
+
 def _args_preview(args: dict[str, Any]) -> dict[str, Any]:
-    sensitive = {"body", "content", "code", "password", "token", "secret"}
-    return {k: "[omitted]" if k.lower() in sensitive else v for k, v in args.items()}
+    """Redact credential-shaped and bulky args before they reach the audit log.
+
+    vault_ref is the one key safe (and required) to log — it is a reference, not
+    a credential.
+    """
+    preview: dict[str, Any] = {}
+    for key, value in args.items():
+        lowered = key.lower()
+        if lowered == "vault_ref":
+            preview[key] = value
+        elif lowered in _BULKY_KEYS or any(fragment in lowered for fragment in _SECRET_FRAGMENTS):
+            preview[key] = "[omitted]"
+        else:
+            preview[key] = value
+    return preview
 
 
 # ── Tool execution ────────────────────────────────────────────────────────────
+
+# Safety net: cap any single tool result so one giant fetch/read can't blow the
+# context window on its own. Generous (~12k tokens) — routine results pass
+# untouched; only outliers are trimmed. Stale turns are handled by compaction.
+_MAX_TOOL_RESULT_CHARS = 48_000
+
+
+def _tool_message(call_id: str, tool_name: str, content: str) -> dict[str, Any]:
+    """Build a tool-role history message, truncating oversized content.
+
+    Keeps the head and tail (the most useful parts of most payloads) and marks
+    the elision so the model knows the result was trimmed and can re-fetch.
+    """
+    if len(content) > _MAX_TOOL_RESULT_CHARS:
+        head = content[: _MAX_TOOL_RESULT_CHARS // 2]
+        tail = content[-(_MAX_TOOL_RESULT_CHARS // 4):]
+        dropped = len(content) - len(head) - len(tail)
+        content = f"{head}\n\n…[{dropped} characters truncated — re-fetch if you need the full result]…\n\n{tail}"
+    return {"role": "tool", "tool_call_id": call_id, "name": tool_name, "content": content}
+
 
 async def _execute_tool(
     call: dict[str, Any],
@@ -383,7 +472,7 @@ async def _execute_tool(
             logger.warning("Sub-agent failed: %s", exc)
             content = json.dumps({"error": str(exc)})
             await emit_activity(task_id, {"type": "tool_error", "tool": tool_name, "error": str(exc)})
-        return {"role": "tool", "tool_call_id": call["id"], "name": tool_name, "content": content}
+        return _tool_message(call["id"], tool_name, content)
 
     # All other tools go through the ToolBroker
     broker_name = to_broker_name(tool_name)
@@ -408,7 +497,7 @@ async def _execute_tool(
         content = json.dumps({"error": str(exc)})
         await emit_activity(task_id, {"type": "tool_error", "tool": tool_name, "error": str(exc)})
 
-    return {"role": "tool", "tool_call_id": call["id"], "name": tool_name, "content": content}
+    return _tool_message(call["id"], tool_name, content)
 
 
 # Renderable file extensions → (artifact kind, mime type).
@@ -454,8 +543,8 @@ async def _maybe_create_artifact(task: dict[str, Any], args: dict[str, Any]) -> 
             title=os.path.basename(path),
             conversation_id=_conversation_id_for(task),
             task_id=task["id"],
-            org_id=task.get("organization_id", "default"),
-            region=task.get("region", "us"),
+            org_id=task.get("organization_id", settings.org_id),
+            region=task.get("region", settings.region),
             mime_type=mime,
         )
     except Exception as exc:
@@ -491,7 +580,7 @@ async def _run_subagent(
             insert(tasks)
             .values(
                 organization_id=parent_task["organization_id"],
-                region=parent_task.get("region", "us"),
+                region=parent_task.get("region", settings.region),
                 parent_task_id=parent_task["id"],
                 triggered_by=f"task:{parent_task['id']}",
                 triggered_by_member_id=parent_task.get("triggered_by_member_id"),
@@ -562,7 +651,7 @@ async def _open_approval_gate(
                 insert(approvals)
                 .values(
                     organization_id=task["organization_id"],
-                    region=task.get("region", "us"),
+                    region=task.get("region", settings.region),
                     task_id=task_id,
                     step_id="agent_loop",
                     action_type=broker_name,
@@ -700,6 +789,12 @@ async def run_loop(
                     started_at=task.get("started_at") or datetime.now(timezone.utc))
 
     while iteration < MAX_ITERATIONS:
+        # ── Context budgeting (Category 7) ──────────────────────────────────
+        # Compact before the call so a long-running task never overflows the
+        # model window. The compacted list becomes the new ground truth so a
+        # restart resumes from the trimmed history, not the unbounded original.
+        history = await _maybe_compact(task_id, history, effective_tools)
+
         # ── Ask the LLM ────────────────────────────────────────────────────
         # Heartbeat: the completion is non-streaming and can take many seconds
         # (e.g. generating a whole file in tool args). Tell the UI we're working
@@ -753,22 +848,25 @@ async def run_loop(
                 *[_execute_tool(c, task, agent) for c in calls],
                 return_exceptions=True,
             )
-            approval_hit = next(
-                (r for r in raw_results if isinstance(r, ApprovalRequired)), None
-            )
-            if approval_hit:
-                await _open_approval_gate(task, calls, history, iteration, model=effective_model)
-                return {"status": "awaiting_approval"}
-            for r in raw_results:
+            gated_calls = [c for c, r in zip(calls, raw_results) if isinstance(r, ApprovalRequired)]
+            # Persist results for calls that already completed BEFORE gating, so
+            # ungated siblings are never discarded and re-run (duplicate side
+            # effects) on resume. Pair each by its own call id.
+            for c, r in zip(calls, raw_results):
+                if isinstance(r, ApprovalRequired):
+                    continue
                 if isinstance(r, Exception):
                     history.append({
                         "role": "tool",
-                        "tool_call_id": "error",
-                        "name": "error",
+                        "tool_call_id": c["id"],
+                        "name": c["name"],
                         "content": json.dumps({"error": str(r)}),
                     })
                 else:
                     history.append(r)
+            if gated_calls:
+                await _open_approval_gate(task, gated_calls, history, iteration, model=effective_model)
+                return {"status": "awaiting_approval"}
 
         # Persist after every iteration
         await _checkpoint(task_id, history, iteration, model=effective_model, current_step=iteration)

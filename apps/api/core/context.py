@@ -8,17 +8,11 @@ from core.config import settings
 from core.db import engine, reflect_table
 from core.models import RequesterContext
 from core.personas import get_persona_prompt
+from core.token_budget import CHARS_PER_TOKEN as _CHARS_PER_TOKEN, estimate_tokens as _estimate_tokens
 from skills.loader import find_relevant_skills, load_skill_content, skill_connector_warning
 from skills.registry import load_skill_index
 
 ROOT = Path(__file__).resolve().parents[3]
-
-# Category 7: rough token estimation (4 chars ≈ 1 token for English prose).
-_CHARS_PER_TOKEN = 4
-
-
-def _estimate_tokens(text: str) -> int:
-    return max(1, len(text) // _CHARS_PER_TOKEN)
 
 
 def load_base_system_prompt() -> str:  # noqa: PLR0915 (long but intentional)
