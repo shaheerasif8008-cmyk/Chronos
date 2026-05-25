@@ -24,6 +24,12 @@ from core.models import AgentContext, Member
 router = APIRouter(prefix="/connectors", tags=["connectors"])
 
 
+def _gmail_module():
+    import importlib
+
+    return importlib.import_module("connectors.gmail")
+
+
 class InstallConnectorRequest(BaseModel):
     workspace_id: str = "default"
 
@@ -189,8 +195,7 @@ async def gmail_oauth_start(member: Member = Depends(get_current_member)) -> dic
             detail="GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET are not configured",
         )
     try:
-        from connectors.gmail import oauth_start_url
-        url = await oauth_start_url(
+        url = await _gmail_module().oauth_start_url(
             member_id=str(member.id),
             org_id=str(member.organization_id),
         )
@@ -216,14 +221,13 @@ async def gmail_oauth_callback(
     """
     import uuid
     from connectors.vault import store as vault_store
-    from connectors.gmail import oauth_finish
     from core.db import engine, reflect_table
     from sqlalchemy import insert, select, update
 
     # oauth_finish verifies the HMAC state internally and returns (member_id, org_id)
     # as part of the credential dict.
     try:
-        credential_data = await oauth_finish(code=code, state=state)
+        credential_data = await _gmail_module().oauth_finish(code=code, state=state)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -297,7 +301,6 @@ async def generic_oauth_start(
     The frontend redirects the user's browser to the returned URL.
     """
     from connectors.oauth_apps import get_app, get_client_credentials
-    from connectors.gmail import _build_state
     from urllib.parse import urlencode
 
     # Gmail has its own route above — don't double-handle it here
@@ -317,7 +320,7 @@ async def generic_oauth_start(
             detail=f"{app.client_id_env} / {app.client_secret_env} are not configured",
         )
 
-    state = _build_state(str(member.id), str(member.organization_id))
+    state = _gmail_module()._build_state(str(member.id), str(member.organization_id))
     redirect_uri = f"{settings.composio_callback_base_url}/connectors/{provider}/oauth-callback"
 
     params: dict[str, str] = {
@@ -354,7 +357,6 @@ async def generic_oauth_callback(
     import uuid
     import time
     from connectors.oauth_apps import get_app, get_client_credentials
-    from connectors.gmail import _verify_state
     from connectors.vault import store as vault_store
     from core.db import engine, reflect_table
     from sqlalchemy import insert, select, update
@@ -370,7 +372,7 @@ async def generic_oauth_callback(
         raise HTTPException(status_code=404, detail=f"Unknown provider: {provider}")
 
     try:
-        member_id, org_id = _verify_state(state)
+        member_id, org_id = _gmail_module()._verify_state(state)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

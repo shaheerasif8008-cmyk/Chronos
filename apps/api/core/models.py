@@ -18,6 +18,7 @@ class RequesterContext(BaseModel):
     persona_id: str | None = None
     task_id: str | None = None
     role: str = "user"
+    memory_context: str = "chat"
 
     @classmethod
     def from_member(cls, member: Member) -> "RequesterContext":

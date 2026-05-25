@@ -232,7 +232,7 @@ async def complete_json(prompt: str, *, model: str | None = None) -> str:
     try:
         kwargs = model_kwargs(selected, messages=messages, stream=False)
         kwargs["response_format"] = {"type": "json_object"}
-        response = await _with_retry(lambda: litellm.acompletion(**kwargs))
+        response = await _with_retry(lambda: litellm.acompletion(**kwargs), max_retries=0)
         return _message_content(response)
     except Exception:
         pass

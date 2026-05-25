@@ -306,6 +306,145 @@ def test_memory_scope_authorization_and_hybrid_rerank():
     assert ranked[0]["id"] == "important-recent"
 
 
+def test_memory_rerank_weights_source_authority_and_deduplicates():
+    from core import memory
+
+    now = datetime.now(timezone.utc)
+    rows = [
+        {
+            "id": "auto-duplicate",
+            "distance": 0.01,
+            "importance_score": 0.6,
+            "source": "autonomous",
+            "content": "ACME prefers procurement calls on Tuesday afternoons.",
+            "created_at": now,
+        },
+        {
+            "id": "explicit-authority",
+            "distance": 0.03,
+            "importance_score": 0.8,
+            "source": "explicit",
+            "content": "ACME prefers procurement calls on Tuesday afternoons",
+            "created_at": now,
+        },
+        {
+            "id": "distinct",
+            "distance": 0.10,
+            "importance_score": 0.7,
+            "source": "synthesized",
+            "content": "Globex uses Salesforce for renewals.",
+            "created_at": now,
+        },
+    ]
+
+    ranked = memory._dedupe_ranked_rows(memory._rank_memory_rows(rows, now=now), limit=10)
+
+    assert [row["id"] for row in ranked] == ["explicit-authority", "distinct"]
+
+
+@pytest.mark.asyncio
+async def test_memory_query_expansion_includes_original_and_model_rewrites(monkeypatch):
+    from core import memory
+
+    async def fake_complete_json(prompt, model=None):
+        return json.dumps(
+            {
+                "queries": [
+                    "client follow up preferences",
+                    "preferred contact channel for accounts",
+                    "recent relationship notes",
+                ]
+            }
+        )
+
+    monkeypatch.setattr(memory, "complete_json", fake_complete_json)
+
+    expanded = await memory.expand_query(
+        "who should I call back?",
+        RequesterContext(member_id="member-1", task_id="task-1"),
+    )
+
+    assert expanded[0] == "who should I call back?"
+    assert "client follow up preferences" in expanded
+    assert len(expanded) == 4
+
+
+@pytest.mark.asyncio
+async def test_task_scratchpad_memory_is_returned_before_long_term(monkeypatch):
+    from core import memory
+    from core.models import RequesterContext
+
+    async def fake_scratchpad(requester_context):
+        assert requester_context.task_id == "task-1"
+        return [
+            memory.MemoryEntry(
+                id="scratch-task-1-0",
+                organization_id="default",
+                content="Temporary lead list from step 1.",
+                scope="task",
+                scope_id="task-1",
+                source="scratchpad",
+                importance_score=1.0,
+            )
+        ]
+
+    async def fake_expand(query, requester_context):
+        return [query]
+
+    async def fake_embed(query):
+        return [0.1] * memory.EXPECTED_EMBEDDING_DIMENSIONS
+
+    class FakeResult:
+        def mappings(self):
+            return self
+
+        def all(self):
+            return [
+                {
+                    "id": "memory-1",
+                    "organization_id": "default",
+                    "region": "us",
+                    "scope": "org",
+                    "scope_id": "default",
+                    "content": "Durable org memory.",
+                    "source": "explicit",
+                    "importance_score": 0.9,
+                    "is_deleted": False,
+                    "created_by": "member-1",
+                    "created_at": datetime.now(timezone.utc),
+                    "distance": 0.1,
+                }
+            ]
+
+    class FakeConn:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def execute(self, stmt, params):
+            return FakeResult()
+
+    class FakeEngine:
+        def begin(self):
+            return FakeConn()
+
+    async def fake_audit_log(*args, **kwargs):
+        return "audit-1"
+
+    monkeypatch.setattr(memory, "_retrieve_task_scratchpad", fake_scratchpad)
+    monkeypatch.setattr(memory, "expand_query", fake_expand)
+    monkeypatch.setattr(memory, "embed", fake_embed)
+    monkeypatch.setattr(memory, "engine", FakeEngine())
+    monkeypatch.setattr(memory.audit, "log", fake_audit_log)
+
+    results = await memory.retrieve("continue the task", RequesterContext(member_id="member-1", task_id="task-1"))
+
+    assert [entry.source for entry in results] == ["scratchpad", "explicit"]
+    assert results[0].content == "Temporary lead list from step 1."
+
+
 @pytest.mark.asyncio
 async def test_filesystem_connector_jails_task_workspace(tmp_path, monkeypatch):
     from connectors import filesystem

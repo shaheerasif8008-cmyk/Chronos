@@ -74,13 +74,24 @@ _LIVE_WEB_NEWS_MARKERS = {
 def _live_web_intent(message: str) -> dict[str, Any] | None:
     normalized = " ".join(message.lower().split())
     starts_like_question = normalized.startswith(("are ", "did ", "do ", "does ", "how ", "is ", "what ", "when ", "where ", "who "))
-    explicit_search = any(marker in normalized for marker in _LIVE_WEB_ACTION_MARKERS)
-    asks_for_current_info = any(marker in normalized for marker in _LIVE_WEB_RECENCY_MARKERS)
-    asks_for_news = any(marker in normalized for marker in _LIVE_WEB_NEWS_MARKERS)
+    explicit_search = _contains_marker(normalized, _LIVE_WEB_ACTION_MARKERS)
+    asks_for_current_info = _contains_marker(normalized, _LIVE_WEB_RECENCY_MARKERS)
+    asks_for_news = _contains_marker(normalized, _LIVE_WEB_NEWS_MARKERS)
 
     if explicit_search or (starts_like_question and (asks_for_current_info or asks_for_news)):
         return {"mode": "task", "confidence": 0.86, "goal": message}
     return None
+
+
+def _contains_marker(normalized: str, markers: set[str]) -> bool:
+    for marker in markers:
+        if " " in marker:
+            if marker in normalized:
+                return True
+            continue
+        if re.search(rf"\b{re.escape(marker)}\b", normalized):
+            return True
+    return False
 
 
 def _heuristic_intent(message: str) -> dict[str, Any]:

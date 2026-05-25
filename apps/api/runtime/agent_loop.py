@@ -266,11 +266,19 @@ def _load_history(task: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 async def _checkpoint(
-    task_id: str, history: list[dict[str, Any]], iteration: int, *, model: str | None = None, **extra: Any
+    task_id: str,
+    history: list[dict[str, Any]],
+    iteration: int,
+    *,
+    model: str | None = None,
+    orchestration_state: dict[str, Any] | None = None,
+    **extra: Any,
 ) -> None:
     state: dict[str, Any] = {"agent_history": history, "iteration_count": iteration}
     if model:
         state["model"] = model  # preserve the UI-chosen model across resume
+    if orchestration_state:
+        state["orchestration_state"] = orchestration_state
     await save_task(task_id, agent_state=state, iteration_count=iteration, **extra)
 
 
@@ -349,6 +357,57 @@ def _parse_args(args_str: str | dict) -> dict[str, Any]:
 def _args_preview(args: dict[str, Any]) -> dict[str, Any]:
     sensitive = {"body", "content", "code", "password", "token", "secret"}
     return {k: "[omitted]" if k.lower() in sensitive else v for k, v in args.items()}
+
+
+def _tool_message_error(message: dict[str, Any]) -> str | None:
+    if message.get("role") != "tool":
+        return None
+    try:
+        payload = json.loads(str(message.get("content") or "{}"))
+    except json.JSONDecodeError:
+        return None
+    error = payload.get("error")
+    return str(error) if error else None
+
+
+def _orchestration_state(
+    calls: list[dict[str, Any]],
+    tool_messages: list[dict[str, Any]],
+    iteration: int,
+) -> dict[str, Any]:
+    errors = [
+        {"tool": message.get("name"), "error": error}
+        for message in tool_messages
+        if (error := _tool_message_error(message))
+    ]
+    return {
+        "mode": "model_native",
+        "iteration": iteration,
+        "last_tool_calls": [{"name": call["name"], "id": call["id"]} for call in calls],
+        "last_tool_errors": errors,
+        "needs_replan": bool(errors),
+    }
+
+
+def _append_replan_instruction(
+    history: list[dict[str, Any]],
+    orchestration_state: dict[str, Any],
+) -> None:
+    errors = orchestration_state.get("last_tool_errors") or []
+    if not errors:
+        return
+    history.append(
+        {
+            "role": "system",
+            "content": (
+                "Controller observation: one or more tool calls failed. Inspect the tool results, "
+                "revise the next action, choose a different tool or narrower arguments if needed, "
+                "and continue from the current state. Do not repeat the same failing call unless "
+                "new evidence justifies it. Error summary: "
+                f"{json.dumps(errors, default=str)}"
+            ),
+        }
+    )
 
 
 # ── Tool execution ────────────────────────────────────────────────────────────
@@ -744,12 +803,14 @@ async def run_loop(
             return {"status": "awaiting_approval"}
 
         # ── Execute tool calls (parallel if multiple) ───────────────────────
+        tool_messages: list[dict[str, Any]] = []
         if len(calls) == 1:
             try:
                 tool_msg = await _execute_tool(calls[0], task, agent)
             except ApprovalRequired:
                 await _open_approval_gate(task, calls, history, iteration, model=effective_model)
                 return {"status": "awaiting_approval"}
+            tool_messages.append(tool_msg)
             history.append(tool_msg)
         else:
             # Parallel execution — gather all results concurrently
@@ -765,17 +826,30 @@ async def run_loop(
                 return {"status": "awaiting_approval"}
             for r in raw_results:
                 if isinstance(r, Exception):
-                    history.append({
+                    tool_msg = {
                         "role": "tool",
                         "tool_call_id": "error",
                         "name": "error",
                         "content": json.dumps({"error": str(r)}),
-                    })
+                    }
+                    tool_messages.append(tool_msg)
+                    history.append(tool_msg)
                 else:
+                    tool_messages.append(r)
                     history.append(r)
 
+        state = _orchestration_state(calls, tool_messages, iteration)
+        _append_replan_instruction(history, state)
+
         # Persist after every iteration
-        await _checkpoint(task_id, history, iteration, model=effective_model, current_step=iteration)
+        await _checkpoint(
+            task_id,
+            history,
+            iteration,
+            model=effective_model,
+            orchestration_state=state,
+            current_step=iteration,
+        )
 
     # Max iterations exceeded
     error = "max_iterations_exceeded"

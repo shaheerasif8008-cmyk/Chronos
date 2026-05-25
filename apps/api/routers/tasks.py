@@ -37,7 +37,7 @@ async def create_task_record(
     workspace_id: str | None = None,
     model: str | None = None,
 ) -> str:
-    """Insert a task row.  No upfront plan — the native agent loop plans dynamically.
+    """Insert a task row. The native model action loop orchestrates by default.
 
     `model` is the chat-model id chosen in the UI; it is resolved to a concrete
     litellm model string and stored in agent_state so the loop honours the picker.
@@ -59,7 +59,7 @@ async def create_task_record(
                 triggered_by_member_id=member.id,
                 status="pending",
                 goal=goal,
-                plan={},                              # agent loop builds plan dynamically
+                plan={},
                 agent_state={"agent_history": [], "iteration_count": 0, "model": resolved_model},
                 current_step=0,
                 result={},

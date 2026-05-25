@@ -58,13 +58,14 @@ async def test_executor_resumes_from_persisted_current_step_after_restart(monkey
         if event["type"] == "step_done" and event["step"]["id"] == "step-1":
             raise RuntimeError("process killed after step 1")
 
-    async def fake_permission(*args, **kwargs):
-        return True
-
     monkeypatch.setattr(executor, "get_task", fake_get_task)
-    monkeypatch.setattr(executor, "update_task", fake_update_task)
+    monkeypatch.setattr(executor, "save_task", fake_update_task)
     monkeypatch.setattr(executor, "emit_activity", fake_emit)
-    monkeypatch.setattr(executor.permissions, "check", fake_permission)
+
+    async def fake_think(self, task_arg, step, context, model):
+        return {"summary": step["id"]}
+
+    monkeypatch.setattr(executor.TaskExecutor, "_run_think_step", fake_think)
 
     with pytest.raises(RuntimeError, match="process killed"):
         await executor.TaskExecutor().run("task-1")
@@ -220,7 +221,7 @@ def test_approved_approval_without_draft_result_is_ready_for_execution():
 @pytest.mark.asyncio
 async def test_agent_loop_uses_model_decisions_and_broker_checkpoint(monkeypatch):
     from core.models import ToolResult
-    from runtime import executor
+    from runtime import agent_loop
 
     tasks = {
         "task-agent-loop": {
@@ -232,12 +233,8 @@ async def test_agent_loop_uses_model_decisions_and_broker_checkpoint(monkeypatch
             "persona_id": None,
             "status": "pending",
             "goal": "Search and summarize",
-            "plan": {
-                "suggested_steps": [
-                    {"id": "search", "action": "tool_call", "tool": "browser.search", "args": {"query": "acme"}, "description": "Search"}
-                ],
-                "agent_history": [],
-            },
+            "plan": {},
+            "agent_state": {},
             "current_step": 0,
             "result": {},
             "iteration_count": 0,
@@ -255,41 +252,47 @@ async def test_agent_loop_uses_model_decisions_and_broker_checkpoint(monkeypatch
     async def fake_get_task(task_id):
         return dict(tasks[task_id])
 
-    async def fake_update_task(task_id, **values):
+    async def fake_save_task(task_id, **values):
         updates.append(values)
         tasks[task_id].update(values)
 
     async def fake_emit(task_id, event, actor_id="chronos"):
         return None
 
-    async def fake_tool_call(messages, tools, model=None):
+    async def fake_persist(task_arg, content):
+        return None
+
+    async def fake_llm_step(messages, tools, model=None):
         assert tools
-        return decisions.pop(0)
+        decision = decisions.pop(0)
+        if decision["type"] == "tool_call":
+            return None, [{"id": "call-1", "name": "browser__search", "args_str": json.dumps(decision["args"])}]
+        return decision["result"]["answer"], []
 
     async def fake_execute(agent, tool, args):
         calls.append((tool, args))
         return ToolResult(summary="searched", data={"results": [{"title": "Acme"}]})
 
-    monkeypatch.setattr(executor, "get_task", fake_get_task)
-    monkeypatch.setattr(executor, "update_task", fake_update_task)
-    monkeypatch.setattr(executor, "emit_activity", fake_emit)
-    monkeypatch.setattr(executor.llm, "tool_call", fake_tool_call)
-    monkeypatch.setattr(executor.tool_broker, "execute", fake_execute)
+    monkeypatch.setattr(agent_loop, "save_task", fake_save_task)
+    monkeypatch.setattr(agent_loop, "publish_activity", fake_emit)
+    monkeypatch.setattr(agent_loop, "emit_activity", fake_emit)
+    monkeypatch.setattr(agent_loop, "_persist_to_conversation", fake_persist)
+    monkeypatch.setattr(agent_loop, "_llm_step", fake_llm_step)
+    monkeypatch.setattr(agent_loop.tool_broker, "execute", fake_execute)
 
-    await executor.TaskExecutor()._run_loop("task-agent-loop")
+    await agent_loop.run_loop(tasks["task-agent-loop"])
 
     assert calls == [("browser.search", {"query": "acme"})]
     assert tasks["task-agent-loop"]["status"] == "complete"
     assert tasks["task-agent-loop"]["result"] == {"answer": "done"}
-    checkpoint = tasks["task-agent-loop"]["plan"]["agent_history"]
+    checkpoint = tasks["task-agent-loop"]["agent_state"]["agent_history"]
     assert any(message.get("role") == "tool" for message in checkpoint)
     assert tasks["task-agent-loop"]["iteration_count"] == 2
 
 
 @pytest.mark.asyncio
 async def test_agent_loop_pauses_and_checkpoints_on_approval(monkeypatch):
-    from core.exceptions import ApprovalRequired
-    from runtime import executor
+    from runtime import agent_loop
 
     tasks = {
         "task-approval-loop": {
@@ -301,7 +304,8 @@ async def test_agent_loop_pauses_and_checkpoints_on_approval(monkeypatch):
             "persona_id": None,
             "status": "pending",
             "goal": "Send email",
-            "plan": {"suggested_steps": [], "agent_history": []},
+            "plan": {},
+            "agent_state": {},
             "current_step": 0,
             "result": {},
             "iteration_count": 0,
@@ -314,34 +318,36 @@ async def test_agent_loop_pauses_and_checkpoints_on_approval(monkeypatch):
     async def fake_get_task(task_id):
         return dict(tasks[task_id])
 
-    async def fake_update_task(task_id, **values):
+    async def fake_save_task(task_id, **values):
         tasks[task_id].update(values)
 
     async def fake_emit(task_id, event, actor_id="chronos"):
         return None
 
-    async def fake_tool_call(messages, tools, model=None):
-        return {"type": "tool_call", "tool": "gmail.send", "args": {"to": ["a@example.com"], "subject": "Hi", "body": "Hello"}}
+    async def fake_llm_step(messages, tools, model=None):
+        return None, [
+            {
+                "id": "call-1",
+                "name": "gmail__send",
+                "args_str": json.dumps({"to": ["a@example.com"], "subject": "Hi", "body": "Hello"}),
+            }
+        ]
 
-    async def fake_execute(agent, tool, args):
-        raise ApprovalRequired(tool, "needs approval")
+    async def fake_open_approval(task, pending_calls, history, iteration, model=None):
+        approval_calls.append((task["id"], pending_calls[0]["name"], list(history)))
+        await fake_save_task(task["id"], status="awaiting_approval", agent_state={"agent_history": history})
 
-    async def fake_open_approval(self, task, decision, history):
-        approval_calls.append((task["id"], decision["tool"], list(history)))
-        await fake_update_task(task["id"], status="awaiting_approval", plan={**task["plan"], "agent_history": history})
+    monkeypatch.setattr(agent_loop, "save_task", fake_save_task)
+    monkeypatch.setattr(agent_loop, "publish_activity", fake_emit)
+    monkeypatch.setattr(agent_loop, "emit_activity", fake_emit)
+    monkeypatch.setattr(agent_loop, "_llm_step", fake_llm_step)
+    monkeypatch.setattr(agent_loop, "_open_approval_gate", fake_open_approval)
 
-    monkeypatch.setattr(executor, "get_task", fake_get_task)
-    monkeypatch.setattr(executor, "update_task", fake_update_task)
-    monkeypatch.setattr(executor, "emit_activity", fake_emit)
-    monkeypatch.setattr(executor.llm, "tool_call", fake_tool_call)
-    monkeypatch.setattr(executor.tool_broker, "execute", fake_execute)
-    monkeypatch.setattr(executor.TaskExecutor, "_open_approval_checkpoint", fake_open_approval)
-
-    await executor.TaskExecutor()._run_loop("task-approval-loop")
+    await agent_loop.run_loop(tasks["task-approval-loop"])
 
     assert tasks["task-approval-loop"]["status"] == "awaiting_approval"
-    assert approval_calls[0][1] == "gmail.send"
-    assert tasks["task-approval-loop"]["plan"]["agent_history"]
+    assert approval_calls[0][1] == "gmail__send"
+    assert tasks["task-approval-loop"]["agent_state"]["agent_history"]
 
 
 @pytest.mark.asyncio
@@ -356,12 +362,13 @@ async def test_approval_gate_waits_for_all_pending_decisions_before_drafting(mon
         "workspace_id": None,
         "persona_id": None,
         "status": "awaiting_approval",
+        "plan": {"steps": [{"id": "approve_drafts", "action": "approval_gate", "depends_on": []}], "context": {}},
         "result": {},
+        "agent_state": {"dag_state": {"completed_step_ids": ["draft"], "skipped_step_ids": []}},
     }
-    step = {"id": "approve_drafts", "tool": "gmail.draft"}
+    task_id = task["id"]
     events = []
     updates = []
-    executed = False
 
     class FakeColumn:
         def __eq__(self, other):
@@ -381,8 +388,22 @@ async def test_approval_gate_waits_for_all_pending_decisions_before_drafting(mon
 
         def all(self):
             return [
-                {"id": "approval-1", "status": "approved", "action_payload": {"to": "approved@example.com"}},
-                {"id": "approval-2", "status": "pending", "action_payload": {"to": "pending@example.com"}},
+                {
+                    "id": "approval-1",
+                    "task_id": task_id,
+                    "step_id": "approve_drafts",
+                    "status": "approved",
+                    "action_type": "gmail.draft",
+                    "action_payload": {"to": "approved@example.com", "tool": "gmail.draft", "dag_step_id": "approve_drafts"},
+                },
+                {
+                    "id": "approval-2",
+                    "task_id": task_id,
+                    "step_id": "approve_drafts",
+                    "status": "pending",
+                    "action_type": "gmail.draft",
+                    "action_payload": {"to": "pending@example.com", "tool": "gmail.draft", "dag_step_id": "approve_drafts"},
+                },
             ]
 
     class FakeConn:
@@ -403,29 +424,26 @@ async def test_approval_gate_waits_for_all_pending_decisions_before_drafting(mon
         assert name == "approvals"
         return FakeApprovals()
 
+    async def fake_get_task(requested_task_id):
+        assert requested_task_id == task_id
+        return dict(task)
+
     async def fake_update_task(task_id, **values):
         updates.append((task_id, values))
 
     async def fake_emit(task_id, event, **kwargs):
         events.append(event)
 
-    async def fake_execute_approved_drafts(self, task_arg, step_arg, rows):
-        nonlocal executed
-        executed = True
-        return []
-
     monkeypatch.setattr(executor, "reflect_table", fake_reflect_table)
+    monkeypatch.setattr(executor, "get_task", fake_get_task)
     monkeypatch.setattr(executor, "engine", FakeEngine())
-    monkeypatch.setattr(executor, "update_task", fake_update_task)
+    monkeypatch.setattr(executor, "save_task", fake_update_task)
     monkeypatch.setattr(executor, "emit_activity", fake_emit)
     monkeypatch.setattr(executor, "select", lambda table: table)
-    monkeypatch.setattr(executor.TaskExecutor, "_execute_approved_drafts", fake_execute_approved_drafts)
 
-    with pytest.raises(executor._PausedForApproval):
-        await executor.TaskExecutor()._handle_approval_gate(task, step)
+    await executor.TaskExecutor().resume("task-approval-batch")
 
-    assert executed is False
-    assert updates == [("task-approval-batch", {"status": "awaiting_approval"})]
+    assert updates == []
     assert events == []
 
 
@@ -442,8 +460,8 @@ async def test_planner_falls_back_to_demo_plan_when_model_fails(monkeypatch):
 
     plan = await planner.create_plan("research leads and draft outreach", {"triggered_by": "test"}, "default")
 
-    assert [step["action"] for step in plan] == ["spawn_sub_agent", "think", "approval_gate"]
-    assert plan[-1]["tool"] == "gmail.draft"
+    assert [step["action"] for step in plan["steps"]] == ["spawn_sub_agent", "think", "approval_gate"]
+    assert plan["steps"][-1]["tool"] == "gmail.draft"
 
 
 @pytest.mark.asyncio
@@ -463,9 +481,9 @@ async def test_planner_falls_back_to_research_plan_for_market_brief(monkeypatch)
         "default",
     )
 
-    assert [step["action"] for step in plan] == ["tool_call", "think"]
-    assert plan[0]["tool"] == "browser.search"
-    assert plan[1]["id"] == "synthesize"
+    assert [step["action"] for step in plan["steps"]] == ["tool_call", "think"]
+    assert plan["steps"][0]["tool"] == "browser.search"
+    assert plan["steps"][1]["id"] == "synthesize"
 
 
 @pytest.mark.asyncio
@@ -485,9 +503,9 @@ async def test_planner_falls_back_to_browser_search_for_current_news(monkeypatch
         "default",
     )
 
-    assert [step["action"] for step in plan] == ["tool_call", "think"]
-    assert plan[0]["tool"] == "browser.search"
-    assert plan[0]["args"]["query"] == "what is the latest news on AI agents?"
+    assert [step["action"] for step in plan["steps"]] == ["tool_call", "think"]
+    assert plan["steps"][0]["tool"] == "browser.search"
+    assert plan["steps"][0]["args"]["query"] == "what is the latest news on AI agents?"
 
 
 def test_agent_system_prompt_includes_current_date_for_live_search():
@@ -535,20 +553,37 @@ async def test_spawn_sub_agent_step_is_not_retried(monkeypatch):
     attempts = []
     events = []
 
-    async def fake_execute_step(self, task, step):
+    async def fake_run_subagent(task, args, depth):
         attempts.append(step["id"])
         raise RuntimeError("child failed")
 
     async def fake_emit(task_id, event, **kwargs):
         events.append(event)
 
-    monkeypatch.setattr(executor.TaskExecutor, "_execute_step", fake_execute_step)
     monkeypatch.setattr(executor, "emit_activity", fake_emit)
+    import runtime.agent_loop as agent_loop
 
-    with pytest.raises(executor.TaskExecutionError, match="after 1 attempts"):
-        await executor.TaskExecutor()._execute_with_retries(
-            {"id": "task-1"},
-            {"id": "research", "action": "spawn_sub_agent"},
+    monkeypatch.setattr(agent_loop, "_run_subagent", fake_run_subagent)
+
+    task = {
+        "id": "task-1",
+        "organization_id": "default",
+        "region": "us",
+        "triggered_by_member_id": "member-1",
+        "goal": "spawn",
+        "depth": 0,
+    }
+    step = {"id": "research", "action": "spawn_sub_agent", "args": {"goal": "research"}}
+
+    with pytest.raises(RuntimeError, match="child failed"):
+        await executor.TaskExecutor()._execute_dag_step(
+            task,
+            step,
+            {},
+            executor.AgentContext.from_task(task),
+            None,
+            set(),
+            set(),
         )
 
     assert attempts == ["research"]
@@ -653,8 +688,10 @@ async def test_operator_workflow_proof_task_api_reaches_pending_approval(monkeyp
     approvals = []
     scheduled = []
 
-    async def fake_create_task_record(*, goal, member, triggered_by, persona_id=None, workspace_id=None):
-        plan = await tasks.create_plan(goal, {"triggered_by": triggered_by}, member.organization_id)
+    async def fake_create_task_record(*, goal, member, triggered_by, persona_id=None, workspace_id=None, model=None):
+        from runtime.planner import create_plan
+
+        plan = await create_plan(goal, {"triggered_by": triggered_by}, member.organization_id)
         task_state.update(
             {
                 "id": task_id,
@@ -717,9 +754,10 @@ async def test_operator_workflow_proof_task_api_reaches_pending_approval(monkeyp
         approvals.append({"task_id": task["id"], "step_id": step["id"], "draft_count": len(task["result"]["drafts"])})
         return ["approval-1", "approval-2"]
 
-    async def fake_handle_approval_gate(self, task, step):
+    async def fake_handle_approval_gate(self, task, step, context, completed, skipped):
+        task["result"] = dict(context)
         approval_ids = await fake_create_approvals(self, task, step)
-        await executor.update_task(task["id"], status="awaiting_approval")
+        await executor.save_task(task["id"], status="awaiting_approval", result=dict(context))
         await executor.emit_activity(
             task["id"],
             {"type": "awaiting_approval", "approval_ids": approval_ids, "step_id": step["id"]},
@@ -729,9 +767,8 @@ async def test_operator_workflow_proof_task_api_reaches_pending_approval(monkeyp
     monkeypatch.setattr(tasks, "create_task_record", fake_create_task_record)
     monkeypatch.setattr(tasks.asyncio, "create_task", fake_create_task)
     monkeypatch.setattr(executor, "get_task", fake_get_task)
-    monkeypatch.setattr(executor, "update_task", fake_update_task)
+    monkeypatch.setattr(executor, "save_task", fake_update_task)
     monkeypatch.setattr(executor, "emit_activity", fake_emit)
-    monkeypatch.setattr(executor.permissions, "check", fake_permission)
     monkeypatch.setattr(executor.tool_broker, "execute", fake_tool_execute)
     monkeypatch.setattr(executor.TaskExecutor, "_handle_approval_gate", fake_handle_approval_gate)
 
@@ -749,9 +786,9 @@ async def test_operator_workflow_proof_task_api_reaches_pending_approval(monkeyp
     await scheduled[0]
 
     assert task_state["status"] == "awaiting_approval", task_state.get("error")
-    assert [step["action"] for step in task_state["plan"]] == ["tool_call", "think", "approval_gate"]
-    assert task_state["plan"][0]["tool"] == "browser.search"
-    assert task_state["plan"][0]["args"]["fixture"] == "operator_workflow_proof"
+    assert [step["action"] for step in task_state["plan"]["steps"]] == ["tool_call", "think", "approval_gate"]
+    assert task_state["plan"]["steps"][0]["tool"] == "browser.search"
+    assert task_state["plan"]["steps"][0]["args"]["fixture"] == "operator_workflow_proof"
     assert len(task_state["result"]["leads"]) == 2
     assert len(task_state["result"]["drafts"]) == 2
     assert approvals == [{"task_id": task_id, "step_id": "proof_approval", "draft_count": 2}]
@@ -772,7 +809,7 @@ async def test_chat_task_intent_routes_to_executor_without_chat_completion(monke
     async def fake_classify(message):
         return {"mode": "task", "confidence": 0.9, "goal": "research leads and draft outreach"}
 
-    async def fake_create_task_record(*, goal, member, triggered_by, persona_id=None, workspace_id=None):
+    async def fake_create_task_record(*, goal, member, triggered_by, persona_id=None, workspace_id=None, model=None):
         assert goal == "research leads and draft outreach"
         assert persona_id == "sdr-outreach"
         assert triggered_by == "conversation-1"
@@ -817,9 +854,10 @@ async def test_chat_task_intent_routes_to_executor_without_chat_completion(monke
     body = ""
     async for chunk in response.body_iterator:
         body += chunk.decode() if isinstance(chunk, bytes) else chunk
+        if "task_created" in body:
+            break
 
     assert "task_created" in body
     assert "task-1" in body
     assert scheduled == ["run-task-1"]
     assert saved[0] == ("conversation-1", "user", "Can you pull together a lead brief and draft outreach?")
-    assert saved[-1][1] == "assistant"

@@ -136,6 +136,7 @@ async def assemble_context(
             base += f"\n\n{warning}"
 
     # ── Layer 5: memory ─────────────────────────────────────────────────────
+    requester_context.memory_context = "task" if requester_context.task_id else "chat"
     try:
         memories = await asyncio.wait_for(
             memory.retrieve(message, requester_context),

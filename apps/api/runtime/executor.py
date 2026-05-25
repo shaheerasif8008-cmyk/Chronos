@@ -10,12 +10,19 @@ Heavy lifting has moved to runtime/agent_loop.py.
 from __future__ import annotations
 
 import asyncio
+import ast
+import inspect
+import json
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import insert, select, update
 
+from core import tool_broker
 from core.db import engine, reflect_table
+from core.llm import complete_json
+from core.models import AgentContext
 from runtime.agent_loop import (
     activity_channel,
     emit_activity,
@@ -24,9 +31,14 @@ from runtime.agent_loop import (
     resume_after_approval,
     save_task,
 )
+from runtime.planner import normalize_plan
 
 # ── Public name kept for imports in approvals.py, sub_agent.py, tests ─────────
 AGENT_LOOP_APPROVAL_STEP_ID = "agent_loop"
+
+
+class _PausedForApproval(Exception):
+    """Internal control flow for DAG steps that created approval records."""
 
 
 def now_utc() -> datetime:
@@ -59,7 +71,7 @@ def approvals_ready_for_drafting(rows: list[dict[str, Any]]) -> list[dict[str, A
 # ── TaskExecutor ───────────────────────────────────────────────────────────────
 
 class TaskExecutor:
-    """Thin wrapper over the native agent loop.  Public API unchanged."""
+    """Run category-1 DAG plans, falling back to the native loop for empty plans."""
 
     async def run(self, task_id: str) -> None:
         task = await get_task(task_id)
@@ -67,8 +79,499 @@ class TaskExecutor:
             raise RuntimeError(f"Task not found: {task_id}")
         if task["status"] in {"complete", "failed", "cancelled"}:
             return
+        if _has_dag_plan(task.get("plan")):
+            await self._run_dag(task)
+            return
         await run_loop(task)
 
     async def resume(self, task_id: str) -> None:
         """Resume a loop that was paused for approval."""
+        task = await get_task(task_id)
+        if task and _has_dag_plan(task.get("plan")):
+            await self._resume_dag(task)
+            return
         await resume_after_approval(task_id)
+
+    async def _run_dag(self, task: dict[str, Any]) -> dict[str, Any]:
+        task_id = task["id"]
+        plan = normalize_plan(task.get("plan"))
+        state = _dag_state(task)
+        completed: set[str] = set(state.get("completed_step_ids") or [])
+        skipped: set[str] = set(state.get("skipped_step_ids") or [])
+        context = dict(plan.get("context") or {})
+        context.update(task.get("result") or {})
+        model = _stored_model(task)
+        agent = AgentContext.from_task(task)
+
+        await save_task(
+            task_id,
+            status="running",
+            plan=plan,
+            started_at=task.get("started_at") or datetime.now(timezone.utc),
+        )
+
+        while True:
+            ready = self._ready_steps(plan["steps"], completed | skipped, context)
+            if not ready:
+                blocked = [
+                    step["id"]
+                    for step in plan["steps"]
+                    if step["id"] not in completed and step["id"] not in skipped
+                ]
+                if blocked:
+                    error = f"blocked_steps:{','.join(blocked)}"
+                    await save_task(task_id, status="failed", error=error, result=_public_context(context))
+                    await emit_activity(task_id, {"type": "task_failed", "error": error})
+                    return {"error": error}
+                result = _public_context(context)
+                await save_task(
+                    task_id,
+                    status="complete",
+                    current_step=len(completed),
+                    result=result,
+                    completed_at=datetime.now(timezone.utc),
+                    agent_state=_updated_dag_state(task, completed, skipped),
+                )
+                await emit_activity(task_id, {"type": "task_complete", "result": result})
+                return result
+
+            runnable: list[dict[str, Any]] = []
+            for step in ready:
+                if not self._condition_met(step, context):
+                    skipped.add(step["id"])
+                    await emit_activity(task_id, {"type": "step_skipped", "step": step, "reason": "condition_false"})
+                    continue
+                runnable.append(step)
+
+            if not runnable:
+                await self._checkpoint_dag(task, plan, completed, skipped, context)
+                continue
+
+            results = await asyncio.gather(
+                *[self._execute_dag_step(task, step, context, agent, model, completed, skipped) for step in runnable],
+                return_exceptions=True,
+            )
+            for step, result in zip(runnable, results):
+                if isinstance(result, _PausedForApproval):
+                    return {"status": "awaiting_approval"}
+                if isinstance(result, Exception):
+                    error = str(result)
+                    await save_task(
+                        task_id,
+                        status="failed",
+                        error=error,
+                        result=_public_context(context),
+                        completed_at=datetime.now(timezone.utc),
+                        agent_state=_updated_dag_state(task, completed, skipped),
+                    )
+                    await emit_activity(task_id, {"type": "task_failed", "error": error, "step": step})
+                    return {"error": error}
+
+                completed.add(step["id"])
+                output_key = step.get("output_key") or step["id"]
+                if result is not None:
+                    context[output_key] = result
+                    if isinstance(result, dict):
+                        for key in ("leads", "drafts", "findings", "answer", "summary"):
+                            if key in result:
+                                context[key] = result[key]
+                await self._checkpoint_dag(task, plan, completed, skipped, context)
+                await emit_activity(task_id, {"type": "step_done", "step": step, "output_key": output_key})
+
+            await self._checkpoint_dag(task, plan, completed, skipped, context)
+            revised_remaining = await _maybe_await(self._maybe_replan(task, completed, context, model))
+            if revised_remaining:
+                plan = self._merge_replan(plan, completed, skipped, revised_remaining)
+                await save_task(task_id, plan=plan)
+
+    def _ready_steps(
+        self,
+        steps: list[dict[str, Any]],
+        resolved: set[str],
+        context: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        del context
+        return [
+            step
+            for step in steps
+            if step["id"] not in resolved
+            and all(dep in resolved for dep in step.get("depends_on", []))
+        ]
+
+    async def _execute_dag_step(
+        self,
+        task: dict[str, Any],
+        step: dict[str, Any],
+        context: dict[str, Any],
+        agent: AgentContext,
+        model: str | None,
+        completed: set[str],
+        skipped: set[str],
+    ) -> Any:
+        await emit_activity(task["id"], {"type": "step_start", "step": step})
+        action = step["action"]
+        if action == "tool_call":
+            result = await tool_broker.execute(agent, str(step["tool"]), dict(step.get("args") or {}))
+            return result.data
+        if action == "think":
+            return await self._run_think_step(task, step, context, model)
+        if action == "escalate":
+            raise RuntimeError(step.get("message") or step.get("description") or "Escalation required")
+        if action == "approval_gate":
+            await self._handle_approval_gate(task, step, context, completed, skipped)
+            raise _PausedForApproval()
+        if action == "spawn_sub_agent":
+            from runtime.agent_loop import _run_subagent
+
+            return await _run_subagent(task, dict(step.get("args") or {}), int(task.get("depth") or 0))
+        raise RuntimeError(f"Unsupported DAG step action: {action}")
+
+    async def _run_think_step(
+        self,
+        task: dict[str, Any],
+        step: dict[str, Any],
+        context: dict[str, Any],
+        model: str | None,
+    ) -> dict[str, Any]:
+        prompt = step.get("prompt") or step.get("description") or "Reason over the task context."
+        if _find_context_list(context, "leads") and "draft" in f"{step.get('id', '')} {prompt}".lower():
+            return self._deterministic_think(step, context)
+        try:
+            raw = await complete_json(
+                "Return JSON only.\n"
+                f"Task goal: {task.get('goal')}\n"
+                f"Step: {prompt}\n"
+                f"Context: {json.dumps(_public_context(context), default=str)}",
+                model=model,
+            )
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {"value": parsed}
+        except Exception:
+            return self._deterministic_think(step, context)
+
+    def _deterministic_think(self, step: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+        leads = _find_context_list(context, "leads")
+        if leads:
+            drafts = []
+            for lead in leads[:10]:
+                if not isinstance(lead, dict):
+                    continue
+                company = lead.get("company") or lead.get("title") or "there"
+                domain = lead.get("domain") or lead.get("url") or ""
+                to = lead.get("email") or (f"hello@{domain}" if domain else "")
+                personalization = lead.get("personalization") or lead.get("summary") or lead.get("snippet") or ""
+                drafts.append(
+                    {
+                        "to": to,
+                        "subject": f"Quick note for {company}",
+                        "body": f"Hi {company},\n\n{personalization}\n\nWould it be useful to compare notes this week?",
+                        "lead": lead,
+                    }
+                )
+            return {"drafts": drafts, "summary": f"Prepared {len(drafts)} approval-ready drafts."}
+        findings = _find_context_list(context, "results") or _find_context_list(context, "findings")
+        if findings:
+            return {"findings": findings, "summary": f"Summarized {len(findings)} findings."}
+        return {"summary": step.get("description") or "Reasoning step complete."}
+
+    async def _handle_approval_gate(
+        self,
+        task: dict[str, Any],
+        step: dict[str, Any],
+        context: dict[str, Any],
+        completed: set[str],
+        skipped: set[str],
+    ) -> None:
+        approvals = await reflect_table("approvals")
+        approval_ids: list[str] = []
+        tool = str(step.get("tool") or "approval.required")
+        drafts = _find_context_list(context, str((step.get("args") or {}).get("from_result") or "drafts"))
+        payloads = drafts if drafts else [dict(step.get("args") or {})]
+
+        async with engine.begin() as conn:
+            for index, payload in enumerate(payloads):
+                row = await conn.execute(
+                    insert(approvals)
+                    .values(
+                        organization_id=task["organization_id"],
+                        region=task.get("region", "us"),
+                        task_id=task["id"],
+                        step_id=step["id"],
+                        action_type=tool,
+                        action_payload={
+                            **(payload if isinstance(payload, dict) else {"value": payload}),
+                            "tool": tool,
+                            "dag_step_id": step["id"],
+                            "batch_index": index,
+                        },
+                    )
+                    .returning(approvals.c.id)
+                )
+                approval_ids.append(str(row.scalar_one()))
+
+        await save_task(
+            task["id"],
+            status="awaiting_approval",
+            result=_public_context(context),
+            agent_state=_updated_dag_state(task, completed, skipped),
+        )
+        await emit_activity(
+            task["id"],
+            {"type": "awaiting_approval", "approval_ids": approval_ids, "step_id": step["id"], "tool": tool},
+        )
+
+    async def _resume_dag(self, task: dict[str, Any]) -> None:
+        if task.get("status") != "awaiting_approval":
+            await self._run_dag(task)
+            return
+
+        approvals = await reflect_table("approvals")
+        async with engine.begin() as conn:
+            rows = (
+                await conn.execute(select(approvals).where(approvals.c.task_id == task["id"]))
+            ).mappings().all()
+        rows = [dict(row) for row in rows]
+        if any(row["status"] == "pending" for row in rows):
+            return
+
+        state = _dag_state(task)
+        completed = set(state.get("completed_step_ids") or [])
+        skipped = set(state.get("skipped_step_ids") or [])
+        context = dict(task.get("result") or {})
+        agent = AgentContext.from_task(task)
+        approval_results: list[dict[str, Any]] = []
+
+        for row in rows:
+            payload = dict(row.get("action_payload") or {})
+            if payload.get("execution_result") or payload.get("execution_error") or payload.get("rejection_result"):
+                continue
+            step_id = str(payload.get("dag_step_id") or row["step_id"])
+            if row["status"] == "rejected":
+                await self._mark_approval_payload(row["id"], {**payload, "rejection_result": True}, approvals)
+                skipped.add(step_id)
+                continue
+
+            tool = payload.get("tool") or row["action_type"]
+            args = {
+                key: value
+                for key, value in payload.items()
+                if key not in {"tool", "dag_step_id", "batch_index", "execution_result", "execution_error"}
+            }
+            try:
+                result = await tool_broker.execute(agent, tool, {**args, "__approved_by_gate": True})
+                result_data = {"summary": result.summary, "data": result.data}
+                approval_results.append(result_data)
+                await self._mark_approval_payload(row["id"], {**payload, "execution_result": result_data}, approvals)
+            except Exception as exc:
+                error_data = {"error": str(exc)}
+                approval_results.append(error_data)
+                await self._mark_approval_payload(row["id"], {**payload, "execution_error": str(exc)}, approvals)
+            completed.add(step_id)
+
+        context["approval_results"] = approval_results
+        await save_task(
+            task["id"],
+            status="running",
+            result=_public_context(context),
+            agent_state=_updated_dag_state(task, completed, skipped),
+        )
+        refreshed = await get_task(task["id"])
+        if refreshed:
+            await self._run_dag(refreshed)
+
+    async def _mark_approval_payload(self, approval_id: str, payload: dict[str, Any], approvals_table: Any) -> None:
+        async with engine.begin() as conn:
+            await conn.execute(
+                update(approvals_table).where(approvals_table.c.id == approval_id).values(action_payload=payload)
+            )
+
+    async def _maybe_replan(
+        self,
+        task: dict[str, Any],
+        completed_steps: set[str],
+        context: dict[str, Any],
+        model: str | None,
+    ) -> list[dict[str, Any]] | None:
+        plan = normalize_plan(task.get("plan"))
+        if plan.get("context", {}).get("allow_replan") is False:
+            return None
+        remaining = [step for step in plan["steps"] if step["id"] not in completed_steps]
+        if not remaining:
+            return None
+        try:
+            raw = await complete_json(
+                "You are Chronos revising a DAG execution plan. Return JSON only with either "
+                '{"replan": false} or {"replan": true, "steps": [...]} for the remaining DAG steps.\n'
+                f"Goal: {task.get('goal')}\n"
+                f"Completed step ids: {sorted(completed_steps)}\n"
+                f"Context: {json.dumps(_public_context(context), default=str)}\n"
+                f"Remaining steps: {json.dumps(remaining, default=str)}",
+                model=model,
+            )
+            parsed = json.loads(raw)
+        except Exception:
+            return None
+        if not isinstance(parsed, dict) or parsed.get("replan") is not True:
+            return None
+        steps = parsed.get("steps")
+        return steps if isinstance(steps, list) and steps else None
+
+    def _merge_replan(
+        self,
+        plan: dict[str, Any],
+        completed: set[str],
+        skipped: set[str],
+        revised_remaining: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        fixed = [step for step in plan["steps"] if step["id"] in completed or step["id"] in skipped]
+        return normalize_plan({"steps": fixed + revised_remaining, "context": plan.get("context") or {}})
+
+    async def _checkpoint_dag(
+        self,
+        task: dict[str, Any],
+        plan: dict[str, Any],
+        completed: set[str],
+        skipped: set[str],
+        context: dict[str, Any],
+    ) -> None:
+        await save_task(
+            task["id"],
+            plan=plan,
+            current_step=len(completed),
+            result=_public_context(context),
+            agent_state=_updated_dag_state(task, completed, skipped),
+        )
+
+    def _condition_met(self, step: dict[str, Any], context: dict[str, Any]) -> bool:
+        condition = step.get("condition")
+        if not isinstance(condition, dict) or not condition.get("if"):
+            return True
+        return _safe_condition(str(condition["if"]), context)
+
+
+def _has_dag_plan(plan: Any) -> bool:
+    if isinstance(plan, dict):
+        return isinstance(plan.get("steps"), list) and bool(plan["steps"])
+    if isinstance(plan, list):
+        return bool(plan)
+    return False
+
+
+def _dag_state(task: dict[str, Any]) -> dict[str, Any]:
+    state = task.get("agent_state") or {}
+    return state.get("dag_state") if isinstance(state.get("dag_state"), dict) else {}
+
+
+def _updated_dag_state(task: dict[str, Any], completed: set[str], skipped: set[str]) -> dict[str, Any]:
+    state = dict(task.get("agent_state") or {})
+    state["dag_state"] = {
+        "completed_step_ids": sorted(completed),
+        "skipped_step_ids": sorted(skipped),
+    }
+    return state
+
+
+def _stored_model(task: dict[str, Any]) -> str | None:
+    state = task.get("agent_state") or {}
+    return state.get("model") if isinstance(state, dict) else None
+
+
+def _public_context(context: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in context.items() if not str(k).startswith("__")}
+
+
+async def _maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+def _safe_condition(expression: str, context: dict[str, Any]) -> bool:
+    names = {key: _to_namespace(value) for key, value in context.items() if key.isidentifier()}
+    try:
+        tree = ast.parse(expression, mode="eval")
+        return bool(_eval_condition_node(tree.body, names))
+    except Exception:
+        return False
+
+
+def _eval_condition_node(node: ast.AST, names: dict[str, Any]) -> Any:
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.Name):
+        if node.id in names:
+            return names[node.id]
+        raise ValueError(f"unknown name: {node.id}")
+    if isinstance(node, ast.Attribute):
+        return getattr(_eval_condition_node(node.value, names), node.attr)
+    if isinstance(node, ast.Subscript):
+        value = _eval_condition_node(node.value, names)
+        index = _eval_condition_node(node.slice, names)
+        return value[index]
+    if isinstance(node, ast.List):
+        return [_eval_condition_node(item, names) for item in node.elts]
+    if isinstance(node, ast.Tuple):
+        return tuple(_eval_condition_node(item, names) for item in node.elts)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return not _eval_condition_node(node.operand, names)
+    if isinstance(node, ast.BoolOp):
+        values = [_eval_condition_node(value, names) for value in node.values]
+        if isinstance(node.op, ast.And):
+            return all(values)
+        if isinstance(node.op, ast.Or):
+            return any(values)
+    if isinstance(node, ast.Compare):
+        left = _eval_condition_node(node.left, names)
+        for op, comparator in zip(node.ops, node.comparators):
+            right = _eval_condition_node(comparator, names)
+            if not _compare_values(left, op, right):
+                return False
+            left = right
+        return True
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        args = [_eval_condition_node(arg, names) for arg in node.args]
+        if node.func.id == "len" and len(args) == 1:
+            return len(args[0])
+        if node.func.id == "any" and len(args) == 1:
+            return any(args[0])
+        if node.func.id == "all" and len(args) == 1:
+            return all(args[0])
+    raise ValueError(f"unsupported condition expression: {ast.dump(node)}")
+
+
+def _compare_values(left: Any, op: ast.cmpop, right: Any) -> bool:
+    if isinstance(op, ast.Eq):
+        return left == right
+    if isinstance(op, ast.NotEq):
+        return left != right
+    if isinstance(op, ast.Lt):
+        return left < right
+    if isinstance(op, ast.LtE):
+        return left <= right
+    if isinstance(op, ast.Gt):
+        return left > right
+    if isinstance(op, ast.GtE):
+        return left >= right
+    if isinstance(op, ast.In):
+        return left in right
+    if isinstance(op, ast.NotIn):
+        return left not in right
+    return False
+
+
+def _to_namespace(value: Any) -> Any:
+    if isinstance(value, dict):
+        return SimpleNamespace(**{k: _to_namespace(v) for k, v in value.items() if str(k).isidentifier()})
+    if isinstance(value, list):
+        return [_to_namespace(item) for item in value]
+    return value
+
+
+def _find_context_list(context: dict[str, Any], key: str) -> list[Any]:
+    direct = context.get(key)
+    if isinstance(direct, list):
+        return direct
+    for value in context.values():
+        if isinstance(value, dict) and isinstance(value.get(key), list):
+            return value[key]
+    return []
