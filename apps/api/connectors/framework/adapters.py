@@ -113,6 +113,84 @@ class InternalTimeAdapter:
         return True
 
 
+class BrowserAdapter:
+    connector = ConnectorDef(
+        id="browser",
+        name="Browser",
+        provider="browser",
+        description="Search, fetch, and extract structured page data through an isolated Playwright browser context.",
+        type="native",
+        auth_type="none",
+        scopes=["browser.search", "browser.fetch", "browser.extract_contacts"],
+        actions=[
+            ConnectorActionDef(
+                name="search",
+                description="Search the web and return structured result snippets.",
+                parameters_schema={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Search query."},
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Maximum result count.",
+                            "minimum": 1,
+                            "maximum": 20,
+                            "default": 10,
+                        },
+                    },
+                    "required": ["query"],
+                },
+                output_schema={"type": "object"},
+                required_permissions=["browser.search"],
+                risk_level="read",
+                approval_required=False,
+            ),
+            ConnectorActionDef(
+                name="fetch",
+                description="Fetch a URL and return readable page text.",
+                parameters_schema={
+                    "type": "object",
+                    "properties": {"url": {"type": "string", "description": "URL to fetch."}},
+                    "required": ["url"],
+                },
+                output_schema={"type": "object"},
+                required_permissions=["browser.fetch"],
+                risk_level="read",
+                approval_required=False,
+            ),
+            ConnectorActionDef(
+                name="extract_contacts",
+                description="Extract emails, phone numbers, and likely people/title lines from a page.",
+                parameters_schema={
+                    "type": "object",
+                    "properties": {"url": {"type": "string", "description": "URL to inspect."}},
+                    "required": ["url"],
+                },
+                output_schema={"type": "object"},
+                required_permissions=["browser.extract_contacts"],
+                risk_level="read",
+                approval_required=False,
+            ),
+        ],
+    )
+
+    async def list_actions(self) -> list[ConnectorActionDef]:
+        return self.connector.actions
+
+    async def execute(self, action_name: str, args: dict[str, Any], context: dict[str, Any]) -> ConnectorResult:
+        from connectors.browser import browser_connector
+
+        tool = f"browser.{action_name}"
+        try:
+            result = await browser_connector.execute(tool, dict(args))
+        except ValueError as exc:
+            return ConnectorResult(status="validation_error", error=str(exc))
+        return ConnectorResult(status="success", output={"summary": result.summary, "data": result.data})
+
+    async def validate_credentials(self, credentials: dict[str, Any]) -> bool:
+        return True
+
+
 class MCPAdapter:
     """Architecture placeholder for MCP connectors.
 
@@ -136,5 +214,5 @@ class MCPAdapter:
 
 
 def adapter_registry() -> dict[str, ConnectorAdapter]:
-    adapters: list[ConnectorAdapter] = [InternalEchoAdapter(), InternalTimeAdapter()]
+    adapters: list[ConnectorAdapter] = [InternalEchoAdapter(), InternalTimeAdapter(), BrowserAdapter()]
     return {adapter.connector.id: adapter for adapter in adapters}

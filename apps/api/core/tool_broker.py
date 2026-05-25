@@ -179,7 +179,7 @@ class ToolBroker:
         # when external OAuth or browser dependencies are not configured.
         provider = tool.split(".")[0]
         tier = await connector_tier(provider)
-        if tier == "live":
+        if tier == "live" and provider not in {"browser", "fs", "code"}:
             from connectors.registry import get as registry_get
 
             connector = await registry_get(agent, tool)

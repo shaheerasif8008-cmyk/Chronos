@@ -287,6 +287,51 @@ async def test_planner_only_uses_registered_permitted_tools():
 
 
 @pytest.mark.asyncio
+async def test_browser_connector_is_registered_and_executable(monkeypatch):
+    from connectors import browser as browser_module
+    from connectors.framework.adapters import adapter_registry
+    from connectors.framework.repository import InMemoryConnectorRepository
+    from connectors.framework.runtime import ConnectorExecutionService
+    from connectors.framework.seed import seed_builtin_connectors
+    from core.models import ToolResult
+
+    async def fake_execute(tool, args):
+        return ToolResult(data={"url": args["url"], "content": "example content"}, summary=f"Fetched {args['url']}: 15 chars")
+
+    monkeypatch.setattr(browser_module.browser_connector, "execute", fake_execute)
+
+    repo = InMemoryConnectorRepository()
+    await seed_builtin_connectors(repo)
+    connector = await repo.install_connector("browser", tenant_id="default", workspace_id="default")
+    await repo.grant_permission(
+        tenant_id="default",
+        workspace_id="default",
+        employee_id="employee-1",
+        user_id="member-1",
+        connector_id=connector["id"],
+        action_name="fetch",
+        allowed_scopes=["browser.fetch"],
+        approval_required=False,
+    )
+
+    tools = await repo.list_permitted_actions(tenant_id="default", workspace_id="default", employee_id="employee-1")
+    assert [action["name"] for _, action, _ in tools] == ["fetch"]
+
+    result = await ConnectorExecutionService(repo, adapter_registry()).execute(
+        connector_id="browser",
+        action_name="fetch",
+        arguments={"url": "https://example.com"},
+        context=AgentContext(id="employee-1", org_id="default", member_id="member-1", workspace_id="default"),
+    )
+
+    assert result.status == "success"
+    assert result.output == {
+        "summary": "Fetched https://example.com: 15 chars",
+        "data": {"url": "https://example.com", "content": "example content"},
+    }
+
+
+@pytest.mark.asyncio
 async def test_planner_execution_stops_at_approval_checkpoint():
     from connectors.framework.planner import ToolExecutionPlan, ToolExecutionStep, ToolOrchestrationPlanner
     from connectors.framework.queue import InMemoryExecutionQueue

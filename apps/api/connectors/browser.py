@@ -47,6 +47,8 @@ async def _save_screenshot(page, label: str) -> str | None:
             secret_key=settings.minio_secret_key,
             secure=settings.minio_secure,
         )
+        if not client.bucket_exists(settings.minio_bucket):
+            client.make_bucket(settings.minio_bucket)
         client.put_object(
             settings.minio_bucket,
             object_name,

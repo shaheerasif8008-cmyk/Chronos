@@ -510,6 +510,54 @@ async def test_tool_broker_blocks_disabled_tool_from_settings(monkeypatch):
         )
 
 
+@pytest.mark.asyncio
+async def test_tool_broker_live_browser_does_not_require_credential_record(monkeypatch):
+    from core import permissions, tool_broker
+    from core.models import AgentContext, ToolResult
+
+    calls = []
+
+    async def fake_permission(*args, **kwargs):
+        return True
+
+    async def noop_rate_limit(org_id):
+        return None
+
+    async def noop_loop(org_id, tool, args_hash):
+        return None
+
+    async def fake_tool_policy(org_id, provider):
+        return {"enabled": True, "approval_required": False}
+
+    async def fake_connector_tier(provider):
+        assert provider == "browser"
+        return "live"
+
+    async def fake_route(agent, tool, args, vault_ref, tier="live"):
+        calls.append((tool, vault_ref, tier))
+        return ToolResult(data={"url": args["url"]}, summary="fetched")
+
+    async def fake_audit_log(*args, **kwargs):
+        return "audit-1"
+
+    monkeypatch.setattr(permissions, "check", fake_permission)
+    monkeypatch.setattr(tool_broker, "_check_rate_limit", noop_rate_limit)
+    monkeypatch.setattr(tool_broker, "_check_loop", noop_loop)
+    monkeypatch.setattr(tool_broker, "tool_policy", fake_tool_policy)
+    monkeypatch.setattr(tool_broker, "connector_tier", fake_connector_tier)
+    monkeypatch.setattr(tool_broker, "_route", fake_route)
+    monkeypatch.setattr(tool_broker.audit, "log", fake_audit_log)
+
+    result = await tool_broker.execute(
+        AgentContext(id="agent-1", org_id="default", member_id="member-1"),
+        "browser.fetch",
+        {"url": "https://example.com"},
+    )
+
+    assert result.summary == "fetched"
+    assert calls == [("browser.fetch", "live", "live")]
+
+
 def test_apply_context_suggestion_appends_patch_to_org_context(tmp_path):
     from routers.context import apply_context_patch
 

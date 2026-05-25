@@ -515,6 +515,43 @@ async def test_browser_search_operator_workflow_fixture_avoids_live_duckduckgo(m
 
 
 @pytest.mark.asyncio
+async def test_browser_screenshot_creates_missing_minio_bucket(monkeypatch):
+    import sys
+    import types
+
+    from connectors import browser
+
+    calls = []
+
+    class FakePage:
+        async def screenshot(self, full_page=False):
+            return b"png"
+
+    class FakeMinio:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def bucket_exists(self, bucket):
+            calls.append(("bucket_exists", bucket))
+            return False
+
+        def make_bucket(self, bucket):
+            calls.append(("make_bucket", bucket))
+
+        def put_object(self, bucket, object_name, data, length, content_type):
+            calls.append(("put_object", bucket, length, content_type))
+
+    monkeypatch.setitem(sys.modules, "minio", types.SimpleNamespace(Minio=FakeMinio))
+
+    object_name = await browser._save_screenshot(FakePage(), "fetch")
+
+    assert object_name and object_name.startswith("browser-screenshots/")
+    assert ("bucket_exists", browser.settings.minio_bucket) in calls
+    assert ("make_bucket", browser.settings.minio_bucket) in calls
+    assert ("put_object", browser.settings.minio_bucket, 3, "image/png") in calls
+
+
+@pytest.mark.asyncio
 async def test_browser_search_falls_back_to_fixture_results_on_live_timeout(monkeypatch):
     from connectors import browser
 
