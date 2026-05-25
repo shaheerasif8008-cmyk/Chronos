@@ -738,7 +738,6 @@ async def resume_after_approval(task_id: str) -> None:
     state = task.get("agent_state") or {}
     history = state.get("agent_history") or await _load_history(task)
     iteration = int(state.get("iteration_count") or 0)
-    pending_calls: list[dict[str, Any]] = state.get("pending_approval_calls") or []
     agent = AgentContext.from_task(task)
 
     # Load approval rows
