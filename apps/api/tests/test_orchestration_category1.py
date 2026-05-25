@@ -480,3 +480,158 @@ async def test_task_executor_rejects_invalid_plan_before_tool_execution(monkeypa
 
     assert task["status"] == "failed"
     assert "salesforce.search" in task["error"]
+
+
+def _wire_run(monkeypatch, executor, task):
+    """Common monkeypatching for TaskExecutor.run() live-routing tests.
+
+    Returns (saved, dag_calls, loop_calls) recorders.
+    """
+    saved: dict = {}
+    dag_calls: list = []
+    loop_calls: list = []
+
+    async def fake_get_task(task_id):
+        return dict(task)
+
+    async def fake_save_task(task_id, **values):
+        saved.update(values)
+        task.update(values)
+
+    async def fake_emit(task_id, event, actor_id="chronos"):
+        return None
+
+    async def fake_run_dag(self, t):
+        dag_calls.append(t)
+        return {}
+
+    async def fake_run_loop(t, **kwargs):
+        loop_calls.append(t)
+        return {}
+
+    monkeypatch.setattr(executor, "get_task", fake_get_task)
+    monkeypatch.setattr(executor, "save_task", fake_save_task)
+    monkeypatch.setattr(executor, "emit_activity", fake_emit)
+    monkeypatch.setattr(executor, "run_loop", fake_run_loop)
+    monkeypatch.setattr(executor.TaskExecutor, "_run_dag", fake_run_dag)
+    return saved, dag_calls, loop_calls
+
+
+@pytest.mark.asyncio
+async def test_run_routes_complex_goal_through_create_plan_to_dag(monkeypatch):
+    from runtime import executor
+    from runtime.planner import TaskClassification
+
+    task = _task({})  # fresh top-level task, empty plan
+    saved, dag_calls, loop_calls = _wire_run(monkeypatch, executor, task)
+    dag_plan = {
+        "steps": [
+            {"id": "s1", "action": "think", "description": "x", "tool": None, "args": {}, "approval_required": False, "depends_on": []}
+        ],
+        "context": {},
+    }
+
+    async def fake_preflight(goal, context, org_id, available_tools=None):
+        return TaskClassification(complexity="complex", requires_tools=["browser.search"]), []
+
+    async def fake_create_plan(goal, context, org_id):
+        return dag_plan
+
+    monkeypatch.setattr(executor, "preflight", fake_preflight)
+    monkeypatch.setattr(executor, "create_plan", fake_create_plan)
+
+    await executor.TaskExecutor().run("task-dag")
+
+    assert saved.get("plan") == dag_plan          # create_plan output persisted to the row
+    assert dag_calls and dag_calls[0]["plan"] == dag_plan
+    assert not loop_calls                          # complex goal must not use the native loop
+
+
+@pytest.mark.asyncio
+async def test_run_uses_native_loop_for_non_complex_goal(monkeypatch):
+    from runtime import executor
+    from runtime.planner import TaskClassification
+
+    task = _task({})
+    saved, dag_calls, loop_calls = _wire_run(monkeypatch, executor, task)
+
+    async def fake_preflight(goal, context, org_id, available_tools=None):
+        return TaskClassification(complexity="medium", requires_tools=[]), []
+
+    async def fail_create_plan(*args, **kwargs):
+        raise AssertionError("create_plan must not run for non-complex goals")
+
+    monkeypatch.setattr(executor, "preflight", fake_preflight)
+    monkeypatch.setattr(executor, "create_plan", fail_create_plan)
+
+    await executor.TaskExecutor().run("task-dag")
+
+    assert loop_calls and not dag_calls            # native loop runs, DAG does not
+    assert task["plan"] == {}                       # plan untouched
+
+
+@pytest.mark.asyncio
+async def test_run_fails_fast_when_required_tool_is_missing(monkeypatch):
+    from runtime import executor
+    from runtime.planner import TaskClassification
+
+    task = _task({})
+    saved, dag_calls, loop_calls = _wire_run(monkeypatch, executor, task)
+
+    async def fake_preflight(goal, context, org_id, available_tools=None):
+        return TaskClassification(complexity="complex", requires_tools=["crm.sync"]), ["crm.sync"]
+
+    async def fail_create_plan(*args, **kwargs):
+        raise AssertionError("create_plan must not run when pre-flight fails")
+
+    monkeypatch.setattr(executor, "preflight", fake_preflight)
+    monkeypatch.setattr(executor, "create_plan", fail_create_plan)
+
+    await executor.TaskExecutor().run("task-dag")
+
+    assert task["status"] == "failed"
+    assert "missing_tools" in (saved.get("error") or "")
+    assert "crm.sync" in saved["error"]
+    assert not dag_calls and not loop_calls
+
+
+@pytest.mark.asyncio
+async def test_run_skips_preflight_for_existing_dag_plan(monkeypatch):
+    from runtime import executor
+
+    task = _task(
+        {
+            "steps": [
+                {"id": "s1", "action": "think", "description": "x", "tool": None, "args": {}, "approval_required": False, "depends_on": []}
+            ],
+            "context": {},
+        }
+    )
+    saved, dag_calls, loop_calls = _wire_run(monkeypatch, executor, task)
+
+    async def fail_preflight(*args, **kwargs):
+        raise AssertionError("pre-flight must be skipped when a DAG plan already exists")
+
+    monkeypatch.setattr(executor, "preflight", fail_preflight)
+
+    await executor.TaskExecutor().run("task-dag")
+
+    assert dag_calls and not loop_calls
+
+
+@pytest.mark.asyncio
+async def test_run_skips_preflight_for_sub_agent_depth(monkeypatch):
+    from runtime import executor
+
+    task = _task({})
+    task["depth"] = 1  # sub-agent — must keep using the native loop
+    saved, dag_calls, loop_calls = _wire_run(monkeypatch, executor, task)
+
+    async def fail_preflight(*args, **kwargs):
+        raise AssertionError("sub-agents must not be pre-flighted or DAG-planned")
+
+    monkeypatch.setattr(executor, "preflight", fail_preflight)
+
+    await executor.TaskExecutor().run("task-dag")
+
+    assert loop_calls and not dag_calls

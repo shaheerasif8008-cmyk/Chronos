@@ -79,8 +79,9 @@ class SubAgentManager:
                 "triggered_by_member_id": parent_task.get("triggered_by_member_id"),
                 "status": "pending",
                 "goal": goal,
-                # No pre-baked plan — executor._run_loop will create_plan from goal.
-                # agent_state starts empty so executor seeds a clean history.
+                # Sub-agents run the native agent loop, never the DAG planner:
+                # TaskExecutor.run() skips pre-flight for depth>0 tasks, and the
+                # empty agent_state lets the loop seed a clean history from the goal.
                 "agent_state": {"agent_history": [], "pending_agent_approval": False},
                 "current_step": 0,
                 "result": {},

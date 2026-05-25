@@ -32,10 +32,21 @@ from runtime.agent_loop import (
     resume_after_approval,
     save_task,
 )
-from runtime.planner import default_available_tools, normalize_plan, validate_plan
+from runtime.checkpoints import create_checkpoint
+from runtime.planner import (
+    PlanningError,
+    create_plan,
+    default_available_tools,
+    normalize_plan,
+    preflight,
+    validate_plan,
+)
 
 # ── Public name kept for imports in approvals.py, sub_agent.py, tests ─────────
 AGENT_LOOP_APPROVAL_STEP_ID = "agent_loop"
+
+# Sentinel returned by _preflight_and_route when the task was failed pre-flight.
+_PREFLIGHT_FAILED = object()
 
 
 class _PausedForApproval(Exception):
@@ -83,15 +94,82 @@ class TaskExecutor:
         if _has_dag_plan(task.get("plan")):
             await self._run_dag(task)
             return
+        if _is_fresh_top_level(task):
+            routed = await self._preflight_and_route(task)
+            if routed is _PREFLIGHT_FAILED:
+                return
+            if routed is not None:
+                await self._run_dag(routed)
+                return
         await run_loop(task)
 
+    async def _preflight_and_route(self, task: dict[str, Any]) -> Any:
+        """Category-4 pre-flight plus category-1 routing for fresh top-level tasks.
+
+        Classifies the goal, dispatches complex goals to the DAG planner, and lets
+        everything else fall through to the native loop. Returns:
+          * ``_PREFLIGHT_FAILED`` — the task was failed (required a missing tool),
+          * a task dict with ``plan`` populated — a DAG plan was built (complex goal),
+          * ``None`` — use the native agent loop (simple/medium goal).
+
+        A classifier or planner failure never blocks execution: it falls back to the
+        native loop rather than failing the task.
+        """
+        goal = str(task.get("goal") or "")
+        context = {"triggered_by": task.get("triggered_by")}
+        org_id = task["organization_id"]
+        try:
+            classification, missing = await preflight(goal, context, org_id)
+        except Exception:
+            return None
+        if missing:
+            error = (
+                f"missing_tools: {', '.join(missing)} — "
+                "connect the required integrations in Settings → Connectors."
+            )
+            await save_task(task["id"], status="failed", error=error, result={}, completed_at=now_utc())
+            await emit_activity(task["id"], {"type": "task_failed", "error": error})
+            return _PREFLIGHT_FAILED
+        if classification.complexity != "complex":
+            return None
+        try:
+            plan = await create_plan(goal, context, org_id)
+        except PlanningError as exc:
+            await emit_activity(task["id"], {"type": "planner_fallback", "error": str(exc)})
+            return None
+        await save_task(task["id"], plan=plan)
+        return {**task, "plan": plan}
+
     async def resume(self, task_id: str) -> None:
-        """Resume a loop that was paused for approval."""
+        """Resume an interrupted task — after an approval pause or a process crash.
+
+        Called both by the approvals router and by ``recover_incomplete_tasks`` on
+        startup, which sweeps every ``pending``/``planning``/``running`` task. Routing:
+
+          * DAG plan present        → ``_resume_dag`` (resumes from completed_step_ids).
+          * awaiting_approval/paused → ``resume_after_approval`` (existing behaviour).
+          * native loop with history → re-enter ``run_loop`` from the checkpointed
+            ``agent_history``/``iteration_count`` (this is the crash-resume path that
+            was previously dropped — ``resume_after_approval`` no-ops on ``running``).
+          * never really started     → delegate to ``run``, which is idempotent: it
+            short-circuits on terminal status and re-runs pre-flight + DAG routing.
+        """
         task = await get_task(task_id)
-        if task and _has_dag_plan(task.get("plan")):
+        if not task:
+            return
+        if task["status"] in {"complete", "failed", "cancelled"}:
+            return
+        if _has_dag_plan(task.get("plan")):
             await self._resume_dag(task)
             return
-        await resume_after_approval(task_id)
+        if task["status"] in {"awaiting_approval", "paused"}:
+            await resume_after_approval(task_id)
+            return
+        state = task.get("agent_state") or {}
+        if isinstance(state, dict) and state.get("agent_history"):
+            await run_loop(task)
+        else:
+            await self.run(task_id)
 
     async def _run_dag(self, task: dict[str, Any]) -> dict[str, Any]:
         task_id = task["id"]
@@ -190,6 +268,8 @@ class TaskExecutor:
                                 context[key] = result[key]
                 await self._checkpoint_dag(task, plan, completed, skipped, context)
                 await emit_activity(task_id, {"type": "step_done", "step": step, "output_key": output_key})
+                if step.get("checkpoint"):
+                    await create_checkpoint(task, step["checkpoint"], _public_context(context), len(completed))
 
             await self._checkpoint_dag(task, plan, completed, skipped, context)
             revised_remaining = await _maybe_await(self._maybe_replan(task, completed, context, model))
@@ -237,7 +317,17 @@ class TaskExecutor:
         if action == "spawn_sub_agent":
             from runtime.agent_loop import _run_subagent
 
-            return await _run_subagent(task, dict(step.get("args") or {}), int(task.get("depth") or 0))
+            args = dict(step.get("args") or {})
+            # Step 4: opt-in state inheritance. The spawn step's `inherit_keys` is the
+            # canonical source; resolve it against the LIVE context (not the stale
+            # persisted result) and hand the snapshot to the child.
+            inherit_keys = args.get("inherit_keys")
+            if inherit_keys:
+                args["_inherited_context"] = {
+                    "parent_goal": task.get("goal", ""),
+                    "parent_context": {key: context[key] for key in inherit_keys if key in context},
+                }
+            return await _run_subagent(task, args, int(task.get("depth") or 0))
         raise RuntimeError(f"Unsupported DAG step action: {action}")
 
     async def _run_think_step(
@@ -461,6 +551,19 @@ class TaskExecutor:
         if not isinstance(condition, dict) or not condition.get("if"):
             return True
         return _safe_condition(str(condition["if"]), context)
+
+
+def _is_fresh_top_level(task: dict[str, Any]) -> bool:
+    """A depth-0 task that has not started a native loop yet — eligible for pre-flight.
+
+    Sub-agents (depth > 0) keep using the native loop. A task that already has agent
+    history is mid-flight or resuming and must not be re-planned.
+    """
+    if int(task.get("depth") or 0) != 0:
+        return False
+    state = task.get("agent_state") or {}
+    history = state.get("agent_history") if isinstance(state, dict) else None
+    return not history
 
 
 def _has_dag_plan(plan: Any) -> bool:

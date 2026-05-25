@@ -63,6 +63,8 @@ def _normalize_step(raw: dict[str, Any], index: int) -> dict[str, Any]:
         step["message"] = str(raw["message"])
     if isinstance(raw.get("gates"), list):
         step["gates"] = [str(gate) for gate in raw["gates"]]
+    if raw.get("checkpoint"):
+        step["checkpoint"] = str(raw["checkpoint"])
     return step
 
 
@@ -448,6 +450,26 @@ def _is_outreach_goal(goal: str) -> bool:
 def _is_research_goal(goal: str) -> bool:
     normalized = goal.lower()
     return any(term in normalized for term in ("research", "brief", "compare", "comparison", "market", "players", "analyze", "analysis"))
+
+
+async def preflight(
+    goal: str,
+    context: dict[str, Any] | None,
+    org_id: str,
+    available_tools: list[str] | None = None,
+) -> tuple[TaskClassification, list[str]]:
+    """Category-4 pre-flight: classify a goal and report required-but-unavailable tools.
+
+    The classification is what actually drives live routing — complex goals are sent
+    to the DAG planner, everything else uses the native loop. The returned ``missing``
+    list is registry-level only: it fires when the classifier names a tool absent from
+    ALL_TOOLS (a hallucinated tool), not when a connector is merely unconnected.
+    Connector-aware gating is a follow-up (Capability Roadmap categories 3/4).
+    """
+    planner = TaskPlanner(available_tools)
+    classification = await planner.classify(goal, context, org_id)
+    missing = _missing_tools(classification.requires_tools, planner.available_tools)
+    return classification, missing
 
 
 async def create_plan(goal: str, context: dict[str, Any] | None, org_id: str) -> dict[str, Any]:
