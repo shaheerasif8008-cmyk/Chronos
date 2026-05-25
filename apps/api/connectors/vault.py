@@ -100,6 +100,29 @@ async def get(vault_ref: str) -> dict[str, Any]:
     return _decrypt(row)
 
 
+async def update(vault_ref: str, credentials: dict[str, Any], actor_id: str = "system") -> None:
+    """Re-encrypt and overwrite credentials for an existing vault_ref.
+
+    Used for in-place token refresh so the vault_ref (and any FK reference to it
+    in the connectors table) remains stable.
+    """
+    from sqlalchemy import update as sa_update
+
+    encrypted = _encrypt(credentials)
+
+    vault_entries = await reflect_table("vault_entries")
+    async with engine.begin() as conn:
+        await conn.execute(
+            sa_update(vault_entries)
+            .where(vault_entries.c.vault_ref == vault_ref)
+            .values(encrypted_data=encrypted)
+        )
+
+    # Overwrite Redis cache
+    await redis_client.set(f"vault:data:{vault_ref}", encrypted, ex=_REDIS_TTL)
+    await audit.log("vault_update", actor_id, "vault.update", resource_type="vault_entries", resource_id=vault_ref)
+
+
 async def delete(vault_ref: str, actor_id: str, org_id: str = "default") -> None:
     """Soft-delete by removing from Redis; Postgres record is retained for audit."""
     await redis_client.delete(f"vault:data:{vault_ref}")

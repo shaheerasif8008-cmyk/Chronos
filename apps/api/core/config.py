@@ -23,10 +23,41 @@ class Settings(BaseSettings):
     memory_retrieve_timeout_seconds: float = 1.5
     jwt_secret: str = "change-me-in-dev"
     access_token_expire_minutes: int = 60
+
+    # Auth: dev_otp (Phase 1 default), cognito, or both
+    auth_provider: str = "dev_otp"
+    cognito_region: str = "us-east-1"
+    cognito_user_pool_id: str = ""
+    cognito_app_client_id: str = ""
+    cognito_app_client_secret: str = ""
+    cognito_domain: str = ""
+    cognito_callback_url: str = "http://localhost:3000/login/callback"
+    cognito_auto_provision_members: bool = False
     # Connector / vault
     vault_encryption_key: str = ""   # 32-byte hex string; required outside dev
-    composio_api_key: str = ""
+    composio_api_key: str = ""       # kept for backward compat; not actively used
     composio_callback_base_url: str = "http://localhost:8000"
+    # Google OAuth2 — covers Gmail, Calendar, Drive
+    google_client_id: str = ""
+    google_client_secret: str = ""
+    google_redirect_uri: str = "http://localhost:8000/connectors/gmail/oauth-callback"
+    # Other OAuth2 integrations — set CLIENT_ID + CLIENT_SECRET for each
+    notion_client_id: str = ""
+    notion_client_secret: str = ""
+    slack_client_id: str = ""
+    slack_client_secret: str = ""
+    github_client_id: str = ""
+    github_client_secret: str = ""
+    linear_client_id: str = ""
+    linear_client_secret: str = ""
+    hubspot_client_id: str = ""
+    hubspot_client_secret: str = ""
+    airtable_client_id: str = ""
+    airtable_client_secret: str = ""
+    jira_client_id: str = ""
+    jira_client_secret: str = ""
+    # Base URL for all OAuth callbacks (should be your public API URL)
+    oauth_callback_base_url: str = "http://localhost:8000"
     demo_mode: bool = False
     # MinIO
     minio_endpoint: str = "localhost:9000"

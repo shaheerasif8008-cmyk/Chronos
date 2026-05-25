@@ -21,6 +21,10 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // _CHARS_PER_TOKEN)
 
 
+def _estimate_tokens_from_chars(char_count: int) -> int:
+    return max(1, char_count // _CHARS_PER_TOKEN)
+
+
 def load_base_system_prompt() -> str:  # noqa: PLR0915 (long but intentional)
     return """\
 You are Chronos, the operational intelligence layer of an enterprise AI workforce platform built by Cognisia.
@@ -328,7 +332,7 @@ async def _compact_history(
 
     # If everything fits in budget, return as-is.
     total_chars = sum(len(m["content"]) for m in all_messages)
-    if _estimate_tokens(total_chars * _CHARS_PER_TOKEN) <= budget_tokens or not older:
+    if _estimate_tokens_from_chars(total_chars) <= budget_tokens or not older:
         return all_messages
 
     # Summarize the older block using the fast model.

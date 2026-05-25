@@ -39,12 +39,13 @@ async def check_connectors(*, refresh: bool = False) -> ConnectorHealth:
     if not refresh and _CACHE and now - _CACHE[0] < _CACHE_TTL_SECONDS:
         return _CACHE[1]
 
-    gmail_status = "live" if settings.composio_api_key and _module_available("composio") else "demo"
-    gmail_reason = "Composio configured; OAuth is required per user."
-    if not settings.composio_api_key:
-        gmail_reason = "COMPOSIO_API_KEY is not set; Gmail drafts use local demo storage."
-    elif not _module_available("composio"):
-        gmail_reason = "composio package is not installed; Gmail drafts use local demo storage."
+    gmail_live = bool(settings.google_client_id and settings.google_client_secret)
+    gmail_status = "live" if gmail_live else "demo"
+    gmail_reason = (
+        "Google OAuth2 configured; each user must authorise via Connect."
+        if gmail_live
+        else "GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET not set; Gmail drafts use local demo storage."
+    )
 
     browser_ok, browser_reason = await _browser_available()
     browser_status = "live" if browser_ok else "fixture"
@@ -54,7 +55,7 @@ async def check_connectors(*, refresh: bool = False) -> ConnectorHealth:
             "status": gmail_status,
             "tier": gmail_status,
             "reason": gmail_reason,
-            "setup": None if gmail_status == "live" else "Set COMPOSIO_API_KEY and install composio.",
+            "setup": None if gmail_status == "live" else "Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET.",
         },
         "browser": {
             "status": browser_status,

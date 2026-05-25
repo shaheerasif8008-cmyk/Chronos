@@ -692,10 +692,51 @@ function ChatScreen({
   const [activityOpen, setActivityOpen] = useState(false);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const streamingRef = useRef(false);
   const bottomRef = useRef<HTMLDivElement>(null);
-  const isEmpty = !activeConvoId;
+  const isEmpty = !activeConvoId && messages.length === 0;
 
   const activePersona = PERSONAS.find(p => p.id === activePersonaId) ?? PERSONAS[0];
+
+  const loadMessagesFromServer = useCallback(async (
+    conversationId: string,
+    opts?: { streamedContent?: string; preserveLocal?: boolean },
+  ) => {
+    const [rawMsgs, arts] = await Promise.all([
+      apiFetch(`/chat/conversations/${conversationId}/messages`).then(r => r.json()),
+      apiFetch(`/artifacts?conversation_id=${conversationId}`).then(r => r.json()).catch(() => []),
+    ]) as [Array<Record<string, unknown>>, Array<{ id: string; message_id?: string | null; title?: string; kind: string; mime_type?: string; size_bytes?: number }>];
+    const byMessage = new Map<string, ArtifactRef[]>();
+    for (const a of arts || []) {
+      if (!a.message_id) continue;
+      const ref: ArtifactRef = { id: a.id, title: a.title ?? "artifact", kind: a.kind, mime_type: a.mime_type, size_bytes: a.size_bytes };
+      byMessage.set(a.message_id, [...(byMessage.get(a.message_id) ?? []), ref]);
+    }
+    const normalized: Message[] = rawMsgs.map(m => {
+      const id = m.id != null ? String(m.id) : undefined;
+      const role = String(m.role ?? "assistant") as MessageRole;
+      const content = String(m.content ?? "");
+      const base: Message = {
+        id,
+        role,
+        content,
+        status: "complete",
+        created_at: m.created_at != null ? String(m.created_at) : undefined,
+      };
+      if (id && byMessage.has(id)) return { ...base, artifacts: byMessage.get(id) };
+      return base;
+    });
+
+    const hasAssistant = normalized.some(m => m.role === "assistant" && m.content.trim());
+    if (!hasAssistant && opts?.streamedContent?.trim()) {
+      normalized.push({ role: "assistant", content: opts.streamedContent.trim(), status: "complete" });
+    }
+
+    setMessages(prev => {
+      if (opts?.preserveLocal && normalized.length < prev.length) return prev;
+      return normalized;
+    });
+  }, []);
 
   useEffect(() => {
     apiFetch("/chat/models")
@@ -713,24 +754,14 @@ function ChatScreen({
   }, []);
 
   useEffect(() => {
-    if (!activeConvoId) { setMessages([]); return; }
-    // Load messages and artifacts together so artifacts reappear on refresh,
-    // grouped under the assistant message that produced them.
-    Promise.all([
-      apiFetch(`/chat/conversations/${activeConvoId}/messages`).then(r => r.json()),
-      apiFetch(`/artifacts?conversation_id=${activeConvoId}`).then(r => r.json()).catch(() => []),
-    ])
-      .then(([msgs, arts]: [Message[], Array<{ id: string; message_id?: string | null; title?: string; kind: string; mime_type?: string; size_bytes?: number }>]) => {
-        const byMessage = new Map<string, ArtifactRef[]>();
-        for (const a of arts || []) {
-          if (!a.message_id) continue;
-          const ref: ArtifactRef = { id: a.id, title: a.title ?? "artifact", kind: a.kind, mime_type: a.mime_type, size_bytes: a.size_bytes };
-          byMessage.set(a.message_id, [...(byMessage.get(a.message_id) ?? []), ref]);
-        }
-        setMessages(msgs.map(m => (m.id && byMessage.has(m.id) ? { ...m, artifacts: byMessage.get(m.id) } : m)));
-      })
-      .catch(() => {});
-  }, [activeConvoId]);
+    if (!activeConvoId) {
+      if (!streamingRef.current) setMessages([]);
+      return;
+    }
+    // Don't clobber in-flight SSE updates when a new conversation id arrives mid-stream.
+    if (streamingRef.current) return;
+    void loadMessagesFromServer(activeConvoId).catch(() => {});
+  }, [activeConvoId, loadMessagesFromServer]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -741,157 +772,197 @@ function ChatScreen({
     const text = draft.trim();
     setDraft("");
     setMessages(prev => [...prev, { role: "user", content: text, status: "complete" }]);
+    streamingRef.current = true;
     setStreaming(true);
 
     const ab = new AbortController();
     abortRef.current = ab;
+    let convoId = activeConvoId;
+
+    type StreamEvent = {
+      type: string; content?: string; conversation_id?: string; task_id?: string;
+      event?: { type: string; tool?: string; summary?: string; error?: string; args_preview?: Record<string, unknown>; step?: { description?: string }; approval_ids?: string[]; goal?: string };
+      artifact?: { artifact_id: string; title?: string; kind?: string; mime_type?: string; size_bytes?: number };
+    };
+
+    let partial = "";
+
+    function handleStreamEvent(ev: StreamEvent) {
+      if (ev.type === "conversation" && ev.conversation_id) {
+        convoId = ev.conversation_id;
+        onConvoCreated(ev.conversation_id);
+      }
+      if (ev.type === "token" && ev.content) {
+        partial += ev.content;
+        setMessages(prev => {
+          const updated = [...prev];
+          const last = updated[updated.length - 1];
+          if (last?.role === "assistant") updated[updated.length - 1] = { ...last, content: partial, thinking: false };
+          return updated;
+        });
+      } else if (ev.type === "trace" && ev.event && ev.event.type === "thinking") {
+        setMessages(prev => {
+          const updated = [...prev];
+          const last = updated[updated.length - 1];
+          if (last?.role === "assistant") updated[updated.length - 1] = { ...last, thinking: true };
+          return updated;
+        });
+      } else if (ev.type === "trace" && ev.event) {
+        const te = ev.event;
+        const traceType = te.type ?? "";
+        const tool = te.tool ?? (traceType === "step_start" ? "think" : traceType === "awaiting_approval" ? "approval" : "");
+        let summary = te.summary ?? "";
+        let traceStatus: MessageStatus = "complete";
+        if (traceType === "tool_call") {
+          summary = `${tool.replace(/[._]/g, " ")}…`;
+          traceStatus = "streaming";
+        } else if (traceType === "tool_result") {
+          summary = te.summary ?? `${tool} done`;
+          traceStatus = "complete";
+        } else if (traceType === "tool_error") {
+          summary = te.error ?? `${tool} failed`;
+          traceStatus = "error";
+        } else if (traceType === "step_start") {
+          summary = te.step?.description ?? "Thinking…";
+          traceStatus = "streaming";
+        } else if (traceType === "step_done") {
+          summary = te.summary ?? "Step complete";
+          traceStatus = "complete";
+        } else if (traceType === "awaiting_approval") {
+          summary = `Waiting for approval on ${te.approval_ids?.length ?? 0} item(s)`;
+          traceStatus = "approval_pending";
+        } else if (traceType === "sub_agent_spawned") {
+          summary = `Sub-agent: ${te.goal ?? "working"}`;
+          traceStatus = "streaming";
+        } else if (traceType === "sub_agent_complete") {
+          summary = `Sub-agent finished`;
+          traceStatus = "complete";
+        }
+        const traceId = `${traceType}-${tool}-${Date.now()}`;
+        setMessages(prev => {
+          const updated = [...prev];
+          const last = updated[updated.length - 1];
+          if (last?.role !== "assistant") return updated;
+          const existing = last.tool_traces ?? [];
+          if (traceType === "tool_result" || traceType === "tool_error") {
+            const idx = [...existing].reverse().findIndex(t => t.tool === tool && t.status === "streaming");
+            if (idx >= 0) {
+              const actualIdx = existing.length - 1 - idx;
+              const newTraces = [...existing];
+              newTraces[actualIdx] = { ...newTraces[actualIdx], summary, status: traceStatus };
+              return [...updated.slice(0, -1), { ...last, tool_traces: newTraces, thinking: false }];
+            }
+          }
+          if (traceType === "step_done") {
+            const idx = [...existing].reverse().findIndex(t => t.tool === "think" && t.status === "streaming");
+            if (idx >= 0) {
+              const actualIdx = existing.length - 1 - idx;
+              const newTraces = [...existing];
+              newTraces[actualIdx] = { ...newTraces[actualIdx], summary, status: "complete" };
+              return [...updated.slice(0, -1), { ...last, tool_traces: newTraces, thinking: false }];
+            }
+          }
+          return [...updated.slice(0, -1), { ...last, tool_traces: [...existing, { id: traceId, tool, summary, status: traceStatus }], thinking: false }];
+        });
+      } else if (ev.type === "artifact" && ev.artifact) {
+        const a = ev.artifact;
+        const ref: ArtifactRef = {
+          id: a.artifact_id,
+          title: a.title ?? "artifact",
+          kind: a.kind ?? "file",
+          mime_type: a.mime_type,
+          size_bytes: a.size_bytes,
+        };
+        setMessages(prev => {
+          const updated = [...prev];
+          const last = updated[updated.length - 1];
+          if (last?.role !== "assistant") return updated;
+          const existing = last.artifacts ?? [];
+          if (existing.some(x => x.id === ref.id)) return updated;
+          return [...updated.slice(0, -1), { ...last, artifacts: [...existing, ref] }];
+        });
+      } else if (ev.type === "task_created" && ev.task_id) {
+        setActiveTaskId(ev.task_id);
+      } else if (ev.type === "done") {
+        setMessages(prev => {
+          const updated = [...prev];
+          const last = updated[updated.length - 1];
+          if (last?.role === "assistant") {
+            updated[updated.length - 1] = {
+              ...last,
+              status: "complete",
+              content: partial || last.content,
+              thinking: false,
+            };
+          }
+          return updated;
+        });
+        if (convoId) {
+          const syncId = convoId;
+          const streamed = partial;
+          void (async () => {
+            for (let attempt = 0; attempt < 8; attempt++) {
+              try {
+                const rawMsgs = (await apiFetch(`/chat/conversations/${syncId}/messages`).then(r => r.json())) as Array<Record<string, unknown>>;
+                const hasAssistant = rawMsgs.some(
+                  m => String(m.role) === "assistant" && String(m.content ?? "").trim(),
+                );
+                await loadMessagesFromServer(syncId, { streamedContent: streamed });
+                if (hasAssistant || streamed.trim()) return;
+              } catch {
+                /* retry */
+              }
+              if (attempt < 7) await new Promise(r => setTimeout(r, 350));
+            }
+          })();
+        }
+      }
+    }
+
+    function consumeSseLine(line: string) {
+      if (!line.startsWith("data: ")) return;
+      try {
+        handleStreamEvent(JSON.parse(line.slice(6)) as StreamEvent);
+      } catch { /* bad JSON */ }
+    }
 
     try {
-      let convoId = activeConvoId;
       const resp = await apiFetch("/chat/message", {
         method: "POST",
+        headers: { Accept: "text/event-stream" },
         body: JSON.stringify({ message: text, conversation_id: convoId, model: selectedModel, persona_id: activePersonaId }),
         signal: ab.signal,
       });
 
       const reader = resp.body?.getReader();
-      if (!reader) { setStreaming(false); return; }
+      if (!reader) return;
 
       const decoder = new TextDecoder();
-      let partial = "";
+      let sseBuffer = "";
       setMessages(prev => [...prev, { role: "assistant", content: "", status: "streaming" }]);
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        const chunk = decoder.decode(value, { stream: true });
-        for (const line of chunk.split("\n")) {
-          if (!line.startsWith("data: ")) continue;
-          try {
-            const ev = JSON.parse(line.slice(6)) as {
-              type: string; content?: string; conversation_id?: string; task_id?: string;
-              event?: { type: string; tool?: string; summary?: string; error?: string; args_preview?: Record<string, unknown>; step?: { description?: string }; approval_ids?: string[]; goal?: string };
-              artifact?: { artifact_id: string; title?: string; kind?: string; mime_type?: string; size_bytes?: number };
-            };
-            if (ev.type === "conversation" && ev.conversation_id) {
-              convoId = ev.conversation_id;
-              onConvoCreated(ev.conversation_id);
-            }
-            if (ev.type === "token" && ev.content) {
-              partial += ev.content;
-              setMessages(prev => {
-                const updated = [...prev];
-                const last = updated[updated.length - 1];
-                if (last?.role === "assistant") updated[updated.length - 1] = { ...last, content: partial, thinking: false };
-                return updated;
-              });
-            } else if (ev.type === "trace" && ev.event && ev.event.type === "thinking") {
-              // Heartbeat — show "Thinking…" while the model generates (non-streaming).
-              setMessages(prev => {
-                const updated = [...prev];
-                const last = updated[updated.length - 1];
-                if (last?.role === "assistant") updated[updated.length - 1] = { ...last, thinking: true };
-                return updated;
-              });
-            } else if (ev.type === "trace" && ev.event) {
-              const te = ev.event;
-              const traceType = te.type ?? "";
-              const tool = te.tool ?? (traceType === "step_start" ? "think" : traceType === "awaiting_approval" ? "approval" : "");
-              let summary = te.summary ?? "";
-              let traceStatus: MessageStatus = "complete";
-              if (traceType === "tool_call") {
-                summary = `${tool.replace(/[._]/g, " ")}…`;
-                traceStatus = "streaming";
-              } else if (traceType === "tool_result") {
-                summary = te.summary ?? `${tool} done`;
-                traceStatus = "complete";
-              } else if (traceType === "tool_error") {
-                summary = te.error ?? `${tool} failed`;
-                traceStatus = "error";
-              } else if (traceType === "step_start") {
-                summary = te.step?.description ?? "Thinking…";
-                traceStatus = "streaming";
-              } else if (traceType === "step_done") {
-                summary = te.summary ?? "Step complete";
-                traceStatus = "complete";
-              } else if (traceType === "awaiting_approval") {
-                summary = `Waiting for approval on ${te.approval_ids?.length ?? 0} item(s)`;
-                traceStatus = "approval_pending";
-              } else if (traceType === "sub_agent_spawned") {
-                summary = `Sub-agent: ${te.goal ?? "working"}`;
-                traceStatus = "streaming";
-              } else if (traceType === "sub_agent_complete") {
-                summary = `Sub-agent finished`;
-                traceStatus = "complete";
-              }
-              const traceId = `${traceType}-${tool}-${Date.now()}`;
-              setMessages(prev => {
-                const updated = [...prev];
-                const last = updated[updated.length - 1];
-                if (last?.role !== "assistant") return updated;
-                const existing = last.tool_traces ?? [];
-                // tool_result / tool_error updates the matching pending tool_call trace
-                if (traceType === "tool_result" || traceType === "tool_error") {
-                  const idx = [...existing].reverse().findIndex(t => t.tool === tool && t.status === "streaming");
-                  if (idx >= 0) {
-                    const actualIdx = existing.length - 1 - idx;
-                    const newTraces = [...existing];
-                    newTraces[actualIdx] = { ...newTraces[actualIdx], summary, status: traceStatus };
-                    return [...updated.slice(0, -1), { ...last, tool_traces: newTraces, thinking: false }];
-                  }
-                }
-                // step_done closes matching step_start
-                if (traceType === "step_done") {
-                  const idx = [...existing].reverse().findIndex(t => t.tool === "think" && t.status === "streaming");
-                  if (idx >= 0) {
-                    const actualIdx = existing.length - 1 - idx;
-                    const newTraces = [...existing];
-                    newTraces[actualIdx] = { ...newTraces[actualIdx], summary, status: "complete" };
-                    return [...updated.slice(0, -1), { ...last, tool_traces: newTraces, thinking: false }];
-                  }
-                }
-                return [...updated.slice(0, -1), { ...last, tool_traces: [...existing, { id: traceId, tool, summary, status: traceStatus }], thinking: false }];
-              });
-            } else if (ev.type === "artifact" && ev.artifact) {
-              const a = ev.artifact;
-              const ref: ArtifactRef = {
-                id: a.artifact_id,
-                title: a.title ?? "artifact",
-                kind: a.kind ?? "file",
-                mime_type: a.mime_type,
-                size_bytes: a.size_bytes,
-              };
-              setMessages(prev => {
-                const updated = [...prev];
-                const last = updated[updated.length - 1];
-                if (last?.role !== "assistant") return updated;
-                const existing = last.artifacts ?? [];
-                if (existing.some(x => x.id === ref.id)) return updated;
-                return [...updated.slice(0, -1), { ...last, artifacts: [...existing, ref] }];
-              });
-            } else if (ev.type === "task_created" && ev.task_id) {
-              setActiveTaskId(ev.task_id);
-              // Don't open drawer — we now stream the result inline
-            } else if (ev.type === "done") {
-              setMessages(prev => {
-                const updated = [...prev];
-                const last = updated[updated.length - 1];
-                if (last?.role === "assistant") updated[updated.length - 1] = { ...last, status: "complete" };
-                return updated;
-              });
-            }
-          } catch { /* bad JSON */ }
-        }
+        sseBuffer += decoder.decode(value, { stream: true });
+        const lines = sseBuffer.split("\n");
+        sseBuffer = lines.pop() ?? "";
+        for (const line of lines) consumeSseLine(line);
       }
+      if (sseBuffer.trim()) consumeSseLine(sseBuffer.trim());
     } catch (e) {
       if ((e as Error).name !== "AbortError") {
+        const errText = e instanceof Error ? e.message : "Something went wrong.";
         setMessages(prev => {
           const last = prev[prev.length - 1];
-          if (last?.role === "assistant") return [...prev.slice(0, -1), { ...last, status: "error", content: last.content || "Something went wrong." }];
-          return prev;
+          if (last?.role === "assistant") {
+            return [...prev.slice(0, -1), { ...last, status: "error", content: last.content || errText }];
+          }
+          return [...prev, { role: "assistant", content: errText, status: "error" }];
         });
       }
     } finally {
+      streamingRef.current = false;
       setStreaming(false);
     }
   }
@@ -928,8 +999,8 @@ function ChatScreen({
             <div className="max-w-[780px] mx-auto space-y-10">
               {messages.map((m, i) => (
                 m.role === "user"
-                  ? <UserMessage key={i} content={m.content}/>
-                  : <AssistantMessage key={i} content={m.content} status={m.status ?? "complete"} persona={activePersona} toolTraces={m.tool_traces} artifacts={m.artifacts} thinking={m.thinking}/>
+                  ? <UserMessage key={m.id ?? `user-${i}`} content={m.content}/>
+                  : <AssistantMessage key={m.id ?? `assistant-${i}`} content={m.content} status={m.status ?? "complete"} persona={activePersona} toolTraces={m.tool_traces} artifacts={m.artifacts} thinking={m.thinking}/>
               ))}
               {streaming && messages[messages.length - 1]?.role !== "assistant" && (
                 <div className="flex gap-4">
@@ -1156,6 +1227,13 @@ function AssistantMessage({ content, status, persona, toolTraces, artifacts, thi
         {/* Typing wave: streaming, nothing else to show yet */}
         {isStreaming && !content && !hasTraces && !thinking && (
           <div className="typing-wave mt-2"><span/><span/><span/></div>
+        )}
+
+        {/* Working state — task running, traces/thinking cleared, answer not streamed yet */}
+        {isStreaming && !content && hasTraces && !thinking && (
+          <div className="flex items-center gap-2 text-[13px] mt-2 shimmer-text" style={{ color: "var(--text-dim)" }}>
+            <Dot color="var(--accent)" size={6} pulse ring /> Still working…
+          </div>
         )}
       </div>
     </div>
@@ -1938,31 +2016,44 @@ function MemoryCard({ m, onDelete, onUpdate }: { m: MemoryEntry; onDelete: (id: 
 }
 
 // ─── Connectors Screen ────────────────────────────────────────────────────────
+// Agent tool health reported by core/connector_health.py
+// ─── Integrations Marketplace ─────────────────────────────────────────────────
+
+type CatalogApp = {
+  id: string;
+  name: string;
+  description: string;
+  icon_svg: string;
+  configured: boolean;
+  connected: boolean;
+  account_handle: string;
+};
+
+function AppIcon({ svg, name }: { svg: string; name: string }) {
+  return (
+    <div
+      className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0 border border-soft"
+      style={{ background: "var(--surface-2)" }}
+      dangerouslySetInnerHTML={{ __html: svg }}
+      title={name}
+    />
+  );
+}
+
 function ConnectorsScreen() {
-  const [connectors, setConnectors] = useState<Connector[]>([]);
-  const [actions, setActions] = useState<Record<string, ConnectorAction[]>>({});
-  const [logs, setLogs] = useState<ConnectorExecutionLog[]>([]);
-  const [health, setHealth] = useState<Record<string, ConnectorHealth>>({});
-  const [traces, setTraces] = useState<ConnectorTrace[]>([]);
-  const [approvals, setApprovals] = useState<ConnectorApproval[]>([]);
-  const [busy, setBusy] = useState<string | null>(null);
+  const [apps, setApps] = useState<CatalogApp[]>([]);
   const [loading, setLoading] = useState(true);
-  const [message, setMessage] = useState("");
+  const [connecting, setConnecting] = useState<string | null>(null);
+  const [disconnecting, setDisconnecting] = useState<string | null>(null);
+  const [error, setError] = useState("");
 
   async function load() {
     setLoading(true);
     try {
-      const data = (await (await apiFetch("/connectors/")).json()) as Connector[];
-      setConnectors(data);
-      const actionEntries = await Promise.all(data.map(async c => [c.id, await (await apiFetch(`/connectors/${c.id}/actions`)).json()] as const));
-      setActions(Object.fromEntries(actionEntries));
-      setLogs((await (await apiFetch("/connectors/execution-logs")).json()) as ConnectorExecutionLog[]);
-      const healthRows = (await (await apiFetch("/connectors/health")).json()) as ConnectorHealth[];
-      setHealth(Object.fromEntries(healthRows.map(row => [row.connector_id, row])));
-      setTraces((await (await apiFetch("/connectors/execution-traces")).json()) as ConnectorTrace[]);
-      setApprovals((await (await apiFetch("/connectors/approvals?limit=20")).json()) as ConnectorApproval[]);
+      const data = await apiFetch("/connectors/catalog").then(r => r.json()) as CatalogApp[];
+      setApps(data);
     } catch {
-      setMessage("Unable to load connectors.");
+      setError("Could not load integrations.");
     } finally {
       setLoading(false);
     }
@@ -1970,158 +2061,136 @@ function ConnectorsScreen() {
 
   useEffect(() => { void load(); }, []);
 
-  async function install(connector: Connector) {
-    setBusy(connector.id);
-    setMessage("");
+  async function connect(app: CatalogApp) {
+    if (!app.configured) {
+      setError(`Set ${app.id.toUpperCase()}_CLIENT_ID and ${app.id.toUpperCase()}_CLIENT_SECRET in your .env to enable ${app.name}.`);
+      return;
+    }
+    setConnecting(app.id);
+    setError("");
     try {
-      const res = await apiFetch(`/connectors/${connector.id}/install`, { method: "POST", body: JSON.stringify({ workspace_id: "default" }) });
-      if (!res.ok) throw new Error(await res.text());
-      setMessage(`${connector.name || connector.id} installed.`);
-      await load();
-    } catch (exc) {
-      setMessage(exc instanceof Error ? exc.message : "Install failed.");
-    } finally {
-      setBusy(null);
+      const endpoint = app.id === "gmail"
+        ? "/connectors/gmail/oauth-start"
+        : `/connectors/${app.id}/oauth-start`;
+      const res = await apiFetch(endpoint, { method: "POST" });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({})) as { detail?: string };
+        throw new Error(body.detail ?? `Error ${res.status}`);
+      }
+      const { url } = await res.json() as { url: string };
+      window.location.href = url;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : `${app.name} connect failed`);
+      setConnecting(null);
     }
   }
 
-  async function disable(connector: Connector) {
-    setBusy(connector.id);
-    setMessage("");
+  async function disconnect(app: CatalogApp) {
+    if (!confirm(`Disconnect ${app.name}? Chronos will no longer be able to access it.`)) return;
+    setDisconnecting(app.id);
+    setError("");
     try {
-      const res = await apiFetch(`/connectors/${connector.id}/disable`, { method: "POST" });
-      if (!res.ok) throw new Error(await res.text());
-      setMessage(`${connector.name || connector.id} disabled.`);
+      const res = await apiFetch(`/connectors/${app.id}/disconnect`, { method: "DELETE" });
+      if (!res.ok) throw new Error(`Error ${res.status}`);
       await load();
-    } catch (exc) {
-      setMessage(exc instanceof Error ? exc.message : "Disable failed.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Disconnect failed");
     } finally {
-      setBusy(null);
-    }
-  }
-
-  async function runAction(connector: Connector, action: ConnectorAction) {
-    setBusy(`${connector.id}:${action.name}`);
-    setMessage("");
-    const args = connector.id === "internal_echo" ? { message: "Connector execution proof" } : {};
-    try {
-      const res = await apiFetch(`/connectors/${connector.id}/actions/${action.name}/execute`, {
-        method: "POST",
-        body: JSON.stringify({ workspace_id: "default", arguments: args }),
-      });
-      const payload = await res.json();
-      if (!res.ok || !["queued", "success"].includes(payload.status)) throw new Error(payload.error || JSON.stringify(payload));
-      setMessage(`${connector.name || connector.id}.${action.name} ${payload.status === "queued" ? "queued for isolated worker execution" : "executed"}.`);
-      await load();
-    } catch (exc) {
-      setMessage(exc instanceof Error ? exc.message : "Execution failed.");
-      await load();
-    } finally {
-      setBusy(null);
+      setDisconnecting(null);
     }
   }
 
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-y-auto">
-      <PageHeader title="Connectors" subtitle="Registry-backed connector actions available to Chronos."/>
+      <PageHeader
+        title="Integrations"
+        subtitle="Connect apps so Chronos can act on your behalf. Each connection is OAuth2 — you control access."
+      />
 
-      <div className="px-10 pb-10 space-y-6">
-        {message && <div className="surface border border-soft rounded-lg px-4 py-3 text-[13px]" style={{ color: "var(--text-muted)" }}>{message}</div>}
-        {loading && <p className="text-[13.5px]" style={{ color: "var(--text-dim)" }}>Loading…</p>}
-        {!loading && connectors.length === 0 && <EmptyState icon={<IC.Connectors size={20}/>} title="No connectors registered" sub="The backend registry has not returned any executable connectors."/>}
-        <div className="grid grid-cols-2 gap-3">
-          {connectors.map(connector => (
-            <div key={connector.id} className="surface border border-soft rounded-xl p-5">
-              <div className="flex items-start justify-between gap-4 mb-4">
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2 mb-1">
-                    <h2 className="text-[15.5px] font-semibold">{connector.name || connector.id}</h2>
-                    <Tag variant={connector.status === "installed" ? "ok" : connector.status === "disabled" ? "danger" : "info"}>{connector.status}</Tag>
-                    {health[connector.id] && <Tag variant={health[connector.id].status === "healthy" ? "ok" : "warn"}>{health[connector.id].status}</Tag>}
-                  </div>
-                  <p className="text-[13px]" style={{ color: "var(--text-muted)" }}>{connector.description}</p>
-                  <div className="mt-2 flex flex-wrap gap-1">
-                    <Tag>{connector.category || "Internal"}</Tag>
-                    <Tag>{connector.type || "native"}</Tag>
-                    <Tag>{connector.auth_type || "none"}</Tag>
-                    {(connector.scopes || []).map(scope => <Tag key={scope}>{scope}</Tag>)}
-                  </div>
-                </div>
-                <div className="flex gap-2">
-                  {connector.status !== "installed" && <button disabled={busy === connector.id} onClick={() => void install(connector)} className="btn btn-accent btn-sm disabled:opacity-50">Install</button>}
-                  {connector.status === "installed" && <button disabled={busy === connector.id} onClick={() => void disable(connector)} className="btn btn-danger-soft btn-sm disabled:opacity-50">Disable</button>}
-                </div>
-              </div>
-              <div className="space-y-2">
-                {(actions[connector.id] || []).map(action => (
-                  <div key={action.name} className="border-t hairline pt-3">
-                    <div className="flex items-start justify-between gap-3">
-                      <div>
-                        <div className="font-medium text-[13.5px]">{action.name}</div>
-                        <div className="text-[12.5px]" style={{ color: "var(--text-dim)" }}>{action.description}</div>
-                        <div className="mt-2 flex flex-wrap gap-1">
-                          <Tag variant={action.risk_level === "read" ? "info" : "warn"}>{action.risk_level}</Tag>
-                          {(action.approval_required || ["write", "destructive", "financial", "external_message"].includes(action.risk_level)) && <Tag variant="warn">approval checkpoint</Tag>}
-                          {action.required_permissions.map(permission => <Tag key={permission}>{permission}</Tag>)}
+      <div className="px-10 pb-10">
+        {error && (
+          <div className="mb-5 rounded-xl border border-soft px-4 py-3 text-[13px]" style={{ color: "var(--danger)", background: "var(--surface-2)" }}>
+            {error}
+            <button className="ml-3 underline" onClick={() => setError("")}>Dismiss</button>
+          </div>
+        )}
+
+        {loading && (
+          <div className="grid grid-cols-3 gap-4">
+            {[1,2,3,4,5,6].map(i => (
+              <div key={i} className="surface border border-soft rounded-2xl p-5 animate-pulse h-28" />
+            ))}
+          </div>
+        )}
+
+        {!loading && (
+          <div className="grid grid-cols-3 gap-4">
+            {apps.map(app => (
+              <div
+                key={app.id}
+                className="surface border border-soft rounded-2xl p-5 flex flex-col gap-3 transition-shadow hover:shadow-sm"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex items-center gap-3 min-w-0">
+                    <AppIcon svg={app.icon_svg} name={app.name} />
+                    <div className="min-w-0">
+                      <div className="font-semibold text-[14.5px] leading-5">{app.name}</div>
+                      {app.connected && app.account_handle && (
+                        <div className="text-[11.5px] truncate" style={{ color: "var(--text-dim)" }}>
+                          {app.account_handle}
                         </div>
-                      </div>
-                      <button disabled={connector.status !== "installed" || busy === `${connector.id}:${action.name}`} onClick={() => void runAction(connector, action)} className="btn btn-secondary btn-sm disabled:opacity-50">Run</button>
+                      )}
                     </div>
                   </div>
-                ))}
-              </div>
-            </div>
-          ))}
-        </div>
-
-        <section>
-          <h2 className="text-[13px] uppercase tracking-wider mb-3" style={{ color: "var(--text-dim)" }}>Execution logs</h2>
-          <div className="surface border border-soft rounded-xl overflow-hidden">
-            {logs.length === 0 && <div className="p-5"><EmptyState title="No executions yet" sub="Run an installed connector action to create an execution log."/></div>}
-            {logs.map(log => <div key={log.id} className="px-4 py-3 border-b hairline last:border-b-0">
-              <div className="flex items-center justify-between gap-3">
-                <div className="font-medium text-[13.5px]">{log.connector_id}.{log.action_name}</div>
-                <Tag variant={log.result_status === "success" ? "ok" : "danger"}>{log.result_status}</Tag>
-              </div>
-              <div className="text-[12px] mt-1" style={{ color: "var(--text-dim)" }}>{log.created_at ? new Date(log.created_at).toLocaleString() : "unknown time"} · {log.duration_ms}ms</div>
-              {log.error_message && <div className="text-[12px] mt-1" style={{ color: "var(--danger)" }}>{log.error_message}</div>}
-              <details className="mt-2 text-[12px]" style={{ color: "var(--text-dim)" }}>
-                <summary className="cursor-pointer">Redacted arguments</summary>
-                <pre className="mt-2 overflow-x-auto rounded-md p-2" style={{ background: "var(--surface-2)" }}>{JSON.stringify(log.arguments_redacted ?? {}, null, 2)}</pre>
-              </details>
-            </div>)}
-          </div>
-        </section>
-
-        <section className="grid grid-cols-2 gap-3">
-          <div>
-            <h2 className="text-[13px] uppercase tracking-wider mb-3" style={{ color: "var(--text-dim)" }}>Approval queue</h2>
-            <div className="surface border border-soft rounded-xl overflow-hidden">
-              {approvals.length === 0 && <div className="p-5"><EmptyState title="No connector approvals" sub="Risky connector actions create approval requests before execution."/></div>}
-              {approvals.map(approval => <div key={approval.id} className="px-4 py-3 border-b hairline last:border-b-0">
-                <div className="flex items-center justify-between gap-3">
-                  <div className="font-medium text-[13.5px]">{approval.connector_id}.{approval.action_name}</div>
-                  <Tag variant={approval.status === "pending" ? "warn" : approval.status === "approved" ? "ok" : "danger"}>{approval.status}</Tag>
+                  {app.connected && (
+                    <span className="shrink-0 inline-flex items-center gap-1 text-[11.5px] font-medium px-2 py-0.5 rounded-full" style={{ background: "color-mix(in srgb, var(--accent) 12%, transparent)", color: "var(--accent)" }}>
+                      <svg width="8" height="8" viewBox="0 0 8 8" fill="currentColor"><circle cx="4" cy="4" r="4"/></svg>
+                      Connected
+                    </span>
+                  )}
                 </div>
-                <div className="text-[12px] mt-1" style={{ color: "var(--text-dim)" }}>{approval.risk_level} · {approval.approval_mode}</div>
-              </div>)}
-            </div>
-          </div>
 
-          <div>
-            <h2 className="text-[13px] uppercase tracking-wider mb-3" style={{ color: "var(--text-dim)" }}>Execution traces</h2>
-            <div className="surface border border-soft rounded-xl overflow-hidden">
-              {traces.length === 0 && <div className="p-5"><EmptyState title="No traces yet" sub="The connector worker records traces when it executes queued jobs."/></div>}
-              {traces.slice(0, 8).map(trace => <div key={trace.id} className="px-4 py-3 border-b hairline last:border-b-0">
-                <div className="flex items-center justify-between gap-3">
-                  <div className="font-medium text-[13.5px]">{trace.connector_id}.{trace.action_name}</div>
-                  <Tag variant={trace.status === "success" ? "ok" : trace.status === "running" ? "info" : "danger"}>{trace.status}</Tag>
+                <p className="text-[12.5px] leading-[1.55]" style={{ color: "var(--text-muted)" }}>
+                  {app.description}
+                </p>
+
+                <div className="mt-auto pt-1 flex gap-2">
+                  {!app.connected ? (
+                    <button
+                      onClick={() => void connect(app)}
+                      disabled={connecting === app.id}
+                      className="btn btn-accent btn-sm w-full disabled:opacity-50"
+                      title={!app.configured ? `Add ${app.id.toUpperCase()}_CLIENT_ID + CLIENT_SECRET to .env first` : undefined}
+                    >
+                      {connecting === app.id ? "Redirecting…" : app.configured ? "Connect" : "Configure first"}
+                    </button>
+                  ) : (
+                    <>
+                      <button
+                        onClick={() => void connect(app)}
+                        disabled={connecting === app.id}
+                        className="btn btn-secondary btn-sm flex-1 disabled:opacity-50"
+                      >
+                        {connecting === app.id ? "…" : "Reconnect"}
+                      </button>
+                      <button
+                        onClick={() => void disconnect(app)}
+                        disabled={disconnecting === app.id}
+                        className="btn btn-danger-soft btn-sm flex-1 disabled:opacity-50"
+                      >
+                        {disconnecting === app.id ? "…" : "Disconnect"}
+                      </button>
+                    </>
+                  )}
                 </div>
-                <div className="text-[12px] mt-1" style={{ color: "var(--text-dim)" }}>{trace.started_at ? new Date(trace.started_at).toLocaleString() : "unknown time"}</div>
-              </div>)}
-            </div>
+              </div>
+            ))}
           </div>
-        </section>
+        )}
+
+        <p className="mt-8 text-[12px]" style={{ color: "var(--text-dim)" }}>
+          More integrations coming soon. Each connection uses OAuth2 — Chronos never sees your password.
+        </p>
       </div>
     </div>
   );

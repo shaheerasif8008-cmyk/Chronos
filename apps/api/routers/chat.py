@@ -23,6 +23,12 @@ from runtime.executor import TaskExecutor, activity_channel
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
+_SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
+
 
 class ChatRequest(BaseModel):
     message: str
@@ -165,7 +171,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
             yield f"data: {json.dumps({'type': 'token', 'content': assistant_response})}\n\n"
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
-        return StreamingResponse(explicit_stream(), media_type="text/event-stream")
+        return StreamingResponse(explicit_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
     intent = await classify_intent(req.message)
     if intent["mode"] == "task":
@@ -238,7 +244,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
 
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
-        return StreamingResponse(task_stream(), media_type="text/event-stream")
+        return StreamingResponse(task_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
     context = await assemble_context(conversation_id, req.message, requester_context)
 
@@ -257,4 +263,4 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
         )
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
-    return StreamingResponse(stream(), media_type="text/event-stream")
+    return StreamingResponse(stream(), media_type="text/event-stream", headers=_SSE_HEADERS)

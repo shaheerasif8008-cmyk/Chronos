@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
 from connectors.framework.adapters import adapter_registry
@@ -15,7 +16,7 @@ from connectors.framework.repository import DatabaseConnectorRepository
 from connectors.framework.runtime import ConnectorExecutionService
 from connectors.framework.seed import seed_builtin_connectors
 from connectors.framework.tool_calling import execute_tool_call, get_available_tools_for_employee
-from core import permissions
+from core import audit, permissions
 from core.auth import get_current_member
 from core.config import settings
 from core.models import AgentContext, Member
@@ -128,6 +129,414 @@ def clean_action(row: dict[str, Any]) -> dict[str, Any]:
         "risk_level": row["risk_level"],
         "approval_required": bool(row.get("approval_required")),
     }
+
+
+@router.get("/agent-tools")
+async def list_agent_tool_health(member: Member = Depends(get_current_member)) -> dict[str, Any]:
+    """Return live health/tier for the agent-loop connectors (gmail, browser, fs, code, mcp).
+
+    This is separate from the framework registry health — it reports on the connectors
+    that the ToolBroker's _route() function dispatches to directly during task execution.
+    """
+    await permissions.check(member, "list_connector_health", member.organization_id)
+    from core.connector_health import check_connectors
+    return await check_connectors()
+
+
+@router.get("/catalog")
+async def list_catalog(member: Member = Depends(get_current_member)) -> list[dict]:
+    """Return the full app catalog with per-app configured + connected status."""
+    from connectors.oauth_apps import available_apps
+    from core.db import engine, reflect_table
+    from sqlalchemy import select
+
+    apps = available_apps()
+
+    # Enrich with connection status from the connectors table
+    connectors_table = await reflect_table("connectors")
+    async with engine.begin() as conn:
+        rows = (
+            await conn.execute(
+                select(
+                    connectors_table.c.provider,
+                    connectors_table.c.account_handle,
+                    connectors_table.c.status,
+                ).where(
+                    (connectors_table.c.organization_id == str(member.organization_id))
+                    & (connectors_table.c.status == "active")
+                )
+            )
+        ).mappings().all()
+
+    connected: dict[str, str] = {row["provider"]: row["account_handle"] or "" for row in rows}
+    for app in apps:
+        app["connected"] = app["id"] in connected
+        app["account_handle"] = connected.get(app["id"], "")
+    return apps
+
+
+@router.post("/gmail/oauth-start")
+async def gmail_oauth_start(member: Member = Depends(get_current_member)) -> dict[str, str]:
+    """Initiate the Google OAuth2 Gmail flow for the current member.
+
+    Returns a URL the frontend should redirect the user's browser to.  The state
+    parameter is HMAC-signed so the callback can verify it without a DB lookup.
+    """
+    await permissions.check(member, "connect_gmail", member.organization_id)
+    if not settings.google_client_id or not settings.google_client_secret:
+        raise HTTPException(
+            status_code=503,
+            detail="GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET are not configured",
+        )
+    try:
+        from connectors.gmail import oauth_start_url
+        url = await oauth_start_url(
+            member_id=str(member.id),
+            org_id=str(member.organization_id),
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    await audit.log(
+        "connector_oauth_start", str(member.id), "gmail.oauth_start",
+        resource_type="connector", resource_id="gmail",
+    )
+    return {"url": url}
+
+
+@router.get("/gmail/oauth-callback")
+async def gmail_oauth_callback(
+    code: str = Query(...),
+    state: str = Query(...),
+) -> RedirectResponse:
+    """Google OAuth2 callback — exchanges the code for tokens and stores them.
+
+    The *state* parameter is an HMAC-signed token that encodes member_id + org_id.
+    We verify the signature here to prevent CSRF and to avoid a DB lookup just to
+    reconstruct the member context.
+    """
+    import uuid
+    from connectors.vault import store as vault_store
+    from connectors.gmail import oauth_finish
+    from core.db import engine, reflect_table
+    from sqlalchemy import insert, select, update
+
+    # oauth_finish verifies the HMAC state internally and returns (member_id, org_id)
+    # as part of the credential dict.
+    try:
+        credential_data = await oauth_finish(code=code, state=state)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    member_id: str = credential_data["member_id"]
+    org_id: str = credential_data["org_id"]
+
+    connector_id = f"gmail:{org_id}:{member_id}"
+    vault_ref = await vault_store(
+        connector_id=connector_id,
+        credentials=credential_data,
+        org_id=org_id,
+    )
+
+    # Upsert the connectors table so the framework registry knows this user's Gmail is live.
+    connectors_table = await reflect_table("connectors")
+    async with engine.begin() as conn:
+        existing = (
+            await conn.execute(
+                select(connectors_table).where(
+                    (connectors_table.c.organization_id == org_id)
+                    & (connectors_table.c.provider == "gmail")
+                    & (connectors_table.c.vault_ref == vault_ref)
+                )
+            )
+        ).mappings().first()
+
+        if existing:
+            await conn.execute(
+                update(connectors_table)
+                .where(connectors_table.c.id == existing["id"])
+                .values(
+                    vault_ref=vault_ref,
+                    status="active",
+                    account_handle=credential_data.get("email", ""),
+                )
+            )
+        else:
+            await conn.execute(
+                insert(connectors_table).values(
+                    id=str(uuid.uuid4()),
+                    organization_id=org_id,
+                    provider="gmail",
+                    account_handle=credential_data.get("email", ""),
+                    vault_ref=vault_ref,
+                    status="active",
+                    scopes=["gmail.read_inbox", "gmail.draft", "gmail.search"],
+                    region=settings.region,
+                )
+            )
+
+    await audit.log(
+        "connector_oauth_complete", member_id, "gmail.oauth_callback",
+        resource_type="connector", resource_id="gmail",
+    )
+    return RedirectResponse(url="/connectors", status_code=302)
+
+
+# ---------------------------------------------------------------------------
+# Generic OAuth2 routes — work for any app in the catalog
+# ---------------------------------------------------------------------------
+
+@router.post("/{provider}/oauth-start")
+async def generic_oauth_start(
+    provider: str,
+    member: Member = Depends(get_current_member),
+) -> dict[str, str]:
+    """Build a Google/Notion/Slack/… consent URL and return it.
+
+    The frontend redirects the user's browser to the returned URL.
+    """
+    from connectors.oauth_apps import get_app, get_client_credentials
+    from connectors.gmail import _build_state
+    from urllib.parse import urlencode
+
+    # Gmail has its own route above — don't double-handle it here
+    if provider == "gmail":
+        raise HTTPException(status_code=400, detail="Use /connectors/gmail/oauth-start for Gmail")
+
+    app = get_app(provider)
+    if not app:
+        raise HTTPException(status_code=404, detail=f"Unknown provider: {provider}")
+
+    await permissions.check(member, f"connect_{provider}", str(member.organization_id))
+
+    client_id, client_secret = get_client_credentials(app)
+    if not client_id or not client_secret:
+        raise HTTPException(
+            status_code=503,
+            detail=f"{app.client_id_env} / {app.client_secret_env} are not configured",
+        )
+
+    state = _build_state(str(member.id), str(member.organization_id))
+    redirect_uri = f"{settings.composio_callback_base_url}/connectors/{provider}/oauth-callback"
+
+    params: dict[str, str] = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "state": state,
+        **app.extra_auth_params,
+    }
+    if app.scopes:
+        params["scope"] = " ".join(app.scopes)
+
+    # Notion uses Basic auth for token exchange — its authorize URL is slightly different
+    if provider == "notion":
+        params.pop("response_type", None)
+        params["response_type"] = "code"
+
+    url = f"{app.auth_url}?{urlencode(params)}"
+    await audit.log(
+        "connector_oauth_start", str(member.id), f"{provider}.oauth_start",
+        resource_type="connector", resource_id=provider,
+    )
+    return {"url": url}
+
+
+@router.get("/{provider}/oauth-callback")
+async def generic_oauth_callback(
+    provider: str,
+    code: str = Query(...),
+    state: str = Query(...),
+    error: str | None = Query(default=None),
+) -> RedirectResponse:
+    """Exchange the OAuth2 code for tokens and store them in the vault."""
+    import uuid
+    import time
+    from connectors.oauth_apps import get_app, get_client_credentials
+    from connectors.gmail import _verify_state
+    from connectors.vault import store as vault_store
+    from core.db import engine, reflect_table
+    from sqlalchemy import insert, select, update
+
+    if provider == "gmail":
+        raise HTTPException(status_code=400, detail="Use /connectors/gmail/oauth-callback for Gmail")
+
+    if error:
+        return RedirectResponse(url=f"/connectors?error={error}", status_code=302)
+
+    app = get_app(provider)
+    if not app:
+        raise HTTPException(status_code=404, detail=f"Unknown provider: {provider}")
+
+    try:
+        member_id, org_id = _verify_state(state)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    client_id, client_secret = get_client_credentials(app)
+    redirect_uri = f"{settings.composio_callback_base_url}/connectors/{provider}/oauth-callback"
+
+    # Exchange code for tokens
+    import httpx as _httpx
+    token_data: dict[str, Any] = {}
+    try:
+        if provider == "notion":
+            # Notion requires HTTP Basic auth
+            import base64 as _b64
+            basic = _b64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+            async with _httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    app.token_url,
+                    headers={"Authorization": f"Basic {basic}", "Content-Type": "application/json"},
+                    json={"grant_type": "authorization_code", "code": code, "redirect_uri": redirect_uri},
+                )
+        elif provider == "github":
+            async with _httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    app.token_url,
+                    headers={"Accept": "application/json"},
+                    data={"client_id": client_id, "client_secret": client_secret,
+                          "code": code, "redirect_uri": redirect_uri},
+                )
+        else:
+            async with _httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    app.token_url,
+                    data={"grant_type": "authorization_code", "code": code,
+                          "client_id": client_id, "client_secret": client_secret,
+                          "redirect_uri": redirect_uri},
+                )
+
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"Token exchange failed: {resp.text[:300]}")
+        token_data = resp.json()
+    except _httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Token exchange request failed: {exc}") from exc
+
+    access_token = token_data.get("access_token", "")
+    if not access_token:
+        raise HTTPException(status_code=502, detail="No access_token in provider response")
+
+    # Build credentials dict for vault storage
+    credentials: dict[str, Any] = {
+        "provider": provider,
+        "access_token": access_token,
+        "expires_at": str(time.time() + token_data.get("expires_in", 0) - 300)
+        if token_data.get("expires_in")
+        else "0",
+        "member_id": member_id,
+        "org_id": org_id,
+    }
+    if token_data.get("refresh_token"):
+        credentials["refresh_token"] = token_data["refresh_token"]
+    if token_data.get("team", {}).get("name"):  # Slack workspace name
+        credentials["account_handle"] = token_data["team"]["name"]
+    if token_data.get("authed_user", {}).get("access_token"):
+        # Slack v2 — use user token for DMs etc.
+        credentials["user_access_token"] = token_data["authed_user"]["access_token"]
+
+    # Fetch account handle (display email/username) from the provider
+    account_handle = credentials.get("account_handle", "")
+    try:
+        async with _httpx.AsyncClient(timeout=10.0) as client:
+            if provider in {"google_calendar", "google_drive"}:
+                r = await client.get(
+                    "https://www.googleapis.com/oauth2/v3/userinfo",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+                if r.status_code == 200:
+                    account_handle = r.json().get("email", "")
+            elif provider == "github":
+                r = await client.get(
+                    "https://api.github.com/user",
+                    headers={"Authorization": f"Bearer {access_token}", "Accept": "application/vnd.github+json"},
+                )
+                if r.status_code == 200:
+                    account_handle = r.json().get("login", "")
+            elif provider == "notion":
+                account_handle = token_data.get("owner", {}).get("user", {}).get("name", "")
+            elif provider == "linear":
+                r = await client.post(
+                    "https://api.linear.app/graphql",
+                    headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+                    json={"query": "{ viewer { email } }"},
+                )
+                if r.status_code == 200:
+                    account_handle = r.json().get("data", {}).get("viewer", {}).get("email", "")
+    except Exception:
+        pass  # non-fatal
+
+    credentials["account_handle"] = account_handle
+    connector_id = f"{provider}:{org_id}:{member_id}"
+    vault_ref = await vault_store(connector_id=connector_id, credentials=credentials, org_id=org_id)
+
+    # Upsert connectors table
+    connectors_table = await reflect_table("connectors")
+    async with engine.begin() as conn:
+        existing = (
+            await conn.execute(
+                select(connectors_table).where(
+                    (connectors_table.c.organization_id == org_id)
+                    & (connectors_table.c.provider == provider)
+                )
+            )
+        ).mappings().first()
+
+        if existing:
+            await conn.execute(
+                update(connectors_table)
+                .where(connectors_table.c.id == existing["id"])
+                .values(vault_ref=vault_ref, status="active", account_handle=account_handle)
+            )
+        else:
+            await conn.execute(
+                insert(connectors_table).values(
+                    id=str(uuid.uuid4()),
+                    organization_id=org_id,
+                    provider=provider,
+                    account_handle=account_handle,
+                    vault_ref=vault_ref,
+                    status="active",
+                    scopes=app.scopes,
+                    region=settings.region,
+                )
+            )
+
+    await audit.log(
+        "connector_oauth_complete", member_id, f"{provider}.oauth_callback",
+        resource_type="connector", resource_id=provider,
+    )
+    return RedirectResponse(url="/connectors", status_code=302)
+
+
+@router.delete("/{provider}/disconnect")
+async def disconnect_connector(
+    provider: str,
+    member: Member = Depends(get_current_member),
+) -> dict[str, str]:
+    """Revoke and remove a connected app."""
+    from core.db import engine, reflect_table
+    from sqlalchemy import select, update
+
+    await permissions.check(member, f"disconnect_{provider}", str(member.organization_id))
+
+    connectors_table = await reflect_table("connectors")
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(connectors_table)
+            .where(
+                (connectors_table.c.organization_id == str(member.organization_id))
+                & (connectors_table.c.provider == provider)
+            )
+            .values(status="disconnected")
+        )
+
+    await audit.log(
+        "connector_disconnected", str(member.id), f"{provider}.disconnect",
+        resource_type="connector", resource_id=provider,
+    )
+    return {"status": "disconnected"}
 
 
 @router.get("/")

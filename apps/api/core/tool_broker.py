@@ -131,8 +131,9 @@ async def _route(agent: AgentContext, tool: str, args: dict, vault_ref: str, tie
         from connectors.mcp_client import mcp_connector
         return await mcp_connector.execute(tool, routed_args, agent)
 
-    # Unknown provider — fail clearly rather than silently
-    raise ValueError(f"No connector registered for provider: {provider}")
+    # Generic HTTP connector — handles any OAuth2-connected app (Notion, Slack, GitHub, etc.)
+    from connectors.generic_http import generic_http_connector
+    return await generic_http_connector.execute(tool, routed_args, vault_ref)
 
 
 class ToolBroker:
