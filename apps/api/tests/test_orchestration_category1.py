@@ -361,3 +361,122 @@ def test_dag_tool_args_resolve_template_references_for_composition():
         "nested": {"title": "Example"},
         "plain": "unchanged",
     }
+
+
+@pytest.mark.asyncio
+async def test_task_planner_classifies_goal_and_rejects_missing_tools(monkeypatch):
+    from runtime import planner
+
+    async def fake_complete_json(prompt, model=None):
+        if "Classify this task goal" in prompt:
+            return json.dumps(
+                {
+                    "complexity": "complex",
+                    "requires_tools": ["salesforce.search"],
+                    "requires_sub_agents": False,
+                    "requires_approval": False,
+                    "estimated_steps": 4,
+                    "success_criteria": "Qualified accounts are listed.",
+                }
+            )
+        raise AssertionError("Planning should stop before asking for a plan when tools are missing")
+
+    monkeypatch.setattr(planner, "complete_json", fake_complete_json)
+
+    with pytest.raises(planner.PlanningError, match="Missing tools"):
+        await planner.TaskPlanner(available_tools=["browser.search"]).plan("find accounts")
+
+
+def test_validate_plan_rejects_unknown_tools_and_missing_approval_gate():
+    from runtime import planner
+
+    plan = {
+        "steps": [
+            {
+                "id": "send",
+                "action": "tool_call",
+                "tool": "gmail.send",
+                "args": {"to": "a@example.com"},
+                "depends_on": [],
+            },
+            {
+                "id": "missing",
+                "action": "tool_call",
+                "tool": "salesforce.search",
+                "args": {},
+                "depends_on": [],
+            },
+        ],
+        "context": {},
+    }
+
+    result = planner.validate_plan(plan, available_tools=["gmail.send"])
+
+    assert result.valid is False
+    assert any("requires an approval_gate" in error for error in result.errors)
+    assert any("salesforce.search" in error for error in result.errors)
+
+
+def test_validate_plan_warns_when_template_reference_has_no_output_key():
+    from runtime import planner
+
+    plan = {
+        "steps": [
+            {"id": "search", "action": "tool_call", "tool": "browser.search", "args": {}, "depends_on": []},
+            {
+                "id": "fetch",
+                "action": "tool_call",
+                "tool": "browser.fetch",
+                "args": {"url": "{{search_results.results[0].url}}"},
+                "depends_on": ["search"],
+            },
+        ],
+        "context": {},
+    }
+
+    result = planner.validate_plan(plan, available_tools=["browser.search", "browser.fetch"])
+
+    assert result.valid is True
+    assert any("search_results" in warning for warning in result.warnings)
+
+
+@pytest.mark.asyncio
+async def test_task_executor_rejects_invalid_plan_before_tool_execution(monkeypatch):
+    from runtime import executor
+
+    task = _task(
+        {
+            "steps": [
+                {
+                    "id": "bad",
+                    "action": "tool_call",
+                    "tool": "salesforce.search",
+                    "args": {},
+                    "depends_on": [],
+                }
+            ],
+            "context": {},
+        }
+    )
+
+    async def fake_get_task(task_id):
+        return dict(task)
+
+    async def fake_save_task(task_id, **values):
+        task.update(values)
+
+    async def fake_emit(task_id, event, actor_id="chronos"):
+        return None
+
+    async def fail_execute(*args, **kwargs):
+        raise AssertionError("invalid plan should not execute a broker tool")
+
+    monkeypatch.setattr(executor, "get_task", fake_get_task)
+    monkeypatch.setattr(executor, "save_task", fake_save_task)
+    monkeypatch.setattr(executor, "emit_activity", fake_emit)
+    monkeypatch.setattr(executor.tool_broker, "execute", fail_execute)
+
+    await executor.TaskExecutor().run("task-dag")
+
+    assert task["status"] == "failed"
+    assert "salesforce.search" in task["error"]

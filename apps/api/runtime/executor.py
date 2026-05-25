@@ -32,7 +32,7 @@ from runtime.agent_loop import (
     resume_after_approval,
     save_task,
 )
-from runtime.planner import normalize_plan
+from runtime.planner import default_available_tools, normalize_plan, validate_plan
 
 # ── Public name kept for imports in approvals.py, sub_agent.py, tests ─────────
 AGENT_LOOP_APPROVAL_STEP_ID = "agent_loop"
@@ -96,6 +96,18 @@ class TaskExecutor:
     async def _run_dag(self, task: dict[str, Any]) -> dict[str, Any]:
         task_id = task["id"]
         plan = normalize_plan(task.get("plan"))
+        validation = validate_plan(plan, default_available_tools())
+        if not validation.valid:
+            error = f"invalid_plan: {'; '.join(validation.errors)}"
+            await save_task(
+                task_id,
+                status="failed",
+                error=error,
+                result={},
+                completed_at=datetime.now(timezone.utc),
+            )
+            await emit_activity(task_id, {"type": "task_failed", "error": error})
+            return {"error": error}
         state = _dag_state(task)
         completed: set[str] = set(state.get("completed_step_ids") or [])
         skipped: set[str] = set(state.get("skipped_step_ids") or [])
