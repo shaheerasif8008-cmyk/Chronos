@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from sqlalchemy import insert, select
 
 from core import permissions
+from core.activity_events import list_task_events
 from core.auth import get_current_member
 from core.config import settings
 from core.db import engine, reflect_table
@@ -113,6 +114,26 @@ async def get_task_detail(task_id: str, member: Member = Depends(get_current_mem
     if not row:
         raise HTTPException(status_code=404, detail="Task not found")
     return dict(row)
+
+
+@router.get("/{task_id}/events")
+async def get_task_events(
+    task_id: str,
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    member: Member = Depends(get_current_member),
+) -> list[dict]:
+    await permissions.check(member, "view_task_events", task_id)
+    tasks = await reflect_table("tasks")
+    async with engine.begin() as conn:
+        row = (
+            await conn.execute(
+                select(tasks.c.id).where(tasks.c.id == task_id, tasks.c.organization_id == member.organization_id)
+            )
+        ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return await list_task_events(task_id, member.organization_id, limit=limit, offset=offset)
 
 
 @router.get("/{task_id}/stream")

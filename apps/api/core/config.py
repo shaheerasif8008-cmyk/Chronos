@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     vault_encryption_key: str = ""   # 32-byte hex string; required outside dev
     composio_api_key: str = ""       # kept for backward compat; not actively used
     composio_callback_base_url: str = "http://localhost:8000"
+    tavily_api_key: str = ""
     # Google OAuth2 — covers Gmail, Calendar, Drive
     google_client_id: str = ""
     google_client_secret: str = ""

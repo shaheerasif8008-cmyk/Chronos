@@ -19,6 +19,8 @@ import secrets
 from datetime import datetime
 from typing import Any
 
+import httpx
+
 from core.config import settings
 from core.models import ToolResult
 
@@ -105,6 +107,17 @@ class BrowserConnector:
                 data={"query": query, "results": results, "leads": results, "tier": tier},
                 summary=f"Fixture search '{query}': {len(results)} leads",
             )
+
+        if settings.tavily_api_key:
+            try:
+                results = await _tavily_search(query, max_results)
+                trimmed = [_normalize_tavily_result(item) for item in results[:max_results]]
+                return ToolResult(
+                    data={"query": query, "results": trimmed, "provider": "tavily", "tier": "live"},
+                    summary=f"Tavily search '{query}': {len(trimmed)} results",
+                )
+            except Exception as exc:
+                log.warning("Tavily search failed; falling back to browser search: %s", exc)
 
         playwright, browser, context, page = await _new_page()
         try:
@@ -232,6 +245,40 @@ _PERSON_RE = re.compile(r"([A-Z][a-z]+(?: [A-Z][a-z]+)+)[,\-–—|]\s*([A-Za-z 
 def _url_encode(s: str) -> str:
     from urllib.parse import quote_plus
     return quote_plus(s)
+
+
+async def _tavily_search(query: str, max_results: int) -> list[dict[str, Any]]:
+    if not query:
+        raise ValueError("browser.search requires 'query'")
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        response = await client.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": settings.tavily_api_key,
+                "query": query,
+                "search_depth": "basic",
+                "max_results": max(1, min(max_results, 20)),
+                "include_answer": False,
+                "include_raw_content": False,
+            },
+        )
+        response.raise_for_status()
+        payload = response.json()
+    results = payload.get("results") or []
+    if not isinstance(results, list):
+        return []
+    return [item for item in results if isinstance(item, dict)]
+
+
+def _normalize_tavily_result(item: dict[str, Any]) -> dict[str, Any]:
+    result = {
+        "title": str(item.get("title") or "").strip(),
+        "snippet": str(item.get("content") or item.get("snippet") or "").strip(),
+        "url": str(item.get("url") or "").strip(),
+    }
+    if item.get("score") is not None:
+        result["score"] = item["score"]
+    return result
 
 
 browser_connector = BrowserConnector()

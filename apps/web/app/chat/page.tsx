@@ -95,7 +95,7 @@ type ConnectorApproval = {
   justification?: string;
   created_at?: string | null;
 };
-type Task = { id: string; status: string; goal: string; current_step: number; plan?: TaskStep[]; result?: Record<string, unknown>; error?: string | null; created_at?: string; parent_task_id?: string | null; depth?: number };
+type Task = { id: string; status: string; goal: string; current_step: number; plan?: TaskStep[]; agent_state?: Record<string, unknown>; result?: Record<string, unknown>; error?: string | null; created_at?: string; parent_task_id?: string | null; depth?: number; iteration_count?: number };
 type TaskStep = { id: string; action: string; description: string; tool?: string | null };
 type ChatModel = { id: string; label: string; model: string; description?: string };
 type TaskStreamEvent = {
@@ -112,6 +112,25 @@ type TaskStreamEvent = {
   attempt?: number;
 };
 type Approval = { id: string; task_id: string; step_id: string; action_type: string; action_payload: Record<string, unknown>; requested_at?: string; status: string };
+type ActivityAction = {
+  id: string;
+  type: string;
+  status: string;
+  summary: string;
+  actor_id?: string | null;
+  task_id?: string | null;
+  task_goal?: string | null;
+  task_status?: string | null;
+  tool?: string | null;
+  approval_id?: string | null;
+  approval_status?: string | null;
+  artifact_id?: string | null;
+  artifact_title?: string | null;
+  artifact_kind?: string | null;
+  error?: string | null;
+  created_at?: string | null;
+  payload?: Record<string, unknown>;
+};
 type SettingsOverview = {
   member: { id: string; email: string; name?: string | null; role: string; can_admin: boolean };
   organization: Record<string, unknown>;
@@ -1509,25 +1528,52 @@ function eventColor(event: TaskStreamEvent) {
 function ActivityScreen() {
   const [mode, setMode] = useState<"jobs" | "actions">("jobs");
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [actions, setActions] = useState<ActivityAction[]>([]);
+  const [events, setEvents] = useState<ActivityAction[]>([]);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
   const [activeTask, setActiveTask] = useState<Task | null>(null);
   const [loading, setLoading] = useState(true);
+  const [actionsLoading, setActionsLoading] = useState(true);
+  const [actionType, setActionType] = useState("all");
+  const [actionStatus, setActionStatus] = useState("all");
+  const [actionQuery, setActionQuery] = useState("");
 
-  useEffect(() => {
+  const loadTasks = useCallback(async () => {
     setLoading(true);
-    apiFetch("/tasks/")
+    await apiFetch("/tasks/")
       .then(r => r.json())
       .then((data: Task[]) => setTasks(data))
       .catch(() => {})
       .finally(() => setLoading(false));
   }, []);
 
+  const loadActions = useCallback(async () => {
+    setActionsLoading(true);
+    const params = new URLSearchParams();
+    if (actionType !== "all") params.set("type", actionType);
+    if (actionStatus !== "all") params.set("status", actionStatus);
+    if (actionQuery.trim()) params.set("query", actionQuery.trim());
+    params.set("limit", "200");
+    await apiFetch(`/activity/actions?${params.toString()}`)
+      .then(r => r.json())
+      .then((data: ActivityAction[]) => setActions(data))
+      .catch(() => setActions([]))
+      .finally(() => setActionsLoading(false));
+  }, [actionQuery, actionStatus, actionType]);
+
+  useEffect(() => { void loadTasks(); }, [loadTasks]);
+  useEffect(() => { void loadActions(); }, [loadActions]);
+
   useEffect(() => {
-    if (!activeTaskId) { setActiveTask(null); return; }
+    if (!activeTaskId) { setActiveTask(null); setEvents([]); return; }
     apiFetch(`/tasks/${activeTaskId}`)
       .then(r => r.json())
       .then((data: Task) => setActiveTask(data))
       .catch(() => setActiveTask(null));
+    apiFetch(`/tasks/${activeTaskId}/events`)
+      .then(r => r.json())
+      .then((data: ActivityAction[]) => setEvents(data))
+      .catch(() => setEvents([]));
   }, [activeTaskId]);
 
   const jobFilters = [
@@ -1597,7 +1643,7 @@ function ActivityScreen() {
                       <div className="flex items-center gap-2 text-[12.5px]" style={{ color: "var(--text-dim)" }}>
                         <span style={{ color: statusColor }}>{sl}</span>
                         <span>·</span>
-                        <span>Step {t.current_step}</span>
+                        <span>{t.iteration_count ?? 0} iterations</span>
                       </div>
                     </div>
                     <IC.Chevron size={16} style={{ color: "var(--text-faint)", transform: activeTaskId === t.id ? "rotate(90deg)" : "none" }}/>
@@ -1605,7 +1651,7 @@ function ActivityScreen() {
                   {activeTaskId === t.id && (
                     <div className="border-t hairline px-5 py-4 space-y-3">
                       {activeTask?.error && <div className="text-[12.5px]" style={{ color: "var(--danger)" }}>{activeTask.error}</div>}
-                      <TaskSteps task={activeTask || t}/>
+                      <TaskTimeline task={activeTask || t} events={events}/>
                       <TaskResult task={activeTask || t}/>
                     </div>
                   )}
@@ -1617,18 +1663,156 @@ function ActivityScreen() {
       )}
 
       {mode === "actions" && (
-        <div className="px-10 pb-10">
-          <EmptyState icon={<IC.Audit size={20}/>} title="Action log" sub="Every action Chronos takes is recorded here. Actions appear as jobs run."/>
+        <div className="px-10 pb-10 space-y-4">
+          <div className="surface border border-soft rounded-lg p-3 flex items-center gap-2 flex-wrap">
+            <select value={actionType} onChange={e => setActionType(e.target.value)} className="surface border border-soft rounded-md px-2.5 py-1.5 text-[12.5px] outline-none" style={{ color: "var(--text)" }}>
+              <option value="all">All event types</option>
+              <option value="tool_call">Tool calls</option>
+              <option value="tool_result">Tool results</option>
+              <option value="tool_error">Tool errors</option>
+              <option value="awaiting_approval">Awaiting approval</option>
+              <option value="artifact">Artifacts</option>
+              <option value="sub_agent_spawned">Sub-agents</option>
+              <option value="task_complete">Completed tasks</option>
+              <option value="task_failed">Failed tasks</option>
+            </select>
+            <select value={actionStatus} onChange={e => setActionStatus(e.target.value)} className="surface border border-soft rounded-md px-2.5 py-1.5 text-[12.5px] outline-none" style={{ color: "var(--text)" }}>
+              <option value="all">All statuses</option>
+              <option value="running">Running</option>
+              <option value="complete">Complete</option>
+              <option value="approval_pending">Approval pending</option>
+              <option value="approved">Approved</option>
+              <option value="rejected">Rejected</option>
+              <option value="error">Error</option>
+            </select>
+            <div className="flex-1 min-w-[220px] relative">
+              <IC.Search size={13} style={{ position: "absolute", left: 10, top: 9, color: "var(--text-dim)" }}/>
+              <input value={actionQuery} onChange={e => setActionQuery(e.target.value)} placeholder="Search actions, tools, or task goals"
+                     className="w-full surface border border-soft rounded-md pl-8 pr-3 py-1.5 text-[12.5px] outline-none"
+                     style={{ color: "var(--text)" }}/>
+            </div>
+            <button onClick={() => { void loadActions(); void loadTasks(); }} className="btn btn-ghost btn-sm"><IC.Refresh size={13}/> Refresh</button>
+          </div>
+          {actionsLoading && <p className="text-[13.5px]" style={{ color: "var(--text-dim)" }}>Loading actions…</p>}
+          {!actionsLoading && actions.length === 0 && (
+            <EmptyState icon={<IC.Audit size={20}/>} title="No actions found" sub="Tool calls, approvals, artifacts, sub-agents, and task outcomes appear here."/>
+          )}
+          {!actionsLoading && actions.length > 0 && (
+            <div className="surface border border-soft rounded-lg overflow-hidden">
+              {actions.map(action => (
+                <ActivityActionRow
+                  key={action.id}
+                  action={action}
+                  onTask={() => {
+                    if (!action.task_id) return;
+                    setMode("jobs");
+                    setActiveTaskId(action.task_id);
+                  }}
+                />
+              ))}
+            </div>
+          )}
         </div>
       )}
     </div>
   );
 }
 
-function TaskSteps({ task }: { task: Task }) {
-  const steps = Array.isArray(task.plan) ? task.plan : [];
-  if (!steps.length) return <div className="text-[12.5px]" style={{ color: "var(--text-muted)" }}>No execution plan recorded.</div>;
-  return <div className="space-y-1.5">{steps.map((step, index) => <div key={step.id || index} className="flex items-center gap-2 text-[12.5px]"><Tag variant={index < task.current_step ? "ok" : index === task.current_step ? "info" : "default"}>{index + 1}</Tag><span className="font-medium">{step.action}</span><span style={{ color: "var(--text-dim)" }}>{step.description}</span>{step.tool && <Tag>{step.tool}</Tag>}</div>)}</div>;
+function TaskTimeline({ task, events }: { task: Task; events: ActivityAction[] }) {
+  const history = Array.isArray(task.agent_state?.agent_history) ? task.agent_state?.agent_history as unknown[] : [];
+  if (!events.length) {
+    return (
+      <div className="rounded-lg border border-soft p-3 text-[12.5px]" style={{ color: "var(--text-muted)" }}>
+        No execution events recorded yet. Agent state contains {history.length} messages and {task.iteration_count ?? 0} loop iterations.
+      </div>
+    );
+  }
+  return (
+    <div className="rounded-lg border border-soft overflow-hidden">
+      <div className="px-3 py-2 flex items-center justify-between border-b hairline">
+        <div className="text-[12.5px] font-medium">Execution timeline</div>
+        <div className="text-[11.5px]" style={{ color: "var(--text-dim)" }}>{task.iteration_count ?? 0} iterations · {history.length} history messages</div>
+      </div>
+      <div className="divide-y" style={{ borderColor: "var(--border-soft)" }}>
+        {events.map(event => <TimelineEvent key={event.id} event={event}/>)}
+      </div>
+    </div>
+  );
+}
+
+function TimelineEvent({ event }: { event: ActivityAction }) {
+  return (
+    <div className="px-3 py-2.5 flex items-start gap-3">
+      <Dot color={activityStatusColor(event.status, event.type)} size={7} pulse={event.status === "running"} ring={event.status === "running"}/>
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-[12.5px] font-medium">{event.summary}</span>
+          {event.tool && <Tag>{event.tool}</Tag>}
+          {event.approval_id && <Tag variant="warn">approval</Tag>}
+          {event.artifact_id && <Tag variant="info">artifact</Tag>}
+        </div>
+        <div className="mt-1 text-[11.5px] flex items-center gap-2 flex-wrap" style={{ color: "var(--text-dim)" }}>
+          <span>{labelTime(event.created_at)}</span>
+          <span>{event.type}</span>
+          {event.actor_id && <span>actor {event.actor_id}</span>}
+          {event.error && <span style={{ color: "var(--danger)" }}>{event.error}</span>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ActivityActionRow({ action, onTask }: { action: ActivityAction; onTask: () => void }) {
+  async function openArtifact() {
+    if (!action.artifact_id) return;
+    const tab = window.open("about:blank", "_blank", "noopener,noreferrer");
+    try {
+      const res = await apiFetch(`/artifacts/${action.artifact_id}/content`);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      if (tab) tab.location.href = url;
+      else window.open(url, "_blank", "noopener,noreferrer");
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    } catch {
+      tab?.close();
+    }
+  }
+
+  return (
+    <div className="px-4 py-3 border-b hairline last:border-b-0 flex items-start gap-3">
+      <Dot color={activityStatusColor(action.status, action.type)} size={8} pulse={action.status === "running"} ring={action.status === "running"}/>
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-[13.5px] font-medium">{action.summary}</span>
+          <Tag>{action.type}</Tag>
+          {action.tool && <Tag variant="info">{action.tool}</Tag>}
+          <Tag variant={action.status === "error" ? "danger" : action.status === "approval_pending" ? "warn" : action.status === "complete" ? "ok" : "default"}>{action.status}</Tag>
+        </div>
+        <div className="mt-1 text-[12px] truncate" style={{ color: "var(--text-dim)" }}>
+          {action.task_goal || "No task goal"} {action.actor_id ? `· ${action.actor_id}` : ""} {action.created_at ? `· ${labelTime(action.created_at)}` : ""}
+        </div>
+        <div className="mt-2 flex items-center gap-2 flex-wrap">
+          {action.task_id && <button onClick={onTask} className="btn btn-ghost btn-sm"><IC.Briefcase size={13}/> Task</button>}
+          {action.approval_id && <button onClick={() => { window.location.href = "/approvals"; }} className="btn btn-ghost btn-sm"><IC.Approvals size={13}/> Approval</button>}
+          {action.artifact_id && <button onClick={() => void openArtifact()} className="btn btn-ghost btn-sm"><IC.Folder size={13}/> {action.artifact_title || "Artifact"}</button>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function activityStatusColor(status: string, type: string) {
+  if (status === "error" || type === "task_failed" || type === "tool_error") return "var(--danger)";
+  if (status === "approval_pending" || type === "awaiting_approval") return "var(--warn)";
+  if (status === "complete" || type === "task_complete" || type === "artifact") return "var(--ok)";
+  return "var(--accent)";
+}
+
+function labelTime(value?: string | null) {
+  if (!value) return "time unknown";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 }
 
 function TaskResult({ task }: { task: Task }) {

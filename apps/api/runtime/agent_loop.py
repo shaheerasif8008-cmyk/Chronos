@@ -234,11 +234,15 @@ async def publish_activity(task_id: str, event: dict[str, Any]) -> None:
 # ── Message history ───────────────────────────────────────────────────────────
 
 def _agent_system_message() -> dict[str, Any]:
+    current_date = datetime.now(timezone.utc).date().isoformat()
     return {
         "role": "system",
         "content": (
             "You are Chronos running an autonomous enterprise task. "
+            f"Current date: {current_date}. "
             "Use the available tools to accomplish the goal. "
+            "For latest, current, recent, news, or time-sensitive questions, use browser__search "
+            "with a query anchored to the current date instead of relying on model memory. "
             "You may call multiple independent tools in parallel in a single response. "
             "When you have gathered enough information to fully answer the goal, respond with "
             "a clear final answer — do not make unnecessary additional tool calls. "

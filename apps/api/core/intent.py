@@ -41,10 +41,54 @@ _CHAT_MARKERS = {
     "what are",
     "why",
 }
+_LIVE_WEB_ACTION_MARKERS = {
+    "browse",
+    "look up",
+    "search",
+    "search web",
+    "web search",
+}
+_LIVE_WEB_RECENCY_MARKERS = {
+    "as of",
+    "current",
+    "currently",
+    "latest",
+    "live",
+    "newest",
+    "now",
+    "recent",
+    "today",
+    "this month",
+    "this week",
+    "up to date",
+}
+_LIVE_WEB_NEWS_MARKERS = {
+    "announced",
+    "headlines",
+    "launched",
+    "news",
+    "released",
+}
+
+
+def _live_web_intent(message: str) -> dict[str, Any] | None:
+    normalized = " ".join(message.lower().split())
+    starts_like_question = normalized.startswith(("are ", "did ", "do ", "does ", "how ", "is ", "what ", "when ", "where ", "who "))
+    explicit_search = any(marker in normalized for marker in _LIVE_WEB_ACTION_MARKERS)
+    asks_for_current_info = any(marker in normalized for marker in _LIVE_WEB_RECENCY_MARKERS)
+    asks_for_news = any(marker in normalized for marker in _LIVE_WEB_NEWS_MARKERS)
+
+    if explicit_search or (starts_like_question and (asks_for_current_info or asks_for_news)):
+        return {"mode": "task", "confidence": 0.86, "goal": message}
+    return None
 
 
 def _heuristic_intent(message: str) -> dict[str, Any]:
     normalized = " ".join(message.lower().split())
+    live_web = _live_web_intent(message)
+    if live_web:
+        return live_web
+
     if "operator workflow proof" in normalized:
         return {"mode": "task", "confidence": 1.0, "goal": message}
 
@@ -64,6 +108,10 @@ async def classify_intent(message: str) -> dict[str, Any]:
     Classify before any streaming response. The LLM path improves recall, while
     the heuristic fallback keeps task routing available when no model is ready.
     """
+    live_web = _live_web_intent(message)
+    if live_web:
+        return live_web
+
     prompt = f"""
 Return only JSON with this shape:
 {{"mode":"chat|task","confidence":0.0,"goal":"cleaned task goal or empty"}}

@@ -1,3 +1,5 @@
+import importlib.util
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select
@@ -6,7 +8,7 @@ import asyncio
 from jobs import context_update, profile_synthesis
 from core.db import engine, reflect_table
 from runtime.executor import TaskExecutor
-from routers import approvals, artifacts, auth, chat, connectors, context, memory, settings, tasks, workflows
+from routers import activity, approvals, artifacts, auth, chat, connectors, context, memory, settings, tasks, workflows
 
 app = FastAPI(title="Chronos API", version="0.1.0")
 
@@ -30,6 +32,7 @@ app.include_router(memory.router)
 app.include_router(connectors.router)
 app.include_router(context.router)
 app.include_router(tasks.router)
+app.include_router(activity.router)
 app.include_router(approvals.router)
 app.include_router(artifacts.router)
 app.include_router(settings.router)
@@ -41,7 +44,11 @@ def _init_observability() -> None:
     from core.config import settings as cfg
 
     # Langfuse — LiteLLM has a built-in Langfuse callback.
-    if cfg.langfuse_public_key and cfg.langfuse_secret_key:
+    if (
+        cfg.langfuse_public_key
+        and cfg.langfuse_secret_key
+        and importlib.util.find_spec("langfuse") is not None
+    ):
         try:
             import litellm
 

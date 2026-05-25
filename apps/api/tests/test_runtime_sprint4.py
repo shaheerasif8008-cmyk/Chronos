@@ -469,6 +469,66 @@ async def test_planner_falls_back_to_research_plan_for_market_brief(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_planner_falls_back_to_browser_search_for_current_news(monkeypatch):
+    from runtime import planner
+
+    async def fake_complete_json(prompt, model=None):
+        assert model == planner.settings.agent_model
+        raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(planner, "complete_json", fake_complete_json)
+    monkeypatch.setattr(planner.settings, "demo_mode", False)
+
+    plan = await planner.create_plan(
+        "what is the latest news on AI agents?",
+        {"triggered_by": "test"},
+        "default",
+    )
+
+    assert [step["action"] for step in plan] == ["tool_call", "think"]
+    assert plan[0]["tool"] == "browser.search"
+    assert plan[0]["args"]["query"] == "what is the latest news on AI agents?"
+
+
+def test_agent_system_prompt_includes_current_date_for_live_search():
+    from runtime import agent_loop
+
+    prompt = agent_loop._agent_system_message()["content"]
+
+    assert "Current date:" in prompt
+    assert "browser__search" in prompt
+    assert "latest" in prompt
+
+
+def test_observability_skips_langfuse_callback_when_package_missing(monkeypatch):
+    import importlib.util
+
+    import litellm
+    import main
+    from core.config import settings
+
+    litellm.success_callback = []
+    litellm.failure_callback = []
+    monkeypatch.setattr(settings, "langfuse_public_key", "pk-test")
+    monkeypatch.setattr(settings, "langfuse_secret_key", "sk-test")
+    monkeypatch.delenv("LANGFUSE_PUBLIC_KEY", raising=False)
+    monkeypatch.delenv("LANGFUSE_SECRET_KEY", raising=False)
+    real_find_spec = importlib.util.find_spec
+
+    def fake_find_spec(name: str, *args, **kwargs):
+        if name == "langfuse":
+            return None
+        return real_find_spec(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib.util, "find_spec", fake_find_spec)
+
+    main._init_observability()
+
+    assert "langfuse" not in litellm.success_callback
+    assert "langfuse" not in litellm.failure_callback
+
+
+@pytest.mark.asyncio
 async def test_spawn_sub_agent_step_is_not_retried(monkeypatch):
     from runtime import executor
 
@@ -571,6 +631,7 @@ async def test_browser_search_falls_back_to_fixture_results_on_live_timeout(monk
         return FakePlaywright(), FakeClosable(), FakeClosable(), FakePage()
 
     monkeypatch.setattr(browser.settings, "demo_mode", False)
+    monkeypatch.setattr(browser.settings, "tavily_api_key", "")
     monkeypatch.setattr(browser, "_new_page", fake_new_page)
 
     result = await browser.browser_connector._search({"query": "data observability market", "max_results": 2})
