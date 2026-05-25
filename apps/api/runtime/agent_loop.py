@@ -256,17 +256,58 @@ async def _agent_system_message(tools: list[dict[str, Any]] | None = None) -> di
     }
 
 
+def _resolve_inherited_context(
+    args: dict[str, Any],
+    parent_task: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Resolve opt-in sub-agent state inheritance, or None if none is requested.
+
+    Canonical source is the spawn step's `inherit_keys`. The DAG executor resolves it
+    against its live context and passes `_inherited_context` directly; a native-loop
+    spawn passes `inherit_keys`, read here from the parent's persisted result. Returns
+    None unless something is actually inherited, so spawns stay isolated by default.
+    """
+    inherited = args.get("_inherited_context")
+    if not inherited and args.get("inherit_keys"):
+        parent_ctx = parent_task.get("result") or {}
+        inherited = {
+            "parent_goal": parent_task.get("goal", ""),
+            "parent_context": {key: parent_ctx[key] for key in args["inherit_keys"] if key in parent_ctx},
+        }
+    if isinstance(inherited, dict) and (inherited.get("parent_context") or inherited.get("parent_goal")):
+        return inherited
+    return None
+
+
+def _format_inherited_context(inherited: dict[str, Any]) -> str:
+    """Render inherited parent state as one delimited, immutable context block."""
+    lines = ["# Inherited context from parent task"]
+    parent_goal = str(inherited.get("parent_goal") or "").strip()
+    if parent_goal:
+        lines.append(f"Parent goal: {parent_goal}")
+    shared = inherited.get("parent_context") or {}
+    if shared:
+        lines.append("Shared values:")
+        lines.append(json.dumps(shared, default=str, indent=2))
+    return "\n".join(lines)
+
+
 async def _load_history(task: dict[str, Any], tools: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     state = task.get("agent_state") or {}
     if isinstance(state, dict):
         history = state.get("agent_history") or []
         if isinstance(history, list) and history:
+            # Resume path: checkpointed history already contains any inherited block
+            # from the first load — return as-is, do NOT re-inject below.
             return list(history)
-    # Fresh start
-    return [
-        await _agent_system_message(tools),
-        {"role": "user", "content": str(task["goal"])},
-    ]
+    # Fresh start. Sub-agents spawned with inherit_keys carry an opt-in snapshot of
+    # parent state, injected here as a single context message before the goal.
+    seed = [await _agent_system_message(tools)]
+    inherited = state.get("inherited_context") if isinstance(state, dict) else None
+    if isinstance(inherited, dict) and (inherited.get("parent_context") or inherited.get("parent_goal")):
+        seed.append({"role": "user", "content": _format_inherited_context(inherited)})
+    seed.append({"role": "user", "content": str(task["goal"])})
+    return seed
 
 
 async def _checkpoint(
@@ -570,6 +611,16 @@ async def _run_subagent(
     model_tier = str(args.get("model") or "agent")
     child_model = settings.agent_model if model_tier == "agent" else settings.fast_model
 
+    # Step 4: opt-in state inheritance. The DAG executor resolves `inherit_keys`
+    # against its live context and passes `_inherited_context`. A native-loop spawn
+    # may instead pass `inherit_keys`, read here from the parent's persisted result.
+    # No inheritance happens unless one of these is present — sub-agents stay
+    # context-isolated by default.
+    inherited_context = _resolve_inherited_context(args, parent_task)
+    child_state: dict[str, Any] = {"agent_history": [], "iteration_count": 0}
+    if inherited_context:
+        child_state["inherited_context"] = inherited_context
+
     tasks = await reflect_table("tasks")
     now = datetime.now(timezone.utc)
     async with engine.begin() as conn:
@@ -584,7 +635,7 @@ async def _run_subagent(
                 status="running",
                 goal=goal,
                 plan={},
-                agent_state={"agent_history": [], "iteration_count": 0},
+                agent_state=child_state,
                 current_step=0,
                 result={},
                 depth=parent_depth + 1,
@@ -687,7 +738,6 @@ async def resume_after_approval(task_id: str) -> None:
     state = task.get("agent_state") or {}
     history = state.get("agent_history") or await _load_history(task)
     iteration = int(state.get("iteration_count") or 0)
-    pending_calls: list[dict[str, Any]] = state.get("pending_approval_calls") or []
     agent = AgentContext.from_task(task)
 
     # Load approval rows
