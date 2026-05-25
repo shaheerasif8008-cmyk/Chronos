@@ -8,6 +8,7 @@ from core.config import settings
 from core.db import engine, reflect_table
 from core.models import RequesterContext
 from core.personas import get_persona_prompt
+from core.tool_manifest import generate_tool_manifest
 from skills.loader import find_relevant_skills, load_skill_content, skill_connector_warning
 from skills.registry import load_skill_index
 
@@ -113,6 +114,15 @@ async def assemble_context(
     org_context = await load_org_context(requester_context.org_id)
     if org_context and _estimate_tokens(base + org_context) <= system_budget:
         base += f"\n\n# Organization Context\n{org_context}"
+
+    # ── Layer 2b: dynamic tool manifest ────────────────────────────────────
+    tool_manifest = await generate_tool_manifest(
+        persona_id=requester_context.persona_id,
+        org_id=requester_context.org_id,
+        sub_agent=requester_context.memory_context == "sub_agent",
+    )
+    if tool_manifest and _estimate_tokens(base + tool_manifest) <= system_budget:
+        base += f"\n\n{tool_manifest}"
 
     # ── Layer 3: persona ────────────────────────────────────────────────────
     persona_prompt = await get_persona_prompt(requester_context.persona_id)

@@ -900,3 +900,84 @@ async def test_assemble_context_loads_persona_skills_memories_and_task_state(mon
     assert "# Skill: sdr-outreach\nUse outbound research workflow." in system
     assert "# What I Remember\n- ACME uses HubSpot." in system
     assert "# Current Task\nGoal: draft outreach" in system
+
+
+@pytest.mark.asyncio
+async def test_assemble_context_injects_dynamic_tool_manifest(monkeypatch):
+    from core import context
+    from core.models import RequesterContext
+
+    async def fake_org_context(org_id):
+        return ""
+
+    async def fake_find_skills(message):
+        return []
+
+    async def fake_retrieve(message, requester_context):
+        return []
+
+    class FakeResult:
+        def mappings(self):
+            return self
+
+        def all(self):
+            return []
+
+    class FakeConn:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def execute(self, stmt):
+            return FakeResult()
+
+    class FakeEngine:
+        def begin(self):
+            return FakeConn()
+
+    class FakeColumn:
+        def __eq__(self, other):
+            return ("eq", other)
+
+        def desc(self):
+            return ("desc", self)
+
+    class FakeMessages:
+        class c:
+            role = FakeColumn()
+            content = FakeColumn()
+            conversation_id = FakeColumn()
+            created_at = FakeColumn()
+
+    async def fake_reflect_table(name):
+        return FakeMessages()
+
+    class FakeSelect:
+        def where(self, *args):
+            return self
+
+        def order_by(self, *args):
+            return self
+
+        def limit(self, *args):
+            return self
+
+    monkeypatch.setattr(context, "load_org_context", fake_org_context)
+    monkeypatch.setattr(context, "find_relevant_skills", fake_find_skills)
+    monkeypatch.setattr(context.memory, "retrieve", fake_retrieve)
+    monkeypatch.setattr(context, "reflect_table", fake_reflect_table)
+    monkeypatch.setattr(context, "engine", FakeEngine())
+    monkeypatch.setattr(context, "select", lambda *args: FakeSelect())
+
+    assembled = await context.assemble_context(
+        "conversation-1",
+        "latest market news",
+        RequesterContext(member_id="member-1"),
+    )
+
+    system = assembled[0]["content"]
+    assert "# Available Runtime Tools" in system
+    assert "`browser__search`" in system
+    assert "`code__python`" in system

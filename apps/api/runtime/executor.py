@@ -13,6 +13,7 @@ import asyncio
 import ast
 import inspect
 import json
+import re
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -211,7 +212,8 @@ class TaskExecutor:
         await emit_activity(task["id"], {"type": "step_start", "step": step})
         action = step["action"]
         if action == "tool_call":
-            result = await tool_broker.execute(agent, str(step["tool"]), dict(step.get("args") or {}))
+            args = resolve_args(dict(step.get("args") or {}), context)
+            result = await tool_broker.execute(agent, str(step["tool"]), args)
             return result.data
         if action == "think":
             return await self._run_think_step(task, step, context, model)
@@ -575,3 +577,47 @@ def _find_context_list(context: dict[str, Any], key: str) -> list[Any]:
         if isinstance(value, dict) and isinstance(value.get(key), list):
             return value[key]
     return []
+
+
+_TEMPLATE_RE = re.compile(r"^\{\{\s*([^}]+?)\s*\}\}$")
+
+
+def resolve_args(args: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+    return {key: _resolve_value(value, context) for key, value in args.items()}
+
+
+def _resolve_value(value: Any, context: dict[str, Any]) -> Any:
+    if isinstance(value, dict):
+        return {key: _resolve_value(item, context) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_resolve_value(item, context) for item in value]
+    if not isinstance(value, str):
+        return value
+    match = _TEMPLATE_RE.match(value)
+    if not match:
+        return value
+    return _lookup_context_path(match.group(1), context)
+
+
+def _lookup_context_path(path: str, context: dict[str, Any]) -> Any:
+    current: Any = context
+    for part in path.split("."):
+        part = part.strip()
+        if not part:
+            continue
+        while "[" in part:
+            name, _, rest = part.partition("[")
+            if name:
+                current = _lookup_key(current, name)
+            index_text, _, remainder = rest.partition("]")
+            current = current[int(index_text)]
+            part = remainder
+        if part:
+            current = _lookup_key(current, part)
+    return current
+
+
+def _lookup_key(value: Any, key: str) -> Any:
+    if isinstance(value, dict):
+        return value[key]
+    return getattr(value, key)

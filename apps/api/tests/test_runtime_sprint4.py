@@ -262,7 +262,7 @@ async def test_agent_loop_uses_model_decisions_and_broker_checkpoint(monkeypatch
     async def fake_persist(task_arg, content):
         return None
 
-    async def fake_llm_step(messages, tools, model=None):
+    async def fake_llm_step(messages, tools, model=None, routing_decision=None):
         assert tools
         decision = decisions.pop(0)
         if decision["type"] == "tool_call":
@@ -324,7 +324,7 @@ async def test_agent_loop_pauses_and_checkpoints_on_approval(monkeypatch):
     async def fake_emit(task_id, event, actor_id="chronos"):
         return None
 
-    async def fake_llm_step(messages, tools, model=None):
+    async def fake_llm_step(messages, tools, model=None, routing_decision=None):
         return None, [
             {
                 "id": "call-1",
@@ -508,10 +508,11 @@ async def test_planner_falls_back_to_browser_search_for_current_news(monkeypatch
     assert plan["steps"][0]["args"]["query"] == "what is the latest news on AI agents?"
 
 
-def test_agent_system_prompt_includes_current_date_for_live_search():
+@pytest.mark.asyncio
+async def test_agent_system_prompt_includes_current_date_for_live_search():
     from runtime import agent_loop
 
-    prompt = agent_loop._agent_system_message()["content"]
+    prompt = (await agent_loop._agent_system_message())["content"]
 
     assert "Current date:" in prompt
     assert "browser__search" in prompt

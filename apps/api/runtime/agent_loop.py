@@ -37,6 +37,8 @@ from core.exceptions import ApprovalRequired
 from core.llm import _message_content, _message, _tool_calls, _with_retry, model_kwargs
 from core.models import AgentContext
 from core.redis import redis_client
+from core.tool_manifest import generate_tool_manifest
+from core.tool_router import ToolRoutingDecision, route as route_tool
 from runtime.tool_registry import (
     ALL_TOOLS,
     ALWAYS_APPROVAL_TOOL_NAMES,
@@ -233,8 +235,9 @@ async def publish_activity(task_id: str, event: dict[str, Any]) -> None:
 
 # ── Message history ───────────────────────────────────────────────────────────
 
-def _agent_system_message() -> dict[str, Any]:
+async def _agent_system_message(tools: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     current_date = datetime.now(timezone.utc).date().isoformat()
+    manifest = await generate_tool_manifest(sub_agent=tools == SUBAGENT_TOOLS)
     return {
         "role": "system",
         "content": (
@@ -247,12 +250,13 @@ def _agent_system_message() -> dict[str, Any]:
             "When you have gathered enough information to fully answer the goal, respond with "
             "a clear final answer — do not make unnecessary additional tool calls. "
             "All external actions are governed by the broker; some require human approval. "
-            "Be direct and operational."
+            "Be direct and operational.\n\n"
+            f"{manifest}"
         ),
     }
 
 
-def _load_history(task: dict[str, Any]) -> list[dict[str, Any]]:
+async def _load_history(task: dict[str, Any], tools: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     state = task.get("agent_state") or {}
     if isinstance(state, dict):
         history = state.get("agent_history") or []
@@ -260,7 +264,7 @@ def _load_history(task: dict[str, Any]) -> list[dict[str, Any]]:
             return list(history)
     # Fresh start
     return [
-        _agent_system_message(),
+        await _agent_system_message(tools),
         {"role": "user", "content": str(task["goal"])},
     ]
 
@@ -288,6 +292,7 @@ async def _llm_step(
     history: list[dict[str, Any]],
     tools: list[dict[str, Any]],
     model: str,
+    routing_decision: ToolRoutingDecision | None = None,
 ) -> tuple[str | None, list[dict[str, Any]]]:
     """Call the LLM and return (final_text | None, list_of_tool_calls).
 
@@ -297,7 +302,10 @@ async def _llm_step(
     """
     kwargs = model_kwargs(model, messages=history, stream=False)
     kwargs["tools"] = tools
-    kwargs["tool_choice"] = "auto"
+    if routing_decision and routing_decision.tool and routing_decision.confidence >= 0.75:
+        kwargs["tool_choice"] = {"type": "function", "function": {"name": routing_decision.tool}}
+    else:
+        kwargs["tool_choice"] = "auto"
     response = await _with_retry(lambda: litellm.acompletion(**kwargs))
 
     msg = _message(response)
@@ -405,6 +413,21 @@ def _append_replan_instruction(
                 "and continue from the current state. Do not repeat the same failing call unless "
                 "new evidence justifies it. Error summary: "
                 f"{json.dumps(errors, default=str)}"
+            ),
+        }
+    )
+
+
+def _append_routing_instruction(history: list[dict[str, Any]], decision: ToolRoutingDecision) -> None:
+    if not decision.tool or decision.confidence < 0.6:
+        return
+    history.append(
+        {
+            "role": "system",
+            "content": (
+                "Tool routing observation: the best first tool appears to be "
+                f"`{decision.tool}` with confidence {decision.confidence:.2f}. "
+                f"Reason: {decision.reasoning}. Use it if the current state still matches."
             ),
         }
     )
@@ -662,7 +685,7 @@ async def resume_after_approval(task_id: str) -> None:
         return
 
     state = task.get("agent_state") or {}
-    history = state.get("agent_history") or _load_history(task)
+    history = state.get("agent_history") or await _load_history(task)
     iteration = int(state.get("iteration_count") or 0)
     pending_calls: list[dict[str, Any]] = state.get("pending_approval_calls") or []
     agent = AgentContext.from_task(task)
@@ -756,8 +779,12 @@ async def run_loop(
     effective_model = model or stored_model or settings.agent_model
     agent = AgentContext.from_task(task)
 
-    history = _load_history(task)
+    history = await _load_history(task, effective_tools)
     iteration = int(task.get("iteration_count") or 0)
+    routing_decision: ToolRoutingDecision | None = None
+    if iteration == 0:
+        routing_decision = await route_tool(str(task["goal"]), [tool["function"]["name"] for tool in effective_tools])
+        _append_routing_instruction(history, routing_decision)
 
     await save_task(task_id, status="running",
                     started_at=task.get("started_at") or datetime.now(timezone.utc))
@@ -770,7 +797,8 @@ async def run_loop(
         # high-frequency signal must not bloat the append-only audit_log.
         await publish_activity(task_id, {"type": "thinking"})
         try:
-            final_text, calls = await _llm_step(history, effective_tools, effective_model)
+            final_text, calls = await _llm_step(history, effective_tools, effective_model, routing_decision)
+            routing_decision = None
         except Exception as exc:
             logger.error("LLM error in agent loop for task %s: %s", task_id, exc)
             await save_task(task_id, status="failed", error=str(exc))
