@@ -407,10 +407,14 @@ async def test_parse_attachments_sets_status_and_returns_preview(monkeypatch):
     async def fake_set_status(artifact_id, status):
         pass
 
+    async def fake_audit_log(*a, **kw):
+        pass
+
     monkeypatch.setattr(chat_router, "_get_artifact", fake_get)
     monkeypatch.setattr(chat_router, "_read_artifact_content", fake_read)
     monkeypatch.setattr(chat_router, "_save_artifact", fake_save)
     monkeypatch.setattr(chat_router, "_set_parse_status", fake_set_status)
+    monkeypatch.setattr(chat_router.audit, "log", fake_audit_log)
 
     result = await chat_router._parse_attachments(["att-1"], "conv-1", "default")
     assert len(result) == 1
