@@ -810,7 +810,7 @@ async def test_chat_task_intent_routes_to_executor_without_chat_completion(monke
     async def fake_classify(message):
         return {"mode": "task", "confidence": 0.9, "goal": "research leads and draft outreach"}
 
-    async def fake_create_task_record(*, goal, member, triggered_by, persona_id=None, workspace_id=None, model=None):
+    async def fake_create_task_record(*, goal, member, triggered_by, persona_id=None, workspace_id=None, model=None, attachments_context=None):
         assert goal == "research leads and draft outreach"
         assert persona_id == "sdr-outreach"
         assert triggered_by == "conversation-1"

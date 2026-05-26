@@ -417,3 +417,17 @@ async def test_parse_attachments_sets_status_and_returns_preview(monkeypatch):
     assert result[0]["preview"] == "important content"
     assert result[0]["filename"] == "note.txt"
     assert result[0]["parsed_artifact_id"] == "parsed-001"
+
+
+@pytest.mark.asyncio
+async def test_attachment_not_parseable_across_orgs(monkeypatch):
+    """An attachment owned by org A must not be parsed when requested as org B."""
+    from routers import chat
+
+    async def fake_get_artifact(att_id):
+        return {"id": att_id, "organization_id": "orgA", "mime_type": "text/plain", "title": "secret.txt"}
+
+    monkeypatch.setattr(chat, "_get_artifact", fake_get_artifact)
+
+    out = await chat._parse_attachments(["att-A"], conversation_id="c1", org_id="orgB")
+    assert out == []  # org mismatch → skipped, no parsed_text created
