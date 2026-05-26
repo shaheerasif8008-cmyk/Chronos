@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from core import llm
+from parsing.engine import PREVIEW_CHAR_LIMIT, ParsedDocument, parse_document
 
 
 @pytest.mark.asyncio
@@ -27,9 +28,6 @@ async def test_vision_ocr_sends_data_url_and_returns_text():
     image_part = next(p for p in content if p["type"] == "image_url")
     assert image_part["image_url"]["url"].startswith("data:image/png;base64,")
     assert base64.b64encode(b"rawbytes").decode() in image_part["image_url"]["url"]
-
-
-from parsing.engine import parse_document, ParsedDocument, PREVIEW_CHAR_LIMIT
 
 
 @pytest.mark.asyncio

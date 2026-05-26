@@ -6,10 +6,7 @@ wrap this module.
 """
 from __future__ import annotations
 
-import io
 from dataclasses import dataclass
-
-from core.llm import vision_ocr
 
 #: Preview is the first ~6K tokens, approximated at 4 chars/token.
 PREVIEW_CHAR_LIMIT = 24_000
