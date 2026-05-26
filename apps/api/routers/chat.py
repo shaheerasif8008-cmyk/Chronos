@@ -209,6 +209,10 @@ async def _parse_attachments(attachment_ids: list[str], conversation_id: str, or
                     "truncated": len(full) > PREVIEW_CHAR_LIMIT,
                     "note": None,
                 })
+                await audit.log(
+                    "attachment_parse_cache_hit", "system", "attachments.parse",
+                    resource_type="artifacts", resource_id=att_id,
+                )
                 continue
 
         raw = await _read_artifact_content(att_id) or b""
@@ -227,6 +231,11 @@ async def _parse_attachments(attachment_ids: list[str], conversation_id: str, or
                 parse_status="parsed", org_id=org_id, mime_type="text/plain",
             )
         await _set_parse_status(att_id, status)
+        await audit.log(
+            "attachment_parsed", "system", "attachments.parse",
+            resource_type="artifacts", resource_id=att_id,
+            payload={"parse_status": status, "parser_used": doc.parser_used},
+        )
         out.append({
             "attachment_id": att_id,
             "parsed_artifact_id": parsed_artifact_id,

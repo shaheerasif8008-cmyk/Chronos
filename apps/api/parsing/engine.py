@@ -18,6 +18,9 @@ PREVIEW_CHAR_LIMIT = 24_000
 #: Used by callers to distinguish "unparseable" from "failed".
 UNPARSEABLE_NOTE = "not parseable yet"
 
+#: Maximum pages that will be OCR'd in a single PDF (cost/latency guard).
+MAX_OCR_PAGES = 50
+
 _TEXT_MIMES = {"text/plain", "text/csv", "text/markdown", "application/csv"}
 _TEXT_EXTS = {".txt", ".csv", ".md", ".markdown", ".log", ".tsv"}
 _IMAGE_MIMES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
@@ -108,15 +111,17 @@ async def _parse_pdf(raw: bytes) -> ParsedDocument:
         return _finalize("", page_count=0, parser_used="none", note="could not read PDF (corrupt or encrypted)")
 
     used_ocr = False
+    ocr_page_count = 0
     out: list[str] = []
     for i, text in enumerate(texts):
         if text:
             out.append(text)
-        else:
+        elif ocr_page_count < MAX_OCR_PAGES:
             ocr = await _pdf_page_ocr(raw, i)
             if ocr:
                 used_ocr = True
                 out.append(ocr)
+            ocr_page_count += 1
     full = "\n\n".join(p for p in out if p)
     return _finalize(
         full,

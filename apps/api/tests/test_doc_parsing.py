@@ -431,3 +431,20 @@ async def test_attachment_not_parseable_across_orgs(monkeypatch):
 
     out = await chat._parse_attachments(["att-A"], conversation_id="c1", org_id="orgB")
     assert out == []  # org mismatch → skipped, no parsed_text created
+
+
+@pytest.mark.asyncio
+async def test_doc_connector_rejects_cross_org_artifact(monkeypatch):
+    """DocConnector must reject artifact reads for a different org."""
+    from parsing import tool as doctool
+
+    async def fake_meta(artifact_id):
+        return {"organization_id": "orgA", "mime_type": "text/plain", "title": "secret.txt", "kind": "attachment"}
+
+    monkeypatch.setattr(doctool, "get_artifact", fake_meta)
+
+    with pytest.raises(PermissionError):
+        await doctool.doc_connector.execute("doc.parse", {"artifact_id": "x", "__org_id": "orgB"})
+
+    with pytest.raises(PermissionError):
+        await doctool.doc_connector.execute("doc.read", {"artifact_id": "x", "__org_id": "orgB"})
