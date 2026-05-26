@@ -152,3 +152,61 @@ async def test_parse_pptx():
     doc = await parse_document(_make_pptx("Roadmap Q3"), "", "deck.pptx")
     assert "Roadmap Q3" in doc.full_text
     assert doc.parser_used == "pptx"
+
+
+@pytest.mark.asyncio
+async def test_parse_docx_with_table():
+    from docx import Document as DocxDocument
+    d = DocxDocument()
+    t = d.add_table(rows=2, cols=2)
+    t.rows[0].cells[0].text = "Name"
+    t.rows[0].cells[1].text = "Score"
+    t.rows[1].cells[0].text = "Alice"
+    t.rows[1].cells[1].text = "95"
+    buf = io.BytesIO()
+    d.save(buf)
+    doc = await parse_document(buf.getvalue(), "", "data.docx")
+    assert "Name | Score" in doc.full_text
+    assert "Alice | 95" in doc.full_text
+
+
+@pytest.mark.asyncio
+async def test_parse_xlsx_multi_sheet():
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws1 = wb.active
+    ws1.title = "Revenue"
+    ws1["A1"] = "Q1"
+    ws2 = wb.create_sheet("Costs")
+    ws2["A1"] = "Q2"
+    buf = io.BytesIO()
+    wb.save(buf)
+    doc = await parse_document(buf.getvalue(), "", "model.xlsx")
+    assert "# Sheet: Revenue" in doc.full_text
+    assert "# Sheet: Costs" in doc.full_text
+    assert doc.page_count == 2
+
+
+@pytest.mark.asyncio
+async def test_parse_pptx_multi_slide():
+    from pptx import Presentation
+    prs = Presentation()
+    layout = prs.slide_layouts[5]
+    s1 = prs.slides.add_slide(layout)
+    s1.shapes.title.text = "Intro"
+    s2 = prs.slides.add_slide(layout)
+    s2.shapes.title.text = "Body"
+    buf = io.BytesIO()
+    prs.save(buf)
+    doc = await parse_document(buf.getvalue(), "", "deck.pptx")
+    assert "# Slide 1" in doc.full_text
+    assert "# Slide 2" in doc.full_text
+    assert doc.page_count == 2
+
+
+@pytest.mark.asyncio
+async def test_parse_docx_corrupt_bytes():
+    doc = await parse_document(b"not a zip", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "bad.docx")
+    assert doc.parser_used == "none"
+    assert doc.note is not None
+    assert "docx" in doc.note

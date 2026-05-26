@@ -128,42 +128,56 @@ async def _parse_pdf(raw: bytes) -> ParsedDocument:
 
 def _parse_docx(raw: bytes) -> ParsedDocument:
     from docx import Document
-
-    d = Document(io.BytesIO(raw))
+    try:
+        d = Document(io.BytesIO(raw))
+    except Exception:
+        return _finalize("", page_count=0, parser_used="none",
+                         note="could not read docx (corrupt or encrypted)")
     parts = [p.text for p in d.paragraphs if p.text.strip()]
     for table in d.tables:
         for row in table.rows:
             cells = [c.text.strip() for c in row.cells]
             if any(cells):
                 parts.append(" | ".join(cells))
-    return _finalize("\n".join(parts), page_count=1, parser_used="docx")
+    return _finalize("\n".join(parts), page_count=1, parser_used="docx")  # python-docx has no page-count API
 
 
 def _parse_xlsx(raw: bytes) -> ParsedDocument:
     from openpyxl import load_workbook
-
-    wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
-    parts: list[str] = []
-    for ws in wb.worksheets:
-        parts.append(f"# Sheet: {ws.title}")
-        for row in ws.iter_rows(values_only=True):
-            cells = [str(c) for c in row if c is not None]
-            if cells:
-                parts.append(",".join(cells))
-    return _finalize("\n".join(parts), page_count=len(wb.worksheets), parser_used="xlsx")
+    try:
+        wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+    except Exception:
+        return _finalize("", page_count=0, parser_used="none",
+                         note="could not read xlsx (corrupt or encrypted)")
+    try:
+        parts: list[str] = []
+        for ws in wb.worksheets:
+            parts.append(f"# Sheet: {ws.title}")
+            for row in ws.iter_rows(values_only=True):
+                cells = [str(c) if c is not None else "" for c in row]
+                if any(cells):
+                    parts.append(",".join(cells))
+        return _finalize("\n".join(parts), page_count=len(wb.worksheets), parser_used="xlsx")
+    finally:
+        wb.close()
 
 
 def _parse_pptx(raw: bytes) -> ParsedDocument:
     from pptx import Presentation
-
-    prs = Presentation(io.BytesIO(raw))
+    try:
+        prs = Presentation(io.BytesIO(raw))
+    except Exception:
+        return _finalize("", page_count=0, parser_used="none",
+                         note="could not read pptx (corrupt or encrypted)")
     slides = list(prs.slides)
     parts: list[str] = []
     for i, slide in enumerate(slides, start=1):
         parts.append(f"# Slide {i}")
         for shape in slide.shapes:
-            if shape.has_text_frame and shape.text_frame.text.strip():
-                parts.append(shape.text_frame.text.strip())
+            if shape.has_text_frame:
+                text = shape.text_frame.text.strip()
+                if text:
+                    parts.append(text)
     return _finalize("\n".join(parts), page_count=len(slides), parser_used="pptx")
 
 
