@@ -126,16 +126,45 @@ async def _parse_pdf(raw: bytes) -> ParsedDocument:
     )
 
 
-def _parse_docx(raw: bytes) -> ParsedDocument:  # implemented in Task 5
-    raise NotImplementedError
+def _parse_docx(raw: bytes) -> ParsedDocument:
+    from docx import Document
+
+    d = Document(io.BytesIO(raw))
+    parts = [p.text for p in d.paragraphs if p.text.strip()]
+    for table in d.tables:
+        for row in table.rows:
+            cells = [c.text.strip() for c in row.cells]
+            if any(cells):
+                parts.append(" | ".join(cells))
+    return _finalize("\n".join(parts), page_count=1, parser_used="docx")
 
 
-def _parse_xlsx(raw: bytes) -> ParsedDocument:  # implemented in Task 5
-    raise NotImplementedError
+def _parse_xlsx(raw: bytes) -> ParsedDocument:
+    from openpyxl import load_workbook
+
+    wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+    parts: list[str] = []
+    for ws in wb.worksheets:
+        parts.append(f"# Sheet: {ws.title}")
+        for row in ws.iter_rows(values_only=True):
+            cells = [str(c) for c in row if c is not None]
+            if cells:
+                parts.append(",".join(cells))
+    return _finalize("\n".join(parts), page_count=len(wb.worksheets), parser_used="xlsx")
 
 
-def _parse_pptx(raw: bytes) -> ParsedDocument:  # implemented in Task 5
-    raise NotImplementedError
+def _parse_pptx(raw: bytes) -> ParsedDocument:
+    from pptx import Presentation
+
+    prs = Presentation(io.BytesIO(raw))
+    slides = list(prs.slides)
+    parts: list[str] = []
+    for i, slide in enumerate(slides, start=1):
+        parts.append(f"# Slide {i}")
+        for shape in slide.shapes:
+            if shape.has_text_frame and shape.text_frame.text.strip():
+                parts.append(shape.text_frame.text.strip())
+    return _finalize("\n".join(parts), page_count=len(slides), parser_used="pptx")
 
 
 async def _parse_image(raw: bytes, mime: str) -> ParsedDocument:

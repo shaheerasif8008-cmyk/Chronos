@@ -103,3 +103,52 @@ async def test_parse_image_uses_vision_ocr():
         doc = await parse_document(b"\x89PNG", "image/png", "receipt.png")
     assert doc.full_text == "receipt total $9"
     assert doc.parser_used == "image-ocr"
+
+
+def _make_docx(text: str) -> bytes:
+    from docx import Document
+    d = Document()
+    d.add_paragraph(text)
+    buf = io.BytesIO()
+    d.save(buf)
+    return buf.getvalue()
+
+
+def _make_xlsx(value: str) -> bytes:
+    from openpyxl import Workbook
+    wb = Workbook()
+    wb.active["A1"] = value
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _make_pptx(text: str) -> bytes:
+    from pptx import Presentation
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[5])
+    slide.shapes.title.text = text
+    buf = io.BytesIO()
+    prs.save(buf)
+    return buf.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_parse_docx():
+    doc = await parse_document(_make_docx("Contract clause 7"), "", "agreement.docx")
+    assert "Contract clause 7" in doc.full_text
+    assert doc.parser_used == "docx"
+
+
+@pytest.mark.asyncio
+async def test_parse_xlsx():
+    doc = await parse_document(_make_xlsx("Revenue 2026"), "", "model.xlsx")
+    assert "Revenue 2026" in doc.full_text
+    assert doc.parser_used == "xlsx"
+
+
+@pytest.mark.asyncio
+async def test_parse_pptx():
+    doc = await parse_document(_make_pptx("Roadmap Q3"), "", "deck.pptx")
+    assert "Roadmap Q3" in doc.full_text
+    assert doc.parser_used == "pptx"
