@@ -1134,6 +1134,8 @@ async def test_upload_attachment_stores_and_returns_id(monkeypatch):
     monkeypatch.setattr(attachments.permissions, "check", fake_check)
 
     member = Member(id="m1", organization_id="default", email="a@b.c", role="user", name="A")
+    # Member fields confirmed against core/models.py: id, organization_id, region,
+    # email, role, name — the kwargs above are exact.
     upload = StarletteUploadFile(
         filename="report.pdf",
         file=BytesIO(b"%PDF-1.4 data"),
@@ -1264,15 +1266,47 @@ Add a helper above `send_message` (after `_is_trivial_chat`, ~line 168):
 
 ```python
 async def _parse_attachments(attachment_ids: list[str], conversation_id: str, org_id: str) -> list[dict]:
-    """Parse each not-yet-parsed attachment, store its text, return seed-context entries."""
+    """Parse each not-yet-parsed attachment, store its text, return seed-context entries.
+
+    Already-parsed attachments reuse their stored parsed_text artifact instead of
+    re-parsing (the spec's "cached so re-sends don't re-parse" contract).
+    """
+    from sqlalchemy import select
+
     from core.artifacts import get_artifact, read_artifact_content, save_artifact, set_parse_status
-    from parsing.engine import parse_document
+    from core.db import engine, reflect_table
+    from parsing.engine import PREVIEW_CHAR_LIMIT, parse_document
 
     out: list[dict] = []
     for att_id in attachment_ids:
         meta = await get_artifact(att_id)
         if not meta or str(meta.get("organization_id")) != str(org_id):
             continue
+
+        # Cache hit: reuse the stored parsed_text child rather than re-parsing.
+        if str(meta.get("parse_status")) == "parsed":
+            artifacts = await reflect_table("artifacts")
+            async with engine.begin() as conn:
+                child = (
+                    await conn.execute(
+                        select(artifacts).where(
+                            artifacts.c.parent_artifact_id == att_id,
+                            artifacts.c.kind == "parsed_text",
+                        )
+                    )
+                ).mappings().first()
+            if child:
+                full = (await read_artifact_content(str(child["id"])) or b"").decode("utf-8", errors="replace")
+                out.append({
+                    "attachment_id": att_id,
+                    "parsed_artifact_id": str(child["id"]),
+                    "filename": meta.get("title"),
+                    "preview": full[:PREVIEW_CHAR_LIMIT],
+                    "truncated": len(full) > PREVIEW_CHAR_LIMIT,
+                    "note": None,
+                })
+                continue
+
         raw = await read_artifact_content(att_id) or b""
         doc = await parse_document(raw, str(meta.get("mime_type") or ""), str(meta.get("title") or "file"))
         status = "parsed" if doc.parser_used != "none" else "unparseable"
@@ -1374,11 +1408,19 @@ const [attachments, setAttachments] = useState<{ id: string; name: string; size:
 const fileInputRef = useRef<HTMLInputElement>(null);
 
 async function uploadFiles(files: FileList) {
+  // Use bare fetch, NOT apiFetch: apiFetch forces `Content-Type: application/json`
+  // whenever a body is present (page.tsx:177), which breaks multipart uploads —
+  // the browser must set the multipart boundary itself. Replicate apiFetch's auth.
+  const token = getToken();
   for (const file of Array.from(files)) {
     const form = new FormData();
     form.append("file", file);
     if (conversationId) form.append("conversation_id", conversationId);
-    const res = await apiFetch("/attachments", { method: "POST", body: form });
+    const res = await fetch(`${apiBase()}/attachments`, {
+      method: "POST",
+      body: form,
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
     if (res.ok) {
       const data = await res.json();
       setAttachments(prev => [...prev, { id: data.attachment_id, name: data.filename, size: data.size_bytes }]);
@@ -1387,7 +1429,7 @@ async function uploadFiles(files: FileList) {
 }
 ```
 
-Use the existing conversation-id variable name found in Step 1 (replace `conversationId` if the component uses a different one). Note: when sending `FormData`, do NOT set a JSON `Content-Type` header — `apiFetch` must let the browser set the multipart boundary. If `apiFetch` hardcodes `Content-Type: application/json`, call `fetch` directly here with the auth header instead.
+Use the existing conversation-id variable name found in Step 1 (replace `conversationId` if the component uses a different name). `getToken` and `apiBase` are already defined at the top of the file.
 
 - [ ] **Step 3: Send attachment_ids and clear on send**
 
