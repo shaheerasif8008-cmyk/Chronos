@@ -247,3 +247,17 @@ async def test_save_artifact_records_parent_and_status():
     meta = await artifacts.get_artifact(child)
     assert str(meta["parent_artifact_id"]) == parent
     assert meta["parse_status"] == "parsed"
+
+
+def test_doc_tools_registered_and_broker_named():
+    from runtime.tool_registry import ALL_TOOLS, SUBAGENT_TOOLS, to_broker_name, tool_name
+
+    names = {tool_name(s) for s in ALL_TOOLS}
+    assert "doc__parse" in names
+    assert "doc__read" in names
+    # available to sub-agents too
+    sub_names = {tool_name(s) for s in SUBAGENT_TOOLS}
+    assert "doc__parse" in sub_names and "doc__read" in sub_names
+    # convert cleanly to broker dot-notation
+    assert to_broker_name("doc__parse") == "doc.parse"
+    assert to_broker_name("doc__read") == "doc.read"
