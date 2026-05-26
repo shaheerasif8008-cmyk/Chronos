@@ -300,6 +300,44 @@ async def test_doc_connector_read_pages_artifact(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_upload_attachment_stores_and_returns_id(monkeypatch):
+    from routers import attachments as att_router
+    from io import BytesIO
+    from starlette.datastructures import UploadFile as StarletteUploadFile, Headers
+
+    saved: dict = {}
+
+    async def fake_save(raw, **kw):
+        saved.update(kw)
+        saved["raw"] = raw
+        return "att-123"
+
+    async def fake_log(*a, **k):
+        return None
+
+    async def fake_check(*a, **k):
+        return True
+
+    monkeypatch.setattr(att_router, "save_artifact", fake_save)
+    monkeypatch.setattr(att_router.audit, "log", fake_log)
+    monkeypatch.setattr(att_router.permissions, "check", fake_check)
+
+    # Adjust Member constructor kwargs to match core/models.py exactly.
+    from core.models import Member
+    member = Member(id="m1", organization_id="default", email="a@b.c", role="user", name="A")
+    upload = StarletteUploadFile(
+        filename="report.pdf",
+        file=BytesIO(b"%PDF-1.4 data"),
+        headers=Headers({"content-type": "application/pdf"}),
+    )
+    out = await att_router.upload_attachment(file=upload, conversation_id="c1", member=member)
+    assert out["attachment_id"] == "att-123"
+    assert out["filename"] == "report.pdf"
+    assert saved["kind"] == "attachment"
+    assert saved["parse_status"] == "pending"
+
+
+@pytest.mark.asyncio
 async def test_doc_parse_routes_through_broker(monkeypatch):
     from core import tool_broker as tb
     from core.models import ToolResult
