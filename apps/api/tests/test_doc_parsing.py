@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from core import llm
+from core.models import AgentContext
 from parsing.engine import PREVIEW_CHAR_LIMIT, ParsedDocument, parse_document
 
 # ---------------------------------------------------------------------------
@@ -261,3 +262,71 @@ def test_doc_tools_registered_and_broker_named():
     # convert cleanly to broker dot-notation
     assert to_broker_name("doc__parse") == "doc.parse"
     assert to_broker_name("doc__read") == "doc.read"
+
+
+@pytest.mark.asyncio
+async def test_doc_connector_parse_by_path(tmp_path, monkeypatch):
+    from parsing import tool as doctool
+
+    # Point the workspace root at a temp dir and drop a file in it.
+    monkeypatch.setattr("connectors.filesystem.WORKSPACE_ROOT", tmp_path)
+    work = tmp_path / "default" / "t1"
+    work.mkdir(parents=True)
+    (work / "note.txt").write_text("workspace doc body")
+
+    args = {"path": "note.txt", "__org_id": "default", "__task_id": "t1"}
+    result = await doctool.doc_connector.execute("doc.parse", args)
+    assert "workspace doc body" in result.data["preview"]
+    assert result.data["parser_used"] == "text"
+
+
+@pytest.mark.asyncio
+async def test_doc_connector_read_pages_artifact(monkeypatch):
+    from parsing import tool as doctool
+
+    async def fake_read(artifact_id):
+        return b"A" * 100
+
+    async def fake_meta(artifact_id):
+        return {"mime_type": "text/plain", "title": "big.txt", "organization_id": "default", "kind": "attachment"}
+
+    monkeypatch.setattr(doctool, "read_artifact_content", fake_read)
+    monkeypatch.setattr(doctool, "get_artifact", fake_meta)
+
+    args = {"artifact_id": "x", "char_offset": 10, "max_chars": 5, "__org_id": "default", "__task_id": "t1"}
+    result = await doctool.doc_connector.execute("doc.read", args)
+    assert result.data["content"] == "AAAAA"
+    assert result.data["char_offset"] == 10
+
+
+@pytest.mark.asyncio
+async def test_doc_parse_routes_through_broker(monkeypatch):
+    from core import tool_broker as tb
+    from core.models import ToolResult
+
+    audited: list[str] = []
+
+    async def fake_log(event_type, actor, action, **kw):
+        audited.append(event_type)
+
+    async def fake_check(*a, **k):
+        return True
+
+    async def fake_tool_policy(*a, **k):
+        return {}
+
+    monkeypatch.setattr(tb.audit, "log", fake_log)
+    monkeypatch.setattr(tb.permissions, "check", fake_check)
+    monkeypatch.setattr(tb, "tool_policy", fake_tool_policy)
+    # connector_tier is imported into tool_broker's namespace; patch it there.
+    monkeypatch.setattr(tb, "connector_tier", AsyncMock(return_value="live"))
+
+    async def fake_doc_exec(tool, args):
+        return ToolResult(data={"preview": "hi"}, summary="ok")
+
+    monkeypatch.setattr("parsing.tool.doc_connector.execute", fake_doc_exec)
+
+    agent = AgentContext(id="a1", org_id="default", task_id="t1", member_id="m1")
+    result = await tb.execute(agent, "doc.parse", {"artifact_id": "x"})
+    assert result.summary == "ok"
+    assert "tool_call" in audited and "tool_result" in audited
