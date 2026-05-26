@@ -292,6 +292,23 @@ def _format_inherited_context(inherited: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _format_attachments_context(attachments: list[dict[str, Any]]) -> str:
+    """Render parsed attachment previews as one immutable seed block."""
+    lines = ["# Attached files", "The user attached these files. Their parsed text follows."]
+    for a in attachments:
+        name = str(a.get("filename") or "file")
+        artifact_id = str(a.get("parsed_artifact_id") or a.get("attachment_id") or "")
+        note = a.get("note")
+        header = f"\n## {name}"
+        if a.get("truncated"):
+            header += f"  (truncated — use doc__read with artifact_id={artifact_id} for more)"
+        if note:
+            header += f"  [{note}]"
+        lines.append(header)
+        lines.append(str(a.get("preview") or ""))
+    return "\n".join(lines)
+
+
 async def _load_history(task: dict[str, Any], tools: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     state = task.get("agent_state") or {}
     if isinstance(state, dict):
@@ -306,6 +323,9 @@ async def _load_history(task: dict[str, Any], tools: list[dict[str, Any]] | None
     inherited = state.get("inherited_context") if isinstance(state, dict) else None
     if isinstance(inherited, dict) and (inherited.get("parent_context") or inherited.get("parent_goal")):
         seed.append({"role": "user", "content": _format_inherited_context(inherited)})
+    attachments = state.get("attachments") if isinstance(state, dict) else None
+    if isinstance(attachments, list) and attachments:
+        seed.append({"role": "user", "content": _format_attachments_context(attachments)})
     seed.append({"role": "user", "content": str(task["goal"])})
     return seed
 

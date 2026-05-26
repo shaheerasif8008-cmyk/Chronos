@@ -368,3 +368,52 @@ async def test_doc_parse_routes_through_broker(monkeypatch):
     result = await tb.execute(agent, "doc.parse", {"artifact_id": "x"})
     assert result.summary == "ok"
     assert "tool_call" in audited and "tool_result" in audited
+
+
+@pytest.mark.asyncio
+async def test_load_history_injects_attachments_block():
+    from runtime import agent_loop
+
+    task = {
+        "id": "t1",
+        "goal": "Summarize the attached report",
+        "agent_state": {
+            "agent_history": [],
+            "attachments": [
+                {"filename": "report.pdf", "preview": "Q3 revenue up 12%", "truncated": True, "parsed_artifact_id": "p1"},
+            ],
+        },
+    }
+    history = await agent_loop._load_history(task, tools=[])
+    blocks = [m["content"] for m in history if m["role"] == "user"]
+    assert any("Q3 revenue up 12%" in b and "report.pdf" in b for b in blocks)
+    assert any("doc__read" in b for b in blocks)  # truncation hint present
+    assert history[-1]["content"] == "Summarize the attached report"  # goal is last
+
+
+@pytest.mark.asyncio
+async def test_parse_attachments_sets_status_and_returns_preview(monkeypatch):
+    from routers import chat as chat_router
+
+    async def fake_get(artifact_id):
+        return {"mime_type": "text/plain", "title": "note.txt", "organization_id": "default", "parse_status": "pending"}
+
+    async def fake_read(artifact_id):
+        return b"important content"
+
+    async def fake_save(*a, **kw):
+        return "parsed-001"
+
+    async def fake_set_status(artifact_id, status):
+        pass
+
+    monkeypatch.setattr(chat_router, "_get_artifact", fake_get)
+    monkeypatch.setattr(chat_router, "_read_artifact_content", fake_read)
+    monkeypatch.setattr(chat_router, "_save_artifact", fake_save)
+    monkeypatch.setattr(chat_router, "_set_parse_status", fake_set_status)
+
+    result = await chat_router._parse_attachments(["att-1"], "conv-1", "default")
+    assert len(result) == 1
+    assert result[0]["preview"] == "important content"
+    assert result[0]["filename"] == "note.txt"
+    assert result[0]["parsed_artifact_id"] == "parsed-001"

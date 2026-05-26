@@ -4,7 +4,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import delete, insert, select, update
 
 from core import audit, permissions
@@ -17,6 +17,10 @@ from core.llm import available_chat_models, normalize_chat_model, stream_complet
 from core.memory_writes import create_memory_entry, extract_explicit_memory_content
 from core.models import Member, RequesterContext
 from core.redis import redis_client
+from core.artifacts import get_artifact as _get_artifact
+from core.artifacts import read_artifact_content as _read_artifact_content
+from core.artifacts import save_artifact as _save_artifact
+from core.artifacts import set_parse_status as _set_parse_status
 from memory.extraction import extract_and_save
 from runtime.agent_loop import format_task_answer
 from runtime.executor import TaskExecutor, activity_channel
@@ -36,6 +40,7 @@ class ChatRequest(BaseModel):
     model: str | None = None
     persona_id: str | None = None
     workspace_id: str | None = None
+    attachment_ids: list[str] = Field(default_factory=list)
 
 
 async def _create_conversation(member: Member, title: str) -> str:
@@ -167,6 +172,72 @@ def _is_trivial_chat(message: str) -> bool:
     return len(normalized.split()) <= 3
 
 
+async def _parse_attachments(attachment_ids: list[str], conversation_id: str, org_id: str) -> list[dict]:
+    """Parse each not-yet-parsed attachment, store its text, return seed-context entries.
+
+    Already-parsed attachments reuse their stored parsed_text artifact.
+    """
+    from sqlalchemy import select
+    from core.db import engine, reflect_table
+    from parsing.engine import PREVIEW_CHAR_LIMIT, UNPARSEABLE_NOTE, parse_document
+
+    out: list[dict] = []
+    for att_id in attachment_ids:
+        meta = await _get_artifact(att_id)
+        if not meta or str(meta.get("organization_id")) != str(org_id):
+            continue
+
+        # Cache hit: reuse the stored parsed_text child rather than re-parsing.
+        if str(meta.get("parse_status")) == "parsed":
+            artifacts = await reflect_table("artifacts")
+            async with engine.begin() as conn:
+                child = (
+                    await conn.execute(
+                        select(artifacts).where(
+                            artifacts.c.parent_artifact_id == att_id,
+                            artifacts.c.kind == "parsed_text",
+                        )
+                    )
+                ).mappings().first()
+            if child:
+                full = (await _read_artifact_content(str(child["id"])) or b"").decode("utf-8", errors="replace")
+                out.append({
+                    "attachment_id": att_id,
+                    "parsed_artifact_id": str(child["id"]),
+                    "filename": meta.get("title"),
+                    "preview": full[:PREVIEW_CHAR_LIMIT],
+                    "truncated": len(full) > PREVIEW_CHAR_LIMIT,
+                    "note": None,
+                })
+                continue
+
+        raw = await _read_artifact_content(att_id) or b""
+        doc = await parse_document(raw, str(meta.get("mime_type") or ""), str(meta.get("title") or "file"))
+        if doc.parser_used != "none":
+            status = "parsed"
+        elif doc.note == UNPARSEABLE_NOTE:
+            status = "unparseable"
+        else:
+            status = "failed"
+        parsed_artifact_id = None
+        if doc.full_text:
+            parsed_artifact_id = await _save_artifact(
+                doc.full_text, kind="parsed_text", title=f"{meta.get('title')} (text)",
+                conversation_id=conversation_id, parent_artifact_id=att_id,
+                parse_status="parsed", org_id=org_id, mime_type="text/plain",
+            )
+        await _set_parse_status(att_id, status)
+        out.append({
+            "attachment_id": att_id,
+            "parsed_artifact_id": parsed_artifact_id,
+            "filename": meta.get("title"),
+            "preview": doc.preview,
+            "truncated": doc.truncated,
+            "note": doc.note,
+        })
+    return out
+
+
 async def _agent_loop_stream(
     *,
     conversation_id: str,
@@ -177,6 +248,7 @@ async def _agent_loop_stream(
     model: str | None,
     requester_context: RequesterContext | None = None,
     user_message_for_memory: str | None = None,
+    attachments_context: list[dict] | None = None,
 ):
     """Run a goal through the tool-capable agent loop and stream it as a chat reply.
 
@@ -195,6 +267,7 @@ async def _agent_loop_stream(
         persona_id=persona_id,
         workspace_id=workspace_id,
         model=model,
+        attachments_context=attachments_context,
     )
 
     # Subscribe BEFORE firing executor to guarantee no events are missed.
@@ -280,12 +353,17 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
 
         return StreamingResponse(explicit_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
+    attachments_context: list[dict] = []
+    if req.attachment_ids:
+        attachments_context = await _parse_attachments(req.attachment_ids, conversation_id, member.organization_id)
+
     intent = await classify_intent(req.message)
 
     # Tool-capable path: explicit "task" goals AND ordinary non-trivial chat both
     # run the agent loop so chat can search and act inline (Option 1). Only clearly
     # trivial, tool-free messages fall through to the fast token-streamed completion.
-    route_through_loop = intent["mode"] == "task" or not _is_trivial_chat(req.message)
+    # Messages with attachments always route through the loop for full context injection.
+    route_through_loop = intent["mode"] == "task" or not _is_trivial_chat(req.message) or bool(attachments_context)
     if route_through_loop:
         is_task = intent["mode"] == "task"
         return StreamingResponse(
@@ -299,6 +377,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
                 # Chat-routed runs keep autonomous memory extraction; explicit tasks do not.
                 requester_context=None if is_task else requester_context,
                 user_message_for_memory=None if is_task else req.message,
+                attachments_context=attachments_context or None,
             ),
             media_type="text/event-stream",
             headers=_SSE_HEADERS,
