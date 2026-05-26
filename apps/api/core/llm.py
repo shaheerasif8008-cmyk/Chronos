@@ -1,3 +1,4 @@
+import base64
 import json
 import logging
 import random
@@ -279,8 +280,6 @@ async def vision_ocr(image_bytes: bytes, mime: str) -> str:
     Returns "" when no vision model is configured or the call fails — OCR is
     best-effort and must never raise into a chat turn or task step.
     """
-    import base64
-
     if not settings.vision_model:
         return ""
     data_url = f"data:{mime};base64,{base64.b64encode(image_bytes).decode()}"
