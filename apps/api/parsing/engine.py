@@ -6,7 +6,10 @@ wrap this module.
 """
 from __future__ import annotations
 
+import io
 from dataclasses import dataclass
+
+from core.llm import vision_ocr
 
 #: Preview is the first ~6K tokens, approximated at 4 chars/token.
 PREVIEW_CHAR_LIMIT = 24_000
@@ -69,8 +72,58 @@ async def parse_document(raw: bytes, mime: str, filename: str) -> ParsedDocument
     return _finalize("", page_count=0, parser_used="none", note=UNPARSEABLE_NOTE)
 
 
-async def _parse_pdf(raw: bytes) -> ParsedDocument:  # implemented in Task 4
-    raise NotImplementedError
+def _pdf_page_texts(raw: bytes) -> list[str]:
+    """Return the extracted text of each PDF page (empty string when none)."""
+    from pypdf import PdfReader
+
+    reader = PdfReader(io.BytesIO(raw))
+    return [(page.extract_text() or "").strip() for page in reader.pages]
+
+
+async def _pdf_page_ocr(raw: bytes, page_index: int) -> str:
+    """Render a single PDF page to a PNG and OCR it. Best-effort; "" on failure.
+
+    Uses pypdfium2 (PDFium via pip wheels) so there is no system-binary dependency.
+    """
+    try:
+        import pypdfium2 as pdfium
+
+        pdf = pdfium.PdfDocument(raw)
+        try:
+            page = pdf[page_index]
+            pil_image = page.render(scale=2.0).to_pil()  # ~144 DPI
+        finally:
+            pdf.close()
+        buf = io.BytesIO()
+        pil_image.save(buf, format="PNG")
+        return await vision_ocr(buf.getvalue(), "image/png")
+    except Exception:
+        return ""
+
+
+async def _parse_pdf(raw: bytes) -> ParsedDocument:
+    try:
+        texts = _pdf_page_texts(raw)
+    except Exception:
+        return _finalize("", page_count=0, parser_used="none", note="could not read PDF (corrupt or encrypted)")
+
+    used_ocr = False
+    out: list[str] = []
+    for i, text in enumerate(texts):
+        if text:
+            out.append(text)
+        else:
+            ocr = await _pdf_page_ocr(raw, i)
+            if ocr:
+                used_ocr = True
+                out.append(ocr)
+    full = "\n\n".join(p for p in out if p)
+    return _finalize(
+        full,
+        page_count=len(texts),
+        parser_used="pdf+ocr" if used_ocr else "pdf",
+        note=None if full else "no extractable text in PDF",
+    )
 
 
 def _parse_docx(raw: bytes) -> ParsedDocument:  # implemented in Task 5
@@ -85,5 +138,11 @@ def _parse_pptx(raw: bytes) -> ParsedDocument:  # implemented in Task 5
     raise NotImplementedError
 
 
-async def _parse_image(raw: bytes, mime: str) -> ParsedDocument:  # implemented in Task 4
-    raise NotImplementedError
+async def _parse_image(raw: bytes, mime: str) -> ParsedDocument:
+    text = await vision_ocr(raw, mime)
+    return _finalize(
+        text,
+        page_count=1,
+        parser_used="image-ocr",
+        note=None if text else "no text extracted from image",
+    )

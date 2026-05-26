@@ -1,4 +1,5 @@
 import base64
+import io
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -62,3 +63,43 @@ async def test_preview_truncates_long_text():
     assert doc.truncated is True
     assert len(doc.preview) == PREVIEW_CHAR_LIMIT
     assert doc.full_text == big
+
+
+def _one_page_pdf_with_text(text: str) -> bytes:
+    from pypdf import PdfWriter
+    # pypdf can't author text-bearing pages easily; use reportlab-free minimal route
+    # via a blank page, then monkeypatch extraction in the test instead.
+    writer = PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_parse_pdf_extracts_text_layer():
+    pdf = _one_page_pdf_with_text("ignored")
+    with patch("parsing.engine._pdf_page_texts", return_value=["Quarterly report", "page two"]):
+        doc = await parse_document(pdf, "application/pdf", "report.pdf")
+    assert "Quarterly report" in doc.full_text
+    assert "page two" in doc.full_text
+    assert doc.page_count == 2
+    assert doc.parser_used == "pdf"
+
+
+@pytest.mark.asyncio
+async def test_parse_pdf_falls_back_to_ocr_on_empty_pages():
+    pdf = _one_page_pdf_with_text("ignored")
+    with patch("parsing.engine._pdf_page_texts", return_value=["", ""]), \
+         patch("parsing.engine._pdf_page_ocr", new=AsyncMock(return_value="scanned text")):
+        doc = await parse_document(pdf, "application/pdf", "scan.pdf")
+    assert "scanned text" in doc.full_text
+    assert doc.parser_used == "pdf+ocr"
+
+
+@pytest.mark.asyncio
+async def test_parse_image_uses_vision_ocr():
+    with patch("parsing.engine.vision_ocr", new=AsyncMock(return_value="receipt total $9")):
+        doc = await parse_document(b"\x89PNG", "image/png", "receipt.png")
+    assert doc.full_text == "receipt total $9"
+    assert doc.parser_used == "image-ocr"
