@@ -710,9 +710,11 @@ function ChatScreen({
   const [streaming, setStreaming] = useState(false);
   const [activityOpen, setActivityOpen] = useState(false);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
+  const [attachments, setAttachments] = useState<{ id: string; name: string; size: number }[]>([]);
   const abortRef = useRef<AbortController | null>(null);
   const streamingRef = useRef(false);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const isEmpty = !activeConvoId && messages.length === 0;
 
   const activePersona = PERSONAS.find(p => p.id === activePersonaId) ?? PERSONAS[0];
@@ -785,6 +787,32 @@ function ChatScreen({
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  async function uploadFiles(files: FileList) {
+    // Must use bare fetch, NOT apiFetch: apiFetch forces Content-Type: application/json
+    // on any request with a body (see apiFetch line ~178), which breaks multipart
+    // uploads — the browser needs to set the multipart boundary itself.
+    const token = getToken();
+    const base = apiBase();
+    for (const file of Array.from(files)) {
+      const form = new FormData();
+      form.append("file", file);
+      if (activeConvoId) form.append("conversation_id", activeConvoId);
+      try {
+        const res = await fetch(`${base}/attachments`, {
+          method: "POST",
+          body: form,
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        });
+        if (res.ok) {
+          const data = await res.json() as { attachment_id: string; filename: string; size_bytes: number };
+          setAttachments(prev => [...prev, { id: data.attachment_id, name: data.filename, size: data.size_bytes }]);
+        }
+      } catch {
+        // Upload failed silently — user can retry
+      }
+    }
+  }
 
   async function sendMessage() {
     if (!draft.trim() || streaming) return;
@@ -946,10 +974,12 @@ function ChatScreen({
     }
 
     try {
+      const pendingAttachmentIds = attachments.map(a => a.id);
+      setAttachments([]);
       const resp = await apiFetch("/chat/message", {
         method: "POST",
         headers: { Accept: "text/event-stream" },
-        body: JSON.stringify({ message: text, conversation_id: convoId, model: selectedModel, persona_id: activePersonaId }),
+        body: JSON.stringify({ message: text, conversation_id: convoId, model: selectedModel, persona_id: activePersonaId, attachment_ids: pendingAttachmentIds }),
         signal: ab.signal,
       });
 
@@ -1036,6 +1066,20 @@ function ChatScreen({
         <div className="px-6 pb-6 pt-2" style={{ background: "var(--bg)" }}>
           <div className="max-w-[780px] mx-auto">
             <div className="composer-shell">
+              {attachments.length > 0 && (
+                <div className="flex flex-wrap gap-2 px-4 pt-3">
+                  {attachments.map(a => (
+                    <span key={a.id} className="surface border border-soft rounded-md px-2 py-1 text-[12px] flex items-center gap-1">
+                      {a.name}
+                      <button
+                        type="button"
+                        aria-label={`Remove ${a.name}`}
+                        onClick={() => setAttachments(prev => prev.filter(x => x.id !== a.id))}
+                      >×</button>
+                    </span>
+                  ))}
+                </div>
+              )}
               <textarea
                 value={draft}
                 onChange={e => setDraft(e.target.value)}
@@ -1047,7 +1091,19 @@ function ChatScreen({
               />
               <div className="flex items-center justify-between px-3 pb-2.5 pt-1">
                 <div className="flex items-center gap-1">
-                  <button className="btn btn-ghost btn-sm btn-icon"><IC.Attach size={15}/></button>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    multiple
+                    className="hidden"
+                    onChange={e => { if (e.target.files) void uploadFiles(e.target.files); e.target.value = ""; }}
+                  />
+                  <button
+                    type="button"
+                    aria-label="Attach files"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="btn btn-ghost btn-sm btn-icon"
+                  ><IC.Attach size={15}/></button>
                   <button className="btn btn-ghost btn-sm">
                     <IC.Sparkles size={14} style={{ color: "var(--accent)" }}/> Skills · 1
                   </button>
