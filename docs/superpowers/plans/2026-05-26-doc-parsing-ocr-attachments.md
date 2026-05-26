@@ -47,14 +47,18 @@
 
 Add these lines to the end of `apps/api/requirements.txt`:
 
-```
+```text
 # Document parsing & OCR
 pypdf>=4.2.0
 python-docx>=1.1.0
 openpyxl>=3.1.0
 python-pptx>=0.6.23
+pypdfium2>=4.30.0
 Pillow>=10.0.0
 ```
+
+`pypdfium2` rasterizes PDF pages for OCR via pip-installable PDFium wheels — no
+separate system binary (unlike `pdf2image`, which needs Poppler installed).
 
 - [ ] **Step 2: Install**
 
@@ -258,6 +262,10 @@ from core.llm import vision_ocr
 #: Preview is the first ~6K tokens, approximated at 4 chars/token.
 PREVIEW_CHAR_LIMIT = 24_000
 
+#: Note set when the file type is not supported (vs a recognized type that errored).
+#: Used by callers to distinguish "unparseable" from "failed".
+UNPARSEABLE_NOTE = "not parseable yet"
+
 _TEXT_MIMES = {"text/plain", "text/csv", "text/markdown", "application/csv"}
 _TEXT_EXTS = {".txt", ".csv", ".md", ".markdown", ".log", ".tsv"}
 _IMAGE_MIMES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
@@ -309,7 +317,7 @@ async def parse_document(raw: bytes, mime: str, filename: str) -> ParsedDocument
     if mime in _IMAGE_MIMES or ext in {".png", ".jpg", ".jpeg", ".webp"}:
         return await _parse_image(raw, mime or f"image/{ext.lstrip('.')}")
 
-    return _finalize("", page_count=0, parser_used="none", note="not parseable yet")
+    return _finalize("", page_count=0, parser_used="none", note=UNPARSEABLE_NOTE)
 ```
 
 (The `_parse_*` helpers are added in the next tasks; for now this task only needs text + unknown to pass. Add temporary stubs so the module imports cleanly:)
@@ -425,14 +433,21 @@ def _pdf_page_texts(raw: bytes) -> list[str]:
 
 
 async def _pdf_page_ocr(raw: bytes, page_index: int) -> str:
-    """Render a single PDF page to a PNG and OCR it. Best-effort; "" on failure."""
+    """Render a single PDF page to a PNG and OCR it. Best-effort; "" on failure.
+
+    Uses pypdfium2 (PDFium via pip wheels) so there is no system-binary dependency.
+    """
     try:
-        from pdf2image import convert_from_bytes  # optional; absent → no OCR
-        images = convert_from_bytes(raw, first_page=page_index + 1, last_page=page_index + 1)
-        if not images:
-            return ""
+        import pypdfium2 as pdfium
+
+        pdf = pdfium.PdfDocument(raw)
+        try:
+            page = pdf[page_index]
+            pil_image = page.render(scale=2.0).to_pil()  # ~144 DPI
+        finally:
+            pdf.close()
         buf = io.BytesIO()
-        images[0].save(buf, format="PNG")
+        pil_image.save(buf, format="PNG")
         return await vision_ocr(buf.getvalue(), "image/png")
     except Exception:
         return ""
@@ -473,7 +488,10 @@ async def _parse_image(raw: bytes, mime: str) -> ParsedDocument:
     )
 ```
 
-Note: `pdf2image` requires the `poppler` binary, which may be absent. The `try/except` makes scanned-PDF OCR best-effort — text-layer PDFs (the common case) always work via `pypdf`. Do NOT add poppler as a hard dependency.
+Note: `pypdfium2` ships prebuilt PDFium wheels, so PDF-page rasterization works
+without any system binary (honoring the "no system binary" constraint). The
+`try/except` keeps scanned-PDF OCR best-effort — text-layer PDFs (the common case)
+always work via `pypdf` regardless. A page is OCR'd only when its text layer is empty.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -1256,10 +1274,12 @@ Expected: PASS after Steps 1–2 (FAIL if run before implementing).
 
 In `apps/api/routers/chat.py`:
 
-Add `attachment_ids` to `ChatRequest` (after `workspace_id`, line 38):
+Add `attachment_ids` to `ChatRequest` (after `workspace_id`, line 38), matching the
+repo's Pydantic idiom for list defaults (e.g. `routers/workflows.py`). Ensure `Field`
+is imported from `pydantic` at the top of the file:
 
 ```python
-    attachment_ids: list[str] = []
+    attachment_ids: list[str] = Field(default_factory=list)
 ```
 
 Add a helper above `send_message` (after `_is_trivial_chat`, ~line 168):
@@ -1275,7 +1295,7 @@ async def _parse_attachments(attachment_ids: list[str], conversation_id: str, or
 
     from core.artifacts import get_artifact, read_artifact_content, save_artifact, set_parse_status
     from core.db import engine, reflect_table
-    from parsing.engine import PREVIEW_CHAR_LIMIT, parse_document
+    from parsing.engine import PREVIEW_CHAR_LIMIT, UNPARSEABLE_NOTE, parse_document
 
     out: list[dict] = []
     for att_id in attachment_ids:
@@ -1309,7 +1329,14 @@ async def _parse_attachments(attachment_ids: list[str], conversation_id: str, or
 
         raw = await read_artifact_content(att_id) or b""
         doc = await parse_document(raw, str(meta.get("mime_type") or ""), str(meta.get("title") or "file"))
-        status = "parsed" if doc.parser_used != "none" else "unparseable"
+        # Distinguish unsupported type (unparseable) from a recognized type that
+        # errored — corrupt/encrypted (failed) — per the spec's status contract.
+        if doc.parser_used != "none":
+            status = "parsed"
+        elif doc.note == UNPARSEABLE_NOTE:
+            status = "unparseable"
+        else:
+            status = "failed"
         parsed_artifact_id = None
         if doc.full_text:
             parsed_artifact_id = await save_artifact(

@@ -21,7 +21,7 @@ Out of scope: audio/video transcription, archives (zip), async background parsin
 
 ## Architecture overview
 
-```
+```text
                   ┌─────────────────────────┐
   user 📎 upload  │  parsing/engine.py      │  agent doc__parse tool
   ───────────────▶│  parse(bytes,mime,name) │◀──────────────────────
