@@ -1,11 +1,30 @@
 import base64
 import io
+import os
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from core import llm
 from parsing.engine import PREVIEW_CHAR_LIMIT, ParsedDocument, parse_document
+
+# ---------------------------------------------------------------------------
+# DB connectivity guard — used by the storage round-trip test only.
+# ---------------------------------------------------------------------------
+def _db_reachable() -> bool:
+    import socket
+
+    host, _, port_str = os.environ.get(
+        "DATABASE_URL", "postgresql+asyncpg://chronos:chronos@localhost:5432/chronos"
+    ).rpartition("@")[-1].partition("/")[0].rpartition(":")
+    try:
+        with socket.create_connection((host or "localhost", int(port_str or 5432)), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+_requires_db = pytest.mark.skipif(not _db_reachable(), reason="Postgres not reachable")
 
 
 @pytest.mark.asyncio
@@ -210,3 +229,21 @@ async def test_parse_docx_corrupt_bytes():
     assert doc.parser_used == "none"
     assert doc.note is not None
     assert "docx" in doc.note
+
+
+@_requires_db
+@pytest.mark.asyncio
+async def test_save_artifact_records_parent_and_status():
+    from core import artifacts
+
+    parent = await artifacts.save_artifact(
+        b"raw pdf bytes", kind="attachment", title="report.pdf",
+        mime_type="application/pdf", parse_status="pending",
+    )
+    child = await artifacts.save_artifact(
+        "extracted text", kind="parsed_text", title="report.pdf (text)",
+        parent_artifact_id=parent, parse_status="parsed",
+    )
+    meta = await artifacts.get_artifact(child)
+    assert str(meta["parent_artifact_id"]) == parent
+    assert meta["parse_status"] == "parsed"
