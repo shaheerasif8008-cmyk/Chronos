@@ -31,6 +31,9 @@ type Message = {
   created_at?: string;
   tool_traces?: ToolTrace[];
   artifacts?: ArtifactRef[];
+  citations?: Array<{ url?: string; text?: string; [key: string]: unknown }>;
+  model?: string;
+  mode?: string;
   thinking?: boolean;
 };
 type ToolTrace = { id: string; tool: string; summary: string; status: MessageStatus };
@@ -761,14 +764,36 @@ function ChatScreen({
       const id = m.id != null ? String(m.id) : undefined;
       const role = String(m.role ?? "assistant") as MessageRole;
       const content = String(m.content ?? "");
+      // runtime_status overrides "complete" when present (e.g. "error", "paused")
+      const status: MessageStatus = (m.runtime_status != null ? String(m.runtime_status) : "complete") as MessageStatus;
       const base: Message = {
         id,
         role,
         content,
-        status: "complete",
+        status,
         created_at: m.created_at != null ? String(m.created_at) : undefined,
+        model: m.model != null ? String(m.model) : undefined,
+        mode: m.mode != null ? String(m.mode) : undefined,
+        citations: Array.isArray(m.citations) ? (m.citations as Array<{ url?: string; text?: string }>) : undefined,
+        // Persisted tool_traces from DB (overridden by live SSE during streaming)
+        tool_traces: Array.isArray(m.tool_traces)
+          ? (m.tool_traces as ToolTrace[])
+          : undefined,
       };
-      if (id && byMessage.has(id)) return { ...base, artifacts: byMessage.get(id) };
+      // artifact_refs from the message row are the authoritative refresh-time source.
+      // Merge with any per-message artifacts from the /artifacts endpoint (live-SSE path
+      // may have set message_id on artifact rows; artifact_refs is the loop-persisted copy).
+      const persistedRefs: ArtifactRef[] = Array.isArray(m.artifact_refs)
+        ? (m.artifact_refs as ArtifactRef[])
+        : [];
+      const byMessageRefs: ArtifactRef[] = (id && byMessage.has(id)) ? (byMessage.get(id) ?? []) : [];
+      // Deduplicate by id; prefer byMessage (has full metadata from artifacts table)
+      const seenIds = new Set(byMessageRefs.map(a => a.id));
+      const merged = [
+        ...byMessageRefs,
+        ...persistedRefs.filter(a => !seenIds.has(a.id)),
+      ];
+      if (merged.length > 0) return { ...base, artifacts: merged };
       return base;
     });
 
