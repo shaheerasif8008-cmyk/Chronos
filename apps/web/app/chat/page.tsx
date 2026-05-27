@@ -502,7 +502,7 @@ function Sidebar({
     { id: "artifacts"  as Route, icon: <IC.Briefcase size={15}/>,  label: "Artifacts" },
     { id: "agents"     as Route, icon: <IC.Sparkles size={15}/>,   label: "Agents" },
     { id: "workflows"  as Route, icon: <IC.Refresh size={15}/>,    label: "Workflows" },
-    { id: "audit"      as Route, icon: <IC.Audit size={15}/>,      label: "Audit" },
+    { id: "audit"      as Route, icon: <IC.Audit size={15}/>,      label: "Audit",      settingsTab: "audit" as SettingsTab },
   ];
 
   // Group conversations by recency
@@ -533,18 +533,22 @@ function Sidebar({
           <IC.Plus size={16}/>
         </button>
         <div className="w-8 h-px" style={{ background: "var(--border-soft)" }}/>
-        {nav.map(it => (
-          <button key={it.id} onClick={() => onNavigate(it.id)} title={it.label}
-                  className="btn btn-ghost btn-icon relative"
-                  style={{ background: route === it.id ? "var(--surface-2)" : "transparent",
-                           color: route === it.id ? "var(--text)" : "var(--text-muted)" }}>
-            {it.icon}
-            {it.badge ? (
-              <span className="absolute -top-0.5 -right-0.5 min-w-[14px] h-[14px] px-1 rounded-full text-[9px] font-semibold flex items-center justify-center"
-                    style={{ background: "var(--warn)", color: "white" }}>{it.badge}</span>
-            ) : null}
-          </button>
-        ))}
+        <div className="flex flex-col items-center gap-2 overflow-y-auto no-scrollbar w-full px-2">
+          {nav.map(it => (
+            <button key={it.id}
+                    onClick={() => it.settingsTab ? onOpenSettings(it.settingsTab) : onNavigate(it.id)}
+                    title={it.label}
+                    className="btn btn-ghost btn-icon relative flex-shrink-0"
+                    style={{ background: (it.settingsTab ? route === "settings" && it.id === "audit" : route === it.id) ? "var(--surface-2)" : "transparent",
+                             color: (it.settingsTab ? route === "settings" && it.id === "audit" : route === it.id) ? "var(--text)" : "var(--text-muted)" }}>
+              {it.icon}
+              {it.badge ? (
+                <span className="absolute -top-0.5 -right-0.5 min-w-[14px] h-[14px] px-1 rounded-full text-[9px] font-semibold flex items-center justify-center"
+                      style={{ background: "var(--warn)", color: "white" }}>{it.badge}</span>
+              ) : null}
+            </button>
+          ))}
+        </div>
       </aside>
     );
   }
@@ -576,10 +580,11 @@ function Sidebar({
       </div>
 
       {/* Top nav */}
-      <div className="px-3 pt-2 pb-1 space-y-0.5">
+      <div className="px-3 pt-2 pb-1 space-y-0.5 overflow-y-auto no-scrollbar">
         {nav.map(it => (
-          <button key={it.id} onClick={() => onNavigate(it.id)}
-                  className={`nav-item w-full ${route === it.id ? "active" : ""}`}>
+          <button key={it.id}
+                  onClick={() => it.settingsTab ? onOpenSettings(it.settingsTab) : onNavigate(it.id)}
+                  className={`nav-item w-full ${it.settingsTab ? "" : route === it.id ? "active" : ""}`}>
             <span className="nav-icon flex-shrink-0">{it.icon}</span>
             <span className="flex-1 text-left">{it.label}</span>
             {it.badge ? (
