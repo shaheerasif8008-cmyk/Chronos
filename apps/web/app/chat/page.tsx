@@ -18,7 +18,7 @@ function apiBase() {
 }
 
 // ─── Types ───────────────────────────────────────────────────────────────────
-type Route = "chat" | "activity" | "approvals" | "memory" | "connectors" | "assistants" | "settings";
+type Route = "chat" | "activity" | "approvals" | "memory" | "connectors" | "assistants" | "settings" | "projects" | "research" | "tasks" | "artifacts" | "agents" | "workflows" | "audit";
 type SettingsTab = "general" | "profile" | "organization" | "members" | "permissions" | "employees" | "runtime" | "memory-settings" | "tools-settings" | "approval-settings" | "notifications" | "security" | "billing" | "audit" | "developer" | "danger";
 type Conversation = { id: string; title: string | null; updated_at?: string; created_at?: string };
 type MessageRole = "user" | "assistant" | "system" | "tool";
@@ -151,6 +151,13 @@ function routeFromPath(pathname: string | null): Route {
   if (pathname === "/connectors") return "connectors";
   if (pathname === "/assistants") return "assistants";
   if (pathname === "/settings") return "settings";
+  if (pathname === "/projects") return "projects";
+  if (pathname === "/research") return "research";
+  if (pathname === "/tasks") return "tasks";
+  if (pathname === "/artifacts") return "artifacts";
+  if (pathname === "/agents") return "agents";
+  if (pathname === "/workflows") return "workflows";
+  if (pathname === "/audit") return "audit";
   return "chat";
 }
 
@@ -456,6 +463,13 @@ export default function ChronosApp() {
           else router.push(target);
         }} />}
         {route === "settings"   && <SettingsScreen tab={settingsTab} setTab={setSettingsTab} theme={theme} setTheme={setTheme} accent={accent} setAccent={setAccent} signOut={signOut} />}
+        {route === "projects"   && <EmptyPanel label="Projects" />}
+        {route === "research"   && <EmptyPanel label="Research" />}
+        {route === "tasks"      && <EmptyPanel label="Tasks" />}
+        {route === "artifacts"  && <EmptyPanel label="Artifacts" />}
+        {route === "agents"     && <EmptyPanel label="Agents" />}
+        {route === "workflows"  && <EmptyPanel label="Workflows" />}
+        {route === "audit"      && <EmptyPanel label="Audit" />}
       </main>
     </div>
   );
@@ -482,6 +496,13 @@ function Sidebar({
     { id: "memory"     as Route, icon: <IC.Memory size={15}/>,     label: "Memory" },
     { id: "connectors" as Route, icon: <IC.Connectors size={15}/>, label: "Connectors" },
     { id: "assistants" as Route, icon: <IC.Personas size={15}/>,   label: "Assistants" },
+    { id: "projects"   as Route, icon: <IC.Folder size={15}/>,     label: "Projects" },
+    { id: "research"   as Route, icon: <IC.Search size={15}/>,     label: "Research" },
+    { id: "tasks"      as Route, icon: <IC.Check size={15}/>,      label: "Tasks" },
+    { id: "artifacts"  as Route, icon: <IC.Briefcase size={15}/>,  label: "Artifacts" },
+    { id: "agents"     as Route, icon: <IC.Sparkles size={15}/>,   label: "Agents" },
+    { id: "workflows"  as Route, icon: <IC.Refresh size={15}/>,    label: "Workflows" },
+    { id: "audit"      as Route, icon: <IC.Audit size={15}/>,      label: "Audit" },
   ];
 
   // Group conversations by recency
@@ -2482,6 +2503,20 @@ const SETTING_TABS: Array<{ id: SettingsTab; label: string; icon: ReactNode; key
   { id: "developer", label: "Developer", icon: <IC.Lightbulb size={15}/>, keywords: "feature flags api mode webhooks debug experimental environment model provider" },
   { id: "danger", label: "Danger zone", icon: <IC.Trash size={15}/>, keywords: "reset delete leave transfer ownership irreversible" },
 ];
+
+function EmptyPanel({ label }: { label: string }) {
+  return (
+    <div className="flex-1 flex flex-col">
+      <PageHeader title={label} />
+      <div className="flex-1 flex items-center justify-center px-10 pb-10">
+        <div className="surface border border-soft rounded-2xl px-10 py-12 flex flex-col items-center gap-3 text-center max-w-sm">
+          <p className="text-[15px] font-medium">{label}</p>
+          <p className="text-[13.5px]" style={{ color: "var(--text-dim)" }}>Nothing here yet.</p>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function SettingsScreen({ tab, setTab, theme, setTheme, accent, setAccent, signOut }: {
   tab: SettingsTab; setTab: (t: SettingsTab) => void;
