@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends
@@ -20,6 +21,8 @@ from core.redis import redis_client
 from memory.extraction import extract_and_save
 from runtime.agent_loop import format_task_answer
 from runtime.executor import TaskExecutor, activity_channel
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -68,29 +71,31 @@ async def _save_message(
     approval_state: str | None = None,
     runtime_status: str | None = None,
     parent_message_id: str | None = None,
+    pinned: bool | None = None,
 ) -> None:
     messages = await reflect_table("messages")
     conversations = await reflect_table("conversations")
+    values: dict[str, Any] = dict(
+        organization_id=settings.org_id,
+        region=settings.region,
+        conversation_id=conversation_id,
+        role=role,
+        content=content,
+        token_count=len(content.split()),
+        model=model,
+        mode=mode,
+        citations=citations if citations is not None else [],
+        tool_traces=tool_traces if tool_traces is not None else [],
+        memory_refs=memory_refs if memory_refs is not None else [],
+        artifact_refs=artifact_refs if artifact_refs is not None else [],
+        approval_state=approval_state,
+        runtime_status=runtime_status,
+        parent_message_id=parent_message_id,
+    )
+    if pinned is not None:
+        values["pinned"] = pinned
     async with engine.begin() as conn:
-        await conn.execute(
-            insert(messages).values(
-                organization_id=settings.org_id,
-                region=settings.region,
-                conversation_id=conversation_id,
-                role=role,
-                content=content,
-                token_count=len(content.split()),
-                model=model,
-                mode=mode,
-                citations=citations if citations is not None else [],
-                tool_traces=tool_traces if tool_traces is not None else [],
-                memory_refs=memory_refs if memory_refs is not None else [],
-                artifact_refs=artifact_refs if artifact_refs is not None else [],
-                approval_state=approval_state,
-                runtime_status=runtime_status,
-                parent_message_id=parent_message_id,
-            )
-        )
+        await conn.execute(insert(messages).values(**values))
         await conn.execute(
             update(conversations)
             .where(conversations.c.id == conversation_id)
@@ -190,6 +195,76 @@ def _is_trivial_chat(message: str) -> bool:
     return len(normalized.split()) <= 3
 
 
+def _normalize_traces(raw_traces: list[dict]) -> list[dict]:
+    """Convert raw pubsub event dicts into the frontend ToolTrace shape.
+
+    Mirrors the live SSE logic in chat/page.tsx so persisted traces render
+    identically on reload: one entry per tool call, with the final status.
+
+    ToolTrace shape: {id: str, tool: str, summary: str, status: str}
+    """
+    result: list[dict] = []
+    for i, event in enumerate(raw_traces):
+        event_type = event.get("type", "")
+        tool = event.get("tool", "") or (
+            "think" if event_type == "step_start" else
+            "approval" if event_type == "awaiting_approval" else
+            ""
+        )
+
+        # Determine summary and status from event type
+        if event_type == "tool_call":
+            summary = f"{tool.replace('.', ' ').replace('_', ' ')}…"
+            status = "streaming"
+        elif event_type == "tool_result":
+            summary = event.get("summary") or f"{tool} done"
+            status = "complete"
+        elif event_type == "tool_error":
+            summary = event.get("error") or f"{tool} failed"
+            status = "error"
+        elif event_type == "step_start":
+            step = event.get("step") or {}
+            summary = (step.get("description") if isinstance(step, dict) else None) or "Thinking…"
+            status = "streaming"
+        elif event_type == "step_done":
+            summary = event.get("summary") or "Step complete"
+            status = "complete"
+        elif event_type == "awaiting_approval":
+            ids = event.get("approval_ids") or []
+            summary = f"Waiting for approval on {len(ids)} item(s)"
+            status = "approval_pending"
+        elif event_type == "sub_agent_spawned":
+            summary = f"Sub-agent: {event.get('goal') or 'working'}"
+            status = "streaming"
+        elif event_type == "sub_agent_complete":
+            summary = "Sub-agent finished"
+            status = "complete"
+        else:
+            # thinking or unknown — skip; these are transient heartbeats
+            continue
+
+        # Mirror the frontend merge: tool_result/tool_error/step_done update the
+        # most-recent streaming entry for the same tool, rather than appending.
+        if event_type in {"tool_result", "tool_error"}:
+            for j in range(len(result) - 1, -1, -1):
+                if result[j]["tool"] == tool and result[j]["status"] == "streaming":
+                    result[j] = {**result[j], "summary": summary, "status": status}
+                    break
+            else:
+                result.append({"id": f"t{i}", "tool": tool, "summary": summary, "status": status})
+        elif event_type == "step_done":
+            for j in range(len(result) - 1, -1, -1):
+                if result[j]["tool"] == "think" and result[j]["status"] == "streaming":
+                    result[j] = {**result[j], "summary": summary, "status": "complete"}
+                    break
+            else:
+                result.append({"id": f"t{i}", "tool": tool, "summary": summary, "status": status})
+        else:
+            result.append({"id": f"t{i}", "tool": tool, "summary": summary, "status": status})
+
+    return result
+
+
 async def _agent_loop_stream(
     *,
     conversation_id: str,
@@ -233,7 +308,10 @@ async def _agent_loop_stream(
         "awaiting_approval", "sub_agent_spawned", "sub_agent_complete", "thinking",
     }
     final_answer: str | None = None
-    # Collect trace and artifact events for post-loop metadata persistence.
+    task_succeeded: bool = True
+    # message_id inserted by agent_loop._save_assistant_message — used for the UPDATE.
+    persisted_message_id: str | None = None
+    # Collect raw trace and artifact events for post-loop metadata persistence.
     collected_traces: list[dict] = []
     collected_artifact_refs: list[dict] = []
     try:
@@ -259,9 +337,13 @@ async def _agent_loop_stream(
                 yield f"data: {json.dumps({'type': 'artifact', 'artifact': event})}\n\n"
             elif event_type == "task_complete":
                 final_answer = format_task_answer(event.get("result") or {})
+                persisted_message_id = event.get("message_id") or None
+                task_succeeded = True
                 break
             elif event_type == "task_failed":
                 final_answer = f"The task stopped: {event.get('error') or 'unknown error'}"
+                persisted_message_id = event.get("message_id") or None
+                task_succeeded = False
                 break
     finally:
         await pubsub.unsubscribe(activity_channel(task_id))
@@ -276,33 +358,31 @@ async def _agent_loop_stream(
             await asyncio.sleep(0)
 
         # Best-effort: attach collected metadata to the just-persisted assistant row.
-        # Strategy: UPDATE the most-recent assistant row for this conversation by id
-        # (scalar subquery so SQLAlchemy doesn't need ORDER BY + LIMIT on UPDATE).
-        # Never raises — failure here must not break the stream.
-        try:
-            messages_tbl = await reflect_table("messages")
-            subq = (
-                select(messages_tbl.c.id)
-                .where(
-                    messages_tbl.c.conversation_id == conversation_id,
-                    messages_tbl.c.role == "assistant",
-                )
-                .order_by(messages_tbl.c.created_at.desc())
-                .limit(1)
-                .scalar_subquery()
-            )
-            async with engine.begin() as conn:
-                await conn.execute(
-                    update(messages_tbl)
-                    .where(messages_tbl.c.id == subq)
-                    .values(
-                        tool_traces=collected_traces,
-                        artifact_refs=collected_artifact_refs if collected_artifact_refs else [],
-                        model=model,
+        # Only update when we have the exact message_id from the loop — avoids any
+        # concurrency ambiguity. If the id is absent (e.g. sub-agent path), skip.
+        if persisted_message_id:
+            try:
+                messages_tbl = await reflect_table("messages")
+                runtime_status = "complete" if task_succeeded else "error"
+                normalized_traces = _normalize_traces(collected_traces)
+                async with engine.begin() as conn:
+                    await conn.execute(
+                        update(messages_tbl)
+                        .where(messages_tbl.c.id == persisted_message_id)
+                        .values(
+                            tool_traces=normalized_traces,
+                            artifact_refs=collected_artifact_refs,
+                            model=model,
+                            runtime_status=runtime_status,
+                        )
                     )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to attach metadata to message %s in conversation %s: %s",
+                    persisted_message_id,
+                    conversation_id,
+                    exc,
                 )
-        except Exception:
-            pass  # best-effort — never break the stream
 
         if requester_context is not None and user_message_for_memory is not None:
             asyncio.create_task(

@@ -60,7 +60,7 @@ async def test_save_message_new_kwargs_forwarded(monkeypatch):
     monkeypatch.setattr(chat, "insert", fake_insert)
     monkeypatch.setattr(chat, "update", fake_update)
 
-    # Must not raise with all new keyword-only args
+    # Must not raise with all new keyword-only args (including pinned)
     await chat._save_message(
         "conv-123",
         "assistant",
@@ -74,6 +74,7 @@ async def test_save_message_new_kwargs_forwarded(monkeypatch):
         approval_state=None,
         runtime_status="complete",
         parent_message_id=None,
+        pinned=True,
     )
 
     # After implementation: new fields appear in INSERT values
@@ -85,6 +86,7 @@ async def test_save_message_new_kwargs_forwarded(monkeypatch):
         {"tool": "search", "summary": "done", "status": "complete"}
     ]
     assert insert_values.get("artifact_refs") == [{"id": "art-1", "title": "Report"}]
+    assert insert_values.get("pinned") is True, "pinned=True must appear in INSERT values"
 
 
 # ── DB round-trip: insert with metadata → SELECT returns it ───────────────────
@@ -277,3 +279,95 @@ async def test_list_messages_returns_rich_fields(monkeypatch):
     assert row["citations"] == [{"url": "https://example.com"}]
     assert row["tool_traces"] == [{"tool": "search", "summary": "done"}]
     assert row["artifact_refs"] == [{"id": "a1", "title": "doc", "kind": "markdown"}]
+
+
+# ── Unit: _normalize_traces produces ToolTrace-shaped dicts ──────────────────
+
+def test_normalize_traces_basic_tool_call_result():
+    """tool_call followed by tool_result merges into one entry with status=complete."""
+    from routers.chat import _normalize_traces
+
+    raw = [
+        {"type": "tool_call", "tool": "browser__search", "args_preview": {}},
+        {"type": "tool_result", "tool": "browser__search", "summary": "Found 5 results"},
+    ]
+    traces = _normalize_traces(raw)
+
+    # Should be exactly one entry (merged)
+    assert len(traces) == 1, f"expected 1 trace after merge, got {len(traces)}: {traces}"
+    t = traces[0]
+    assert "id" in t, "ToolTrace must have id field"
+    assert t["tool"] == "browser__search"
+    assert t["summary"] == "Found 5 results"
+    assert t["status"] == "complete"
+
+
+def test_normalize_traces_tool_error_merges():
+    """tool_call followed by tool_error merges into one entry with status=error."""
+    from routers.chat import _normalize_traces
+
+    raw = [
+        {"type": "tool_call", "tool": "fs__read", "args_preview": {}},
+        {"type": "tool_error", "tool": "fs__read", "error": "file not found"},
+    ]
+    traces = _normalize_traces(raw)
+
+    assert len(traces) == 1
+    t = traces[0]
+    assert t["status"] == "error"
+    assert t["summary"] == "file not found"
+    assert t["tool"] == "fs__read"
+
+
+def test_normalize_traces_multiple_tools_stay_separate():
+    """Two different tool calls each produce their own merged entry."""
+    from routers.chat import _normalize_traces
+
+    raw = [
+        {"type": "tool_call", "tool": "tool_a"},
+        {"type": "tool_call", "tool": "tool_b"},
+        {"type": "tool_result", "tool": "tool_a", "summary": "a done"},
+        {"type": "tool_result", "tool": "tool_b", "summary": "b done"},
+    ]
+    traces = _normalize_traces(raw)
+
+    assert len(traces) == 2
+    tools = {t["tool"] for t in traces}
+    assert tools == {"tool_a", "tool_b"}
+    for t in traces:
+        assert t["status"] == "complete"
+
+
+def test_normalize_traces_thinking_skipped():
+    """'thinking' events are transient heartbeats and must not appear in output."""
+    from routers.chat import _normalize_traces
+
+    raw = [
+        {"type": "thinking"},
+        {"type": "tool_call", "tool": "browser__search"},
+        {"type": "thinking"},
+        {"type": "tool_result", "tool": "browser__search", "summary": "done"},
+    ]
+    traces = _normalize_traces(raw)
+
+    assert len(traces) == 1
+    assert traces[0]["tool"] == "browser__search"
+
+
+def test_normalize_traces_required_fields_present():
+    """Every entry in normalized output must have id, tool, summary, and status."""
+    from routers.chat import _normalize_traces
+
+    raw = [
+        {"type": "tool_call", "tool": "some__tool"},
+        {"type": "tool_result", "tool": "some__tool", "summary": "ok"},
+        {"type": "sub_agent_spawned", "goal": "do something"},
+        {"type": "sub_agent_complete"},
+    ]
+    traces = _normalize_traces(raw)
+
+    for t in traces:
+        assert "id" in t, f"missing id in: {t}"
+        assert "tool" in t, f"missing tool in: {t}"
+        assert "summary" in t, f"missing summary in: {t}"
+        assert "status" in t, f"missing status in: {t}"

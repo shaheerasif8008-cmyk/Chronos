@@ -764,8 +764,11 @@ function ChatScreen({
       const id = m.id != null ? String(m.id) : undefined;
       const role = String(m.role ?? "assistant") as MessageRole;
       const content = String(m.content ?? "");
-      // runtime_status overrides "complete" when present (e.g. "error", "paused")
-      const status: MessageStatus = (m.runtime_status != null ? String(m.runtime_status) : "complete") as MessageStatus;
+      // runtime_status overrides "complete" when present (e.g. "error", "paused").
+      // Validate against the known union to guard against stale or unknown values.
+      const KNOWN_STATUSES: ReadonlySet<string> = new Set<MessageStatus>(["streaming", "complete", "paused", "approval_pending", "error"]);
+      const rawStatus = m.runtime_status != null ? String(m.runtime_status) : "complete";
+      const status: MessageStatus = KNOWN_STATUSES.has(rawStatus) ? (rawStatus as MessageStatus) : "complete";
       const base: Message = {
         id,
         role,
