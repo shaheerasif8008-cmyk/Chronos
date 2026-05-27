@@ -175,6 +175,18 @@ const ACCENT_PALETTES: Record<string, { accent: string; hover: string; soft: str
   slate:  { accent: "oklch(0.42 0.025 240)", hover: "oklch(0.36 0.03 240)",  soft: "oklch(0.94 0.01 240)", text: "oklch(0.30 0.025 240)" },
 };
 
+const CHAT_MODES = [
+  { id: "default",  label: "Default" },
+  { id: "research", label: "Research" },
+  { id: "agent",    label: "Agent" },
+  { id: "browser",  label: "Browser" },
+  { id: "computer", label: "Computer" },
+  { id: "data",     label: "Data" },
+  { id: "image",    label: "Image" },
+  { id: "voice",    label: "Voice" },
+  { id: "coding",   label: "Coding" },
+] as const;
+
 // ─── Auth helpers ─────────────────────────────────────────────────────────────
 function getToken() {
   if (typeof window === "undefined") return "";
@@ -732,18 +744,6 @@ function ChatScreen({
   activePersonaId: string;
   onConvoCreated: (id: string) => void;
 }) {
-  const CHAT_MODES = [
-    { id: "default",  label: "Default" },
-    { id: "research", label: "Research" },
-    { id: "agent",    label: "Agent" },
-    { id: "browser",  label: "Browser" },
-    { id: "computer", label: "Computer" },
-    { id: "data",     label: "Data" },
-    { id: "image",    label: "Image" },
-    { id: "voice",    label: "Voice" },
-    { id: "coding",   label: "Coding" },
-  ] as const;
-
   const [draft, setDraft] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
   const [chatModels, setChatModels] = useState<ChatModel[]>([]);

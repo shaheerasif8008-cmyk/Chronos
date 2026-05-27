@@ -10,6 +10,7 @@ from sqlalchemy import insert, select
 
 from core import permissions
 from core.activity_events import list_task_events
+from core.modes import normalize_mode
 from core.auth import get_current_member
 from core.config import settings
 from core.db import engine, reflect_table
@@ -48,6 +49,7 @@ async def create_task_record(
 
     await permissions.check(member, "create_task", workspace_id or "default")
     resolved_model = resolve_agent_model(model)
+    normalized_mode = normalize_mode(mode)
     tasks = await reflect_table("tasks")
     async with engine.begin() as conn:
         result = await conn.execute(
@@ -66,7 +68,7 @@ async def create_task_record(
                 current_step=0,
                 result={},
                 depth=0,
-                mode=mode,
+                mode=normalized_mode,
             )
             .returning(tasks.c.id)
         )

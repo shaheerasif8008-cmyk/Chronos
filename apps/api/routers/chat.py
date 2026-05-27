@@ -16,6 +16,7 @@ from core.db import engine, reflect_table
 from core.intent import classify_intent
 from core.llm import available_chat_models, normalize_chat_model, stream_completion
 from core.memory_writes import create_memory_entry, extract_explicit_memory_content
+from core.modes import normalize_mode
 from core.models import Member, RequesterContext
 from core.redis import redis_client
 from memory.extraction import extract_and_save
@@ -32,18 +33,6 @@ _SSE_HEADERS = {
     "X-Accel-Buffering": "no",
 }
 
-
-_ALLOWED_MODES = frozenset({
-    "default", "research", "agent", "browser", "computer",
-    "data", "image", "voice", "coding",
-})
-
-
-def _normalize_mode(mode: str | None) -> str:
-    """Coerce missing or unknown modes to 'default'; pass valid values through."""
-    if mode and mode in _ALLOWED_MODES:
-        return mode
-    return "default"
 
 
 class ChatRequest(BaseModel):
@@ -413,7 +402,7 @@ async def _agent_loop_stream(
 async def send_message(req: ChatRequest, member: Member = Depends(get_current_member)) -> StreamingResponse:
     await permissions.check(member, "chat", req.conversation_id or "new_conversation")
     selected_model = normalize_chat_model(req.model)
-    normalized_mode = _normalize_mode(req.mode)
+    normalized_mode = normalize_mode(req.mode)
     conversation_id = req.conversation_id or await _create_conversation(member, req.message)
     await _save_message(conversation_id, "user", req.message)
     requester_context = RequesterContext.from_member(member)
@@ -434,7 +423,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
                 created_by=member.id,
             )
             assistant_response = f"Got it, I'll remember that: {explicit_memory}"
-            await _save_message(conversation_id, "assistant", assistant_response)
+            await _save_message(conversation_id, "assistant", assistant_response, mode=normalized_mode)
             await audit.log("chat_response", member.id, "chat.message", resource_id=conversation_id)
             yield f"data: {json.dumps({'type': 'conversation', 'conversation_id': conversation_id})}\n\n"
             yield f"data: {json.dumps({'type': 'memory_saved', 'entry_id': entry_id, 'content': explicit_memory, 'scope': 'org', 'source': 'explicit'})}\n\n"
