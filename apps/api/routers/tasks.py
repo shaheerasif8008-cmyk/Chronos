@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import asyncio
 import json
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import insert, select
+from sqlalchemy import insert, select, update
 
 from core import permissions
 from core.activity_events import list_task_events
@@ -15,7 +14,8 @@ from core.config import settings
 from core.db import engine, reflect_table
 from core.models import Member
 from core.redis import redis_client
-from runtime.executor import TaskExecutor, activity_channel
+from runtime import task_runner
+from runtime.executor import activity_channel
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
@@ -57,7 +57,7 @@ async def create_task_record(
                 workspace_id=workspace_id,
                 triggered_by=triggered_by,
                 triggered_by_member_id=member.id,
-                status="pending",
+                status="queued",
                 goal=goal,
                 plan={},
                 agent_state={"agent_history": [], "iteration_count": 0, "model": resolved_model},
@@ -80,8 +80,31 @@ async def create_task(req: CreateTaskRequest, member: Member = Depends(get_curre
         workspace_id=req.workspace_id,
         model=req.model,
     )
-    asyncio.create_task(TaskExecutor().run(task_id))
-    return {"task_id": task_id}
+    await task_runner.enqueue_task(task_id)
+    return {"task_id": task_id, "status": "queued"}
+
+
+@router.post("/{task_id}/cancel")
+async def cancel_task(task_id: str, member: Member = Depends(get_current_member)) -> dict:
+    await permissions.check(member, "cancel_task", task_id)
+    tasks = await reflect_table("tasks")
+    async with engine.begin() as conn:
+        row = (
+            await conn.execute(
+                select(tasks).where(tasks.c.id == task_id, tasks.c.organization_id == member.organization_id)
+            )
+        ).mappings().first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Task not found")
+        if row["status"] in {"complete", "failed", "cancelled"}:
+            return {"task_id": task_id, "status": row["status"], "cancelled": False}
+        await conn.execute(
+            update(tasks)
+            .where(tasks.c.id == task_id, tasks.c.organization_id == member.organization_id)
+            .values(status="cancelled", error="user_cancelled")
+        )
+    task_runner.cancel_task(task_id)
+    return {"task_id": task_id, "status": "cancelled", "cancelled": True}
 
 
 @router.get("/")

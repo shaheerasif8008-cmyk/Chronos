@@ -24,7 +24,7 @@ async def test_stream_chat_completion_defaults_to_agent_model(monkeypatch):
 
     monkeypatch.setattr(llm.litellm, "acompletion", fake_completion)
     monkeypatch.setattr(llm.settings, "openrouter_api_key", "or-test-key")
-    monkeypatch.setattr(llm.settings, "agent_model", "openrouter/deepseek/deepseek-v4-pro")
+    monkeypatch.setattr(llm.settings, "agent_model", "openrouter/deepseek/deepseek-v4-flash:free")
 
     tokens = []
     async for token in llm.stream_completion([{"role": "user", "content": "hi"}]):
@@ -34,7 +34,7 @@ async def test_stream_chat_completion_defaults_to_agent_model(monkeypatch):
     assert len(calls) == 1
     assert calls[0]["api_key"] == "or-test-key"
     assert calls[0]["api_base"] == "https://openrouter.ai/api/v1"
-    assert calls[0]["model"] == "openrouter/deepseek/deepseek-v4-pro"
+    assert calls[0]["model"] == "openrouter/deepseek/deepseek-v4-flash:free"
 
 
 @pytest.mark.asyncio
@@ -119,7 +119,7 @@ async def test_complete_json_falls_back_to_main_model_after_fast_failure(monkeyp
 
     monkeypatch.setattr(llm.litellm, "acompletion", fake_completion)
     monkeypatch.setattr(llm.settings, "fast_model", "openrouter/minimax/minimax-m2.5:free")
-    monkeypatch.setattr(llm.settings, "agent_model", "openrouter/deepseek/deepseek-v4-pro")
+    monkeypatch.setattr(llm.settings, "agent_model", "openrouter/deepseek/deepseek-v4-flash:free")
     monkeypatch.setattr(llm.settings, "openrouter_api_key", "or-test-key")
 
     result = await llm.complete_json("Return JSON")
@@ -127,7 +127,7 @@ async def test_complete_json_falls_back_to_main_model_after_fast_failure(monkeyp
     assert result == '{"mode":"chat"}'
     assert calls[0]["model"] == "openrouter/minimax/minimax-m2.5:free"
     assert calls[0]["response_format"] == {"type": "json_object"}
-    assert calls[1]["model"] == "openrouter/deepseek/deepseek-v4-pro"
+    assert calls[1]["model"] == "openrouter/deepseek/deepseek-v4-flash:free"
 
 
 @pytest.mark.asyncio

@@ -51,6 +51,27 @@ logger = logging.getLogger(__name__)
 
 MAX_ITERATIONS = 40
 MAX_DEPTH = 3
+DURABLE_TRACE_TYPES = {
+    "route_decision",
+    "model_step",
+    "model_result",
+    "tool_call",
+    "tool_result",
+    "tool_error",
+    "artifact",
+    "awaiting_approval",
+    "approval_rejected",
+    "sub_agent_spawned",
+    "sub_agent_complete",
+    "task_cancelled",
+    "task_complete",
+    "task_failed",
+}
+_UNTRUSTED_WRITE_NAMES = {
+    "gmail__draft",
+    "gmail__send",
+    "fs__write",
+}
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
@@ -66,6 +87,14 @@ async def save_task(task_id: str, **values: Any) -> None:
     tasks = await reflect_table("tasks")
     async with engine.begin() as conn:
         await conn.execute(update(tasks).where(tasks.c.id == task_id).values(**values))
+
+
+async def is_task_cancelled(task_id: str) -> bool:
+    try:
+        task = await get_task(task_id)
+    except Exception:
+        return False
+    return bool(task and task.get("status") == "cancelled")
 
 
 # ── Conversation persistence (source of truth, independent of SSE) ────────────
@@ -224,12 +253,22 @@ async def emit_activity(
 
 
 async def publish_activity(task_id: str, event: dict[str, Any]) -> None:
-    """Publish a transient activity event to Redis WITHOUT writing audit_log.
+    """Publish a runtime activity event to Redis.
 
-    Used for high-frequency heartbeats (e.g. 'thinking') that should drive the
-    live UI but must not bloat the append-only audit table.
+    High-frequency heartbeats remain Redis-only, while replay-significant
+    activity is also written to audit_log so crash/restart investigations have
+    model-step evidence without relying on the live SSE stream.
     """
     payload = {"task_id": task_id, "ts": datetime.now(timezone.utc).isoformat(), **event}
+    if payload.get("type") in DURABLE_TRACE_TYPES:
+        await audit.log(
+            "activity",
+            "chronos",
+            payload.get("type", "activity"),
+            resource_type="tasks",
+            resource_id=task_id,
+            payload=payload,
+        )
     await redis_client.publish(activity_channel(task_id), json.dumps(payload, default=str))
 
 
@@ -251,6 +290,13 @@ async def _agent_system_message(tools: list[dict[str, Any]] | None = None) -> di
             "a clear final answer — do not make unnecessary additional tool calls. "
             "All external actions are governed by the broker; some require human approval. "
             "Be direct and operational.\n\n"
+            "CRITICAL RULE — Honesty about search results:\n"
+            "- If a search returns 0 results, say so. Do not fabricate statistics, sources, or data.\n"
+            "- If a tool result contains `is_fallback: true` or a `warning` field, the live search failed. "
+            "Report this to the user honestly. Do not use placeholder/fixture data as real information.\n"
+            "- If you cannot find real data to answer a question, say \"I could not find that information\" "
+            "rather than making up plausible-looking numbers or sources.\n"
+            "- Fabricating statistics, study results, or sources undermines user trust and is never acceptable.\n\n"
             f"{manifest}"
         ),
     }
@@ -417,6 +463,33 @@ def _tool_message_error(message: dict[str, Any]) -> str | None:
         return None
     error = payload.get("error")
     return str(error) if error else None
+
+
+def _tool_message_has_prompt_injection(message: dict[str, Any]) -> bool:
+    if message.get("role") != "tool":
+        return False
+    try:
+        payload = json.loads(str(message.get("content") or "{}"))
+    except json.JSONDecodeError:
+        return False
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        return False
+    marker = data.get("untrusted_content")
+    return isinstance(marker, dict) and marker.get("risk") == "prompt_injection"
+
+
+def _history_has_prompt_injection(history: list[dict[str, Any]]) -> bool:
+    return any(_tool_message_has_prompt_injection(message) for message in history)
+
+
+def _call_is_external_write(call: dict[str, Any]) -> bool:
+    name = str(call.get("name") or "")
+    broker_name = to_broker_name(name)
+    return (
+        name in _UNTRUSTED_WRITE_NAMES
+        or any(marker in broker_name for marker in (".draft", ".send", ".post", ".publish", ".write", ".create", ".update", ".delete"))
+    )
 
 
 def _orchestration_state(
@@ -738,7 +811,6 @@ async def resume_after_approval(task_id: str) -> None:
     state = task.get("agent_state") or {}
     history = state.get("agent_history") or await _load_history(task)
     iteration = int(state.get("iteration_count") or 0)
-    pending_calls: list[dict[str, Any]] = state.get("pending_approval_calls") or []
     agent = AgentContext.from_task(task)
 
     # Load approval rows
@@ -836,16 +908,37 @@ async def run_loop(
     if iteration == 0:
         routing_decision = await route_tool(str(task["goal"]), [tool["function"]["name"] for tool in effective_tools])
         _append_routing_instruction(history, routing_decision)
+        await publish_activity(task_id, {
+            "type": "route_decision",
+            "tool": routing_decision.tool,
+            "confidence": routing_decision.confidence,
+            "summary": routing_decision.reasoning,
+        })
 
     await save_task(task_id, status="running",
                     started_at=task.get("started_at") or datetime.now(timezone.utc))
 
     while iteration < MAX_ITERATIONS:
+        if await is_task_cancelled(task_id):
+            await save_task(
+                task_id,
+                status="cancelled",
+                error="task_cancelled",
+                completed_at=datetime.now(timezone.utc),
+            )
+            await emit_activity(task_id, {"type": "task_cancelled", "reason": "task_cancelled"})
+            return {"error": "task_cancelled"}
+
         # ── Ask the LLM ────────────────────────────────────────────────────
         # Heartbeat: the completion is non-streaming and can take many seconds
         # (e.g. generating a whole file in tool args). Tell the UI we're working
         # so it shows "Thinking…" instead of a frozen caret. Publish-only — this
         # high-frequency signal must not bloat the append-only audit_log.
+        await publish_activity(task_id, {
+            "type": "model_step",
+            "iteration": iteration + 1,
+            "summary": "Assembling context and deciding the next action.",
+        })
         await publish_activity(task_id, {"type": "thinking"})
         try:
             final_text, calls = await _llm_step(history, effective_tools, effective_model, routing_decision)
@@ -859,6 +952,11 @@ async def run_loop(
 
         # ── Final answer ────────────────────────────────────────────────────
         if not calls:
+            await publish_activity(task_id, {
+                "type": "model_result",
+                "iteration": iteration + 1,
+                "summary": "No tool call needed; preparing final answer.",
+            })
             result = {"answer": final_text or ""}
             history.append({"role": "assistant", "content": final_text or ""})
             await _checkpoint(task_id, history, iteration + 1, model=effective_model,
@@ -877,11 +975,23 @@ async def run_loop(
 
         # ── Check for always-approval tools ────────────────────────────────
         approval_needed = [c for c in calls if _needs_approval(c["name"])]
+        if _history_has_prompt_injection(history):
+            approval_needed.extend(c for c in calls if _call_is_external_write(c) and c not in approval_needed)
         if approval_needed:
             await _open_approval_gate(task, approval_needed, history, iteration, model=effective_model)
             return {"status": "awaiting_approval"}
 
         # ── Execute tool calls (parallel if multiple) ───────────────────────
+        if await is_task_cancelled(task_id):
+            await save_task(
+                task_id,
+                status="cancelled",
+                error="task_cancelled",
+                completed_at=datetime.now(timezone.utc),
+            )
+            await emit_activity(task_id, {"type": "task_cancelled", "reason": "task_cancelled"})
+            return {"error": "task_cancelled"}
+
         tool_messages: list[dict[str, Any]] = []
         if len(calls) == 1:
             try:

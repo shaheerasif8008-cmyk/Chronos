@@ -19,7 +19,8 @@ from core.models import Member, RequesterContext
 from core.redis import redis_client
 from memory.extraction import extract_and_save
 from runtime.agent_loop import format_task_answer
-from runtime.executor import TaskExecutor, activity_channel
+from runtime import task_runner
+from runtime.executor import activity_channel
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -111,6 +112,26 @@ async def list_messages(conversation_id: str, member: Member = Depends(get_curre
     return [dict(row) for row in rows]
 
 
+@router.get("/conversations/{conversation_id}/latest-task")
+async def latest_conversation_task(conversation_id: str, member: Member = Depends(get_current_member)) -> dict | None:
+    await permissions.check(member, "view_conversation", conversation_id)
+    tasks = await reflect_table("tasks")
+    async with engine.begin() as conn:
+        row = (
+            await conn.execute(
+                select(tasks)
+                .where(
+                    tasks.c.triggered_by == conversation_id,
+                    tasks.c.organization_id == member.organization_id,
+                    tasks.c.parent_task_id.is_(None),
+                )
+                .order_by(tasks.c.created_at.desc())
+                .limit(1)
+            )
+        ).mappings().first()
+    return dict(row) if row else None
+
+
 @router.delete("/conversations/{conversation_id}")
 async def delete_conversation(conversation_id: str, member: Member = Depends(get_current_member)) -> dict:
     await permissions.check(member, "delete_conversation", conversation_id)
@@ -197,10 +218,12 @@ async def _agent_loop_stream(
         model=model,
     )
 
-    # Subscribe BEFORE firing executor to guarantee no events are missed.
+    # Subscribe BEFORE firing executor, then wait briefly for subscription to
+    # propagate so Redis doesn't miss the first events due to race condition.
     pubsub = redis_client.pubsub()
     await pubsub.subscribe(activity_channel(task_id))
-    asyncio.create_task(TaskExecutor().run(task_id))
+    await asyncio.sleep(0.1)
+    await task_runner.enqueue_task(task_id)
 
     yield f"data: {json.dumps({'type': 'conversation', 'conversation_id': conversation_id})}\n\n"
     yield f"data: {json.dumps({'type': 'task_created', 'task_id': task_id})}\n\n"
@@ -208,6 +231,7 @@ async def _agent_loop_stream(
     TRACE_TYPES = {
         "tool_call", "tool_result", "tool_error", "step_start", "step_done",
         "awaiting_approval", "sub_agent_spawned", "sub_agent_complete", "thinking",
+        "route_decision", "model_step", "model_result",
     }
     final_answer: str | None = None
     try:
@@ -280,25 +304,35 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
 
         return StreamingResponse(explicit_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
-    intent = await classify_intent(req.message)
-
     # Tool-capable path: explicit "task" goals AND ordinary non-trivial chat both
     # run the agent loop so chat can search and act inline (Option 1). Only clearly
     # trivial, tool-free messages fall through to the fast token-streamed completion.
-    route_through_loop = intent["mode"] == "task" or not _is_trivial_chat(req.message)
-    if route_through_loop:
-        is_task = intent["mode"] == "task"
+    if not _is_trivial_chat(req.message):
         return StreamingResponse(
             _agent_loop_stream(
                 conversation_id=conversation_id,
-                goal=(intent.get("goal") or req.message) if is_task else req.message,
+                goal=req.message,
                 member=member,
                 persona_id=req.persona_id,
                 workspace_id=req.workspace_id,
                 model=req.model,
-                # Chat-routed runs keep autonomous memory extraction; explicit tasks do not.
-                requester_context=None if is_task else requester_context,
-                user_message_for_memory=None if is_task else req.message,
+                requester_context=requester_context,
+                user_message_for_memory=req.message,
+            ),
+            media_type="text/event-stream",
+            headers=_SSE_HEADERS,
+        )
+
+    intent = await classify_intent(req.message)
+    if intent["mode"] == "task":
+        return StreamingResponse(
+            _agent_loop_stream(
+                conversation_id=conversation_id,
+                goal=intent.get("goal") or req.message,
+                member=member,
+                persona_id=req.persona_id,
+                workspace_id=req.workspace_id,
+                model=req.model,
             ),
             media_type="text/event-stream",
             headers=_SSE_HEADERS,
