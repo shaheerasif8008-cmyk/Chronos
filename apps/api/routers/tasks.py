@@ -26,6 +26,7 @@ class CreateTaskRequest(BaseModel):
     persona_id: str | None = None
     workspace_id: str | None = None
     model: str | None = None
+    mode: str | None = None
 
 
 async def create_task_record(
@@ -36,6 +37,7 @@ async def create_task_record(
     persona_id: str | None = None,
     workspace_id: str | None = None,
     model: str | None = None,
+    mode: str | None = None,
 ) -> str:
     """Insert a task row. The native model action loop orchestrates by default.
 
@@ -64,6 +66,7 @@ async def create_task_record(
                 current_step=0,
                 result={},
                 depth=0,
+                mode=mode,
             )
             .returning(tasks.c.id)
         )
@@ -79,6 +82,7 @@ async def create_task(req: CreateTaskRequest, member: Member = Depends(get_curre
         persona_id=req.persona_id,
         workspace_id=req.workspace_id,
         model=req.model,
+        mode=req.mode,
     )
     asyncio.create_task(TaskExecutor().run(task_id))
     return {"task_id": task_id}

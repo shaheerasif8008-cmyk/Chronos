@@ -33,10 +33,24 @@ _SSE_HEADERS = {
 }
 
 
+_ALLOWED_MODES = frozenset({
+    "default", "research", "agent", "browser", "computer",
+    "data", "image", "voice", "coding",
+})
+
+
+def _normalize_mode(mode: str | None) -> str:
+    """Coerce missing or unknown modes to 'default'; pass valid values through."""
+    if mode and mode in _ALLOWED_MODES:
+        return mode
+    return "default"
+
+
 class ChatRequest(BaseModel):
     message: str
     conversation_id: str | None = None
     model: str | None = None
+    mode: str | None = None
     persona_id: str | None = None
     workspace_id: str | None = None
 
@@ -273,6 +287,7 @@ async def _agent_loop_stream(
     persona_id: str | None,
     workspace_id: str | None,
     model: str | None,
+    mode: str | None = None,
     requester_context: RequesterContext | None = None,
     user_message_for_memory: str | None = None,
 ):
@@ -293,6 +308,7 @@ async def _agent_loop_stream(
         persona_id=persona_id,
         workspace_id=workspace_id,
         model=model,
+        mode=mode,
     )
 
     # Subscribe BEFORE firing executor to guarantee no events are missed.
@@ -373,6 +389,7 @@ async def _agent_loop_stream(
                             tool_traces=normalized_traces,
                             artifact_refs=collected_artifact_refs,
                             model=model,
+                            mode=mode,
                             runtime_status=runtime_status,
                         )
                     )
@@ -396,6 +413,7 @@ async def _agent_loop_stream(
 async def send_message(req: ChatRequest, member: Member = Depends(get_current_member)) -> StreamingResponse:
     await permissions.check(member, "chat", req.conversation_id or "new_conversation")
     selected_model = normalize_chat_model(req.model)
+    normalized_mode = _normalize_mode(req.mode)
     conversation_id = req.conversation_id or await _create_conversation(member, req.message)
     await _save_message(conversation_id, "user", req.message)
     requester_context = RequesterContext.from_member(member)
@@ -441,6 +459,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
                 persona_id=req.persona_id,
                 workspace_id=req.workspace_id,
                 model=req.model,
+                mode=normalized_mode,
                 # Chat-routed runs keep autonomous memory extraction; explicit tasks do not.
                 requester_context=None if is_task else requester_context,
                 user_message_for_memory=None if is_task else req.message,
@@ -462,7 +481,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
         await _save_message(
             conversation_id, "assistant", assistant_response,
             model=selected_model,
-            mode="chat",
+            mode=normalized_mode,
         )
         await audit.log("chat_response", member.id, "chat.message", resource_id=conversation_id)
         asyncio.create_task(

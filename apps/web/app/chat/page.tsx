@@ -732,10 +732,23 @@ function ChatScreen({
   activePersonaId: string;
   onConvoCreated: (id: string) => void;
 }) {
+  const CHAT_MODES = [
+    { id: "default",  label: "Default" },
+    { id: "research", label: "Research" },
+    { id: "agent",    label: "Agent" },
+    { id: "browser",  label: "Browser" },
+    { id: "computer", label: "Computer" },
+    { id: "data",     label: "Data" },
+    { id: "image",    label: "Image" },
+    { id: "voice",    label: "Voice" },
+    { id: "coding",   label: "Coding" },
+  ] as const;
+
   const [draft, setDraft] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
   const [chatModels, setChatModels] = useState<ChatModel[]>([]);
   const [selectedModel, setSelectedModel] = useState("auto");
+  const [selectedMode, setSelectedMode] = useState<string>("default");
   const [streaming, setStreaming] = useState(false);
   const [activityOpen, setActivityOpen] = useState(false);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
@@ -1003,7 +1016,7 @@ function ChatScreen({
       const resp = await apiFetch("/chat/message", {
         method: "POST",
         headers: { Accept: "text/event-stream" },
-        body: JSON.stringify({ message: text, conversation_id: convoId, model: selectedModel, persona_id: activePersonaId }),
+        body: JSON.stringify({ message: text, conversation_id: convoId, model: selectedModel, mode: selectedMode, persona_id: activePersonaId }),
         signal: ab.signal,
       });
 
@@ -1073,7 +1086,7 @@ function ChatScreen({
               {messages.map((m, i) => (
                 m.role === "user"
                   ? <UserMessage key={m.id ?? `user-${i}`} content={m.content}/>
-                  : <AssistantMessage key={m.id ?? `assistant-${i}`} content={m.content} status={m.status ?? "complete"} persona={activePersona} toolTraces={m.tool_traces} artifacts={m.artifacts} thinking={m.thinking}/>
+                  : <AssistantMessage key={m.id ?? `assistant-${i}`} content={m.content} status={m.status ?? "complete"} persona={activePersona} toolTraces={m.tool_traces} artifacts={m.artifacts} thinking={m.thinking} mode={m.mode}/>
               ))}
               {streaming && messages[messages.length - 1]?.role !== "assistant" && (
                 <div className="flex gap-4">
@@ -1118,6 +1131,20 @@ function ChatScreen({
                   >
                     {(chatModels.length ? chatModels : [{ id: "auto", label: "Auto", model: "auto" }]).map(model => (
                       <option key={model.id} value={model.id}>{model.label}</option>
+                    ))}
+                  </select>
+                  <label className="sr-only" htmlFor="chat-mode-select">Mode</label>
+                  <select
+                    id="chat-mode-select"
+                    aria-label="Mode"
+                    value={selectedMode}
+                    onChange={event => setSelectedMode(event.target.value)}
+                    disabled={streaming}
+                    className="surface border border-soft rounded-md px-2 py-1.5 text-[12.5px] outline-none disabled:opacity-60"
+                    style={{ color: "var(--text)" }}
+                  >
+                    {CHAT_MODES.map(m => (
+                      <option key={m.id} value={m.id}>{m.label}</option>
                     ))}
                   </select>
                 </div>
@@ -1252,7 +1279,7 @@ function ArtifactCard({ artifact }: { artifact: ArtifactRef }) {
   );
 }
 
-function AssistantMessage({ content, status, persona, toolTraces, artifacts, thinking }: { content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[]; artifacts?: ArtifactRef[]; thinking?: boolean }) {
+function AssistantMessage({ content, status, persona, toolTraces, artifacts, thinking, mode }: { content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[]; artifacts?: ArtifactRef[]; thinking?: boolean; mode?: string }) {
   const hasTraces = !!(toolTraces && toolTraces.length > 0);
   const isStreaming = status === "streaming";
   return (
@@ -1261,6 +1288,7 @@ function AssistantMessage({ content, status, persona, toolTraces, artifacts, thi
       <div className="flex-1 min-w-0 pt-0.5">
         <div className="flex items-baseline gap-2 mb-1.5">
           <span className="text-[14px] font-semibold">{persona.name}</span>
+          {mode && mode !== "default" && <Tag variant="info">{mode}</Tag>}
           {status === "error" && <Tag variant="danger">Error</Tag>}
         </div>
 
