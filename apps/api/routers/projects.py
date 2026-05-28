@@ -393,6 +393,121 @@ async def get_project_sources(
     return [dict(row) for row in rows]
 
 
+async def _require_source(member: Member, project_id: str, sid: str) -> dict:
+    """Return the project_sources row or raise 404 if it isn't in this project+org."""
+    project_sources = await reflect_table("project_sources")
+    async with engine.begin() as conn:
+        row = (
+            await conn.execute(
+                select(project_sources).where(
+                    project_sources.c.id == sid,
+                    project_sources.c.project_id == project_id,
+                    project_sources.c.organization_id == member.organization_id,
+                )
+            )
+        ).mappings().first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Source not found")
+    return dict(row)
+
+
+@router.post("/{project_id}/sources/{sid}/reindex")
+async def reindex_source(
+    project_id: str,
+    sid: str,
+    member: Member = Depends(get_current_member),
+) -> dict:
+    await _require_member(member, project_id)
+    await _require_source(member, project_id, sid)
+    await permissions.check(member, "reindex_project_source", project_id)
+
+    from memory.source_indexing import index_source
+
+    summary = await index_source(sid, member.organization_id)
+    await audit.log(
+        "source_reindexed",
+        member.id,
+        "projects.reindex_source",
+        resource_type="project_sources",
+        resource_id=sid,
+        payload={"project_id": project_id, "chunk_count": summary.get("chunk_count")},
+    )
+    return summary
+
+
+@router.post("/{project_id}/sources/{sid}/refresh")
+async def refresh_source(
+    project_id: str,
+    sid: str,
+    member: Member = Depends(get_current_member),
+) -> dict:
+    await _require_member(member, project_id)
+    source = await _require_source(member, project_id, sid)
+    await permissions.check(member, "refresh_project_source", project_id)
+
+    from core.artifacts import set_parse_status
+    from memory.source_indexing import index_source
+
+    # Force a fresh parse: drop the cached parsed_text child and reset parse_status
+    # so index_source re-parses the attachment from raw bytes.
+    artifact_id = source.get("artifact_id")
+    if artifact_id:
+        artifacts = await reflect_table("artifacts")
+        async with engine.begin() as conn:
+            await conn.execute(
+                delete(artifacts).where(
+                    artifacts.c.parent_artifact_id == str(artifact_id),
+                    artifacts.c.kind == "parsed_text",
+                    artifacts.c.organization_id == member.organization_id,
+                )
+            )
+        await set_parse_status(str(artifact_id), "pending")
+
+    summary = await index_source(sid, member.organization_id)
+    await audit.log(
+        "source_refreshed",
+        member.id,
+        "projects.refresh_source",
+        resource_type="project_sources",
+        resource_id=sid,
+        payload={"project_id": project_id, "chunk_count": summary.get("chunk_count")},
+    )
+    return summary
+
+
+@router.delete("/{project_id}/sources/{sid}")
+async def delete_source(
+    project_id: str,
+    sid: str,
+    member: Member = Depends(get_current_member),
+) -> dict:
+    await _require_owner(member, project_id)
+    await _require_source(member, project_id, sid)
+    await permissions.check(member, "delete_project_source", project_id)
+
+    from memory.source_indexing import delete_source_chunks
+
+    deleted_chunks = await delete_source_chunks(sid, member.organization_id)
+    project_sources = await reflect_table("project_sources")
+    async with engine.begin() as conn:
+        await conn.execute(
+            delete(project_sources).where(
+                project_sources.c.id == sid,
+                project_sources.c.organization_id == member.organization_id,
+            )
+        )
+
+    await audit.log(
+        "source_deleted",
+        member.id,
+        "projects.delete_source",
+        resource_type="project_sources",
+        resource_id=sid,
+        payload={"project_id": project_id, "deleted_chunks": deleted_chunks},
+    )
+    return {"deleted": True, "source_id": sid, "deleted_chunks": deleted_chunks}
+
+
 @router.get("/{project_id}/tasks")
 async def get_project_tasks(
     project_id: str,

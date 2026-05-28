@@ -1,6 +1,8 @@
 """Attachment upload — stores raw bytes as an artifact. Parsing happens on first use."""
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, Form
 from sqlalchemy import insert
 
@@ -71,6 +73,11 @@ async def upload_attachment(
             resource_type="project_sources", resource_id=source_id,
             payload={"project_id": project_id},
         )
+        # Fire-and-forget background index so upload returns immediately (still
+        # index_status="pending"). index_source owns its error handling and marks
+        # the source "failed" on error rather than crashing.
+        from memory.source_indexing import index_source
+        asyncio.create_task(index_source(source_id, member.organization_id))
 
     return {
         "attachment_id": attachment_id,
