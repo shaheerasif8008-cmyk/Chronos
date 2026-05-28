@@ -325,7 +325,7 @@ async def test_upload_attachment_stores_and_returns_id(monkeypatch):
         file=BytesIO(b"%PDF-1.4 data"),
         headers=Headers({"content-type": "application/pdf"}),
     )
-    out = await attachments.upload_attachment(file=upload, conversation_id="c1", member=member)
+    out = await attachments.upload_attachment(file=upload, conversation_id="c1", project_id=None, member=member)
     assert out["attachment_id"] == "att-123"
     assert out["filename"] == "report.pdf"
     assert saved["kind"] == "attachment"

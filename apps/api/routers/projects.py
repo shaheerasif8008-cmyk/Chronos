@@ -371,6 +371,28 @@ async def get_project_conversations(
     return [dict(row) for row in rows]
 
 
+@router.get("/{project_id}/sources")
+async def get_project_sources(
+    project_id: str,
+    member: Member = Depends(get_current_member),
+) -> list[dict]:
+    await _require_member(member, project_id)
+    await permissions.check(member, "view_project_sources", project_id)
+
+    project_sources = await reflect_table("project_sources")
+    async with engine.begin() as conn:
+        rows = (
+            await conn.execute(
+                select(project_sources).where(
+                    project_sources.c.project_id == project_id,
+                    project_sources.c.organization_id == member.organization_id,
+                )
+                .order_by(project_sources.c.created_at.desc())
+            )
+        ).mappings().all()
+    return [dict(row) for row in rows]
+
+
 @router.get("/{project_id}/tasks")
 async def get_project_tasks(
     project_id: str,
