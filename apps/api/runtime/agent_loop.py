@@ -335,6 +335,9 @@ async def _load_history(task: dict[str, Any], tools: list[dict[str, Any]] | None
     attachments = state.get("attachments") if isinstance(state, dict) else None
     if isinstance(attachments, list) and attachments:
         seed.append({"role": "user", "content": _format_attachments_context(attachments)})
+    project_knowledge = state.get("project_knowledge") if isinstance(state, dict) else None
+    if isinstance(project_knowledge, str) and project_knowledge.strip():
+        seed.append({"role": "user", "content": project_knowledge})
     seed.append({"role": "user", "content": str(task["goal"])})
     return seed
 

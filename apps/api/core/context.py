@@ -9,6 +9,11 @@ from core.db import engine, reflect_table
 from core.models import RequesterContext
 from core.personas import get_persona_prompt
 from core.tool_manifest import generate_tool_manifest
+from memory.source_retrieval import (
+    build_knowledge_block,
+    citations_payload,
+    retrieve_source_chunks,
+)
 from skills.loader import find_relevant_skills, load_skill_content, skill_connector_warning
 from skills.registry import load_skill_index
 
@@ -166,6 +171,22 @@ async def assemble_context(
         mem_block = "\n".join(f"- {m.content}" for m in memories)
         if _estimate_tokens(base + mem_block) <= system_budget:
             base += "\n\n# What I Remember\n" + mem_block
+
+    # ── Layer 5b: project knowledge (permission-aware source citations) ─────
+    if requester_context.project_id is not None:
+        try:
+            citations = await retrieve_source_chunks(message, requester_context)
+        except Exception:
+            citations = []
+        if citations:
+            knowledge_block = build_knowledge_block(citations)
+            if knowledge_block and _estimate_tokens(base + knowledge_block) <= system_budget:
+                base += f"\n\n{knowledge_block}"
+                requester_context.surfaced_citations = citations_payload(citations)
+            else:
+                requester_context.surfaced_citations = []
+        else:
+            requester_context.surfaced_citations = []
 
     # ── Layer 6: task state ─────────────────────────────────────────────────
     if requester_context.task_id:

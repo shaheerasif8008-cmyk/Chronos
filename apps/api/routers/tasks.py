@@ -42,6 +42,7 @@ async def create_task_record(
     mode: str | None = None,
     project_id: str | None = None,
     attachments_context: list[dict] | None = None,
+    project_knowledge: str | None = None,
 ) -> str:
     """Insert a task row. The native model action loop orchestrates by default.
 
@@ -65,7 +66,7 @@ async def create_task_record(
             status="pending",
             goal=goal,
             plan={},
-            agent_state={"agent_history": [], "iteration_count": 0, "model": resolved_model, "attachments": attachments_context or []},
+            agent_state={"agent_history": [], "iteration_count": 0, "model": resolved_model, "attachments": attachments_context or [], "project_knowledge": project_knowledge or ""},
             current_step=0,
             result={},
             depth=0,

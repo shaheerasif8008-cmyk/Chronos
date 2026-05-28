@@ -1835,6 +1835,30 @@ function AssistantMessage({ message, content, status, persona, toolTraces, artif
           </div>
         )}
 
+        {/* Sources — project knowledge citations grounding this answer */}
+        {message.citations && message.citations.length > 0 && (
+          <div className="mt-3 surface border border-soft rounded-lg p-2.5">
+            <div className="text-[11px] font-medium mb-1.5" style={{ color: "var(--text-dim)" }}>Sources</div>
+            <div className="space-y-1">
+              {message.citations.map((c, i) => {
+                const marker = (c.marker as string) || `S${i + 1}`;
+                const title = (c.source_title as string) || (c.text as string) || "Untitled source";
+                const snippet = (c.snippet as string) || "";
+                return (
+                  <details key={i} className="text-[12.5px]">
+                    <summary className="cursor-pointer smooth hover:text-[var(--text)]" style={{ color: "var(--text-muted)" }}>
+                      <span style={{ color: "var(--accent)" }}>[{marker}]</span> {title}
+                    </summary>
+                    {snippet && (
+                      <div className="mt-1 pl-3 text-[12px] whitespace-pre-wrap" style={{ color: "var(--text-dim)" }}>{snippet}</div>
+                    )}
+                  </details>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
         {/* Typing wave: streaming, nothing else to show yet */}
         {isStreaming && !content && !hasTraces && !thinking && (
           <div className="typing-wave mt-2"><span/><span/><span/></div>

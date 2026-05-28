@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from datetime import datetime
 
 
@@ -20,6 +20,9 @@ class RequesterContext(BaseModel):
     project_id: str | None = None
     role: str = "user"
     memory_context: str = "chat"
+    # Side-channel: surfaced source citations, set by assemble_context so the
+    # caller can persist them without changing assemble_context's return type.
+    surfaced_citations: list = Field(default_factory=list)
 
     @classmethod
     def from_member(cls, member: Member) -> "RequesterContext":

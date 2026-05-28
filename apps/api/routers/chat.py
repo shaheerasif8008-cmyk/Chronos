@@ -20,6 +20,11 @@ from core.modes import normalize_mode
 from core.models import Member, RequesterContext
 from core.redis import redis_client
 from memory.extraction import extract_and_save
+from memory.source_retrieval import (
+    build_knowledge_block,
+    citations_payload,
+    retrieve_source_chunks,
+)
 from runtime.agent_loop import format_task_answer
 from runtime.executor import TaskExecutor, activity_channel
 from routers.tasks import create_task_record
@@ -679,6 +684,19 @@ async def _agent_loop_stream(
     When `requester_context`/`user_message_for_memory` are supplied (chat-routed
     runs), autonomous memory extraction fires too, matching the fast path.
     """
+    # Permission-aware source retrieval: surface project knowledge to the loop and
+    # persist the resulting citations. Retrieve once; reuse for both seed + persist.
+    surfaced_citations: list[dict] = []
+    project_knowledge: str | None = None
+    if requester_context is not None and requester_context.project_id is not None:
+        try:
+            _citations = await retrieve_source_chunks(goal, requester_context)
+        except Exception:
+            _citations = []
+        if _citations:
+            project_knowledge = build_knowledge_block(_citations)
+            surfaced_citations = citations_payload(_citations)
+
     task_id = await create_task_record(
         goal=goal,
         member=member,
@@ -688,6 +706,7 @@ async def _agent_loop_stream(
         model=model,
         mode=mode,
         attachments_context=attachments_context,
+        project_knowledge=project_knowledge,
     )
 
     # Subscribe BEFORE firing executor to guarantee no events are missed.
@@ -767,6 +786,7 @@ async def _agent_loop_stream(
                         .values(
                             tool_traces=normalized_traces,
                             artifact_refs=collected_artifact_refs,
+                            citations=surfaced_citations,
                             model=model,
                             mode=mode,
                             runtime_status=runtime_status,
@@ -882,7 +902,9 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
                 workspace_id=req.workspace_id,
                 model=req.model,
                 mode=normalized_mode,
-                # Chat-routed runs keep autonomous memory extraction; explicit tasks do not.
+                # Chat-routed runs keep autonomous memory extraction AND project-source
+                # citations; explicit tasks opt out of both (requester_context=None gates
+                # the retrieve_source_chunks call inside _agent_loop_stream).
                 requester_context=None if is_task else requester_context,
                 user_message_for_memory=None if is_task else req.message,
                 attachments_context=attachments_context or None,
@@ -905,6 +927,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
             conversation_id, "assistant", assistant_response,
             model=selected_model,
             mode=normalized_mode,
+            citations=requester_context.surfaced_citations,
         )
         await audit.log("chat_response", member.id, "chat.message", resource_id=conversation_id)
         asyncio.create_task(
