@@ -432,6 +432,7 @@ async def test_send_message_pushes_req_project_id_into_requester_context(monkeyp
         return "conv-new-1"
 
     async def fake_save_message(*args, **kwargs):
+        # New conversations (conversation_id=None) return None (no RETURNING fired)
         return None
 
     def fake_extract_explicit(message):
@@ -479,7 +480,11 @@ async def test_send_message_pushes_req_project_id_into_requester_context(monkeyp
 
 @pytest.mark.asyncio
 async def test_send_message_hydrates_project_id_from_existing_conversation(monkeypatch):
-    """When req.project_id is absent but the conversation has one, it is hydrated."""
+    """When req.project_id is absent, project_id is hydrated from _save_message's return value.
+
+    With fix #1, _save_message returns the conversation row dict (including project_id)
+    via RETURNING — no extra roundtrip or reflect_table call is needed.
+    """
     from routers import chat
     from core.models import Member
 
@@ -495,6 +500,9 @@ async def test_send_message_hydrates_project_id_from_existing_conversation(monke
         return True
 
     async def fake_save_message(*args, **kwargs):
+        # Simulate _save_message returning the conversation row when member/org are scoped.
+        if kwargs.get("_member_id") is not None:
+            return {"project_id": "proj-from-db"}
         return None
 
     def fake_extract_explicit(message):
@@ -509,56 +517,6 @@ async def test_send_message_hydrates_project_id_from_existing_conversation(monke
     async def fake_extract_and_save(*args, **kwargs):
         pass
 
-    # Fake reflect_table: returns a table stub for both conversations and messages
-    class _FakeCol:
-        def __eq__(self, other): return True
-        def __and__(self, other): return True
-
-    class _FakeConversations:
-        class c:
-            id = _FakeCol()
-            member_id = _FakeCol()
-            organization_id = _FakeCol()
-            project_id = _FakeCol()
-            role = _FakeCol()
-            content = _FakeCol()
-            conversation_id = _FakeCol()
-            created_at = _FakeCol()
-
-    async def fake_reflect_table(name):
-        return _FakeConversations()
-
-    # DB call for project_id hydration
-    class _FakeResult:
-        def __init__(self, data):
-            self._data = data
-
-        def mappings(self):
-            return self
-
-        def first(self):
-            return self._data
-
-        def all(self):
-            if isinstance(self._data, list):
-                return self._data
-            return [self._data] if self._data else []
-
-    class _FakeConn:
-        async def execute(self, stmt):
-            return _FakeResult({"project_id": "proj-from-db"})
-
-        async def __aenter__(self): return self
-        async def __aexit__(self, *_): pass
-
-    class _FakeEngine:
-        def begin(self): return _FakeConn()
-
-    class _FakeSelect:
-        def where(self, *args): return self
-        def order_by(self, *args): return self
-        def limit(self, *args): return self
-
     monkeypatch.setattr(chat, "assemble_context", fake_assemble_context)
     monkeypatch.setattr(chat.permissions, "check", fake_check)
     monkeypatch.setattr(chat, "_save_message", fake_save_message)
@@ -568,9 +526,6 @@ async def test_send_message_hydrates_project_id_from_existing_conversation(monke
     monkeypatch.setattr(chat, "extract_and_save", fake_extract_and_save)
     monkeypatch.setattr(chat.audit, "log", AsyncMock())
     monkeypatch.setattr(chat, "_is_trivial_chat", lambda msg: True)
-    monkeypatch.setattr(chat, "reflect_table", fake_reflect_table)
-    monkeypatch.setattr(chat, "engine", _FakeEngine())
-    monkeypatch.setattr(chat, "select", lambda *args: _FakeSelect())
 
     class FakeReq:
         message = "hi"
@@ -587,3 +542,212 @@ async def test_send_message_hydrates_project_id_from_existing_conversation(monke
         body += chunk if isinstance(chunk, bytes) else chunk.encode()
 
     assert captured_context.get("project_id") == "proj-from-db"
+
+
+# ─── Fix #2: whitespace-only instructions ─────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_load_project_instructions_returns_none_when_instructions_whitespace_only(monkeypatch):
+    """Returns None when instructions column contains only whitespace."""
+    from core import context
+
+    project_row = {"id": "proj-1", "organization_id": "default", "instructions": "   \n  "}
+    engine, reflect, sel = _make_project_table_and_engine(project_row)
+    monkeypatch.setattr(context, "engine", engine)
+    monkeypatch.setattr(context, "reflect_table", reflect)
+    monkeypatch.setattr(context, "select", sel)
+
+    result = await context._load_project_instructions("proj-1", "default")
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_assemble_context_omits_project_block_when_instructions_whitespace_only(monkeypatch):
+    """# Project Instructions block is absent when helper returns None for whitespace-only instructions."""
+    from core import context
+    from core.models import RequesterContext
+
+    async def fake_org_context(org_id):
+        return ""
+
+    async def fake_find_skills(message):
+        return []
+
+    async def fake_retrieve(message, requester_context):
+        return []
+
+    async def fake_load_project_instructions(project_id, org_id):
+        # Simulate what the real helper does for whitespace-only instructions
+        return None
+
+    class _FakeResult:
+        def mappings(self):
+            return self
+        def all(self):
+            return []
+
+    class _FakeConn:
+        async def execute(self, stmt):
+            return _FakeResult()
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): pass
+
+    class _FakeEngine:
+        def begin(self): return _FakeConn()
+
+    class _FakeColumn:
+        def __eq__(self, other): return ("eq", other)
+        def desc(self): return ("desc", self)
+
+    class _FakeMessages:
+        class c:
+            role = _FakeColumn()
+            content = _FakeColumn()
+            conversation_id = _FakeColumn()
+            created_at = _FakeColumn()
+
+    async def fake_reflect_table(name):
+        return _FakeMessages()
+
+    class _FakeSelect:
+        def where(self, *args): return self
+        def order_by(self, *args): return self
+        def limit(self, *args): return self
+
+    monkeypatch.setattr(context, "load_org_context", fake_org_context)
+    monkeypatch.setattr(context, "find_relevant_skills", fake_find_skills)
+    monkeypatch.setattr(context.memory, "retrieve", fake_retrieve)
+    monkeypatch.setattr(context, "_load_project_instructions", fake_load_project_instructions)
+    monkeypatch.setattr(context, "reflect_table", fake_reflect_table)
+    monkeypatch.setattr(context, "engine", _FakeEngine())
+    monkeypatch.setattr(context, "select", lambda *args: _FakeSelect())
+
+    assembled = await context.assemble_context(
+        "conversation-1",
+        "hello",
+        RequesterContext(member_id="member-1", org_id="default", project_id="proj-1"),
+    )
+
+    system = assembled[0]["content"]
+    assert "# Project Instructions" not in system
+
+
+# ─── Fix #3: caller project_id vs conversation mismatch → 422 ─────────────────
+
+@pytest.mark.asyncio
+async def test_send_message_raises_422_when_project_id_mismatches_conversation(monkeypatch):
+    """When req.project_id and the conversation's stored project_id differ, 422 is raised."""
+    from routers import chat
+    from core.models import Member
+    from fastapi import HTTPException
+
+    member = Member(id="member-1", organization_id="default", email="test@example.com", role="user")
+
+    async def fake_check(*args, **kwargs):
+        return True
+
+    async def fake_save_message(*args, **kwargs):
+        # Return a stored project_id that differs from req.project_id
+        if kwargs.get("_member_id") is not None:
+            return {"project_id": "proj-stored"}
+        return None
+
+    monkeypatch.setattr(chat.permissions, "check", fake_check)
+    monkeypatch.setattr(chat, "_save_message", fake_save_message)
+    monkeypatch.setattr(chat.audit, "log", AsyncMock())
+
+    class FakeReq:
+        message = "hi"
+        conversation_id = "conv-existing-1"
+        model = None
+        mode = None
+        persona_id = None
+        workspace_id = None
+        project_id = "proj-different"  # mismatch with "proj-stored"
+
+    with pytest.raises(HTTPException) as exc_info:
+        await chat.send_message(FakeReq(), member)
+
+    assert exc_info.value.status_code == 422
+    assert "project_id does not match conversation" in exc_info.value.detail
+
+
+# ─── Fix #5: no hydration when both project_id and conversation_id are None ───
+
+@pytest.mark.asyncio
+async def test_send_message_skips_hydration_when_no_conversation_id(monkeypatch):
+    """When both req.project_id and req.conversation_id are None, _save_message
+    is called without _member_id/_org_id (so no RETURNING fires) and
+    requester_context.project_id remains None.
+    """
+    from routers import chat
+    from core.models import Member
+
+    member = Member(id="member-1", organization_id="default", email="test@example.com", role="user")
+
+    save_message_kwargs_list: list[dict] = []
+    captured_context: dict = {}
+
+    async def fake_assemble_context(conversation_id, message, requester_context):
+        captured_context["project_id"] = requester_context.project_id
+        return [{"role": "system", "content": "sys"}, {"role": "user", "content": message}]
+
+    async def fake_check(*args, **kwargs):
+        return True
+
+    async def fake_create_conversation(member, title, project_id=None):
+        return "conv-new-1"
+
+    async def fake_save_message(*args, **kwargs):
+        save_message_kwargs_list.append(kwargs)
+        return None  # new conversation: no RETURNING
+
+    def fake_extract_explicit(message):
+        return None
+
+    async def fake_classify_intent(message):
+        return {"mode": "chat", "confidence": 0.9, "goal": ""}
+
+    async def fake_stream_completion(context, model_id=None):
+        yield "hello"
+
+    async def fake_extract_and_save(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(chat, "assemble_context", fake_assemble_context)
+    monkeypatch.setattr(chat.permissions, "check", fake_check)
+    monkeypatch.setattr(chat, "_create_conversation", fake_create_conversation)
+    monkeypatch.setattr(chat, "_save_message", fake_save_message)
+    monkeypatch.setattr(chat, "extract_explicit_memory_content", fake_extract_explicit)
+    monkeypatch.setattr(chat, "classify_intent", fake_classify_intent)
+    monkeypatch.setattr(chat, "stream_completion", fake_stream_completion)
+    monkeypatch.setattr(chat, "extract_and_save", fake_extract_and_save)
+    monkeypatch.setattr(chat.audit, "log", AsyncMock())
+    monkeypatch.setattr(chat, "_is_trivial_chat", lambda msg: True)
+
+    class FakeReq:
+        message = "hi"
+        conversation_id = None   # no existing conversation
+        model = None
+        mode = None
+        persona_id = None
+        workspace_id = None
+        project_id = None        # no project_id either
+
+    response = await chat.send_message(FakeReq(), member)
+    body = b""
+    async for chunk in response.body_iterator:
+        body += chunk if isinstance(chunk, bytes) else chunk.encode()
+
+    # _save_message must have been called without _member_id/_org_id,
+    # meaning no RETURNING / hydration SELECT fired.
+    assert save_message_kwargs_list, "_save_message was not called"
+    user_msg_kwargs = save_message_kwargs_list[0]
+    assert user_msg_kwargs.get("_member_id") is None, (
+        "_member_id must be None for a new conversation (no hydration path)"
+    )
+    assert user_msg_kwargs.get("_org_id") is None, (
+        "_org_id must be None for a new conversation (no hydration path)"
+    )
+    # project_id in requester_context must remain None
+    assert captured_context.get("project_id") is None

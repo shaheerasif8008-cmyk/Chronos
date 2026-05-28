@@ -202,7 +202,7 @@ async def _load_project_instructions(project_id: str, org_id: str) -> str | None
     if row is None:
         return None
     instructions = row["instructions"]
-    if not instructions:
+    if not instructions or not instructions.strip():
         return None
     return instructions
 

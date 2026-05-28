@@ -80,7 +80,16 @@ async def _save_message(
     runtime_status: str | None = None,
     parent_message_id: str | None = None,
     pinned: bool | None = None,
-) -> None:
+    _member_id: str | None = None,
+    _org_id: str | None = None,
+) -> dict | None:
+    """Save a message and touch the conversation's updated_at.
+
+    When `_member_id` and `_org_id` are provided the conversation UPDATE is scoped
+    to that member+org (defence-in-depth), and the row's project_id is returned via
+    RETURNING so the caller avoids a second roundtrip.  Without them the UPDATE
+    falls back to id-only scoping and None is returned.
+    """
     messages = await reflect_table("messages")
     conversations = await reflect_table("conversations")
     values: dict[str, Any] = dict(
@@ -104,11 +113,24 @@ async def _save_message(
         values["pinned"] = pinned
     async with engine.begin() as conn:
         await conn.execute(insert(messages).values(**values))
-        await conn.execute(
+        upd = (
             update(conversations)
-            .where(conversations.c.id == conversation_id)
             .values(updated_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc))
         )
+        if _member_id is not None and _org_id is not None:
+            upd = upd.where(
+                conversations.c.id == conversation_id,
+                conversations.c.member_id == _member_id,
+                conversations.c.organization_id == _org_id,
+            )
+            result = await conn.execute(upd.returning(conversations.c.project_id))
+            row = result.mappings().first()
+            return dict(row) if row is not None else None
+        else:
+            await conn.execute(
+                upd.where(conversations.c.id == conversation_id)
+            )
+            return None
 
 
 @router.get("/models")
@@ -700,30 +722,44 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
     conversation_id = req.conversation_id or await _create_conversation(
         member, req.message, project_id=req.project_id
     )
-    await _save_message(conversation_id, "user", req.message)
+    # Save user message and — for existing conversations — piggyback project_id
+    # hydration on the same UPDATE via RETURNING (no extra reflect_table / roundtrip).
+    conv_row = await _save_message(
+        conversation_id,
+        "user",
+        req.message,
+        _member_id=member.id if req.conversation_id is not None else None,
+        _org_id=member.organization_id if req.conversation_id is not None else None,
+    )
     requester_context = RequesterContext.from_member(member)
     requester_context.persona_id = req.persona_id
     requester_context.workspace_id = req.workspace_id
 
     # Resolve project_id: prefer explicit request value; fall back to the
-    # conversation row when re-opening an in-project conversation.
-    if req.project_id is not None:
-        requester_context.project_id = req.project_id
+    # conversation row returned from _save_message (no extra roundtrip).
+    db_project_id: str | None = None
+    if conv_row is not None:
+        db_project_id = conv_row.get("project_id")
     elif req.conversation_id is not None:
-        # Tight SELECT — only fetch project_id, org-scoped for defence-in-depth.
-        conversations = await reflect_table("conversations")
-        async with engine.begin() as conn:
-            conv_row = (
-                await conn.execute(
-                    select(conversations.c.project_id).where(
-                        conversations.c.id == req.conversation_id,
-                        conversations.c.member_id == member.id,
-                        conversations.c.organization_id == member.organization_id,
-                    )
-                )
-            ).mappings().first()
-        if conv_row is not None:
-            requester_context.project_id = conv_row["project_id"]
+        # _save_message returned None, meaning the row was not found or not
+        # owned by this member/org (e.g. out-of-band delete or race).
+        await audit.log(
+            "conversation_lookup_missing",
+            member.id,
+            "chat.message",
+            resource_type="conversations",
+            resource_id=req.conversation_id,
+        )
+
+    # Validate that an explicit req.project_id matches the conversation's stored value.
+    if req.project_id is not None and req.conversation_id is not None:
+        if db_project_id != req.project_id:
+            raise HTTPException(
+                status_code=422,
+                detail="project_id does not match conversation",
+            )
+
+    requester_context.project_id = req.project_id if req.project_id is not None else db_project_id
     explicit_memory = extract_explicit_memory_content(req.message)
 
     if explicit_memory:
