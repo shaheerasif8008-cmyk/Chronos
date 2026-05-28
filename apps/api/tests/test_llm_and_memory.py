@@ -981,3 +981,127 @@ async def test_assemble_context_injects_dynamic_tool_manifest(monkeypatch):
     assert "# Available Runtime Tools" in system
     assert "`browser__search`" in system
     assert "`code__python`" in system
+
+
+def test_memory_authorized_scopes_include_project_and_conversation():
+    from core import memory
+    from core.models import RequesterContext
+
+    pairs = memory._authorized_scope_pairs(
+        RequesterContext(
+            member_id="member-1",
+            workspace_id="workspace-1",
+            project_id="project-1",
+            conversation_id="conversation-1",
+            persona_id="persona-1",
+        )
+    )
+
+    assert ("project", "project-1") in pairs
+    assert ("conversation", "conversation-1") in pairs
+    assert ("workspace", "workspace-1") in pairs
+    assert ("persona", "persona-1") in pairs
+
+
+@pytest.mark.asyncio
+async def test_memory_retrieve_respects_disabled_policy(monkeypatch):
+    from core import memory
+    from core.models import RequesterContext
+
+    audit_events = []
+
+    async def fake_policy(*args, **kwargs):
+        return False
+
+    async def fake_audit_log(*args, **kwargs):
+        audit_events.append((args, kwargs))
+
+    monkeypatch.setattr(memory, "memory_policy_allows", fake_policy)
+    monkeypatch.setattr(memory.audit, "log", fake_audit_log)
+
+    results = await memory.retrieve("remember anything?", RequesterContext(member_id="member-1"))
+
+    assert results == []
+    assert audit_events[0][1]["decision"] == "disabled_by_policy"
+
+
+@pytest.mark.asyncio
+async def test_user_memory_disabled_does_not_disable_project_memory(monkeypatch):
+    from core import memory
+    from core.models import RequesterContext
+
+    async def fake_settings_doc(*args, **kwargs):
+        return {
+            "retrieval_enabled": True,
+            "chat_memory": True,
+            "project_memory": True,
+            "workspace_memory": True,
+            "employee_memory": True,
+            "user_memory": False,
+        }
+
+    monkeypatch.setattr(memory, "get_settings_doc", fake_settings_doc)
+
+    assert await memory.memory_policy_allows(
+        RequesterContext(member_id="member-1", project_id="project-1"),
+        operation="retrieve",
+    )
+    assert not await memory.memory_policy_allows(
+        RequesterContext(member_id="member-1", memory_context="personal"),
+        operation="retrieve",
+    )
+
+
+@pytest.mark.asyncio
+async def test_autonomous_extraction_uses_scope_specific_ids(monkeypatch):
+    from memory import extraction
+    from core.models import RequesterContext
+
+    writes = []
+    published = []
+
+    async def fake_policy(*args, **kwargs):
+        return True
+
+    async def fake_complete_json(*args, **kwargs):
+        return '{"memories":[{"content":"Use project alpha for roadmap work","scope":"project","importance":0.8}]}'
+
+    async def fake_create_memory_entry(**kwargs):
+        writes.append(kwargs)
+        return "memory-1"
+
+    class FakeRedis:
+        async def publish(self, channel, payload):
+            published.append((channel, payload))
+
+    monkeypatch.setattr(extraction, "memory_policy_allows", fake_policy)
+    monkeypatch.setattr(extraction, "complete_json", fake_complete_json)
+    monkeypatch.setattr(extraction, "create_memory_entry", fake_create_memory_entry)
+    monkeypatch.setattr(extraction, "_redis", FakeRedis())
+
+    await extraction.extract_and_save(
+        "conversation-1",
+        "remember this",
+        "ok",
+        RequesterContext(member_id="member-1", project_id="project-1"),
+    )
+
+    assert writes[0]["scope"] == "project"
+    assert writes[0]["scope_id"] == "project-1"
+    assert writes[0]["provenance"]["conversation_id"] == "conversation-1"
+    assert published[0][0] == "memories:conversation-1"
+
+
+@pytest.mark.asyncio
+async def test_memory_router_requires_scope_id_for_project_memory():
+    from fastapi import HTTPException
+    from routers import memory as memory_router
+    from core.models import Member
+
+    member = Member(id="member-1", organization_id="org-1", email="a@example.com")
+
+    assert memory_router._scope_id_for("personal", member, None) == "member-1"
+    assert memory_router._scope_id_for("org", member, None) == "org-1"
+    assert memory_router._scope_id_for("project", member, "project-1") == "project-1"
+    with pytest.raises(HTTPException):
+        memory_router._scope_id_for("project", member, None)

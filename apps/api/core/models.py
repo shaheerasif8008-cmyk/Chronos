@@ -15,6 +15,8 @@ class RequesterContext(BaseModel):
     org_id: str = "default"
     member_id: str
     workspace_id: str | None = None
+    project_id: str | None = None
+    conversation_id: str | None = None
     persona_id: str | None = None
     task_id: str | None = None
     role: str = "user"
@@ -62,6 +64,15 @@ class MemoryEntry(BaseModel):
     source: str = "stub"
     scope_id: str = "default"
     importance_score: float = 0.5
+    confidence_score: float = 1.0
+    status: str = "active"
+    is_pinned: bool = False
+    is_archived: bool = False
+    is_sensitive: bool = False
+    staleness: str = "fresh"
+    provenance: dict | None = None
+    conflict_group_id: str | None = None
+    supersedes_memory_id: str | None = None
     is_deleted: bool = False
     created_by: str | None = None
     created_at: datetime | None = None

@@ -10,8 +10,9 @@ from core.config import settings
 from core.db import engine, reflect_table
 from core.embeddings import embed
 from core.llm import complete_json
-from core.memory_writes import EXPECTED_EMBEDDING_DIMENSIONS
-from core.models import MemoryEntry, RequesterContext
+from core.memory_writes import EXPECTED_EMBEDDING_DIMENSIONS, log_memory_access
+from core.models import Member, MemoryEntry, RequesterContext
+from core.settings_store import get_settings_doc
 
 
 async def _retrieve_recent_memories(
@@ -26,10 +27,14 @@ async def _retrieve_recent_memories(
                 text(
                     f"""
                     SELECT id, organization_id, region, scope, scope_id, content, source,
-                           importance_score, is_deleted, created_by, created_at
+                           importance_score, confidence_score, status, is_pinned, is_archived,
+                           is_sensitive, staleness, provenance, conflict_group_id,
+                           supersedes_memory_id, is_deleted, created_by, created_at
                     FROM memory_entries
                     WHERE organization_id = :org_id
                       AND is_deleted = FALSE
+                      AND status = 'active'
+                      AND is_archived = FALSE
                       AND ({scope_filter})
                     ORDER BY created_at DESC
                     LIMIT 10
@@ -53,6 +58,10 @@ def _authorized_scope_pairs(requester_context: RequesterContext) -> list[tuple[s
     pairs = [("org", requester_context.org_id)]
     if requester_context.workspace_id:
         pairs.append(("workspace", requester_context.workspace_id))
+    if requester_context.project_id:
+        pairs.append(("project", requester_context.project_id))
+    if requester_context.conversation_id:
+        pairs.append(("conversation", requester_context.conversation_id))
     if requester_context.persona_id:
         pairs.append(("persona", requester_context.persona_id))
     if requester_context.member_id:
@@ -61,6 +70,43 @@ def _authorized_scope_pairs(requester_context: RequesterContext) -> list[tuple[s
     if requester_context.role in {"owner", "admin"}:
         pairs.append(("restricted", requester_context.org_id))
     return pairs
+
+
+async def memory_policy_allows(requester_context: RequesterContext, *, operation: str) -> bool:
+    member = Member(
+        id=requester_context.member_id,
+        organization_id=requester_context.org_id,
+        region="us",
+        email="memory-policy@local",
+        role=requester_context.role,
+    )
+    try:
+        policy = await get_settings_doc(member, "memory")
+    except Exception:
+        return True
+    if operation == "retrieve" and not policy.get("retrieval_enabled", True):
+        return False
+    if operation == "write" and not policy.get("auto_save", True):
+        return False
+    if requester_context.memory_context == "chat" and not policy.get("chat_memory", True):
+        return False
+    if requester_context.workspace_id and not policy.get("workspace_memory", True):
+        return False
+    if requester_context.project_id and not policy.get("project_memory", True):
+        return False
+    if requester_context.persona_id and not policy.get("employee_memory", True):
+        return False
+    personal_memory_requested = (
+        requester_context.memory_context == "personal"
+        or not any([requester_context.workspace_id, requester_context.project_id, requester_context.conversation_id, requester_context.persona_id, requester_context.task_id])
+    )
+    if personal_memory_requested and not policy.get("user_memory", True):
+        return False
+    if requester_context.project_id and requester_context.project_id in set(policy.get("disabled_projects") or []):
+        return False
+    if requester_context.conversation_id and requester_context.conversation_id in set(policy.get("disabled_conversations") or []):
+        return False
+    return True
 
 
 async def expand_query(query: str, requester_context: RequesterContext) -> list[str]:
@@ -276,6 +322,16 @@ async def add_task_scratchpad_memory(
 
 
 async def retrieve(query: str, requester_context: RequesterContext) -> list[MemoryEntry]:
+    if not await memory_policy_allows(requester_context, operation="retrieve"):
+        await audit.log(
+            "memory_retrieve",
+            requester_context.member_id,
+            "memory.retrieve",
+            resource_type="memory_entries",
+            payload={"reason": "memory_policy_disabled", "memory_context": requester_context.memory_context},
+            decision="disabled_by_policy",
+        )
+        return []
     expanded_queries = await expand_query(query, requester_context)
     scratchpad = await _retrieve_task_scratchpad(requester_context)
     embeddings: list[tuple[str, list[float]]] = []
@@ -319,11 +375,16 @@ async def retrieve(query: str, requester_context: RequesterContext) -> list[Memo
                     text(
                         f"""
                         SELECT id, organization_id, region, scope, scope_id, content, source,
-                               importance_score, is_deleted, created_by, created_at,
+                               importance_score, confidence_score, status, is_pinned,
+                               is_archived, is_sensitive, staleness, provenance,
+                               conflict_group_id, supersedes_memory_id, is_deleted,
+                               created_by, created_at,
                                embedding <=> (:embedding)::vector AS distance
                         FROM memory_entries
                         WHERE organization_id = :org_id
                           AND is_deleted = FALSE
+                          AND status = 'active'
+                          AND is_archived = FALSE
                           AND embedding IS NOT NULL
                           AND ({scope_filter})
                         ORDER BY embedding <=> (:embedding)::vector
@@ -340,6 +401,12 @@ async def retrieve(query: str, requester_context: RequesterContext) -> list[Memo
                 if existing is None or float(row_dict.get("distance") or 1.0) < float(existing.get("distance") or 1.0):
                     rows_by_id[str(row_dict["id"])] = row_dict
     ranked = _dedupe_ranked_rows(_rank_memory_rows(list(rows_by_id.values())), limit=max(10 - len(scratchpad), 0))
+    await log_memory_access(
+        [str(row.get("id")) for row in ranked],
+        requester_context=requester_context,
+        action="retrieve",
+        surface=requester_context.memory_context,
+    )
     await audit.log(
         "memory_retrieve",
         requester_context.member_id,

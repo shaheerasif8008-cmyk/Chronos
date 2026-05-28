@@ -31,11 +31,18 @@ type Message = {
   created_at?: string;
   tool_traces?: ToolTrace[];
   artifacts?: ArtifactRef[];
+  saved_memories?: MemoryEntry[];
+  used_memories?: MemoryEntry[];
   thinking?: boolean;
 };
 type ToolTrace = { id: string; tool: string; summary: string; status: MessageStatus };
 type ArtifactRef = { id: string; title: string; kind: string; mime_type?: string; size_bytes?: number };
-type MemoryEntry = { id: string; scope: string; scope_id: string; content: string; source: string; importance_score?: number; created_by?: string | null; created_at?: string };
+type MemoryEntry = {
+  id: string; scope: string; scope_id: string; content: string; source: string;
+  importance_score?: number; confidence_score?: number; status?: string; is_pinned?: boolean;
+  is_archived?: boolean; is_sensitive?: boolean; staleness?: string; provenance?: Record<string, unknown>;
+  conflict_group_id?: string | null; supersedes_memory_id?: string | null; created_by?: string | null; created_at?: string
+};
 type Connector = {
   id: string;
   name?: string;
@@ -1003,6 +1010,8 @@ function ChatScreen({
 
     type StreamEvent = {
       type: string; content?: string; conversation_id?: string; task_id?: string;
+      entry_id?: string; scope?: string; source?: string; undo_expires?: string;
+      memory?: MemoryEntry;
       event?: { type: string; tool?: string | null; summary?: string; error?: string; confidence?: number; iteration?: number; args_preview?: Record<string, unknown>; step?: { description?: string }; approval_ids?: string[]; goal?: string };
       artifact?: { artifact_id: string; title?: string; kind?: string; mime_type?: string; size_bytes?: number };
     };
@@ -1102,6 +1111,31 @@ function ChatScreen({
           const existing = last.artifacts ?? [];
           if (existing.some(x => x.id === ref.id)) return updated;
           return [...updated.slice(0, -1), { ...last, artifacts: [...existing, ref] }];
+        });
+      } else if (ev.type === "memory_saved" && ev.entry_id) {
+        const memoryRef: MemoryEntry = {
+          id: ev.entry_id,
+          content: ev.content ?? "Saved memory",
+          scope: ev.scope ?? "org",
+          scope_id: "",
+          source: ev.source ?? "autonomous",
+        };
+        setMessages(prev => {
+          const updated = [...prev];
+          const last = updated[updated.length - 1];
+          if (last?.role !== "assistant") return updated;
+          const existing = last.saved_memories ?? [];
+          if (existing.some(memory => memory.id === memoryRef.id)) return updated;
+          return [...updated.slice(0, -1), { ...last, saved_memories: [...existing, memoryRef] }];
+        });
+      } else if (ev.type === "memory_used" && ev.memory) {
+        setMessages(prev => {
+          const updated = [...prev];
+          const last = updated[updated.length - 1];
+          if (last?.role !== "assistant") return updated;
+          const existing = last.used_memories ?? [];
+          if (existing.some(memory => memory.id === ev.memory!.id)) return updated;
+          return [...updated.slice(0, -1), { ...last, used_memories: [...existing, ev.memory!] }];
         });
       } else if (ev.type === "task_created" && ev.task_id) {
         const taskId = ev.task_id;
@@ -1298,7 +1332,7 @@ function ChatScreen({
               {messages.map((m, i) => (
                 m.role === "user"
                   ? <UserMessage key={m.id ?? `user-${i}`} content={m.content}/>
-                  : <AssistantMessage key={m.id ?? `assistant-${i}`} content={m.content} status={m.status ?? "complete"} persona={activePersona} toolTraces={m.tool_traces} artifacts={m.artifacts} thinking={m.thinking}/>
+                  : <AssistantMessage key={m.id ?? `assistant-${i}`} content={m.content} status={m.status ?? "complete"} persona={activePersona} toolTraces={m.tool_traces} artifacts={m.artifacts} savedMemories={m.saved_memories} usedMemories={m.used_memories} thinking={m.thinking}/>
               ))}
               {streaming && messages[messages.length - 1]?.role !== "assistant" && (
                 <div className="flex gap-4">
@@ -1481,7 +1515,35 @@ function ArtifactCard({ artifact }: { artifact: ArtifactRef }) {
   );
 }
 
-function AssistantMessage({ content, status, persona, toolTraces, artifacts, thinking }: { content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[]; artifacts?: ArtifactRef[]; thinking?: boolean }) {
+function MemoryChip({ memory, mode }: { memory: MemoryEntry; mode: "saved" | "used" }) {
+  const [hidden, setHidden] = useState(false);
+  if (hidden) return null;
+  async function undo() {
+    try {
+      await apiFetch(`/memory/${memory.id}/undo`, { method: "POST" });
+      setHidden(true);
+    } catch {
+      try {
+        await apiFetch(`/memory/${memory.id}`, { method: "DELETE" });
+        setHidden(true);
+      } catch { /* keep visible */ }
+    }
+  }
+  return (
+    <span className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md border text-[11.5px]"
+          style={{ borderColor: "var(--border-soft)", background: "var(--surface)", color: "var(--text-muted)" }}>
+      <IC.Memory size={11}/>
+      <span>{mode === "saved" ? "Saved" : "Used"} · {memory.scope}</span>
+      {mode === "saved" && (
+        <button onClick={undo} className="smooth hover:text-[var(--danger)]" title="Undo memory">
+          <IC.X size={11}/>
+        </button>
+      )}
+    </span>
+  );
+}
+
+function AssistantMessage({ content, status, persona, toolTraces, artifacts, savedMemories, usedMemories, thinking }: { content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[]; artifacts?: ArtifactRef[]; savedMemories?: MemoryEntry[]; usedMemories?: MemoryEntry[]; thinking?: boolean }) {
   const hasTraces = !!(toolTraces && toolTraces.length > 0);
   const isStreaming = status === "streaming";
   return (
@@ -1523,6 +1585,13 @@ function AssistantMessage({ content, status, persona, toolTraces, artifacts, thi
         {artifacts && artifacts.length > 0 && (
           <div className="mt-3 space-y-2">
             {artifacts.map(a => <ArtifactCard key={a.id} artifact={a} />)}
+          </div>
+        )}
+
+        {((savedMemories && savedMemories.length > 0) || (usedMemories && usedMemories.length > 0)) && (
+          <div className="mt-3 flex items-center gap-1.5 flex-wrap">
+            {(savedMemories ?? []).map(memory => <MemoryChip key={`saved-${memory.id}`} memory={memory} mode="saved"/>)}
+            {(usedMemories ?? []).map(memory => <MemoryChip key={`used-${memory.id}`} memory={memory} mode="used"/>)}
           </div>
         )}
 
@@ -2332,6 +2401,10 @@ function ApprovalsScreen({ onDecision }: { onDecision: () => void }) {
 const MEMORY_SCOPES = [
   { id: "org", label: "Organization", description: "Shared across the entire organization" },
   { id: "workspace", label: "Workspace", description: "Shared within your workspace" },
+  { id: "project", label: "Project", description: "Scoped to a project" },
+  { id: "conversation", label: "Chat", description: "Scoped to this chat" },
+  { id: "persona", label: "Persona", description: "Scoped to an assistant persona" },
+  { id: "task", label: "Task scratchpad", description: "Working memory for a task" },
   { id: "personal", label: "Personal", description: "Private to you" },
 ];
 
@@ -2343,16 +2416,20 @@ function MemoryScreen() {
   const [adding, setAdding] = useState(false);
   const [newContent, setNewContent] = useState("");
   const [newScope, setNewScope] = useState("org");
+  const [newSource, setNewSource] = useState("explicit");
+  const [includeArchived, setIncludeArchived] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
+  const [importText, setImportText] = useState("");
   const [toast, setToast] = useState<{ kind: "ok" | "danger"; text: string } | null>(null);
 
   const loadMemories = useCallback(() => {
     setLoading(true);
-    apiFetch("/memory/")
+    apiFetch(`/memory/?include_archived=${includeArchived ? "true" : "false"}`)
       .then(r => r.json())
       .then((data: MemoryEntry[]) => setMemories(data))
       .catch(() => {})
       .finally(() => setLoading(false));
-  }, []);
+  }, [includeArchived]);
 
   useEffect(() => {
     loadMemories();
@@ -2380,7 +2457,7 @@ function MemoryScreen() {
     try {
       await apiFetch("/memory/", {
         method: "POST",
-        body: JSON.stringify({ content: newContent, scope: newScope, scope_id: "default", source: "manual" }),
+        body: JSON.stringify({ content: newContent, scope: newScope, source: newSource, provenance: { source: "memory_control_center" } }),
       });
       await loadMemories();
       setAdding(false);
@@ -2407,15 +2484,40 @@ function MemoryScreen() {
     } catch { /* silently */ }
   }
 
+  async function importMemories() {
+    const lines = importText.split("\n").map(line => line.trim()).filter(Boolean);
+    if (lines.length === 0) return;
+    try {
+      await apiFetch("/memory/import", {
+        method: "POST",
+        body: JSON.stringify({ memories: lines.map(content => ({ content, scope: "org", source: "imported", importance_score: 0.7 })) }),
+      });
+      setImportText("");
+      setImportOpen(false);
+      await loadMemories();
+      setToast({ kind: "ok", text: `Imported ${lines.length} memories.` });
+    } catch {
+      setToast({ kind: "danger", text: "Memory import failed." });
+    }
+  }
+
+  function exportMemories() {
+    window.open(`${apiBase()}/memory/export.csv`, "_blank", "noopener,noreferrer");
+  }
+
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-y-auto">
       <PageHeader
         title="Memory"
         subtitle="What Chronos remembers about you and your workspace. Save anything important."
         right={
-          <button onClick={() => setAdding(true)} className="btn btn-secondary btn-sm">
-            <IC.Plus size={14}/> Add a memory
-          </button>
+          <div className="flex items-center gap-2">
+            <button onClick={exportMemories} className="btn btn-ghost btn-sm"><IC.External size={14}/> Export</button>
+            <button onClick={() => setImportOpen(v => !v)} className="btn btn-ghost btn-sm"><IC.ArrowUp size={14}/> Import</button>
+            <button onClick={() => setAdding(true)} className="btn btn-secondary btn-sm">
+              <IC.Plus size={14}/> Add a memory
+            </button>
+          </div>
         }
       />
 
@@ -2435,6 +2537,11 @@ function MemoryScreen() {
           <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search memories…"
                  className="bg-transparent text-[13.5px] outline-none w-48" style={{ color: "var(--text)" }}/>
         </div>
+
+        <label className="flex items-center gap-2 text-[12.5px]" style={{ color: "var(--text-muted)" }}>
+          <input type="checkbox" checked={includeArchived} onChange={e => setIncludeArchived(e.target.checked)}/>
+          Show archived
+        </label>
 
         <span className="text-[13px] ml-auto" style={{ color: "var(--text-dim)" }}>
           {filtered.length} {filtered.length === 1 ? "memory" : "memories"}
@@ -2476,6 +2583,11 @@ function MemoryScreen() {
                         style={{ color: "var(--text)" }}>
                   {MEMORY_SCOPES.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}
                 </select>
+                <select value={newSource} onChange={e => setNewSource(e.target.value)}
+                        className="text-[12.5px] surface border border-soft rounded-md px-2 py-1 outline-none"
+                        style={{ color: "var(--text)" }}>
+                  {["explicit", "autonomous", "synthesized", "imported", "connector-derived"].map(s => <option key={s} value={s}>{s}</option>)}
+                </select>
                 {newScope !== "org" && (
                   <span className="text-[11.5px]" style={{ color: "var(--text-dim)" }}>
                     {MEMORY_SCOPES.find(s => s.id === newScope)?.description}
@@ -2495,6 +2607,19 @@ function MemoryScreen() {
           </div>
         )}
 
+        {importOpen && (
+          <div className="mem-card p-4 fadeup">
+            <textarea value={importText} onChange={e => setImportText(e.target.value)} rows={4}
+                      placeholder="Paste one memory per line…"
+                      className="w-full bg-transparent outline-none text-[14px] resize-none border border-soft rounded-md p-2"
+                      style={{ color: "var(--text)" }}/>
+            <div className="mt-2 flex justify-end gap-2">
+              <button onClick={() => setImportOpen(false)} className="btn btn-ghost btn-sm">Cancel</button>
+              <button onClick={() => void importMemories()} className="btn btn-accent btn-sm">Import</button>
+            </div>
+          </div>
+        )}
+
         {loading && (
           <div className="space-y-3">
             {[1,2,3].map(i => (
@@ -2510,15 +2635,17 @@ function MemoryScreen() {
                       sub={memories.length === 0 ? "Chronos saves memories automatically during conversations. You can also add them manually." : "No memories match your current filter."}/>
         )}
 
-        {filtered.map(m => <MemoryCard key={m.id} m={m} onDelete={deleteMemory} onUpdate={updateMemory}/>)}
+        {filtered.map(m => <MemoryCard key={m.id} m={m} onDelete={deleteMemory} onUpdate={updateMemory} onReload={loadMemories}/>)}
       </div>
     </div>
   );
 }
 
-function MemoryCard({ m, onDelete, onUpdate }: { m: MemoryEntry; onDelete: (id: string) => void; onUpdate: (id: string, content: string, importance_score?: number) => Promise<void> }) {
+function MemoryCard({ m, onDelete, onUpdate, onReload }: { m: MemoryEntry; onDelete: (id: string) => void; onUpdate: (id: string, content: string, importance_score?: number) => Promise<void>; onReload: () => void }) {
   const [hover, setHover] = useState(false);
   const [editing, setEditing] = useState(false);
+  const [logsOpen, setLogsOpen] = useState(false);
+  const [logs, setLogs] = useState<Array<Record<string, unknown>>>([]);
   const [draft, setDraft] = useState(m.content);
   const [saving, setSaving] = useState(false);
   const isPrivate = m.scope === "restricted";
@@ -2534,6 +2661,24 @@ function MemoryCard({ m, onDelete, onUpdate }: { m: MemoryEntry; onDelete: (id: 
     } finally {
       setSaving(false);
     }
+  }
+
+  async function patchMemory(values: Record<string, unknown>) {
+    await apiFetch(`/memory/${m.id}`, { method: "PATCH", body: JSON.stringify({ content: m.content, ...values }) });
+    onReload();
+  }
+
+  async function archive() {
+    await apiFetch(`/memory/${m.id}/archive?archived=${m.is_archived ? "false" : "true"}`, { method: "POST" });
+    onReload();
+  }
+
+  async function loadLogs() {
+    if (!logsOpen) {
+      const data = await apiFetch(`/memory/${m.id}/access-logs`).then(r => r.json()).catch(() => []);
+      setLogs(data);
+    }
+    setLogsOpen(v => !v);
   }
 
   return (
@@ -2563,10 +2708,39 @@ function MemoryCard({ m, onDelete, onUpdate }: { m: MemoryEntry; onDelete: (id: 
             </span>
             {m.scope && <><span>·</span><span>{m.scope}</span></>}
             {typeof m.importance_score === "number" && <><span>·</span><span>{Math.round(m.importance_score * 100)}% importance</span></>}
+            {typeof m.confidence_score === "number" && <><span>·</span><span>{Math.round(m.confidence_score * 100)}% confidence</span></>}
+            {m.staleness && <><span>·</span><span>{m.staleness}</span></>}
+            {m.is_pinned && <><span>·</span><span>pinned</span></>}
+            {m.is_archived && <><span>·</span><span>archived</span></>}
+            {m.is_sensitive && <><span>·</span><span>sensitive</span></>}
             {m.created_by && <><span>·</span><span>by {m.created_by}</span></>}
           </div>
+          {m.provenance && Object.keys(m.provenance).length > 0 && (
+            <div className="mt-2 text-[11.5px] truncate" style={{ color: "var(--text-dim)" }}>
+              provenance: {JSON.stringify(m.provenance)}
+            </div>
+          )}
+          {logsOpen && (
+            <div className="mt-2 rounded-md border border-soft p-2 text-[11.5px] space-y-1" style={{ color: "var(--text-dim)" }}>
+              {logs.length === 0 ? "No usage logs yet." : logs.slice(0, 5).map((log, index) => (
+                <div key={String(log.id ?? index)}>{String(log.action ?? "access")} · {String(log.surface ?? "api")} · {String(log.created_at ?? "")}</div>
+              ))}
+            </div>
+          )}
         </div>
         <div className="flex items-center gap-1 flex-shrink-0" style={{ opacity: hover ? 1 : 0, transition: "opacity 0.15s" }}>
+          <button onClick={() => void patchMemory({ is_pinned: !m.is_pinned })} className="btn btn-ghost btn-sm btn-icon" title={m.is_pinned ? "Unpin" : "Pin"}>
+            <IC.Check size={13}/>
+          </button>
+          <button onClick={() => void patchMemory({ staleness: m.staleness === "stale" ? "fresh" : "stale" })} className="btn btn-ghost btn-sm btn-icon" title="Toggle stale">
+            <IC.Clock size={13}/>
+          </button>
+          <button onClick={() => void loadLogs()} className="btn btn-ghost btn-sm btn-icon" title="Usage logs">
+            <IC.Audit size={13}/>
+          </button>
+          <button onClick={() => void archive()} className="btn btn-ghost btn-sm btn-icon" title={m.is_archived ? "Unarchive" : "Archive"}>
+            <IC.Folder size={13}/>
+          </button>
           <button onClick={() => setEditing(true)} className="btn btn-ghost btn-sm btn-icon" title="Edit">
             <IC.Pencil size={13}/>
           </button>
@@ -3106,7 +3280,7 @@ function RuntimeSettings({ data, patch, health }: { data: Record<string, unknown
 
 function MemorySettings({ data, patch, stats, setToast, setConfirm, reload }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void; stats: { active: number; deleted: number }; setToast: (t: { kind: "ok" | "danger"; text: string }) => void; setConfirm: (c: { title: string; text: string; required?: string; action: (typed: string) => Promise<void> } | null) => void; reload: () => Promise<void> }) {
   async function purge() { try { await apiFetch("/settings/memory/purge", { method: "POST", body: JSON.stringify({ confirmation: "PURGE MEMORY" }) }); setToast({ kind: "ok", text: "Memory purged" }); await reload(); } catch (exc) { setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to purge memory" }); } }
-  return <><SettingsSection title="Memory policy" note={`${stats.active} active memories, ${stats.deleted} deleted.`}><SettingsField label="Workspace memory"><Toggle label="Workspace memory" checked={Boolean(data.workspace_memory)} onChange={workspace_memory => patch({ workspace_memory })}/></SettingsField><SettingsField label="Employee memory"><Toggle label="Employee memory" checked={Boolean(data.employee_memory)} onChange={employee_memory => patch({ employee_memory })}/></SettingsField><SettingsField label="User memory"><Toggle label="User memory" checked={Boolean(data.user_memory)} onChange={user_memory => patch({ user_memory })}/></SettingsField><SettingsField label="Retention days"><TextInput ariaLabel="Memory retention" value={val(data, "retention_days")} onChange={retention_days => patch({ retention_days: Number(retention_days) || 0 })}/></SettingsField><SettingsField label="Review required"><Toggle label="Memory review required" checked={Boolean(data.review_required)} onChange={review_required => patch({ review_required })}/></SettingsField><SettingsField label="Auto-save memory"><Toggle label="Auto-save memory" checked={Boolean(data.auto_save)} onChange={auto_save => patch({ auto_save })}/></SettingsField><SettingsField label="Sensitive detection"><Toggle label="Sensitive memory detection" checked={Boolean(data.sensitive_detection)} onChange={sensitive_detection => patch({ sensitive_detection })}/></SettingsField></SettingsSection><SettingsSection title="Memory danger zone"><SettingsField label="Export memory"><button className="btn btn-sm" disabled title="Memory export endpoint is not implemented">Export unavailable</button></SettingsField><SettingsField label="Purge all memory" hint="Requires typed confirmation and writes an audit entry."><button className="btn btn-danger-soft btn-sm" onClick={() => setConfirm({ title: "Purge memory", text: "This soft-deletes all active memory entries in this workspace.", required: "PURGE MEMORY", action: async () => purge() })}>Purge memory</button></SettingsField></SettingsSection></>;
+  return <><SettingsSection title="Memory policy" note={`${stats.active} active memories, ${stats.deleted} deleted.`}><SettingsField label="Retrieval enabled"><Toggle label="Retrieval enabled" checked={data.retrieval_enabled !== false} onChange={retrieval_enabled => patch({ retrieval_enabled })}/></SettingsField><SettingsField label="Chat memory"><Toggle label="Chat memory" checked={data.chat_memory !== false} onChange={chat_memory => patch({ chat_memory })}/></SettingsField><SettingsField label="Project memory"><Toggle label="Project memory" checked={data.project_memory !== false} onChange={project_memory => patch({ project_memory })}/></SettingsField><SettingsField label="Workspace memory"><Toggle label="Workspace memory" checked={Boolean(data.workspace_memory)} onChange={workspace_memory => patch({ workspace_memory })}/></SettingsField><SettingsField label="Employee memory"><Toggle label="Employee memory" checked={Boolean(data.employee_memory)} onChange={employee_memory => patch({ employee_memory })}/></SettingsField><SettingsField label="User memory"><Toggle label="User memory" checked={Boolean(data.user_memory)} onChange={user_memory => patch({ user_memory })}/></SettingsField><SettingsField label="Connector-derived memory"><Toggle label="Connector memory" checked={data.connector_memory !== false} onChange={connector_memory => patch({ connector_memory })}/></SettingsField><SettingsField label="Retention days"><TextInput ariaLabel="Memory retention" value={val(data, "retention_days")} onChange={retention_days => patch({ retention_days: Number(retention_days) || 0 })}/></SettingsField><SettingsField label="Review required"><Toggle label="Memory review required" checked={Boolean(data.review_required)} onChange={review_required => patch({ review_required })}/></SettingsField><SettingsField label="Auto-save memory"><Toggle label="Auto-save memory" checked={Boolean(data.auto_save)} onChange={auto_save => patch({ auto_save })}/></SettingsField><SettingsField label="Sensitive detection"><Toggle label="Sensitive memory detection" checked={Boolean(data.sensitive_detection)} onChange={sensitive_detection => patch({ sensitive_detection })}/></SettingsField></SettingsSection><SettingsSection title="Memory danger zone"><SettingsField label="Export memory"><button className="btn btn-sm" onClick={() => window.open(`${apiBase()}/memory/export.csv`, "_blank", "noopener,noreferrer")}>Export CSV</button></SettingsField><SettingsField label="Purge all memory" hint="Requires typed confirmation and writes an audit entry."><button className="btn btn-danger-soft btn-sm" onClick={() => setConfirm({ title: "Purge memory", text: "This soft-deletes all active memory entries in this workspace.", required: "PURGE MEMORY", action: async () => purge() })}>Purge memory</button></SettingsField></SettingsSection></>;
 }
 
 function ToolsSettings({ data, patch, connectors, capabilities, health }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void; connectors: SettingsOverview["connectors"]; capabilities: SettingsOverview["capabilities"]; health: NonNullable<SettingsOverview["runtime_health"]["connectors"]> }) {

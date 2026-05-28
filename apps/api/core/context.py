@@ -100,7 +100,16 @@ async def assemble_context(
     conversation_id: str,
     message: str,
     requester_context: RequesterContext,
-) -> list[dict[str, str]]:
+) -> list[dict[str, str]] | tuple[list[dict[str, str]], list[memory.MemoryEntry]]:
+    messages, _ = await assemble_context_with_memories(conversation_id, message, requester_context)
+    return messages
+
+
+async def assemble_context_with_memories(
+    conversation_id: str,
+    message: str,
+    requester_context: RequesterContext,
+) -> tuple[list[dict[str, str]], list[memory.MemoryEntry]]:
     # ── Category 7: establish token budget ──────────────────────────────────
     budget = settings.max_context_tokens - settings.response_reserve_tokens
     # Reserve half the budget for history; the system layers get the other half.
@@ -168,7 +177,7 @@ async def assemble_context(
     # ── Layer 7: conversation history (with compaction) ─────────────────────
     history = await _compact_history(conversation_id, budget_tokens=history_budget)
 
-    return [{"role": "system", "content": base}, *history, {"role": "user", "content": message}]
+    return [{"role": "system", "content": base}, *history, {"role": "user", "content": message}], memories
 
 
 async def _load_task_context(task_id: str) -> str:

@@ -10,7 +10,7 @@ from sqlalchemy import delete, insert, select, update
 from core import audit, permissions
 from core.auth import get_current_member
 from core.config import settings
-from core.context import assemble_context
+from core.context import assemble_context_with_memories
 from core.db import engine, reflect_table
 from core.intent import classify_intent
 from core.llm import available_chat_models, normalize_chat_model, stream_completion
@@ -280,6 +280,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
     requester_context = RequesterContext.from_member(member)
     requester_context.persona_id = req.persona_id
     requester_context.workspace_id = req.workspace_id
+    requester_context.conversation_id = conversation_id
     explicit_memory = extract_explicit_memory_content(req.message)
 
     if explicit_memory:
@@ -338,10 +339,12 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
             headers=_SSE_HEADERS,
         )
 
-    context = await assemble_context(conversation_id, req.message, requester_context)
+    context, used_memories = await assemble_context_with_memories(conversation_id, req.message, requester_context)
 
     async def stream():
         yield f"data: {json.dumps({'type': 'conversation', 'conversation_id': conversation_id})}\n\n"
+        for mem in used_memories:
+            yield f"data: {json.dumps({'type': 'memory_used', 'memory': mem.model_dump(mode='json')})}\n\n"
         full = ""
         async for token in stream_completion(context, model_id=selected_model):
             full += token
