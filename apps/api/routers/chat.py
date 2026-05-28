@@ -704,6 +704,26 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
     requester_context = RequesterContext.from_member(member)
     requester_context.persona_id = req.persona_id
     requester_context.workspace_id = req.workspace_id
+
+    # Resolve project_id: prefer explicit request value; fall back to the
+    # conversation row when re-opening an in-project conversation.
+    if req.project_id is not None:
+        requester_context.project_id = req.project_id
+    elif req.conversation_id is not None:
+        # Tight SELECT — only fetch project_id, org-scoped for defence-in-depth.
+        conversations = await reflect_table("conversations")
+        async with engine.begin() as conn:
+            conv_row = (
+                await conn.execute(
+                    select(conversations.c.project_id).where(
+                        conversations.c.id == req.conversation_id,
+                        conversations.c.member_id == member.id,
+                        conversations.c.organization_id == member.organization_id,
+                    )
+                )
+            ).mappings().first()
+        if conv_row is not None:
+            requester_context.project_id = conv_row["project_id"]
     explicit_memory = extract_explicit_memory_content(req.message)
 
     if explicit_memory:

@@ -129,6 +129,14 @@ async def assemble_context(
     if persona_prompt and _estimate_tokens(base + persona_prompt) <= system_budget:
         base += f"\n\n# Your Identity\n{persona_prompt}"
 
+    # ── Layer 3b: project instructions ─────────────────────────────────────
+    if requester_context.project_id is not None:
+        project_instructions = await _load_project_instructions(
+            requester_context.project_id, requester_context.org_id
+        )
+        if project_instructions and _estimate_tokens(base + project_instructions) <= system_budget:
+            base += f"\n\n# Project Instructions\n{project_instructions}"
+
     # ── Layer 4: skills (Category 6: connector-aware, progressive) ──────────
     skill_ids = await find_relevant_skills(message)
     skill_index = {s["id"]: s for s in load_skill_index()}
@@ -169,6 +177,34 @@ async def assemble_context(
     history = await _compact_history(conversation_id, budget_tokens=history_budget)
 
     return [{"role": "system", "content": base}, *history, {"role": "user", "content": message}]
+
+
+async def _load_project_instructions(project_id: str, org_id: str) -> str | None:
+    """Return the project's instructions text, or None if absent / not in caller's org.
+
+    Defense-in-depth: filters on BOTH id AND organization_id so a caller cannot
+    obtain instructions from a project in a different tenant, even if they supply
+    the correct project UUID.
+    """
+    try:
+        projects = await reflect_table("projects")
+    except Exception:
+        return None
+    async with engine.begin() as conn:
+        row = (
+            await conn.execute(
+                select(projects.c.instructions).where(
+                    projects.c.id == project_id,
+                    projects.c.organization_id == org_id,
+                )
+            )
+        ).mappings().first()
+    if row is None:
+        return None
+    instructions = row["instructions"]
+    if not instructions:
+        return None
+    return instructions
 
 
 async def _load_task_context(task_id: str) -> str:
