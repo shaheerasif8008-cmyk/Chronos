@@ -260,7 +260,7 @@ async def test_doc_parse_routes_through_broker(monkeypatch):
 
     monkeypatch.setattr("parsing.tool.doc_connector.execute", fake_doc_exec)
 
-    agent = AgentContext(id="a1", org_id="default", task_id="t1")
+    agent = AgentContext(id="a1", org_id="default", task_id="t1", member_id="m1")
     result = await tb.execute(agent, "doc.parse", {"artifact_id": "x"})
     assert result.summary == "ok"
     assert "tool_call" in audited and "tool_result" in audited
