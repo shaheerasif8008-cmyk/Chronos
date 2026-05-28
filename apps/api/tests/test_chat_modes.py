@@ -226,7 +226,7 @@ async def test_send_message_fast_path_persists_mode(monkeypatch):
     async def fake_permissions_check(*args, **kwargs):
         return True
 
-    async def fake_create_conversation(member, title):
+    async def fake_create_conversation(member, title, **kwargs):
         return "conv-new"
 
     async def fake_assemble_context(conv_id, msg, ctx):
