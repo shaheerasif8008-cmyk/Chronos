@@ -250,8 +250,20 @@ async def test_doc_parse_routes_through_broker(monkeypatch):
     async def fake_check(*a, **k):
         return True
 
+    async def fake_rate_limit(*a, **k):
+        return None
+
+    async def fake_loop_check(*a, **k):
+        return None
+
+    async def fake_tool_policy(*a, **k):
+        return {}
+
     monkeypatch.setattr(tb.audit, "log", fake_log)
     monkeypatch.setattr(tb.permissions, "check", fake_check)
+    monkeypatch.setattr(tb, "_check_rate_limit", fake_rate_limit)
+    monkeypatch.setattr(tb, "_check_loop", fake_loop_check)
+    monkeypatch.setattr(tb, "tool_policy", fake_tool_policy)
     # connector_tier is imported into tool_broker's namespace; patch it there.
     monkeypatch.setattr(tb, "connector_tier", AsyncMock(return_value="live"))
 
