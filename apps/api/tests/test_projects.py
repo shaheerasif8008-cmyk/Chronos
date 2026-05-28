@@ -60,6 +60,7 @@ class _Clause:
     def limit(self, *a): return self
     def offset(self, *a): return self
     def join(self, *a, **kw): return self
+    def with_for_update(self, *a, **kw): return self
 
 
 def _noop_select(*a, **kw): return _Clause()
@@ -435,10 +436,12 @@ async def test_add_member_by_owner_succeeds(monkeypatch):
 
     member = _make_member()
     mem_row = {"id": "pm-1", "project_id": "proj-1", "member_id": "member-1", "role": "owner"}
+    target_member_row = {"id": "member-2", "organization_id": "default", "email": "m2@example.com", "role": "user"}
     new_pm_id = "pm-new-99"
 
     call_idx = [0]
-    results = [mem_row]  # membership check; insert returns scalar
+    # _require_owner (join query), target member existence check, idempotency check, INSERT
+    results = [mem_row, target_member_row, None]
 
     class _FakeResult:
         def __init__(self, data): self._data = data
@@ -812,3 +815,183 @@ async def test_create_task_record_persists_project_id(monkeypatch):
     )
     assert result == task_id
     assert inserted_values.get("project_id") == "proj-xyz"
+
+
+# ─── Fix 1: TOCTOU owner-count lock ──────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_remove_owner_locks_owner_count(monkeypatch):
+    """remove_project_member calls .with_for_update() on the owner SELECT.
+
+    Concurrency is not testable against mocks; this test verifies the SELECT
+    wrapper is called so that the locking statement is emitted in production.
+    Note: a full concurrency stress test would require two concurrent DB
+    transactions against a live Postgres instance and is deferred.
+    """
+    from routers import projects
+
+    member = _make_member()
+    caller_row = {"id": "pm-1", "project_id": "proj-1", "member_id": "member-1", "role": "owner"}
+    # Two owners — removal is allowed
+    other_owner_row = {"id": "pm-2", "project_id": "proj-1", "member_id": "member-X", "role": "owner"}
+
+    with_for_update_called = [False]
+
+    class _TrackingClause:
+        def where(self, *a, **kw): return self
+        def values(self, **kw): return self
+        def returning(self, *a): return self
+        def order_by(self, *a): return self
+        def limit(self, *a): return self
+        def offset(self, *a): return self
+        def join(self, *a, **kw): return self
+        def with_for_update(self, *a, **kw):
+            with_for_update_called[0] = True
+            return self
+
+    call_idx = [0]
+    results = [caller_row, [caller_row, other_owner_row], None]  # membership, owners, DELETE
+
+    class _FakeResult:
+        def __init__(self, data): self._data = data
+        def mappings(self):
+            data = self._data
+            class M:
+                def first(self_inner):
+                    if isinstance(data, list): return data[0] if data else None
+                    return data
+                def all(self_inner):
+                    if isinstance(data, list): return data
+                    return [data] if data else []
+            return M()
+        def first(self): return self._data
+
+    class _FakeConn:
+        async def execute(self, stmt):
+            idx = call_idx[0]; call_idx[0] += 1
+            return _FakeResult(results[idx] if idx < len(results) else None)
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): pass
+
+    class _FakeEngine:
+        def begin(self): return _FakeConn()
+
+    def _tracking_select(*a, **kw):
+        return _TrackingClause()
+
+    monkeypatch.setattr(projects, "engine", _FakeEngine())
+    monkeypatch.setattr(projects, "reflect_table", _fake_reflect())
+    monkeypatch.setattr(projects, "select", _tracking_select)
+    monkeypatch.setattr(projects, "delete", _noop_delete)
+    monkeypatch.setattr(projects.permissions, "check", AsyncMock(return_value=True))
+    monkeypatch.setattr(projects.audit, "log", AsyncMock())
+
+    result = await projects.remove_project_member("proj-1", "member-X", member)
+    assert result["removed"] is True
+    assert with_for_update_called[0], ".with_for_update() must be called on the owner SELECT"
+
+
+# ─── Fix 2: member existence validation ──────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_add_member_rejects_unknown_member_id(monkeypatch):
+    """add_project_member returns 404 when target member_id does not exist in org."""
+    from routers import projects
+
+    member = _make_member()
+    caller_row = {"id": "pm-1", "project_id": "proj-1", "member_id": "member-1", "role": "owner"}
+
+    call_idx = [0]
+    # _require_owner (join query) returns owner row; member existence returns None
+    results = [caller_row, None]
+
+    class _FakeResult:
+        def __init__(self, data): self._data = data
+        def mappings(self):
+            data = self._data
+            class M:
+                def first(self_inner): return data
+                def all(self_inner): return [data] if data else []
+            return M()
+        def first(self): return self._data
+
+    class _FakeConn:
+        async def execute(self, stmt):
+            idx = call_idx[0]; call_idx[0] += 1
+            return _FakeResult(results[idx] if idx < len(results) else None)
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): pass
+
+    class _FakeEngine:
+        def begin(self): return _FakeConn()
+
+    monkeypatch.setattr(projects, "engine", _FakeEngine())
+    monkeypatch.setattr(projects, "reflect_table", _fake_reflect())
+    monkeypatch.setattr(projects, "select", _noop_select)
+    monkeypatch.setattr(projects.permissions, "check", AsyncMock(return_value=True))
+    monkeypatch.setattr(projects.audit, "log", AsyncMock())
+
+    class AddReq:
+        member_id = "nonexistent-member"
+        role = "member"
+
+    with pytest.raises(HTTPException) as exc_info:
+        await projects.add_project_member("proj-1", AddReq(), member)
+    assert exc_info.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_add_member_idempotent_on_duplicate(monkeypatch):
+    """add_project_member is idempotent: calling twice results in a single membership row."""
+    from routers import projects
+
+    member = _make_member()
+    caller_row = {"id": "pm-1", "project_id": "proj-1", "member_id": "member-1", "role": "owner"}
+    target_member_row = {"id": "member-2", "organization_id": "default", "email": "m2@example.com", "role": "user"}
+    existing_pm_row = {"id": "pm-2", "project_id": "proj-1", "member_id": "member-2", "role": "member"}
+
+    insert_called = [0]
+    original_insert = projects.insert
+
+    def counting_insert(tbl):
+        insert_called[0] += 1
+        return _Clause()
+
+    call_idx = [0]
+    # _require_owner, target existence, idempotency check (already exists) → no INSERT
+    results = [caller_row, target_member_row, existing_pm_row]
+
+    class _FakeResult:
+        def __init__(self, data): self._data = data
+        def mappings(self):
+            data = self._data
+            class M:
+                def first(self_inner): return data
+                def all(self_inner): return [data] if data else []
+            return M()
+        def first(self): return self._data
+
+    class _FakeConn:
+        async def execute(self, stmt):
+            idx = call_idx[0]; call_idx[0] += 1
+            return _FakeResult(results[idx] if idx < len(results) else None)
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): pass
+
+    class _FakeEngine:
+        def begin(self): return _FakeConn()
+
+    monkeypatch.setattr(projects, "engine", _FakeEngine())
+    monkeypatch.setattr(projects, "reflect_table", _fake_reflect())
+    monkeypatch.setattr(projects, "select", _noop_select)
+    monkeypatch.setattr(projects, "insert", counting_insert)
+    monkeypatch.setattr(projects.permissions, "check", AsyncMock(return_value=True))
+    monkeypatch.setattr(projects.audit, "log", AsyncMock())
+
+    class AddReq:
+        member_id = "member-2"
+        role = "member"
+
+    result = await projects.add_project_member("proj-1", AddReq(), member)
+    assert result["member_id"] == "member-2"
+    assert insert_called[0] == 0, "INSERT must not be called when membership already exists"

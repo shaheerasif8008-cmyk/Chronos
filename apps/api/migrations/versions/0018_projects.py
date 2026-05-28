@@ -43,11 +43,19 @@ def upgrade() -> None:
         sa.Column("organization_id", sa.Text(), nullable=False, server_default="default"),
         sa.Column("region", sa.Text(), nullable=False, server_default="us"),
         sa.Column("project_id", sa.UUID(), nullable=False),
-        sa.Column("member_id", sa.UUID(), nullable=False),
+        sa.Column("member_id", sa.Text(), nullable=False),
         sa.Column("role", sa.Text(), nullable=True, server_default="member"),
         sa.Column("created_at", sa.TIMESTAMP(timezone=True), server_default=sa.text("NOW()")),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("project_id", "member_id", name="uq_project_members_proj_member"),
+        sa.ForeignKeyConstraint(
+            ["project_id"], ["projects.id"], ondelete="CASCADE",
+            name="fk_project_members_project_id",
+        ),
+        sa.ForeignKeyConstraint(
+            ["member_id"], ["members.id"], ondelete="CASCADE",
+            name="fk_project_members_member_id",
+        ),
     )
     op.create_index("ix_project_members_member_id", "project_members", ["member_id"])
     op.create_index("ix_project_members_project_id", "project_members", ["project_id"])

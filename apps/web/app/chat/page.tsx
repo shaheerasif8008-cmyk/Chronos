@@ -3064,9 +3064,21 @@ function ProjectsScreen() {
   useEffect(() => {
     if (typeof window !== "undefined") {
       const id = new URLSearchParams(window.location.search).get("id");
-      if (id) setActiveProjectId(id);
+      setActiveProjectId(id ?? null);
     }
   }, [pathname]);
+
+  // Keep detail view in sync with browser back/forward navigation.
+  useEffect(() => {
+    function onPopState() {
+      if (typeof window !== "undefined") {
+        const id = new URLSearchParams(window.location.search).get("id");
+        setActiveProjectId(id ?? null);
+      }
+    }
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -3128,7 +3140,6 @@ function ProjectsScreen() {
         projectId={activeProjectId}
         project={activeProject}
         onBack={closeProject}
-        onUpdated={load}
       />
     );
   }
@@ -3158,7 +3169,7 @@ function ProjectsScreen() {
             placeholder="Project name"
             value={createName}
             onChange={e => setCreateName(e.target.value)}
-            onKeyDown={e => { if (e.key === "Enter") void createProject(); }}
+            onKeyDown={e => { if (e.key === "Enter" && !creating) void createProject(); }}
           />
           <textarea
             className="input-field resize-none"
@@ -3222,21 +3233,21 @@ function ProjectDetailScreen({
   projectId,
   project,
   onBack,
-  onUpdated,
 }: {
   projectId: string;
   project: Project | null;
   onBack: () => void;
-  onUpdated: () => void;
 }) {
   const [tab, setTab] = useState<ProjectTab>("chat");
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [artifacts, setArtifacts] = useState<ArtifactRef[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(false);
 
   useEffect(() => {
     setLoading(true);
+    setLoadError(false);
     Promise.all([
       apiFetch(`/projects/${projectId}/conversations`).then(r => r.json()),
       apiFetch(`/projects/${projectId}/tasks`).then(r => r.json()),
@@ -3247,7 +3258,7 @@ function ProjectDetailScreen({
         setTasks(tsks as Task[]);
         setArtifacts(arts as ArtifactRef[]);
       })
-      .catch(() => {})
+      .catch(() => { setLoadError(true); })
       .finally(() => setLoading(false));
   }, [projectId]);
 
@@ -3263,10 +3274,12 @@ function ProjectDetailScreen({
         }
       />
       {/* Tab bar */}
-      <div className="flex gap-0.5 px-10 mb-6 border-b hairline">
+      <div role="tablist" className="flex gap-0.5 px-10 mb-6 border-b hairline">
         {PROJECT_TABS.map(t => (
           <button
             key={t.id}
+            role="tab"
+            aria-selected={tab === t.id}
             onClick={() => setTab(t.id)}
             className="px-4 py-2.5 text-[13.5px] font-medium transition-colors"
             style={{
@@ -3280,7 +3293,9 @@ function ProjectDetailScreen({
         ))}
       </div>
       <div className="flex-1 overflow-auto px-10 pb-10">
-        {loading ? (
+        {loadError ? (
+          <div className="text-[13.5px] mt-4" style={{ color: "var(--danger)" }}>Couldn't load project details.</div>
+        ) : loading ? (
           <div className="text-[13.5px]" style={{ color: "var(--text-dim)" }}>Loading…</div>
         ) : tab === "chat" ? (
           conversations.length === 0 ? (

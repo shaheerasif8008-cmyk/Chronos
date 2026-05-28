@@ -17,14 +17,18 @@ router = APIRouter(prefix="/projects", tags=["projects"])
 
 async def _require_member(member: Member, project_id: str) -> dict:
     """Return caller's project_members row or raise 404 (don't leak existence)."""
+    projects = await reflect_table("projects")
     project_members = await reflect_table("project_members")
     async with engine.begin() as conn:
         row = (
             await conn.execute(
-                select(project_members).where(
+                select(project_members)
+                .join(projects, projects.c.id == project_members.c.project_id)
+                .where(
                     project_members.c.project_id == project_id,
                     project_members.c.member_id == member.id,
                     project_members.c.organization_id == member.organization_id,
+                    projects.c.organization_id == member.organization_id,
                 )
             )
         ).mappings().first()
@@ -123,8 +127,8 @@ async def get_project(
     project_id: str,
     member: Member = Depends(get_current_member),
 ) -> dict:
-    await permissions.check(member, "view_project", project_id)
     await _require_member(member, project_id)
+    await permissions.check(member, "view_project", project_id)
     projects = await reflect_table("projects")
     async with engine.begin() as conn:
         row = (
@@ -156,8 +160,8 @@ async def patch_project(
     req: PatchProjectRequest,
     member: Member = Depends(get_current_member),
 ) -> dict:
-    await permissions.check(member, "update_project", project_id)
     await _require_owner(member, project_id)
+    await permissions.check(member, "update_project", project_id)
 
     patch_data = req.model_dump(exclude_unset=True)
     if not patch_data:
@@ -177,7 +181,10 @@ async def patch_project(
             raise HTTPException(status_code=404, detail="Project not found")
         await conn.execute(
             update(projects)
-            .where(projects.c.id == project_id)
+            .where(
+                projects.c.id == project_id,
+                projects.c.organization_id == member.organization_id,
+            )
             .values(**patch_data)
         )
 
@@ -210,15 +217,12 @@ async def delete_project(
     project_id: str,
     member: Member = Depends(get_current_member),
 ) -> dict:
-    await permissions.check(member, "delete_project", project_id)
     await _require_owner(member, project_id)
+    await permissions.check(member, "delete_project", project_id)
 
     projects = await reflect_table("projects")
-    project_members = await reflect_table("project_members")
     async with engine.begin() as conn:
-        await conn.execute(
-            delete(project_members).where(project_members.c.project_id == project_id)
-        )
+        # CASCADE on project_members.project_id → projects.id handles member rows.
         await conn.execute(
             delete(projects).where(
                 projects.c.id == project_id,
@@ -249,17 +253,31 @@ async def add_project_member(
     req: AddMemberRequest,
     member: Member = Depends(get_current_member),
 ) -> dict:
-    await permissions.check(member, "add_project_member", project_id)
     await _require_owner(member, project_id)
+    await permissions.check(member, "add_project_member", project_id)
 
+    members_table = await reflect_table("members")
     project_members = await reflect_table("project_members")
     async with engine.begin() as conn:
-        # Idempotent: check existing first
+        # Validate the target member exists in the caller's org
+        target_member = (
+            await conn.execute(
+                select(members_table).where(
+                    members_table.c.id == req.member_id,
+                    members_table.c.organization_id == member.organization_id,
+                )
+            )
+        ).mappings().first()
+        if target_member is None:
+            raise HTTPException(status_code=404, detail="Member not found")
+
+        # Idempotent: check existing first (scoped to org for defense-in-depth)
         existing = (
             await conn.execute(
                 select(project_members).where(
                     project_members.c.project_id == project_id,
                     project_members.c.member_id == req.member_id,
+                    project_members.c.organization_id == member.organization_id,
                 )
             )
         ).mappings().first()
@@ -291,18 +309,18 @@ async def remove_project_member(
     mid: str,
     member: Member = Depends(get_current_member),
 ) -> dict:
-    await permissions.check(member, "remove_project_member", project_id)
     await _require_owner(member, project_id)
+    await permissions.check(member, "remove_project_member", project_id)
 
     project_members = await reflect_table("project_members")
     async with engine.begin() as conn:
-        # Count remaining owners; disallow removing if it would leave zero owners
+        # Lock owner rows to prevent concurrent last-owner removal (TOCTOU fix).
         owner_rows = (
             await conn.execute(
                 select(project_members).where(
                     project_members.c.project_id == project_id,
                     project_members.c.role == "owner",
-                )
+                ).with_for_update()
             )
         ).mappings().all()
         owner_ids = [str(r["member_id"]) for r in owner_rows]
@@ -336,8 +354,8 @@ async def get_project_conversations(
     project_id: str,
     member: Member = Depends(get_current_member),
 ) -> list[dict]:
-    await permissions.check(member, "view_project_conversations", project_id)
     await _require_member(member, project_id)
+    await permissions.check(member, "view_project_conversations", project_id)
 
     conversations = await reflect_table("conversations")
     async with engine.begin() as conn:
@@ -358,8 +376,8 @@ async def get_project_tasks(
     project_id: str,
     member: Member = Depends(get_current_member),
 ) -> list[dict]:
-    await permissions.check(member, "view_project_tasks", project_id)
     await _require_member(member, project_id)
+    await permissions.check(member, "view_project_tasks", project_id)
 
     tasks = await reflect_table("tasks")
     async with engine.begin() as conn:
@@ -380,8 +398,8 @@ async def get_project_artifacts(
     project_id: str,
     member: Member = Depends(get_current_member),
 ) -> list[dict]:
-    await permissions.check(member, "view_project_artifacts", project_id)
     await _require_member(member, project_id)
+    await permissions.check(member, "view_project_artifacts", project_id)
 
     conversations = await reflect_table("conversations")
     tasks = await reflect_table("tasks")
