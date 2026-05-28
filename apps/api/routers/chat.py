@@ -6,7 +6,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import delete, insert, select, update
+from sqlalchemy import delete, insert, or_, select, update
 
 from core import audit, permissions
 from core.auth import get_current_member
@@ -296,6 +296,7 @@ async def edit_message(
         "chat.edit_message",
         resource_type="messages",
         resource_id=message_id,
+        payload={"prev_length": len(msg["content"]), "new_length": len(req.content)},
     )
     return {"message_id": message_id, "content": req.content}
 
@@ -322,15 +323,21 @@ async def branch_conversation(
         conv = await _verify_conversation_ownership(conn, conversations, conversation_id, member)
         src_msg = await _fetch_message(conn, messages, message_id, conversation_id)
 
-        # Fetch all messages up to and including the branch point
+        # Fetch all messages up to and including the branch point.
+        # Use (created_at < src) OR (id == src) so ties on the same timestamp
+        # are broken deterministically and the branch-point message is always
+        # included exactly once.
         prior_rows = (
             await conn.execute(
                 select(messages)
                 .where(
                     messages.c.conversation_id == conversation_id,
-                    messages.c.created_at <= src_msg["created_at"],
+                    or_(
+                        messages.c.created_at < src_msg["created_at"],
+                        messages.c.id == src_msg["id"],
+                    ),
                 )
-                .order_by(messages.c.created_at.asc())
+                .order_by(messages.c.created_at.asc(), messages.c.id.asc())
             )
         ).mappings().all()
 

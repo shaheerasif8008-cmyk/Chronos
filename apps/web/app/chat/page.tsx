@@ -1410,7 +1410,11 @@ function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: Mes
   const [toast, setToast] = useState<string | null>(null);
   const [editMode, setEditMode] = useState(false);
   const [editContent, setEditContent] = useState(message.content);
+  // Fix 3: track in-flight actions to prevent double-submits
+  const [inflight, setInflight] = useState<Set<string>>(new Set());
   const menuRef = useRef<HTMLDivElement>(null);
+  // Fix 5: keep a ref to the trigger so we can return focus after Escape
+  const triggerRef = useRef<HTMLButtonElement>(null);
   const mid = message.id;
 
   // Close menu on outside click
@@ -1423,19 +1427,36 @@ function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: Mes
     return () => document.removeEventListener("mousedown", onDown);
   }, [open]);
 
+  // Fix 6: wrap toast cleanup in useEffect so the timer is cancelled on unmount
+  useEffect(() => {
+    if (!toast) return;
+    const id = setTimeout(() => setToast(null), 3000);
+    return () => clearTimeout(id);
+  }, [toast]);
+
   function showToast(msg: string) {
     setToast(msg);
-    setTimeout(() => setToast(null), 3000);
   }
 
+  // Fix 3: helpers for in-flight tracking
+  function startAction(key: string) {
+    setInflight(prev => new Set(prev).add(key));
+  }
+  function endAction(key: string) {
+    setInflight(prev => { const s = new Set(prev); s.delete(key); return s; });
+  }
+  function isBusy(key: string) { return inflight.has(key); }
+
   async function handlePin() {
-    if (!mid) return;
+    if (!mid || isBusy("pin")) return;
     const endpoint = message.pinned ? "unpin" : "pin";
+    startAction("pin");
     try {
       await apiFetch(`/chat/conversations/${conversationId}/messages/${mid}/${endpoint}`, { method: "POST" });
       onRefresh();
       showToast(message.pinned ? "Unpinned" : "Pinned");
     } catch { showToast("Failed"); }
+    finally { endAction("pin"); }
     setOpen(false);
   }
 
@@ -1451,7 +1472,8 @@ function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: Mes
   }
 
   async function submitEdit() {
-    if (!mid) return;
+    if (!mid || isBusy("edit")) return;
+    startAction("edit");
     try {
       await apiFetch(`/chat/conversations/${conversationId}/messages/${mid}`, {
         method: "PATCH",
@@ -1461,21 +1483,25 @@ function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: Mes
       setEditMode(false);
       showToast("Saved");
     } catch { showToast("Failed to save"); }
+    finally { endAction("edit"); }
   }
 
   async function handleBranch() {
-    if (!mid) return;
+    if (!mid || isBusy("branch")) return;
+    startAction("branch");
     try {
       const res = await apiFetch(`/chat/conversations/${conversationId}/messages/${mid}/branch`, { method: "POST" });
       const data = await res.json() as { conversation_id: string };
       onBranch(data.conversation_id);
       showToast("Branched into new conversation");
     } catch { showToast("Branch failed"); }
+    finally { endAction("branch"); }
     setOpen(false);
   }
 
   async function handleSaveMemory() {
-    if (!mid) return;
+    if (!mid || isBusy("save-memory")) return;
+    startAction("save-memory");
     try {
       await apiFetch(`/chat/conversations/${conversationId}/messages/${mid}/save-memory`, {
         method: "POST",
@@ -1483,11 +1509,13 @@ function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: Mes
       });
       showToast("Saved to memory");
     } catch { showToast("Failed"); }
+    finally { endAction("save-memory"); }
     setOpen(false);
   }
 
   async function handleConvertTask() {
-    if (!mid) return;
+    if (!mid || isBusy("convert-task")) return;
+    startAction("convert-task");
     try {
       const res = await apiFetch(`/chat/conversations/${conversationId}/messages/${mid}/convert-task`, {
         method: "POST",
@@ -1496,6 +1524,7 @@ function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: Mes
       const data = await res.json() as { task_id: string };
       showToast(`Task created: ${data.task_id.slice(0, 8)}…`);
     } catch { showToast("Failed"); }
+    finally { endAction("convert-task"); }
     setOpen(false);
   }
 
@@ -1509,8 +1538,18 @@ function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: Mes
     document.body.appendChild(a);
     a.click();
     a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    // Fix 6: revoke immediately after the click gesture — no timer needed
+    URL.revokeObjectURL(url);
     setOpen(false);
+  }
+
+  // Fix 5: Escape closes menu and returns focus to trigger
+  function handleKeyDown(e: React.KeyboardEvent) {
+    if (e.key === "Escape" && open) {
+      e.stopPropagation();
+      setOpen(false);
+      triggerRef.current?.focus();
+    }
   }
 
   if (editMode) {
@@ -1524,7 +1563,7 @@ function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: Mes
           rows={3}
         />
         <div className="flex gap-2 mt-1.5">
-          <button onClick={submitEdit} className="btn btn-accent btn-sm">Save</button>
+          <button onClick={submitEdit} disabled={isBusy("edit")} className="btn btn-accent btn-sm">Save</button>
           <button onClick={() => setEditMode(false)} className="btn btn-ghost btn-sm">Cancel</button>
         </div>
       </div>
@@ -1532,46 +1571,55 @@ function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: Mes
   }
 
   return (
-    <div className="relative inline-block" ref={menuRef}>
+    // Fix 5 + Fix 7: focus-within keeps the trigger visible while the dropdown is open
+    // and when keyboard focus moves inside the menu, without needing JS state.
+    <div className="relative inline-block" ref={menuRef} onKeyDown={handleKeyDown}>
       {toast && (
         <div className="absolute -top-8 left-1/2 -translate-x-1/2 text-[12px] px-2.5 py-1 rounded-md whitespace-nowrap z-50"
              style={{ background: "var(--surface-2)", color: "var(--text-muted)", border: "1px solid var(--border-soft)" }}>
           {toast}
         </div>
       )}
+      {/* Fix 5: ARIA trigger attributes */}
       <button
+        ref={triggerRef}
         onClick={() => setOpen(o => !o)}
-        className="p-1 rounded-md opacity-0 group-hover:opacity-100 smooth hover:bg-[var(--surface-2)]"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-label="Message actions"
+        className="p-1 rounded-md opacity-0 group-hover:opacity-100 focus-visible:opacity-100 smooth hover:bg-[var(--surface-2)]"
         style={{ color: "var(--text-dim)" }}
         title="Message actions"
       >
         <IC.More size={14}/>
       </button>
+      {/* Fix 5: role="menu" on dropdown */}
       {open && (
-        <div className="absolute right-0 top-7 z-40 rounded-xl shadow-lg border py-1 min-w-[160px]"
+        <div role="menu" className="absolute right-0 top-7 z-40 rounded-xl shadow-lg border py-1 min-w-[160px]"
              style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
-          <button onClick={handlePin} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5" style={{ color: "var(--text)" }}>
+          {/* Fix 3 + Fix 5: role="menuitem" + disabled when in-flight */}
+          <button role="menuitem" onClick={handlePin} disabled={isBusy("pin")} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5 disabled:opacity-50" style={{ color: "var(--text)" }}>
             <IC.Lock size={13}/>{message.pinned ? "Unpin" : "Pin"}
           </button>
-          <button onClick={handleCopy} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5" style={{ color: "var(--text)" }}>
+          <button role="menuitem" onClick={handleCopy} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5" style={{ color: "var(--text)" }}>
             <IC.External size={13}/>Copy
           </button>
           {message.role === "user" && (
-            <button onClick={handleEdit} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5" style={{ color: "var(--text)" }}>
+            <button role="menuitem" onClick={handleEdit} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5" style={{ color: "var(--text)" }}>
               <IC.Pencil size={13}/>Edit
             </button>
           )}
-          <button onClick={handleBranch} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5" style={{ color: "var(--text)" }}>
+          <button role="menuitem" onClick={handleBranch} disabled={isBusy("branch")} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5 disabled:opacity-50" style={{ color: "var(--text)" }}>
             <IC.ArrowRight size={13}/>Branch here
           </button>
-          <button onClick={handleSaveMemory} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5" style={{ color: "var(--text)" }}>
+          <button role="menuitem" onClick={handleSaveMemory} disabled={isBusy("save-memory")} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5 disabled:opacity-50" style={{ color: "var(--text)" }}>
             <IC.Memory size={13}/>Save to memory
           </button>
-          <button onClick={handleConvertTask} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5" style={{ color: "var(--text)" }}>
+          <button role="menuitem" onClick={handleConvertTask} disabled={isBusy("convert-task")} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5 disabled:opacity-50" style={{ color: "var(--text)" }}>
             <IC.Briefcase size={13}/>Convert to task
           </button>
           <div className="mx-2 my-1 border-t" style={{ borderColor: "var(--border-soft)" }}/>
-          <button onClick={handleExport} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5" style={{ color: "var(--text-dim)" }}>
+          <button role="menuitem" onClick={handleExport} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5" style={{ color: "var(--text-dim)" }}>
             <IC.Folder size={13}/>Export
           </button>
         </div>
@@ -1585,15 +1633,15 @@ function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: Mes
 type MsgProps = { message: Message; conversationId: string; onRefresh: () => void; onBranch: (id: string) => void };
 
 function UserMessage({ message, conversationId, onRefresh, onBranch }: MsgProps) {
-  const [actionVisible, setActionVisible] = useState(false);
   return (
-    <div className="flex gap-4 fadein group" onMouseEnter={() => setActionVisible(true)} onMouseLeave={() => setActionVisible(false)}>
+    <div className="flex gap-4 fadein group">
       <div className="avatar-u">A</div>
       <div className="flex-1 min-w-0 pt-0.5">
         <div className="flex items-baseline gap-2 mb-1.5">
           <span className="text-[14px] font-semibold">You</span>
           {message.pinned && <IC.Lock size={12} style={{ color: "var(--accent)" }}/>}
-          <div className={`ml-auto transition-opacity ${actionVisible ? "opacity-100" : "opacity-0"}`}>
+          {/* Fix 7: rely on Tailwind group-hover + focus-within instead of JS state */}
+          <div className="ml-auto transition-opacity opacity-0 group-hover:opacity-100 focus-within:opacity-100">
             <MessageActionMenu message={message} conversationId={conversationId} onRefresh={onRefresh} onBranch={onBranch}/>
           </div>
         </div>
@@ -1693,11 +1741,10 @@ function ArtifactCard({ artifact }: { artifact: ArtifactRef }) {
 }
 
 function AssistantMessage({ message, content, status, persona, toolTraces, artifacts, thinking, mode, conversationId, onRefresh, onBranch }: { message: Message; content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[]; artifacts?: ArtifactRef[]; thinking?: boolean; mode?: string; conversationId: string; onRefresh: () => void; onBranch: (id: string) => void }) {
-  const [actionVisible, setActionVisible] = useState(false);
   const hasTraces = !!(toolTraces && toolTraces.length > 0);
   const isStreaming = status === "streaming";
   return (
-    <div className="flex gap-4 fadein group" onMouseEnter={() => setActionVisible(true)} onMouseLeave={() => setActionVisible(false)}>
+    <div className="flex gap-4 fadein group">
       <PersonaAvatar name={persona.name} color={persona.color} size={28}/>
       <div className="flex-1 min-w-0 pt-0.5">
         <div className="flex items-baseline gap-2 mb-1.5">
@@ -1705,8 +1752,9 @@ function AssistantMessage({ message, content, status, persona, toolTraces, artif
           {mode && mode !== "default" && <Tag variant="info">{mode}</Tag>}
           {status === "error" && <Tag variant="danger">Error</Tag>}
           {message.pinned && <IC.Lock size={12} style={{ color: "var(--accent)" }}/>}
+          {/* Fix 7: rely on Tailwind group-hover + focus-within instead of JS state */}
           {!isStreaming && (
-            <div className={`ml-auto transition-opacity ${actionVisible ? "opacity-100" : "opacity-0"}`}>
+            <div className="ml-auto transition-opacity opacity-0 group-hover:opacity-100 focus-within:opacity-100">
               <MessageActionMenu message={message} conversationId={conversationId} onRefresh={onRefresh} onBranch={onBranch}/>
             </div>
           )}

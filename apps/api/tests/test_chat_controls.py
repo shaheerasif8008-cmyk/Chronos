@@ -103,6 +103,7 @@ def _fake_sql_builder():
         class _FakeCol:
             def __eq__(self, other): return True
             def __le__(self, other): return True
+            def __lt__(self, other): return True
             def asc(self): return self
             def desc(self): return self
             def is_(self, v): return True
@@ -305,6 +306,9 @@ async def test_edit_user_message_updates_content(monkeypatch):
     result = await chat.edit_message("conv-1", "msg-1", EditReq(), member)
     assert result["content"] == "new content"
     chat.audit.log.assert_awaited()
+    # Fix 4: audit payload must carry prev/new lengths
+    call_kwargs = chat.audit.log.call_args
+    assert call_kwargs.kwargs.get("payload") == {"prev_length": len("old content"), "new_length": len("new content")}
 
 
 @pytest.mark.asyncio
@@ -658,3 +662,146 @@ async def test_convert_task_404_wrong_org(monkeypatch):
     with pytest.raises(HTTPException) as exc_info:
         await chat.convert_message_to_task("conv-1", "msg-1", ConvertReq(), member)
     assert exc_info.value.status_code == 404
+
+
+# ─── Fix 1: ownership 404 for edit and save-memory ───────────────────────────
+
+@pytest.mark.asyncio
+async def test_edit_message_404_wrong_owner(monkeypatch):
+    """Cross-member: conversation lookup returns None → 404 for edit."""
+    from routers import chat
+    from unittest.mock import AsyncMock
+
+    member = _make_member(member_id="intruder-99")
+
+    class _FakeResult:
+        def __init__(self, data): self._data = data
+        def mappings(self):
+            data = self._data
+            class M:
+                def first(self_inner): return data
+            return M()
+        def first(self): return self._data
+
+    class _FakeConn:
+        async def execute(self, stmt): return _FakeResult(None)  # ownership fails
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): pass
+
+    class _FakeEngine:
+        def begin(self): return _FakeConn()
+
+    _select, _insert, _update, _reflect = _fake_sql_builder()
+    monkeypatch.setattr(chat, "engine", _FakeEngine())
+    monkeypatch.setattr(chat, "reflect_table", _reflect)
+    monkeypatch.setattr(chat, "select", _select)
+    monkeypatch.setattr(chat.permissions, "check", AsyncMock(return_value=True))
+
+    class EditReq:
+        content = "hacked content"
+
+    with pytest.raises(HTTPException) as exc_info:
+        await chat.edit_message("conv-1", "msg-1", EditReq(), member)
+    assert exc_info.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_save_memory_404_wrong_owner(monkeypatch):
+    """Cross-member: conversation lookup returns None → 404 for save-memory."""
+    from routers import chat
+    from unittest.mock import AsyncMock
+
+    member = _make_member(member_id="intruder-99")
+
+    class _FakeResult:
+        def __init__(self, data): self._data = data
+        def mappings(self):
+            data = self._data
+            class M:
+                def first(self_inner): return data
+            return M()
+        def first(self): return self._data
+
+    class _FakeConn:
+        async def execute(self, stmt): return _FakeResult(None)  # ownership fails
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): pass
+
+    class _FakeEngine:
+        def begin(self): return _FakeConn()
+
+    _select, _insert, _update, _reflect = _fake_sql_builder()
+    monkeypatch.setattr(chat, "engine", _FakeEngine())
+    monkeypatch.setattr(chat, "reflect_table", _reflect)
+    monkeypatch.setattr(chat, "select", _select)
+    monkeypatch.setattr(chat.permissions, "check", AsyncMock(return_value=True))
+
+    class SaveMemReq:
+        scope = "org"
+
+    with pytest.raises(HTTPException) as exc_info:
+        await chat.save_message_to_memory("conv-1", "msg-1", SaveMemReq(), member)
+    assert exc_info.value.status_code == 404
+
+
+# ─── Fix 2: or_ used in branch predicate ─────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_branch_uses_or_predicate(monkeypatch):
+    """Branch handler must call or_() to build a deterministic WHERE predicate."""
+    from routers import chat
+    from unittest.mock import AsyncMock, MagicMock
+
+    member = _make_member()
+    conv_row = {"id": "conv-1", "member_id": "member-1", "organization_id": "default", "title": "Original"}
+    src_msg = {
+        "id": "msg-2", "conversation_id": "conv-1", "role": "user",
+        "content": "branch here", "created_at": "2024-01-01T00:00:00",
+        "organization_id": "default", "region": "us", "token_count": 2,
+        "model": None, "mode": None, "citations": [], "tool_traces": [],
+        "memory_refs": [], "artifact_refs": [], "approval_state": None,
+        "runtime_status": None, "pinned": False,
+    }
+    prior_msgs = [src_msg]
+    new_conv_id = "new-conv-xyz"
+
+    call_idx = [0]
+    results = [conv_row, src_msg, prior_msgs, new_conv_id, None]
+
+    class _FakeResult:
+        def __init__(self, data): self._data = data
+        def mappings(self):
+            data = self._data
+            class M:
+                def first(self_inner): return data[0] if isinstance(data, list) and data else data
+                def all(self_inner): return data if isinstance(data, list) else [data]
+            return M()
+        def first(self): return self._data[0] if isinstance(self._data, list) and self._data else self._data
+        def scalar_one(self): return new_conv_id
+        def scalar_one_or_none(self): return self._data
+
+    class _FakeConn:
+        async def execute(self, stmt):
+            idx = call_idx[0]; call_idx[0] += 1
+            return _FakeResult(results[idx] if idx < len(results) else None)
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): pass
+
+    class _FakeEngine:
+        def begin(self): return _FakeConn()
+
+    _select, _insert, _update, _reflect = _fake_sql_builder()
+    monkeypatch.setattr(chat, "engine", _FakeEngine())
+    monkeypatch.setattr(chat, "reflect_table", _reflect)
+    monkeypatch.setattr(chat, "select", _select)
+    monkeypatch.setattr(chat, "insert", _insert)
+    monkeypatch.setattr(chat, "update", _update)
+    monkeypatch.setattr(chat.permissions, "check", AsyncMock(return_value=True))
+    monkeypatch.setattr(chat.audit, "log", AsyncMock())
+
+    or_spy = MagicMock(wraps=chat.or_)
+    monkeypatch.setattr(chat, "or_", or_spy)
+
+    await chat.branch_conversation("conv-1", "msg-2", member)
+
+    assert or_spy.called, "branch_conversation must call or_() for deterministic predicate"
