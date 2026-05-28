@@ -7,6 +7,21 @@ import pytest
 from core import llm
 
 
+@pytest.fixture(autouse=True)
+def dispose_db_engine():
+    """Dispose the SQLAlchemy engine pool before each test in this module.
+
+    pytest-asyncio gives each test its own event loop (function scope). asyncpg
+    connection pools are bound to the loop that created them, so a pool created
+    in test N's loop is unusable in test N+1's loop. Disposing before each test
+    forces a fresh pool in the current event loop, preventing 'Future attached
+    to a different loop' failures when DB tests follow non-DB tests.
+    """
+    import core.db as _db
+    _db.engine.sync_engine.pool.dispose()
+    yield
+
+
 # ── Task 2: vision_ocr ────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
