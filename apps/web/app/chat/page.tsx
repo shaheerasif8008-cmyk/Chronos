@@ -35,6 +35,8 @@ type Message = {
   model?: string;
   mode?: string;
   thinking?: boolean;
+  pinned?: boolean;
+  parent_message_id?: string | null;
 };
 type ToolTrace = { id: string; tool: string; summary: string; status: MessageStatus };
 type ArtifactRef = { id: string; title: string; kind: string; mime_type?: string; size_bytes?: number };
@@ -933,6 +935,8 @@ function ChatScreen({
         tool_traces: Array.isArray(m.tool_traces)
           ? (m.tool_traces as ToolTrace[])
           : undefined,
+        pinned: m.pinned === true,
+        parent_message_id: m.parent_message_id != null ? String(m.parent_message_id) : null,
       };
       // artifact_refs from the message row are the authoritative refresh-time source.
       // Merge with any per-message artifacts from the /artifacts endpoint (live-SSE path
@@ -1223,8 +1227,8 @@ function ChatScreen({
             <div className="max-w-[780px] mx-auto space-y-10">
               {messages.map((m, i) => (
                 m.role === "user"
-                  ? <UserMessage key={m.id ?? `user-${i}`} content={m.content}/>
-                  : <AssistantMessage key={m.id ?? `assistant-${i}`} content={m.content} status={m.status ?? "complete"} persona={activePersona} toolTraces={m.tool_traces} artifacts={m.artifacts} thinking={m.thinking} mode={m.mode}/>
+                  ? <UserMessage key={m.id ?? `user-${i}`} message={m} conversationId={activeConvoId ?? ""} onRefresh={() => { if (activeConvoId) void loadMessagesFromServer(activeConvoId); }} onBranch={(newConvoId) => { onConvoCreated(newConvoId); }}/>
+                  : <AssistantMessage key={m.id ?? `assistant-${i}`} message={m} content={m.content} conversationId={activeConvoId ?? ""} status={m.status ?? "complete"} persona={activePersona} toolTraces={m.tool_traces} artifacts={m.artifacts} thinking={m.thinking} mode={m.mode} onRefresh={() => { if (activeConvoId) void loadMessagesFromServer(activeConvoId); }} onBranch={(newConvoId) => { onConvoCreated(newConvoId); }}/>
               ))}
               {streaming && messages[messages.length - 1]?.role !== "assistant" && (
                 <div className="flex gap-4">
@@ -1392,15 +1396,208 @@ function ChatScreen({
   );
 }
 
-function UserMessage({ content }: { content: string }) {
+// ─── Message Action Menu ──────────────────────────────────────────────────────
+
+type MessageActionMenuProps = {
+  message: Message;
+  conversationId: string;
+  onRefresh: () => void;
+  onBranch: (newConvoId: string) => void;
+};
+
+function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: MessageActionMenuProps) {
+  const [open, setOpen] = useState(false);
+  const [toast, setToast] = useState<string | null>(null);
+  const [editMode, setEditMode] = useState(false);
+  const [editContent, setEditContent] = useState(message.content);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const mid = message.id;
+
+  // Close menu on outside click
+  useEffect(() => {
+    if (!open) return;
+    function onDown(e: MouseEvent) {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [open]);
+
+  function showToast(msg: string) {
+    setToast(msg);
+    setTimeout(() => setToast(null), 3000);
+  }
+
+  async function handlePin() {
+    if (!mid) return;
+    const endpoint = message.pinned ? "unpin" : "pin";
+    try {
+      await apiFetch(`/chat/conversations/${conversationId}/messages/${mid}/${endpoint}`, { method: "POST" });
+      onRefresh();
+      showToast(message.pinned ? "Unpinned" : "Pinned");
+    } catch { showToast("Failed"); }
+    setOpen(false);
+  }
+
+  async function handleCopy() {
+    try { await navigator.clipboard.writeText(message.content); showToast("Copied"); } catch { showToast("Failed to copy"); }
+    setOpen(false);
+  }
+
+  async function handleEdit() {
+    setEditMode(true);
+    setEditContent(message.content);
+    setOpen(false);
+  }
+
+  async function submitEdit() {
+    if (!mid) return;
+    try {
+      await apiFetch(`/chat/conversations/${conversationId}/messages/${mid}`, {
+        method: "PATCH",
+        body: JSON.stringify({ content: editContent }),
+      });
+      onRefresh();
+      setEditMode(false);
+      showToast("Saved");
+    } catch { showToast("Failed to save"); }
+  }
+
+  async function handleBranch() {
+    if (!mid) return;
+    try {
+      const res = await apiFetch(`/chat/conversations/${conversationId}/messages/${mid}/branch`, { method: "POST" });
+      const data = await res.json() as { conversation_id: string };
+      onBranch(data.conversation_id);
+      showToast("Branched into new conversation");
+    } catch { showToast("Branch failed"); }
+    setOpen(false);
+  }
+
+  async function handleSaveMemory() {
+    if (!mid) return;
+    try {
+      await apiFetch(`/chat/conversations/${conversationId}/messages/${mid}/save-memory`, {
+        method: "POST",
+        body: JSON.stringify({ scope: "org" }),
+      });
+      showToast("Saved to memory");
+    } catch { showToast("Failed"); }
+    setOpen(false);
+  }
+
+  async function handleConvertTask() {
+    if (!mid) return;
+    try {
+      const res = await apiFetch(`/chat/conversations/${conversationId}/messages/${mid}/convert-task`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      const data = await res.json() as { task_id: string };
+      showToast(`Task created: ${data.task_id.slice(0, 8)}…`);
+    } catch { showToast("Failed"); }
+    setOpen(false);
+  }
+
+  function handleExport() {
+    // Client-side: export the single message content as JSON
+    const blob = new Blob([JSON.stringify({ id: mid, role: message.role, content: message.content }, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `message-${mid ?? "unknown"}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    setOpen(false);
+  }
+
+  if (editMode) {
+    return (
+      <div className="mt-2">
+        <textarea
+          value={editContent}
+          onChange={e => setEditContent(e.target.value)}
+          className="w-full border rounded-lg px-3 py-2 text-[14px] outline-none resize-none"
+          style={{ borderColor: "var(--border)", background: "var(--surface)", color: "var(--text)", minHeight: 72 }}
+          rows={3}
+        />
+        <div className="flex gap-2 mt-1.5">
+          <button onClick={submitEdit} className="btn btn-accent btn-sm">Save</button>
+          <button onClick={() => setEditMode(false)} className="btn btn-ghost btn-sm">Cancel</button>
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className="flex gap-4 fadein">
+    <div className="relative inline-block" ref={menuRef}>
+      {toast && (
+        <div className="absolute -top-8 left-1/2 -translate-x-1/2 text-[12px] px-2.5 py-1 rounded-md whitespace-nowrap z-50"
+             style={{ background: "var(--surface-2)", color: "var(--text-muted)", border: "1px solid var(--border-soft)" }}>
+          {toast}
+        </div>
+      )}
+      <button
+        onClick={() => setOpen(o => !o)}
+        className="p-1 rounded-md opacity-0 group-hover:opacity-100 smooth hover:bg-[var(--surface-2)]"
+        style={{ color: "var(--text-dim)" }}
+        title="Message actions"
+      >
+        <IC.More size={14}/>
+      </button>
+      {open && (
+        <div className="absolute right-0 top-7 z-40 rounded-xl shadow-lg border py-1 min-w-[160px]"
+             style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
+          <button onClick={handlePin} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5" style={{ color: "var(--text)" }}>
+            <IC.Lock size={13}/>{message.pinned ? "Unpin" : "Pin"}
+          </button>
+          <button onClick={handleCopy} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5" style={{ color: "var(--text)" }}>
+            <IC.External size={13}/>Copy
+          </button>
+          {message.role === "user" && (
+            <button onClick={handleEdit} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5" style={{ color: "var(--text)" }}>
+              <IC.Pencil size={13}/>Edit
+            </button>
+          )}
+          <button onClick={handleBranch} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5" style={{ color: "var(--text)" }}>
+            <IC.ArrowRight size={13}/>Branch here
+          </button>
+          <button onClick={handleSaveMemory} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5" style={{ color: "var(--text)" }}>
+            <IC.Memory size={13}/>Save to memory
+          </button>
+          <button onClick={handleConvertTask} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5" style={{ color: "var(--text)" }}>
+            <IC.Briefcase size={13}/>Convert to task
+          </button>
+          <div className="mx-2 my-1 border-t" style={{ borderColor: "var(--border-soft)" }}/>
+          <button onClick={handleExport} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5" style={{ color: "var(--text-dim)" }}>
+            <IC.Folder size={13}/>Export
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── User Message ─────────────────────────────────────────────────────────────
+
+type MsgProps = { message: Message; conversationId: string; onRefresh: () => void; onBranch: (id: string) => void };
+
+function UserMessage({ message, conversationId, onRefresh, onBranch }: MsgProps) {
+  const [actionVisible, setActionVisible] = useState(false);
+  return (
+    <div className="flex gap-4 fadein group" onMouseEnter={() => setActionVisible(true)} onMouseLeave={() => setActionVisible(false)}>
       <div className="avatar-u">A</div>
       <div className="flex-1 min-w-0 pt-0.5">
         <div className="flex items-baseline gap-2 mb-1.5">
           <span className="text-[14px] font-semibold">You</span>
+          {message.pinned && <IC.Lock size={12} style={{ color: "var(--accent)" }}/>}
+          <div className={`ml-auto transition-opacity ${actionVisible ? "opacity-100" : "opacity-0"}`}>
+            <MessageActionMenu message={message} conversationId={conversationId} onRefresh={onRefresh} onBranch={onBranch}/>
+          </div>
         </div>
-        <div className="prose-body" style={{ color: "var(--text)" }}>{content}</div>
+        <div className="prose-body" style={{ color: "var(--text)" }}>{message.content}</div>
       </div>
     </div>
   );
@@ -1495,17 +1692,24 @@ function ArtifactCard({ artifact }: { artifact: ArtifactRef }) {
   );
 }
 
-function AssistantMessage({ content, status, persona, toolTraces, artifacts, thinking, mode }: { content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[]; artifacts?: ArtifactRef[]; thinking?: boolean; mode?: string }) {
+function AssistantMessage({ message, content, status, persona, toolTraces, artifacts, thinking, mode, conversationId, onRefresh, onBranch }: { message: Message; content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[]; artifacts?: ArtifactRef[]; thinking?: boolean; mode?: string; conversationId: string; onRefresh: () => void; onBranch: (id: string) => void }) {
+  const [actionVisible, setActionVisible] = useState(false);
   const hasTraces = !!(toolTraces && toolTraces.length > 0);
   const isStreaming = status === "streaming";
   return (
-    <div className="flex gap-4 fadein">
+    <div className="flex gap-4 fadein group" onMouseEnter={() => setActionVisible(true)} onMouseLeave={() => setActionVisible(false)}>
       <PersonaAvatar name={persona.name} color={persona.color} size={28}/>
       <div className="flex-1 min-w-0 pt-0.5">
         <div className="flex items-baseline gap-2 mb-1.5">
           <span className="text-[14px] font-semibold">{persona.name}</span>
           {mode && mode !== "default" && <Tag variant="info">{mode}</Tag>}
           {status === "error" && <Tag variant="danger">Error</Tag>}
+          {message.pinned && <IC.Lock size={12} style={{ color: "var(--accent)" }}/>}
+          {!isStreaming && (
+            <div className={`ml-auto transition-opacity ${actionVisible ? "opacity-100" : "opacity-0"}`}>
+              <MessageActionMenu message={message} conversationId={conversationId} onRefresh={onRefresh} onBranch={onBranch}/>
+            </div>
+          )}
         </div>
 
         {/* Inline tool traces — like Claude's tool use steps */}

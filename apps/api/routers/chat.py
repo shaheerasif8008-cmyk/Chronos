@@ -3,7 +3,7 @@ import json
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import delete, insert, select, update
@@ -22,6 +22,7 @@ from core.redis import redis_client
 from memory.extraction import extract_and_save
 from runtime.agent_loop import format_task_answer
 from runtime.executor import TaskExecutor, activity_channel
+from routers.tasks import create_task_record
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +172,290 @@ async def delete_conversation(conversation_id: str, member: Member = Depends(get
     return {"id": conversation_id, "deleted": True}
 
 
+# ─── Per-message action helpers ──────────────────────────────────────────────
+
+async def _verify_conversation_ownership(conn, conversations, conversation_id: str, member) -> dict:
+    """Fetch the conversation row and verify the calling member owns it.
+
+    Raises HTTPException 404 if not found or owned by a different member/org.
+    """
+    row = (
+        await conn.execute(
+            select(conversations).where(
+                conversations.c.id == conversation_id,
+                conversations.c.member_id == member.id,
+                conversations.c.organization_id == member.organization_id,
+            )
+        )
+    ).mappings().first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return dict(row)
+
+
+async def _fetch_message(conn, messages, message_id: str, conversation_id: str) -> dict:
+    """Fetch a message row by id and conversation_id. Raises 404 if missing."""
+    row = (
+        await conn.execute(
+            select(messages).where(
+                messages.c.id == message_id,
+                messages.c.conversation_id == conversation_id,
+            )
+        )
+    ).mappings().first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Message not found")
+    return dict(row)
+
+
+# ─── Pin / Unpin ──────────────────────────────────────────────────────────────
+
+@router.post("/conversations/{conversation_id}/messages/{message_id}/pin")
+async def pin_message(
+    conversation_id: str,
+    message_id: str,
+    member=Depends(get_current_member),
+) -> dict:
+    await permissions.check(member, "pin_message", conversation_id)
+    conversations = await reflect_table("conversations")
+    messages = await reflect_table("messages")
+    async with engine.begin() as conn:
+        await _verify_conversation_ownership(conn, conversations, conversation_id, member)
+        await _fetch_message(conn, messages, message_id, conversation_id)
+        await conn.execute(
+            update(messages)
+            .where(messages.c.id == message_id)
+            .values(pinned=True)
+        )
+    await audit.log(
+        "message_pinned",
+        member.id,
+        "chat.pin_message",
+        resource_type="messages",
+        resource_id=message_id,
+    )
+    return {"message_id": message_id, "pinned": True}
+
+
+@router.post("/conversations/{conversation_id}/messages/{message_id}/unpin")
+async def unpin_message(
+    conversation_id: str,
+    message_id: str,
+    member=Depends(get_current_member),
+) -> dict:
+    await permissions.check(member, "unpin_message", conversation_id)
+    conversations = await reflect_table("conversations")
+    messages = await reflect_table("messages")
+    async with engine.begin() as conn:
+        await _verify_conversation_ownership(conn, conversations, conversation_id, member)
+        await _fetch_message(conn, messages, message_id, conversation_id)
+        await conn.execute(
+            update(messages)
+            .where(messages.c.id == message_id)
+            .values(pinned=False)
+        )
+    await audit.log(
+        "message_unpinned",
+        member.id,
+        "chat.unpin_message",
+        resource_type="messages",
+        resource_id=message_id,
+    )
+    return {"message_id": message_id, "pinned": False}
+
+
+# ─── Edit message ─────────────────────────────────────────────────────────────
+
+class EditMessageRequest(BaseModel):
+    content: str
+
+
+@router.patch("/conversations/{conversation_id}/messages/{message_id}")
+async def edit_message(
+    conversation_id: str,
+    message_id: str,
+    req: EditMessageRequest,
+    member=Depends(get_current_member),
+) -> dict:
+    await permissions.check(member, "edit_message", conversation_id)
+    conversations = await reflect_table("conversations")
+    messages = await reflect_table("messages")
+    async with engine.begin() as conn:
+        await _verify_conversation_ownership(conn, conversations, conversation_id, member)
+        msg = await _fetch_message(conn, messages, message_id, conversation_id)
+        if msg.get("role") != "user":
+            raise HTTPException(status_code=400, detail="Only user messages can be edited")
+        await conn.execute(
+            update(messages)
+            .where(messages.c.id == message_id)
+            .values(content=req.content)
+        )
+    await audit.log(
+        "message_edited",
+        member.id,
+        "chat.edit_message",
+        resource_type="messages",
+        resource_id=message_id,
+    )
+    return {"message_id": message_id, "content": req.content}
+
+
+# ─── Branch conversation ───────────────────────────────────────────────────────
+
+@router.post("/conversations/{conversation_id}/messages/{message_id}/branch")
+async def branch_conversation(
+    conversation_id: str,
+    message_id: str,
+    member=Depends(get_current_member),
+) -> dict:
+    await permissions.check(member, "branch_conversation", conversation_id)
+    conversations = await reflect_table("conversations")
+    messages = await reflect_table("messages")
+
+    _COPY_COLS = [
+        "role", "content", "token_count", "model", "mode", "citations",
+        "tool_traces", "memory_refs", "artifact_refs", "approval_state",
+        "runtime_status", "pinned",
+    ]
+
+    async with engine.begin() as conn:
+        conv = await _verify_conversation_ownership(conn, conversations, conversation_id, member)
+        src_msg = await _fetch_message(conn, messages, message_id, conversation_id)
+
+        # Fetch all messages up to and including the branch point
+        prior_rows = (
+            await conn.execute(
+                select(messages)
+                .where(
+                    messages.c.conversation_id == conversation_id,
+                    messages.c.created_at <= src_msg["created_at"],
+                )
+                .order_by(messages.c.created_at.asc())
+            )
+        ).mappings().all()
+
+        # Create the new conversation
+        new_conv_result = await conn.execute(
+            insert(conversations)
+            .values(
+                organization_id=settings.org_id,
+                region=settings.region,
+                member_id=member.id,
+                title=(conv.get("title") or "Branch")[:80],
+            )
+            .returning(conversations.c.id)
+        )
+        new_conv_id = str(new_conv_result.scalar_one())
+
+        # Copy messages, setting parent_message_id to original row's id
+        for row in prior_rows:
+            row_dict = dict(row)
+            copy_values: dict[str, Any] = dict(
+                organization_id=settings.org_id,
+                region=settings.region,
+                conversation_id=new_conv_id,
+                parent_message_id=row_dict["id"],
+            )
+            for col in _COPY_COLS:
+                if col in row_dict:
+                    copy_values[col] = row_dict[col]
+            await conn.execute(insert(messages).values(**copy_values))
+
+    await audit.log(
+        "conversation_branched",
+        member.id,
+        "chat.branch_conversation",
+        resource_type="conversations",
+        resource_id=conversation_id,
+        payload={"new_conversation_id": new_conv_id, "branch_point_message_id": message_id},
+    )
+    return {"conversation_id": new_conv_id}
+
+
+# ─── Save message to memory ───────────────────────────────────────────────────
+
+class SaveMemoryRequest(BaseModel):
+    scope: str = "org"
+
+
+@router.post("/conversations/{conversation_id}/messages/{message_id}/save-memory")
+async def save_message_to_memory(
+    conversation_id: str,
+    message_id: str,
+    req: SaveMemoryRequest,
+    member=Depends(get_current_member),
+) -> dict:
+    await permissions.check(member, "save_message_to_memory", conversation_id)
+    if req.scope not in {"org", "personal"}:
+        raise HTTPException(status_code=400, detail="scope must be 'org' or 'personal'")
+    conversations = await reflect_table("conversations")
+    messages = await reflect_table("messages")
+    async with engine.begin() as conn:
+        await _verify_conversation_ownership(conn, conversations, conversation_id, member)
+        msg = await _fetch_message(conn, messages, message_id, conversation_id)
+
+    scope_id = member.id if req.scope == "personal" else member.organization_id
+    requester_context = RequesterContext.from_member(member)
+    entry_id = await create_memory_entry(
+        content=msg["content"],
+        requester_context=requester_context,
+        source="explicit",
+        scope=req.scope,
+        scope_id=scope_id,
+        importance_score=0.8,
+        conversation_id=conversation_id,
+        created_by=member.id,
+    )
+    await audit.log(
+        "message_saved_to_memory",
+        member.id,
+        "chat.save_message_to_memory",
+        resource_type="messages",
+        resource_id=message_id,
+        payload={"memory_entry_id": entry_id, "scope": req.scope},
+    )
+    return {"memory_entry_id": entry_id}
+
+
+# ─── Convert message to task ──────────────────────────────────────────────────
+
+class ConvertTaskRequest(BaseModel):
+    model: str | None = None
+    mode: str | None = None
+
+
+@router.post("/conversations/{conversation_id}/messages/{message_id}/convert-task")
+async def convert_message_to_task(
+    conversation_id: str,
+    message_id: str,
+    req: ConvertTaskRequest,
+    member=Depends(get_current_member),
+) -> dict:
+    await permissions.check(member, "convert_message_to_task", conversation_id)
+    conversations = await reflect_table("conversations")
+    messages = await reflect_table("messages")
+    async with engine.begin() as conn:
+        await _verify_conversation_ownership(conn, conversations, conversation_id, member)
+        msg = await _fetch_message(conn, messages, message_id, conversation_id)
+
+    task_id = await create_task_record(
+        goal=msg["content"],
+        member=member,
+        triggered_by=conversation_id,
+        model=req.model,
+        mode=req.mode,
+    )
+    await audit.log(
+        "message_converted_to_task",
+        member.id,
+        "chat.convert_message_to_task",
+        resource_type="messages",
+        resource_id=message_id,
+        payload={"task_id": task_id},
+    )
+    return {"task_id": task_id}
+
+
 _TRIVIAL_CHAT_PHRASES = {
     "hi", "hello", "hey", "yo", "thanks", "thank you", "ty", "ok", "okay",
     "cool", "great", "nice", "got it", "yes", "no", "yep", "nope", "sure", "k",
@@ -288,8 +573,6 @@ async def _agent_loop_stream(
     When `requester_context`/`user_message_for_memory` are supplied (chat-routed
     runs), autonomous memory extraction fires too, matching the fast path.
     """
-    from routers.tasks import create_task_record
-
     task_id = await create_task_record(
         goal=goal,
         member=member,
