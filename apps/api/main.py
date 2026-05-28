@@ -8,7 +8,7 @@ import asyncio
 from jobs import context_update, profile_synthesis
 from core.db import engine, reflect_table
 from runtime.executor import TaskExecutor
-from routers import activity, approvals, artifacts, auth, chat, connectors, context, memory, search, settings, tasks, workflows
+from routers import activity, approvals, artifacts, auth, chat, connectors, context, memory, projects, search, settings, tasks, workflows
 
 app = FastAPI(title="Chronos API", version="0.1.0")
 
@@ -33,6 +33,7 @@ app.include_router(search.router)
 app.include_router(connectors.router)
 app.include_router(context.router)
 app.include_router(tasks.router)
+app.include_router(projects.router)
 app.include_router(activity.router)
 app.include_router(approvals.router)
 app.include_router(artifacts.router)

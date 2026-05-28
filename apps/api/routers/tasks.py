@@ -28,6 +28,7 @@ class CreateTaskRequest(BaseModel):
     workspace_id: str | None = None
     model: str | None = None
     mode: str | None = None
+    project_id: str | None = None
 
 
 async def create_task_record(
@@ -39,6 +40,7 @@ async def create_task_record(
     workspace_id: str | None = None,
     model: str | None = None,
     mode: str | None = None,
+    project_id: str | None = None,
 ) -> str:
     """Insert a task row. The native model action loop orchestrates by default.
 
@@ -52,24 +54,27 @@ async def create_task_record(
     normalized_mode = normalize_mode(mode)
     tasks = await reflect_table("tasks")
     async with engine.begin() as conn:
+        insert_values: dict = dict(
+            organization_id=settings.org_id,
+            region=settings.region,
+            persona_id=persona_id,
+            workspace_id=workspace_id,
+            triggered_by=triggered_by,
+            triggered_by_member_id=member.id,
+            status="pending",
+            goal=goal,
+            plan={},
+            agent_state={"agent_history": [], "iteration_count": 0, "model": resolved_model},
+            current_step=0,
+            result={},
+            depth=0,
+            mode=normalized_mode,
+        )
+        if project_id is not None:
+            insert_values["project_id"] = project_id
         result = await conn.execute(
             insert(tasks)
-            .values(
-                organization_id=settings.org_id,
-                region=settings.region,
-                persona_id=persona_id,
-                workspace_id=workspace_id,
-                triggered_by=triggered_by,
-                triggered_by_member_id=member.id,
-                status="pending",
-                goal=goal,
-                plan={},
-                agent_state={"agent_history": [], "iteration_count": 0, "model": resolved_model},
-                current_step=0,
-                result={},
-                depth=0,
-                mode=normalized_mode,
-            )
+            .values(**insert_values)
             .returning(tasks.c.id)
         )
         return str(result.scalar_one())
@@ -85,6 +90,7 @@ async def create_task(req: CreateTaskRequest, member: Member = Depends(get_curre
         workspace_id=req.workspace_id,
         model=req.model,
         mode=req.mode,
+        project_id=req.project_id,
     )
     asyncio.create_task(TaskExecutor().run(task_id))
     return {"task_id": task_id}

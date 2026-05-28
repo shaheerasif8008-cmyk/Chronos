@@ -43,19 +43,23 @@ class ChatRequest(BaseModel):
     mode: str | None = None
     persona_id: str | None = None
     workspace_id: str | None = None
+    project_id: str | None = None
 
 
-async def _create_conversation(member: Member, title: str) -> str:
+async def _create_conversation(member: Member, title: str, project_id: str | None = None) -> str:
     conversations = await reflect_table("conversations")
+    values: dict[str, Any] = dict(
+        organization_id=settings.org_id,
+        region=settings.region,
+        member_id=member.id,
+        title=title[:80],
+    )
+    if project_id is not None:
+        values["project_id"] = project_id
     async with engine.begin() as conn:
         result = await conn.execute(
             insert(conversations)
-            .values(
-                organization_id=settings.org_id,
-                region=settings.region,
-                member_id=member.id,
-                title=title[:80],
-            )
+            .values(**values)
             .returning(conversations.c.id)
         )
         return str(result.scalar_one())
@@ -693,7 +697,9 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
     await permissions.check(member, "chat", req.conversation_id or "new_conversation")
     selected_model = normalize_chat_model(req.model)
     normalized_mode = normalize_mode(req.mode)
-    conversation_id = req.conversation_id or await _create_conversation(member, req.message)
+    conversation_id = req.conversation_id or await _create_conversation(
+        member, req.message, project_id=req.project_id
+    )
     await _save_message(conversation_id, "user", req.message)
     requester_context = RequesterContext.from_member(member)
     requester_context.persona_id = req.persona_id

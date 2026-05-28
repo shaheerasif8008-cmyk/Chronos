@@ -494,7 +494,7 @@ export default function ChronosApp() {
           else router.push(target);
         }} />}
         {route === "settings"   && <SettingsScreen tab={settingsTab} setTab={setSettingsTab} theme={theme} setTheme={setTheme} accent={accent} setAccent={setAccent} signOut={signOut} />}
-        {route === "projects"   && <EmptyPanel label="Projects" />}
+        {route === "projects"   && <ProjectsScreen />}
         {route === "research"   && <EmptyPanel label="Research" />}
         {route === "tasks"      && <EmptyPanel label="Tasks" />}
         {route === "artifacts"  && <EmptyPanel label="Artifacts" />}
@@ -3032,6 +3032,307 @@ const SETTING_TABS: Array<{ id: SettingsTab; label: string; icon: ReactNode; key
   { id: "developer", label: "Developer", icon: <IC.Lightbulb size={15}/>, keywords: "feature flags api mode webhooks debug experimental environment model provider" },
   { id: "danger", label: "Danger zone", icon: <IC.Trash size={15}/>, keywords: "reset delete leave transfer ownership irreversible" },
 ];
+
+// ─── Projects ─────────────────────────────────────────────────────────────────
+
+type Project = {
+  id: string;
+  name: string;
+  instructions?: string | null;
+  visibility?: string | null;
+  memory_policy?: string | null;
+  default_tools?: unknown[];
+  created_at?: string;
+  created_by?: string | null;
+};
+
+type ProjectTab = "chat" | "sources" | "artifacts" | "tasks" | "research";
+
+function ProjectsScreen() {
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [loading, setLoading] = useState(true);
+  // null = list view; string = detail view for that project id
+  const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
+  const [showCreate, setShowCreate] = useState(false);
+  const [createName, setCreateName] = useState("");
+  const [createInstructions, setCreateInstructions] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [toast, setToast] = useState<{ kind: "ok" | "danger"; text: string } | null>(null);
+
+  // URL-based project detail: /projects?id=<uuid>
+  const pathname = usePathname();
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      const id = new URLSearchParams(window.location.search).get("id");
+      if (id) setActiveProjectId(id);
+    }
+  }, [pathname]);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = (await (await apiFetch("/projects/")).json()) as Project[];
+      setProjects(data);
+    } catch (e) {
+      setToast({ kind: "danger", text: e instanceof Error ? e.message : "Failed to load projects" });
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { void load(); }, [load]);
+
+  async function createProject() {
+    if (!createName.trim()) return;
+    setCreating(true);
+    try {
+      await apiFetch("/projects/", {
+        method: "POST",
+        body: JSON.stringify({ name: createName.trim(), instructions: createInstructions.trim() || null }),
+      });
+      setCreateName("");
+      setCreateInstructions("");
+      setShowCreate(false);
+      await load();
+      setToast({ kind: "ok", text: "Project created" });
+    } catch (e) {
+      setToast({ kind: "danger", text: e instanceof Error ? e.message : "Failed to create project" });
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  function openProject(id: string) {
+    setActiveProjectId(id);
+    if (typeof window !== "undefined") {
+      const url = new URL(window.location.href);
+      url.searchParams.set("id", id);
+      window.history.pushState({}, "", url.toString());
+    }
+  }
+
+  function closeProject() {
+    setActiveProjectId(null);
+    if (typeof window !== "undefined") {
+      const url = new URL(window.location.href);
+      url.searchParams.delete("id");
+      window.history.pushState({}, "", url.toString());
+    }
+  }
+
+  const activeProject = projects.find(p => p.id === activeProjectId) ?? null;
+
+  if (activeProjectId) {
+    return (
+      <ProjectDetailScreen
+        projectId={activeProjectId}
+        project={activeProject}
+        onBack={closeProject}
+        onUpdated={load}
+      />
+    );
+  }
+
+  return (
+    <div className="flex-1 flex flex-col min-h-0">
+      <PageHeader
+        title="Projects"
+        subtitle="Organize conversations, tasks, and artifacts by project"
+        right={
+          <button className="btn btn-primary btn-sm" onClick={() => setShowCreate(v => !v)}>
+            <IC.Plus size={14} /> New project
+          </button>
+        }
+      />
+      {toast && (
+        <div className={`mx-10 mb-4 px-4 py-2.5 rounded-lg text-[13.5px] font-medium ${toast.kind === "ok" ? "bg-[var(--ok-soft)] text-[var(--ok-text)]" : "bg-[var(--danger-soft)] text-[var(--danger)]"}`}>
+          {toast.text}
+          <button className="ml-3 opacity-60 hover:opacity-100" onClick={() => setToast(null)}>✕</button>
+        </div>
+      )}
+      {showCreate && (
+        <div className="mx-10 mb-6 surface border border-soft rounded-xl p-5 flex flex-col gap-3">
+          <div className="font-medium text-[14px]">New project</div>
+          <input
+            className="input-field"
+            placeholder="Project name"
+            value={createName}
+            onChange={e => setCreateName(e.target.value)}
+            onKeyDown={e => { if (e.key === "Enter") void createProject(); }}
+          />
+          <textarea
+            className="input-field resize-none"
+            rows={3}
+            placeholder="Instructions (optional) — describe the project goal, context, or constraints"
+            value={createInstructions}
+            onChange={e => setCreateInstructions(e.target.value)}
+          />
+          <div className="flex gap-2">
+            <button className="btn btn-primary btn-sm" disabled={creating || !createName.trim()} onClick={() => void createProject()}>
+              {creating ? "Creating…" : "Create"}
+            </button>
+            <button className="btn btn-sm" onClick={() => { setShowCreate(false); setCreateName(""); setCreateInstructions(""); }}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+      <div className="flex-1 overflow-auto px-10 pb-10">
+        {loading ? (
+          <div className="text-[13.5px] mt-6" style={{ color: "var(--text-dim)" }}>Loading projects…</div>
+        ) : projects.length === 0 ? (
+          <EmptyState icon={<IC.Folder size={22} />} title="No projects yet" sub="Create a project to organize conversations, tasks, and artifacts." />
+        ) : (
+          <div className="grid gap-3 mt-2" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))" }}>
+            {projects.map(proj => (
+              <button
+                key={proj.id}
+                className="surface border border-soft rounded-xl p-5 text-left hover:border-[var(--accent)] transition-colors group"
+                onClick={() => openProject(proj.id)}
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div className="font-medium text-[14px] truncate">{proj.name}</div>
+                  <IC.Chevron size={14} style={{ color: "var(--text-faint)", flexShrink: 0, marginTop: 2 }} />
+                </div>
+                {proj.instructions && (
+                  <p className="text-[12.5px] mt-1.5 line-clamp-2" style={{ color: "var(--text-dim)" }}>{proj.instructions}</p>
+                )}
+                <div className="flex gap-3 mt-3 text-[12px]" style={{ color: "var(--text-faint)" }}>
+                  <span>{proj.visibility ?? "private"}</span>
+                  {proj.created_at && <span>{new Date(proj.created_at).toLocaleDateString()}</span>}
+                </div>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const PROJECT_TABS: { id: ProjectTab; label: string }[] = [
+  { id: "chat",     label: "Chat" },
+  { id: "sources",  label: "Sources" },
+  { id: "artifacts",label: "Artifacts" },
+  { id: "tasks",    label: "Tasks" },
+  { id: "research", label: "Research" },
+];
+
+function ProjectDetailScreen({
+  projectId,
+  project,
+  onBack,
+  onUpdated,
+}: {
+  projectId: string;
+  project: Project | null;
+  onBack: () => void;
+  onUpdated: () => void;
+}) {
+  const [tab, setTab] = useState<ProjectTab>("chat");
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [artifacts, setArtifacts] = useState<ArtifactRef[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    setLoading(true);
+    Promise.all([
+      apiFetch(`/projects/${projectId}/conversations`).then(r => r.json()),
+      apiFetch(`/projects/${projectId}/tasks`).then(r => r.json()),
+      apiFetch(`/projects/${projectId}/artifacts`).then(r => r.json()),
+    ])
+      .then(([convs, tsks, arts]) => {
+        setConversations(convs as Conversation[]);
+        setTasks(tsks as Task[]);
+        setArtifacts(arts as ArtifactRef[]);
+      })
+      .catch(() => {})
+      .finally(() => setLoading(false));
+  }, [projectId]);
+
+  return (
+    <div className="flex-1 flex flex-col min-h-0">
+      <PageHeader
+        title={project?.name ?? "Project"}
+        subtitle={project?.instructions ?? undefined}
+        right={
+          <button className="btn btn-sm" onClick={onBack}>
+            ← Back
+          </button>
+        }
+      />
+      {/* Tab bar */}
+      <div className="flex gap-0.5 px-10 mb-6 border-b hairline">
+        {PROJECT_TABS.map(t => (
+          <button
+            key={t.id}
+            onClick={() => setTab(t.id)}
+            className="px-4 py-2.5 text-[13.5px] font-medium transition-colors"
+            style={{
+              color: tab === t.id ? "var(--text)" : "var(--text-dim)",
+              borderBottom: tab === t.id ? "2px solid var(--accent)" : "2px solid transparent",
+              marginBottom: -1,
+            }}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+      <div className="flex-1 overflow-auto px-10 pb-10">
+        {loading ? (
+          <div className="text-[13.5px]" style={{ color: "var(--text-dim)" }}>Loading…</div>
+        ) : tab === "chat" ? (
+          conversations.length === 0 ? (
+            <EmptyState icon={<IC.Chat size={22} />} title="No conversations" sub="Send a message in this project to see conversations here." />
+          ) : (
+            <div className="flex flex-col gap-2">
+              {conversations.map(conv => (
+                <div key={conv.id} className="surface border border-soft rounded-xl px-5 py-4">
+                  <div className="font-medium text-[14px]">{conv.title ?? "Untitled conversation"}</div>
+                  {conv.updated_at && <div className="text-[12px] mt-1" style={{ color: "var(--text-faint)" }}>{new Date(conv.updated_at).toLocaleString()}</div>}
+                </div>
+              ))}
+            </div>
+          )
+        ) : tab === "artifacts" ? (
+          artifacts.length === 0 ? (
+            <EmptyState icon={<IC.Folder size={22} />} title="No artifacts" sub="Artifacts created in project conversations and tasks appear here." />
+          ) : (
+            <div className="flex flex-col gap-2">
+              {artifacts.map(art => (
+                <div key={art.id} className="surface border border-soft rounded-xl px-5 py-4 flex items-center gap-4">
+                  <div className="flex-1 min-w-0">
+                    <div className="font-medium text-[14px] truncate">{art.title ?? "Untitled"}</div>
+                    <div className="text-[12px] mt-0.5" style={{ color: "var(--text-faint)" }}>{art.kind}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )
+        ) : tab === "tasks" ? (
+          tasks.length === 0 ? (
+            <EmptyState icon={<IC.Activity size={22} />} title="No tasks" sub="Tasks linked to this project appear here." />
+          ) : (
+            <div className="flex flex-col gap-2">
+              {tasks.map(task => (
+                <div key={task.id} className="surface border border-soft rounded-xl px-5 py-4">
+                  <div className="font-medium text-[14px] truncate">{task.goal}</div>
+                  <div className="flex gap-3 mt-1 text-[12px]" style={{ color: "var(--text-faint)" }}>
+                    <span>{task.status}</span>
+                    {task.created_at && <span>{new Date(task.created_at).toLocaleString()}</span>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )
+        ) : (
+          <EmptyState title="Nothing here yet" sub="This feature is coming soon." />
+        )}
+      </div>
+    </div>
+  );
+}
 
 function EmptyPanel({ label }: { label: string }) {
   return (
