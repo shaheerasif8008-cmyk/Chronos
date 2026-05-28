@@ -586,11 +586,18 @@ function Sidebar({
       </div>
 
       {/* New conversation */}
-      <div className="px-3 pt-1 pb-2">
+      <div className="px-3 pt-1 pb-2 flex gap-1.5">
         <button onClick={onNewConvo}
-                className="w-full flex items-center gap-2.5 px-3 py-2 rounded-lg smooth surface border border-soft hover:border-[var(--border)] whitespace-nowrap">
+                className="flex-1 flex items-center gap-2.5 px-3 py-2 rounded-lg smooth surface border border-soft hover:border-[var(--border)] whitespace-nowrap">
           <IC.Plus size={15} stroke={2}/>
           <span className="text-[13.5px] font-medium">New conversation</span>
+        </button>
+        <button
+          onClick={() => { /* palette is opened via ⌘K; this is a click affordance */ document.dispatchEvent(new KeyboardEvent("keydown", { key: "k", metaKey: true, bubbles: true })); window.dispatchEvent(new KeyboardEvent("keydown", { key: "k", metaKey: true, bubbles: true })); }}
+          title="Search (⌘K)"
+          className="btn btn-ghost btn-icon flex-shrink-0 surface border border-soft hover:border-[var(--border)]"
+        >
+          <IC.Search size={14}/>
         </button>
       </div>
 
@@ -756,6 +763,85 @@ function ChatScreen({
   const streamingRef = useRef(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const isEmpty = !activeConvoId && messages.length === 0;
+
+  // ── Command palette (⌘K) ──────────────────────────────────────────────────
+  type SearchResult = { type: string; id: string; title: string; snippet: string; url: string };
+  const router = useRouter();
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [paletteQuery, setPaletteQuery] = useState("");
+  const [paletteResults, setPaletteResults] = useState<SearchResult[]>([]);
+  const paletteInputRef = useRef<HTMLInputElement>(null);
+  const paletteDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const paletteAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+        e.preventDefault();
+        setPaletteOpen(o => !o);
+      }
+      if (e.key === "Escape" && paletteOpen) {
+        setPaletteOpen(false);
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [paletteOpen]);
+
+  useEffect(() => {
+    if (paletteOpen) {
+      setPaletteQuery("");
+      setPaletteResults([]);
+      // Focus input on next tick after mount
+      setTimeout(() => paletteInputRef.current?.focus(), 0);
+    }
+  }, [paletteOpen]);
+
+  useEffect(() => {
+    if (paletteDebounceRef.current) clearTimeout(paletteDebounceRef.current);
+    if (!paletteQuery.trim()) { setPaletteResults([]); return; }
+
+    paletteDebounceRef.current = setTimeout(async () => {
+      paletteAbortRef.current?.abort();
+      const ctrl = new AbortController();
+      paletteAbortRef.current = ctrl;
+      try {
+        const res = await apiFetch(`/search?q=${encodeURIComponent(paletteQuery.trim())}`, { signal: ctrl.signal });
+        const data = (await res.json()) as SearchResult[];
+        if (!ctrl.signal.aborted) setPaletteResults(data);
+      } catch {
+        // Aborted or network error — leave stale results
+      }
+    }, 200);
+
+    return () => {
+      if (paletteDebounceRef.current) clearTimeout(paletteDebounceRef.current);
+    };
+  }, [paletteQuery]);
+
+  function handlePaletteSelect(result: SearchResult) {
+    setPaletteOpen(false);
+    setPaletteQuery("");
+    router.push(result.url);
+  }
+
+  // Group results by type in a stable order
+  const PALETTE_TYPE_LABELS: Record<string, string> = {
+    conversations: "Conversations",
+    messages: "Messages",
+    tasks: "Tasks",
+    artifacts: "Artifacts",
+    memory: "Memory",
+    sources: "Sources",
+  };
+  const paletteGrouped = paletteResults.reduce<Record<string, SearchResult[]>>((acc, r) => {
+    (acc[r.type] ??= []).push(r);
+    return acc;
+  }, {});
+  const paletteGroups = Object.keys(PALETTE_TYPE_LABELS)
+    .filter(k => paletteGrouped[k]?.length)
+    .map(k => ({ type: k, label: PALETTE_TYPE_LABELS[k], items: paletteGrouped[k] }));
+  // ── End command palette ───────────────────────────────────────────────────
 
   const activePersona = PERSONAS.find(p => p.id === activePersonaId) ?? PERSONAS[0];
 
@@ -1171,6 +1257,76 @@ function ChatScreen({
 
       {activityOpen && (
         <ActivityDrawer taskId={activeTaskId} onClose={() => setActivityOpen(false)} />
+      )}
+
+      {/* ⌘K Command palette */}
+      {paletteOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-start justify-center pt-[15vh]"
+          style={{ background: "color-mix(in oklch, var(--text) 20%, transparent)" }}
+          onClick={() => setPaletteOpen(false)}
+        >
+          <div
+            className="surface border rounded-xl shadow-2xl w-full max-w-[560px] mx-4 overflow-hidden"
+            style={{ borderColor: "var(--border)" }}
+            onClick={e => e.stopPropagation()}
+          >
+            {/* Search input */}
+            <div className="flex items-center gap-2.5 px-4 py-3 border-b hairline">
+              <IC.Search size={15} style={{ color: "var(--text-dim)", flexShrink: 0 }}/>
+              <input
+                ref={paletteInputRef}
+                type="text"
+                value={paletteQuery}
+                onChange={e => setPaletteQuery(e.target.value)}
+                placeholder="Search conversations, memory, tasks…"
+                className="flex-1 bg-transparent text-[14px] outline-none"
+                style={{ color: "var(--text)" }}
+              />
+              <kbd className="text-[11px] px-1.5 py-0.5 rounded border border-soft"
+                   style={{ color: "var(--text-dim)", background: "var(--surface-2)" }}>Esc</kbd>
+            </div>
+
+            {/* Results */}
+            <div className="max-h-[400px] overflow-y-auto">
+              {paletteQuery.trim() && paletteGroups.length === 0 && (
+                <div className="px-4 py-8 text-center text-[13.5px]" style={{ color: "var(--text-dim)" }}>
+                  No results for &ldquo;{paletteQuery}&rdquo;
+                </div>
+              )}
+              {paletteGroups.map(group => (
+                <div key={group.type}>
+                  <div className="px-4 pt-3 pb-1 text-[11.5px] font-medium uppercase tracking-wider"
+                       style={{ color: "var(--text-dim)" }}>
+                    {group.label}
+                  </div>
+                  {group.items.map(result => (
+                    <button
+                      key={result.id}
+                      onClick={() => handlePaletteSelect(result)}
+                      className="w-full flex items-start gap-3 px-4 py-2.5 text-left smooth hover:bg-[var(--surface-2)]"
+                    >
+                      <div className="flex-1 min-w-0">
+                        <div className="text-[13.5px] font-medium truncate">{result.title}</div>
+                        {result.snippet && result.snippet !== result.title && (
+                          <div className="text-[12px] truncate mt-0.5" style={{ color: "var(--text-dim)" }}>
+                            {result.snippet}
+                          </div>
+                        )}
+                      </div>
+                      <IC.ArrowRight size={13} style={{ color: "var(--text-dim)", flexShrink: 0, marginTop: 3 }}/>
+                    </button>
+                  ))}
+                </div>
+              ))}
+              {!paletteQuery.trim() && (
+                <div className="px-4 py-6 text-center text-[13px]" style={{ color: "var(--text-dim)" }}>
+                  Type to search across conversations, memory, tasks, and more.
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
