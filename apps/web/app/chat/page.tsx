@@ -175,6 +175,18 @@ const ACCENT_PALETTES: Record<string, { accent: string; hover: string; soft: str
   slate:  { accent: "oklch(0.42 0.025 240)", hover: "oklch(0.36 0.03 240)",  soft: "oklch(0.94 0.01 240)", text: "oklch(0.30 0.025 240)" },
 };
 
+// ─── Search palette types (module scope) ─────────────────────────────────────
+type SearchResult = { type: string; id: string; title: string; snippet: string; url: string };
+
+const PALETTE_TYPE_LABELS: Record<string, string> = {
+  conversations: "Conversations",
+  messages: "Messages",
+  tasks: "Tasks",
+  artifacts: "Artifacts",
+  memory: "Memory",
+  sources: "Sources",
+};
+
 const CHAT_MODES = [
   { id: "default",  label: "Default" },
   { id: "research", label: "Research" },
@@ -371,6 +383,7 @@ export default function ChronosApp() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [theme, setTheme] = useState<"light" | "dark">("light");
   const [accent, setAccent] = useState("coral");
+  const [searchPaletteOpen, setSearchPaletteOpen] = useState(false);
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark");
@@ -459,10 +472,11 @@ export default function ChronosApp() {
         pendingApprovals={pendingApprovals}
         onOpenSettings={openSettings}
         onSignOut={signOut}
+        onOpenSearch={() => setSearchPaletteOpen(true)}
       />
 
       <main className="flex-1 min-w-0 flex flex-col" style={{ background: "var(--bg)" }}>
-        {route === "chat"       && <ChatScreen activeConvoId={activeConvoId} activePersonaId={activePersonaId} onConvoCreated={(id) => loadConversations(id)} />}
+        {route === "chat"       && <ChatScreen activeConvoId={activeConvoId} activePersonaId={activePersonaId} onConvoCreated={(id) => loadConversations(id)} paletteOpen={searchPaletteOpen} onPaletteOpenChange={setSearchPaletteOpen} />}
         {route === "activity"   && <ActivityScreen />}
         {route === "approvals"  && <ApprovalsScreen onDecision={loadPendingApprovals} />}
         {route === "memory"     && <MemoryScreen />}
@@ -493,7 +507,8 @@ export default function ChronosApp() {
 // ─── Sidebar ──────────────────────────────────────────────────────────────────
 function Sidebar({
   collapsed, onCollapse, onExpand, route, onNavigate, conversations, activeConvoId,
-  onSelectConvo, onNewConvo, onDeleteConvo, pendingApprovals, onOpenSettings, onSignOut
+  onSelectConvo, onNewConvo, onDeleteConvo, pendingApprovals, onOpenSettings, onSignOut,
+  onOpenSearch,
 }: {
   collapsed: boolean; onCollapse: () => void; onExpand: () => void;
   route: Route; onNavigate: (r: Route) => void;
@@ -501,6 +516,7 @@ function Sidebar({
   onSelectConvo: (id: string) => void; onNewConvo: () => void;
   onDeleteConvo: (id: string) => void; pendingApprovals: number;
   onOpenSettings: (tab: SettingsTab) => void; onSignOut: () => void;
+  onOpenSearch?: () => void;
 }) {
   const [accountOpen, setAccountOpen] = useState(false);
   const [convoMenu, setConvoMenu] = useState<string | null>(null);
@@ -593,7 +609,7 @@ function Sidebar({
           <span className="text-[13.5px] font-medium">New conversation</span>
         </button>
         <button
-          onClick={() => { /* palette is opened via ⌘K; this is a click affordance */ document.dispatchEvent(new KeyboardEvent("keydown", { key: "k", metaKey: true, bubbles: true })); window.dispatchEvent(new KeyboardEvent("keydown", { key: "k", metaKey: true, bubbles: true })); }}
+          onClick={() => onOpenSearch?.()}
           title="Search (⌘K)"
           className="btn btn-ghost btn-icon flex-shrink-0 surface border border-soft hover:border-[var(--border)]"
         >
@@ -746,10 +762,14 @@ function ChatScreen({
   activeConvoId,
   activePersonaId,
   onConvoCreated,
+  paletteOpen,
+  onPaletteOpenChange,
 }: {
   activeConvoId: string | null;
   activePersonaId: string;
   onConvoCreated: (id: string) => void;
+  paletteOpen: boolean;
+  onPaletteOpenChange: (open: boolean) => void;
 }) {
   const [draft, setDraft] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
@@ -765,41 +785,52 @@ function ChatScreen({
   const isEmpty = !activeConvoId && messages.length === 0;
 
   // ── Command palette (⌘K) ──────────────────────────────────────────────────
-  type SearchResult = { type: string; id: string; title: string; snippet: string; url: string };
   const router = useRouter();
-  const [paletteOpen, setPaletteOpen] = useState(false);
   const [paletteQuery, setPaletteQuery] = useState("");
   const [paletteResults, setPaletteResults] = useState<SearchResult[]>([]);
+  const [paletteSelectedIdx, setPaletteSelectedIdx] = useState(-1);
   const paletteInputRef = useRef<HTMLInputElement>(null);
   const paletteDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const paletteAbortRef = useRef<AbortController | null>(null);
+  const palettePrevFocusRef = useRef<Element | null>(null);
 
+  // Cmd/Ctrl+K global listener — toggles palette
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
       if ((e.metaKey || e.ctrlKey) && e.key === "k") {
         e.preventDefault();
-        setPaletteOpen(o => !o);
+        onPaletteOpenChange(!paletteOpen);
       }
       if (e.key === "Escape" && paletteOpen) {
-        setPaletteOpen(false);
+        onPaletteOpenChange(false);
       }
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [paletteOpen]);
+  }, [paletteOpen, onPaletteOpenChange]);
 
   useEffect(() => {
     if (paletteOpen) {
+      // Capture previously focused element so we can restore it on close
+      palettePrevFocusRef.current = document.activeElement;
       setPaletteQuery("");
       setPaletteResults([]);
-      // Focus input on next tick after mount
+      setPaletteSelectedIdx(-1);
       setTimeout(() => paletteInputRef.current?.focus(), 0);
+    } else {
+      // Abort any in-flight request
+      paletteAbortRef.current?.abort();
+      // Restore focus to previously focused element (best-effort)
+      if (palettePrevFocusRef.current && palettePrevFocusRef.current instanceof HTMLElement) {
+        palettePrevFocusRef.current.focus();
+      }
+      palettePrevFocusRef.current = null;
     }
   }, [paletteOpen]);
 
   useEffect(() => {
     if (paletteDebounceRef.current) clearTimeout(paletteDebounceRef.current);
-    if (!paletteQuery.trim()) { setPaletteResults([]); return; }
+    if (!paletteQuery.trim()) { setPaletteResults([]); setPaletteSelectedIdx(-1); return; }
 
     paletteDebounceRef.current = setTimeout(async () => {
       paletteAbortRef.current?.abort();
@@ -807,10 +838,13 @@ function ChatScreen({
       paletteAbortRef.current = ctrl;
       try {
         const res = await apiFetch(`/search?q=${encodeURIComponent(paletteQuery.trim())}`, { signal: ctrl.signal });
+        if (!res.ok) return;
         const data = (await res.json()) as SearchResult[];
-        if (!ctrl.signal.aborted) setPaletteResults(data);
-      } catch {
-        // Aborted or network error — leave stale results
+        if (!ctrl.signal.aborted) { setPaletteResults(data); setPaletteSelectedIdx(-1); }
+      } catch (err) {
+        if ((err as Error).name === "AbortError") return;
+        console.error("[palette] search error:", err);
+        setPaletteResults([]);
       }
     }, 200);
 
@@ -819,21 +853,32 @@ function ChatScreen({
     };
   }, [paletteQuery]);
 
+  // Flat list of all results for keyboard index math
+  const paletteFlatResults = paletteResults;
+
   function handlePaletteSelect(result: SearchResult) {
-    setPaletteOpen(false);
+    onPaletteOpenChange(false);
     setPaletteQuery("");
     router.push(result.url);
   }
 
-  // Group results by type in a stable order
-  const PALETTE_TYPE_LABELS: Record<string, string> = {
-    conversations: "Conversations",
-    messages: "Messages",
-    tasks: "Tasks",
-    artifacts: "Artifacts",
-    memory: "Memory",
-    sources: "Sources",
-  };
+  function handlePaletteKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (!paletteFlatResults.length) return;
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setPaletteSelectedIdx(i => Math.min(i + 1, paletteFlatResults.length - 1));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setPaletteSelectedIdx(i => Math.max(i - 1, -1));
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      if (paletteSelectedIdx >= 0 && paletteSelectedIdx < paletteFlatResults.length) {
+        handlePaletteSelect(paletteFlatResults[paletteSelectedIdx]);
+      }
+    }
+  }
+
+  // Group results by type in a stable order (uses module-scope PALETTE_TYPE_LABELS)
   const paletteGrouped = paletteResults.reduce<Record<string, SearchResult[]>>((acc, r) => {
     (acc[r.type] ??= []).push(r);
     return acc;
@@ -841,6 +886,13 @@ function ChatScreen({
   const paletteGroups = Object.keys(PALETTE_TYPE_LABELS)
     .filter(k => paletteGrouped[k]?.length)
     .map(k => ({ type: k, label: PALETTE_TYPE_LABELS[k], items: paletteGrouped[k] }));
+
+  // Build a flat index map so we can highlight the right item in grouped view
+  let _paletteFlatIdx = 0;
+  const paletteGroupsWithIdx = paletteGroups.map(g => ({
+    ...g,
+    items: g.items.map(item => ({ item, flatIdx: _paletteFlatIdx++ })),
+  }));
   // ── End command palette ───────────────────────────────────────────────────
 
   const activePersona = PERSONAS.find(p => p.id === activePersonaId) ?? PERSONAS[0];
@@ -1262,9 +1314,11 @@ function ChatScreen({
       {/* ⌘K Command palette */}
       {paletteOpen && (
         <div
+          role="dialog"
+          aria-modal="true"
           className="fixed inset-0 z-50 flex items-start justify-center pt-[15vh]"
           style={{ background: "color-mix(in oklch, var(--text) 20%, transparent)" }}
-          onClick={() => setPaletteOpen(false)}
+          onClick={() => onPaletteOpenChange(false)}
         >
           <div
             className="surface border rounded-xl shadow-2xl w-full max-w-[560px] mx-4 overflow-hidden"
@@ -1279,7 +1333,9 @@ function ChatScreen({
                 type="text"
                 value={paletteQuery}
                 onChange={e => setPaletteQuery(e.target.value)}
+                onKeyDown={handlePaletteKeyDown}
                 placeholder="Search conversations, memory, tasks…"
+                aria-label="Search"
                 className="flex-1 bg-transparent text-[14px] outline-none"
                 style={{ color: "var(--text)" }}
               />
@@ -1289,34 +1345,38 @@ function ChatScreen({
 
             {/* Results */}
             <div className="max-h-[400px] overflow-y-auto">
-              {paletteQuery.trim() && paletteGroups.length === 0 && (
+              {paletteQuery.trim() && paletteGroupsWithIdx.length === 0 && (
                 <div className="px-4 py-8 text-center text-[13.5px]" style={{ color: "var(--text-dim)" }}>
                   No results for &ldquo;{paletteQuery}&rdquo;
                 </div>
               )}
-              {paletteGroups.map(group => (
+              {paletteGroupsWithIdx.map(group => (
                 <div key={group.type}>
                   <div className="px-4 pt-3 pb-1 text-[11.5px] font-medium uppercase tracking-wider"
                        style={{ color: "var(--text-dim)" }}>
                     {group.label}
                   </div>
-                  {group.items.map(result => (
-                    <button
-                      key={result.id}
-                      onClick={() => handlePaletteSelect(result)}
-                      className="w-full flex items-start gap-3 px-4 py-2.5 text-left smooth hover:bg-[var(--surface-2)]"
-                    >
-                      <div className="flex-1 min-w-0">
-                        <div className="text-[13.5px] font-medium truncate">{result.title}</div>
-                        {result.snippet && result.snippet !== result.title && (
-                          <div className="text-[12px] truncate mt-0.5" style={{ color: "var(--text-dim)" }}>
-                            {result.snippet}
-                          </div>
-                        )}
-                      </div>
-                      <IC.ArrowRight size={13} style={{ color: "var(--text-dim)", flexShrink: 0, marginTop: 3 }}/>
-                    </button>
-                  ))}
+                  {group.items.map(({ item: result, flatIdx }) => {
+                    const isSelected = flatIdx === paletteSelectedIdx;
+                    return (
+                      <button
+                        key={`${result.type}-${result.id}`}
+                        onClick={() => handlePaletteSelect(result)}
+                        className="w-full flex items-start gap-3 px-4 py-2.5 text-left smooth hover:bg-[var(--surface-2)]"
+                        style={{ background: isSelected ? "var(--accent-soft)" : undefined }}
+                      >
+                        <div className="flex-1 min-w-0">
+                          <div className="text-[13.5px] font-medium truncate">{result.title}</div>
+                          {result.snippet && result.snippet !== result.title && (
+                            <div className="text-[12px] truncate mt-0.5" style={{ color: "var(--text-dim)" }}>
+                              {result.snippet}
+                            </div>
+                          )}
+                        </div>
+                        <IC.ArrowRight size={13} style={{ color: "var(--text-dim)", flexShrink: 0, marginTop: 3 }}/>
+                      </button>
+                    );
+                  })}
                 </div>
               ))}
               {!paletteQuery.trim() && (

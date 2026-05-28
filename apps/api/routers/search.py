@@ -6,10 +6,11 @@ member-scoped (member owns the conversation).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import and_, select
 
 from core import audit, memory, permissions
@@ -25,6 +26,11 @@ _ALL_TYPES = ["conversations", "messages", "tasks", "artifacts", "memory", "sour
 _PER_TYPE_LIMIT = 10
 
 
+def _escape_like(q: str) -> str:
+    """Escape LIKE metacharacters so user input is treated as a literal string."""
+    return q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _snippet(text: str | None, *, max_len: int = 200) -> str:
     if not text:
         return ""
@@ -33,6 +39,7 @@ def _snippet(text: str | None, *, max_len: int = 200) -> str:
 
 
 async def _search_conversations(q: str, member: Member) -> list[dict[str, Any]]:
+    escaped = _escape_like(q)
     tbl = await reflect_table("conversations")
     async with engine.begin() as conn:
         rows = (
@@ -42,7 +49,7 @@ async def _search_conversations(q: str, member: Member) -> list[dict[str, Any]]:
                     and_(
                         tbl.c.organization_id == member.organization_id,
                         tbl.c.member_id == member.id,
-                        tbl.c.title.ilike(f"%{q}%"),
+                        tbl.c.title.ilike(f"%{escaped}%", escape="\\"),
                     )
                 )
                 .order_by(tbl.c.updated_at.desc())
@@ -62,6 +69,7 @@ async def _search_conversations(q: str, member: Member) -> list[dict[str, Any]]:
 
 
 async def _search_messages(q: str, member: Member) -> list[dict[str, Any]]:
+    escaped = _escape_like(q)
     msgs = await reflect_table("messages")
     convos = await reflect_table("conversations")
     # Subquery: IDs of conversations owned by this member in this org
@@ -82,7 +90,7 @@ async def _search_messages(q: str, member: Member) -> list[dict[str, Any]]:
                     and_(
                         msgs.c.organization_id == member.organization_id,
                         msgs.c.conversation_id.in_(owned_convo_ids),
-                        msgs.c.content.ilike(f"%{q}%"),
+                        msgs.c.content.ilike(f"%{escaped}%", escape="\\"),
                     )
                 )
                 .order_by(msgs.c.created_at.desc())
@@ -102,6 +110,7 @@ async def _search_messages(q: str, member: Member) -> list[dict[str, Any]]:
 
 
 async def _search_tasks(q: str, member: Member) -> list[dict[str, Any]]:
+    escaped = _escape_like(q)
     tbl = await reflect_table("tasks")
     async with engine.begin() as conn:
         rows = (
@@ -110,7 +119,7 @@ async def _search_tasks(q: str, member: Member) -> list[dict[str, Any]]:
                 .where(
                     and_(
                         tbl.c.organization_id == member.organization_id,
-                        tbl.c.goal.ilike(f"%{q}%"),
+                        tbl.c.goal.ilike(f"%{escaped}%", escape="\\"),
                     )
                 )
                 .order_by(tbl.c.created_at.desc())
@@ -130,6 +139,7 @@ async def _search_tasks(q: str, member: Member) -> list[dict[str, Any]]:
 
 
 async def _search_artifacts(q: str, member: Member) -> list[dict[str, Any]]:
+    escaped = _escape_like(q)
     tbl = await reflect_table("artifacts")
     async with engine.begin() as conn:
         rows = (
@@ -138,7 +148,7 @@ async def _search_artifacts(q: str, member: Member) -> list[dict[str, Any]]:
                 .where(
                     and_(
                         tbl.c.organization_id == member.organization_id,
-                        tbl.c.title.ilike(f"%{q}%"),
+                        tbl.c.title.ilike(f"%{escaped}%", escape="\\"),
                     )
                 )
                 .order_by(tbl.c.created_at.desc())
@@ -175,6 +185,7 @@ async def _search_memory(q: str, member: Member) -> list[dict[str, Any]]:
 
 async def _search_sources(q: str, member: Member) -> list[dict[str, Any]]:
     """Search project_sources if the table exists; degrade to [] if not."""
+    escaped = _escape_like(q)
     try:
         tbl = await reflect_table("project_sources")
     except Exception:
@@ -188,7 +199,7 @@ async def _search_sources(q: str, member: Member) -> list[dict[str, Any]]:
                     .where(
                         and_(
                             tbl.c.organization_id == member.organization_id,
-                            tbl.c.title.ilike(f"%{q}%"),
+                            tbl.c.title.ilike(f"%{escaped}%", escape="\\"),
                         )
                     )
                     .order_by(tbl.c.created_at.desc())
@@ -209,6 +220,16 @@ async def _search_sources(q: str, member: Member) -> list[dict[str, Any]]:
         return []
 
 
+_HANDLERS: dict[str, Any] = {
+    "conversations": _search_conversations,
+    "messages": _search_messages,
+    "tasks": _search_tasks,
+    "artifacts": _search_artifacts,
+    "memory": _search_memory,
+    "sources": _search_sources,
+}
+
+
 # Public helper used by tests (avoids importing FastAPI machinery)
 async def run_search(
     *,
@@ -227,8 +248,6 @@ async def run_search(
     )
 
     q = q.strip()
-    if not q:
-        return []
 
     requested = _ALL_TYPES[:]
     if types_csv:
@@ -238,38 +257,31 @@ async def run_search(
         if not requested:
             return []
 
-    _HANDLERS = {
-        "conversations": _search_conversations,
-        "messages": _search_messages,
-        "tasks": _search_tasks,
-        "artifacts": _search_artifacts,
-        "memory": _search_memory,
-        "sources": _search_sources,
-    }
-
-    results: list[dict[str, Any]] = []
-    for type_name in requested:
-        handler = _HANDLERS[type_name]
+    async def _run_handler(type_name: str) -> list[dict[str, Any]]:
         try:
-            hits = await handler(q, member)
-            results.extend(hits)
-        except Exception as exc:
-            logger.warning("Search handler %r failed: %s", type_name, exc)
-            # Degrade gracefully — other types still return
+            return await _HANDLERS[type_name](q, member)
+        except Exception:
+            logger.exception("Search handler %r failed", type_name)
+            return []
+
+    nested = await asyncio.gather(*[_run_handler(t) for t in requested])
+    results: list[dict[str, Any]] = []
+    for hits in nested:
+        results.extend(hits)
 
     return results
 
 
 @router.get("")
 async def search(
-    q: str,
+    q: str = Query(..., min_length=1, max_length=200),
     types: str | None = None,
     member: Member = Depends(get_current_member),
 ) -> list[dict[str, Any]]:
     """Search across conversations, messages, tasks, artifacts, memory, and sources.
 
     Args:
-        q: Required search term.
+        q: Required search term (1–200 characters).
         types: Optional comma-separated list of result types to include.
                Defaults to all types. Unknown types are silently ignored.
 
