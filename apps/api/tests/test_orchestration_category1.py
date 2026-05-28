@@ -364,27 +364,47 @@ def test_dag_tool_args_resolve_template_references_for_composition():
 
 
 @pytest.mark.asyncio
-async def test_task_planner_classifies_goal_and_rejects_missing_tools(monkeypatch):
+async def test_task_planner_uses_available_tools_when_classifier_names_wrong_tools(monkeypatch):
     from runtime import planner
 
+    prompts = []
+
     async def fake_complete_json(prompt, model=None):
+        prompts.append(prompt)
         if "Classify this task goal" in prompt:
             return json.dumps(
                 {
                     "complexity": "complex",
-                    "requires_tools": ["salesforce.search"],
+                    "requires_tools": ["subagent.spawn", "research.search", "presentation.create"],
                     "requires_sub_agents": False,
                     "requires_approval": False,
                     "estimated_steps": 4,
                     "success_criteria": "Qualified accounts are listed.",
                 }
             )
-        raise AssertionError("Planning should stop before asking for a plan when tools are missing")
+        assert "Use only tools from this available list" in prompt
+        assert "browser.search" in prompt
+        return json.dumps(
+            {
+                "steps": [
+                    {
+                        "id": "research",
+                        "action": "tool_call",
+                        "tool": "browser.search",
+                        "args": {"query": "find accounts"},
+                        "depends_on": [],
+                    }
+                ],
+                "context": {},
+            }
+        )
 
     monkeypatch.setattr(planner, "complete_json", fake_complete_json)
 
-    with pytest.raises(planner.PlanningError, match="Missing tools"):
-        await planner.TaskPlanner(available_tools=["browser.search"]).plan("find accounts")
+    plan = await planner.TaskPlanner(available_tools=["browser.search"]).plan("find accounts")
+
+    assert plan["steps"][0]["tool"] == "browser.search"
+    assert len(prompts) == 2
 
 
 def test_validate_plan_rejects_unknown_tools_and_missing_approval_gate():
@@ -571,7 +591,7 @@ async def test_run_uses_native_loop_for_non_complex_goal(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_run_fails_fast_when_required_tool_is_missing(monkeypatch):
+async def test_run_falls_back_to_native_loop_when_classifier_names_wrong_tools(monkeypatch):
     from runtime import executor
     from runtime.planner import TaskClassification
 
@@ -579,20 +599,22 @@ async def test_run_fails_fast_when_required_tool_is_missing(monkeypatch):
     saved, dag_calls, loop_calls = _wire_run(monkeypatch, executor, task)
 
     async def fake_preflight(goal, context, org_id, available_tools=None):
-        return TaskClassification(complexity="complex", requires_tools=["crm.sync"]), ["crm.sync"]
+        return TaskClassification(
+            complexity="complex",
+            requires_tools=["subagent.spawn", "research.search", "presentation.create"],
+        ), ["subagent.spawn", "research.search", "presentation.create"]
 
     async def fail_create_plan(*args, **kwargs):
-        raise AssertionError("create_plan must not run when pre-flight fails")
+        raise executor.PlanningError("classifier named non-registry tools")
 
     monkeypatch.setattr(executor, "preflight", fake_preflight)
     monkeypatch.setattr(executor, "create_plan", fail_create_plan)
 
     await executor.TaskExecutor().run("task-dag")
 
-    assert task["status"] == "failed"
-    assert "missing_tools" in (saved.get("error") or "")
-    assert "crm.sync" in saved["error"]
-    assert not dag_calls and not loop_calls
+    assert task["status"] != "failed"
+    assert "missing_tools" not in (saved.get("error") or "")
+    assert loop_calls and not dag_calls
 
 
 @pytest.mark.asyncio

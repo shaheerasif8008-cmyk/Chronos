@@ -255,6 +255,45 @@ async def test_publish_activity_persists_replayable_model_trace(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_reasoning_summary_activity_is_live_only(monkeypatch):
+    from runtime import agent_loop
+
+    published = []
+    audited = []
+
+    async def fake_publish(channel, payload):
+        published.append((channel, json.loads(payload)))
+
+    async def fake_audit_log(event_type, actor_id, action, **kwargs):
+        audited.append((event_type, actor_id, action, kwargs))
+        return "audit-1"
+
+    async def fake_complete_text(prompt, *, model=None):
+        assert "summarize the agent's current reasoning" in prompt
+        assert "hidden controller instruction" not in prompt
+        return "I am checking current context, then I will use search because the request is time-sensitive."
+
+    monkeypatch.setattr(agent_loop.redis_client, "publish", fake_publish)
+    monkeypatch.setattr(agent_loop.audit, "log", fake_audit_log)
+    monkeypatch.setattr(agent_loop, "complete_text", fake_complete_text)
+
+    await agent_loop.publish_reasoning_summary(
+        "task-reasoning",
+        history=[
+            {"role": "system", "content": "hidden controller instruction"},
+            {"role": "user", "content": "Find the latest funding news."},
+        ],
+        iteration=1,
+        next_actions=[{"name": "browser__search"}],
+    )
+
+    assert [event[1]["type"] for event in published] == ["reasoning_summary"]
+    assert published[0][1]["summary"].startswith("I am checking current context")
+    assert published[0][1]["iteration"] == 1
+    assert audited == []
+
+
+@pytest.mark.asyncio
 async def test_tool_broker_reuses_idempotent_external_write_result(monkeypatch):
     from core import tool_broker
     from core.models import AgentContext, Member, ToolResult
