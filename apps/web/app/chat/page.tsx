@@ -796,6 +796,30 @@ function ChatScreen({
   const paletteAbortRef = useRef<AbortController | null>(null);
   const palettePrevFocusRef = useRef<Element | null>(null);
 
+  const [attachments, setAttachments] = useState<{ id: string; name: string; size: number }[]>([]);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  async function uploadFiles(files: FileList) {
+    // Use bare fetch, NOT apiFetch: apiFetch forces `Content-Type: application/json`
+    // whenever a body is present, which breaks multipart uploads —
+    // the browser must set the multipart boundary itself.
+    const token = getToken();
+    for (const file of Array.from(files)) {
+      const form = new FormData();
+      form.append("file", file);
+      if (activeConvoId) form.append("conversation_id", activeConvoId);
+      const res = await fetch(`${apiBase()}/attachments`, {
+        method: "POST",
+        body: form,
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (res.ok) {
+        const data = await res.json() as { attachment_id: string; filename: string; size_bytes: number };
+        setAttachments(prev => [...prev, { id: data.attachment_id, name: data.filename, size: data.size_bytes }]);
+      }
+    }
+  }
+
   // Cmd/Ctrl+K global listener — toggles palette
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
@@ -999,6 +1023,7 @@ function ChatScreen({
     if (!draft.trim() || streaming) return;
     const text = draft.trim();
     setDraft("");
+    setAttachments([]);
     setMessages(prev => [...prev, { role: "user", content: text, status: "complete" }]);
     streamingRef.current = true;
     setStreaming(true);
@@ -1158,7 +1183,7 @@ function ChatScreen({
       const resp = await apiFetch("/chat/message", {
         method: "POST",
         headers: { Accept: "text/event-stream" },
-        body: JSON.stringify({ message: text, conversation_id: convoId, model: selectedModel, mode: selectedMode, persona_id: activePersonaId }),
+        body: JSON.stringify({ message: text, conversation_id: convoId, model: selectedModel, mode: selectedMode, persona_id: activePersonaId, attachment_ids: attachments.map(a => a.id) }),
         signal: ab.signal,
       });
 
@@ -1244,7 +1269,24 @@ function ChatScreen({
         {/* Composer */}
         <div className="px-6 pb-6 pt-2" style={{ background: "var(--bg)" }}>
           <div className="max-w-[780px] mx-auto">
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              className="hidden"
+              onChange={e => { if (e.target.files) void uploadFiles(e.target.files); e.target.value = ""; }}
+            />
             <div className="composer-shell">
+              {attachments.length > 0 && (
+                <div className="flex flex-wrap gap-2 px-4 pt-3 pb-1">
+                  {attachments.map(a => (
+                    <span key={a.id} className="surface border border-soft rounded-md px-2 py-1 text-[12px] flex items-center gap-1">
+                      {a.name}
+                      <button aria-label={`Remove ${a.name}`} onClick={() => setAttachments(prev => prev.filter(x => x.id !== a.id))}>×</button>
+                    </span>
+                  ))}
+                </div>
+              )}
               <textarea
                 value={draft}
                 onChange={e => setDraft(e.target.value)}
@@ -1256,7 +1298,7 @@ function ChatScreen({
               />
               <div className="flex items-center justify-between px-3 pb-2.5 pt-1">
                 <div className="flex items-center gap-1">
-                  <button className="btn btn-ghost btn-sm btn-icon"><IC.Attach size={15}/></button>
+                  <button type="button" aria-label="Attach files" className="btn btn-ghost btn-sm btn-icon" onClick={() => fileInputRef.current?.click()}><IC.Attach size={15}/></button>
                   <button className="btn btn-ghost btn-sm">
                     <IC.Sparkles size={14} style={{ color: "var(--accent)" }}/> Skills · 1
                   </button>
