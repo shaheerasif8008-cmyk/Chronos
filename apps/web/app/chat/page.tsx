@@ -1416,36 +1416,119 @@ function TraceRow({ trace }: { trace: ToolTrace }) {
   );
 }
 
+type RenderMode = "html" | "image" | "text";
+function artifactRenderMode(artifact: ArtifactRef): RenderMode | null {
+  const mime = (artifact.mime_type ?? "").toLowerCase();
+  const kind = (artifact.kind ?? "").toLowerCase();
+  if (mime === "text/html" || kind === "html") return "html";
+  if (mime.startsWith("image/")) return "image";
+  if (
+    mime.startsWith("text/") ||
+    mime === "application/json" ||
+    ["markdown", "code", "data", "text"].includes(kind)
+  ) return "text";
+  return null;
+}
+
+const HEIGHT_REPORTER =
+  "<scr" + "ipt>(function(){function p(){try{var h=Math.max(" +
+  "document.documentElement.scrollHeight||0,document.body?document.body.scrollHeight:0);" +
+  "parent.postMessage({type:'chronos:artifact-height',height:h},'*');}catch(e){}}" +
+  "try{new ResizeObserver(p).observe(document.documentElement);}catch(e){}" +
+  "window.addEventListener('load',p);setTimeout(p,60);setTimeout(p,400);})();</scr" + "ipt>";
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function textShell(text: string): string {
+  return (
+    "<!doctype html><meta charset='utf-8'>" +
+    "<style>body{margin:0;padding:14px;color:#1f2328;background:#fff;" +
+    "font:13px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;" +
+    "white-space:pre-wrap;word-break:break-word;}</style><pre>" +
+    escapeHtml(text) + "</pre>" + HEIGHT_REPORTER
+  );
+}
+
+function ArtifactInline({ artifact, mode }: { artifact: ArtifactRef; mode: RenderMode }) {
+  const [srcDoc, setSrcDoc] = useState<string | null>(null);
+  const [imgUrl, setImgUrl] = useState<string | null>(null);
+  const [error, setError] = useState(false);
+  const [height, setHeight] = useState(320);
+  const frameRef = useRef<HTMLIFrameElement>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    let objectUrl: string | null = null;
+    (async () => {
+      try {
+        const res = await apiFetch(`/artifacts/${artifact.id}/content`);
+        if (mode === "image") {
+          const url = URL.createObjectURL(await res.blob());
+          objectUrl = url;
+          if (!cancelled) setImgUrl(url);
+        } else {
+          const text = await res.text();
+          if (!cancelled) setSrcDoc(mode === "html" ? text + HEIGHT_REPORTER : textShell(text));
+        }
+      } catch {
+        if (!cancelled) setError(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [artifact.id, mode]);
+
+  useEffect(() => {
+    function onMessage(event: MessageEvent) {
+      if (!frameRef.current || event.source !== frameRef.current.contentWindow) return;
+      const data = event.data as { type?: string; height?: unknown };
+      if (data?.type !== "chronos:artifact-height") return;
+      const nextHeight = Number(data.height);
+      if (Number.isFinite(nextHeight)) setHeight(Math.min(1400, Math.max(120, Math.ceil(nextHeight))));
+    }
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, []);
+
+  if (error) {
+    return <div className="text-[12px] px-1 py-1.5" style={{ color: "var(--text-dim)" }}>Couldn&apos;t load preview. Try Download.</div>;
+  }
+  if (mode === "image") {
+    return imgUrl
+      ? <img src={imgUrl} alt={artifact.title} style={{ maxWidth: "100%", display: "block", borderRadius: 8 }} />
+      : <div className="shimmer-text text-[12px] px-1 py-2" style={{ color: "var(--text-dim)" }}>Loading preview...</div>;
+  }
+  if (srcDoc === null) {
+    return <div className="shimmer-text text-[12px] px-1 py-2" style={{ color: "var(--text-dim)" }}>Loading preview...</div>;
+  }
+  return (
+    <iframe
+      ref={frameRef}
+      title={artifact.title}
+      srcDoc={srcDoc}
+      sandbox="allow-scripts"
+      style={{ width: "100%", height, border: "none", borderRadius: 8, background: "#fff" }}
+    />
+  );
+}
+
 function ArtifactCard({ artifact }: { artifact: ArtifactRef }) {
   const [busy, setBusy] = useState(false);
-  const mime = artifact.mime_type ?? "";
-  const isOpenable = mime.startsWith("text/html") || mime.includes("svg") || mime.startsWith("image/");
+  const mode = artifactRenderMode(artifact);
+  const [open, setOpen] = useState(mode === "html" || mode === "image");
   const sizeLabel = artifact.size_bytes ? `${(artifact.size_bytes / 1024).toFixed(1)} KB` : "";
-
-  async function fetchBlob(): Promise<Blob | null> {
-    try {
-      const res = await apiFetch(`/artifacts/${artifact.id}/content`);
-      return await res.blob();
-    } catch { return null; }
-  }
-
-  async function handleOpen() {
-    // Open the tab synchronously (inside the click gesture) so popup blockers
-    // don't kill it, then point it at the blob once fetched.
-    const tab = window.open("about:blank", "_blank", "noopener,noreferrer");
-    setBusy(true);
-    const blob = await fetchBlob();
-    setBusy(false);
-    if (!blob) { tab?.close(); return; }
-    const url = URL.createObjectURL(blob);
-    if (tab) tab.location.href = url;
-    else window.open(url, "_blank", "noopener,noreferrer");  // fallback
-    setTimeout(() => URL.revokeObjectURL(url), 60_000);
-  }
 
   async function handleDownload() {
     setBusy(true);
-    const blob = await fetchBlob();
+    let blob: Blob | null = null;
+    try {
+      const res = await apiFetch(`/artifacts/${artifact.id}/content`);
+      blob = await res.blob();
+    } catch { /* no-op */ }
     setBusy(false);
     if (!blob) return;
     const url = URL.createObjectURL(blob);
@@ -1459,24 +1542,31 @@ function ArtifactCard({ artifact }: { artifact: ArtifactRef }) {
   }
 
   return (
-    <div className="rounded-xl border flex items-center gap-3 px-3.5 py-3"
+    <div className="rounded-xl border overflow-hidden"
          style={{ borderColor: "var(--border)", background: "var(--surface)" }}>
-      <div className="w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0"
-           style={{ background: "var(--accent-soft)", color: "var(--accent-text)" }}>
-        <IC.Folder size={18}/>
-      </div>
-      <div className="flex-1 min-w-0">
-        <div className="text-[13.5px] font-medium truncate">{artifact.title}</div>
-        <div className="text-[11.5px]" style={{ color: "var(--text-dim)" }}>
-          {artifact.kind}{sizeLabel ? ` · ${sizeLabel}` : ""}
+      <div className="flex items-center gap-3 px-3.5 py-3">
+        <div className="w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0"
+             style={{ background: "var(--accent-soft)", color: "var(--accent-text)" }}>
+          <IC.Folder size={18}/>
         </div>
+        <div className="flex-1 min-w-0">
+          <div className="text-[13.5px] font-medium truncate">{artifact.title}</div>
+          <div className="text-[11.5px]" style={{ color: "var(--text-dim)" }}>
+            {artifact.kind}{sizeLabel ? ` · ${sizeLabel}` : ""}
+          </div>
+        </div>
+        {mode && (
+          <button onClick={() => setOpen(value => !value)} className="btn btn-ghost btn-sm">
+            <IC.Eye size={13}/> {open ? "Hide" : "Preview"}
+          </button>
+        )}
+        <button onClick={handleDownload} disabled={busy} className="btn btn-ghost btn-sm">Download</button>
       </div>
-      {isOpenable && (
-        <button onClick={handleOpen} disabled={busy} className="btn btn-secondary btn-sm">
-          <IC.External size={13}/> Open
-        </button>
+      {open && mode && (
+        <div className="px-2.5 pb-2.5 pt-0.5 border-t" style={{ borderColor: "var(--border)" }}>
+          <ArtifactInline artifact={artifact} mode={mode}/>
+        </div>
       )}
-      <button onClick={handleDownload} disabled={busy} className="btn btn-ghost btn-sm">Download</button>
     </div>
   );
 }

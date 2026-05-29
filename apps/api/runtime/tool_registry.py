@@ -148,6 +148,38 @@ CODE_PYTHON = _fn(
     ["code"],
 )
 
+# ── Artifacts ─────────────────────────────────────────────────────────────────
+
+ARTIFACT_LIST = _fn(
+    "artifact__list",
+    "List current artifacts in this conversation, including key, title, kind, and version.",
+    {},
+    [],
+)
+
+ARTIFACT_READ = _fn(
+    "artifact__read",
+    "Read the current content of a conversation artifact by stable key. Use before revising an existing artifact.",
+    {"key": {"type": "string", "description": "Stable artifact key, e.g. 'report.md' or 'demo.html'."}},
+    ["key"],
+)
+
+ARTIFACT_WRITE = _fn(
+    "artifact__write",
+    "Create or update a conversation artifact under a stable key. Reusing a key creates a new version.",
+    {
+        "key": {"type": "string", "description": "Stable artifact key, ideally with an extension."},
+        "content": {"type": "string", "description": "Full artifact content."},
+        "title": {"type": "string", "description": "Human-readable title."},
+        "kind": {
+            "type": "string",
+            "description": "Artifact kind; inferred from the key extension when omitted.",
+            "enum": ["html", "markdown", "code", "data", "text", "image"],
+        },
+    },
+    ["key", "content"],
+)
+
 # ── Sub-agent ─────────────────────────────────────────────────────────────────
 
 SPAWN_SUBAGENT = _fn(
@@ -183,6 +215,9 @@ ALL_TOOLS: list[dict[str, Any]] = [
     FS_LIST,
     FS_READ,
     FS_WRITE,
+    ARTIFACT_LIST,
+    ARTIFACT_READ,
+    ARTIFACT_WRITE,
     CODE_PYTHON,
     SPAWN_SUBAGENT,
 ]
@@ -195,12 +230,19 @@ SUBAGENT_TOOLS: list[dict[str, Any]] = [
     FS_LIST,
     FS_READ,
     FS_WRITE,
+    ARTIFACT_LIST,
+    ARTIFACT_READ,
+    ARTIFACT_WRITE,
     CODE_PYTHON,
 ]
 
 #: Names that always need explicit human approval before execution.
 ALWAYS_APPROVAL_TOOL_NAMES: frozenset[str] = frozenset(
     {"gmail__send", "twitter__post", "linkedin__post", "website__publish"}
+)
+
+ARTIFACT_TOOL_NAMES: frozenset[str] = frozenset(
+    {"artifact__list", "artifact__read", "artifact__write"}
 )
 
 _SUBAGENT_TOOL_NAME = "spawn__subagent"
