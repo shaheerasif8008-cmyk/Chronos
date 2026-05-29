@@ -9,6 +9,11 @@ from core.db import engine, reflect_table
 from core.models import RequesterContext
 from core.personas import get_persona_prompt
 from core.tool_manifest import generate_tool_manifest
+from memory.source_retrieval import (
+    build_knowledge_block,
+    citations_payload,
+    retrieve_source_chunks,
+)
 from skills.loader import find_relevant_skills, load_skill_content, skill_connector_warning
 from skills.registry import load_skill_index
 
@@ -129,6 +134,14 @@ async def assemble_context(
     if persona_prompt and _estimate_tokens(base + persona_prompt) <= system_budget:
         base += f"\n\n# Your Identity\n{persona_prompt}"
 
+    # ── Layer 3b: project instructions ─────────────────────────────────────
+    if requester_context.project_id is not None:
+        project_instructions = await _load_project_instructions(
+            requester_context.project_id, requester_context.org_id
+        )
+        if project_instructions and _estimate_tokens(base + project_instructions) <= system_budget:
+            base += f"\n\n# Project Instructions\n{project_instructions}"
+
     # ── Layer 4: skills (Category 6: connector-aware, progressive) ──────────
     skill_ids = await find_relevant_skills(message)
     skill_index = {s["id"]: s for s in load_skill_index()}
@@ -159,6 +172,22 @@ async def assemble_context(
         if _estimate_tokens(base + mem_block) <= system_budget:
             base += "\n\n# What I Remember\n" + mem_block
 
+    # ── Layer 5b: project knowledge (permission-aware source citations) ─────
+    if requester_context.project_id is not None:
+        try:
+            citations = await retrieve_source_chunks(message, requester_context)
+        except Exception:
+            citations = []
+        if citations:
+            knowledge_block = build_knowledge_block(citations)
+            if knowledge_block and _estimate_tokens(base + knowledge_block) <= system_budget:
+                base += f"\n\n{knowledge_block}"
+                requester_context.surfaced_citations = citations_payload(citations)
+            else:
+                requester_context.surfaced_citations = []
+        else:
+            requester_context.surfaced_citations = []
+
     # ── Layer 6: task state ─────────────────────────────────────────────────
     if requester_context.task_id:
         task_context = await _load_task_context(requester_context.task_id)
@@ -169,6 +198,34 @@ async def assemble_context(
     history = await _compact_history(conversation_id, budget_tokens=history_budget)
 
     return [{"role": "system", "content": base}, *history, {"role": "user", "content": message}]
+
+
+async def _load_project_instructions(project_id: str, org_id: str) -> str | None:
+    """Return the project's instructions text, or None if absent / not in caller's org.
+
+    Defense-in-depth: filters on BOTH id AND organization_id so a caller cannot
+    obtain instructions from a project in a different tenant, even if they supply
+    the correct project UUID.
+    """
+    try:
+        projects = await reflect_table("projects")
+    except Exception:
+        return None
+    async with engine.begin() as conn:
+        row = (
+            await conn.execute(
+                select(projects.c.instructions).where(
+                    projects.c.id == project_id,
+                    projects.c.organization_id == org_id,
+                )
+            )
+        ).mappings().first()
+    if row is None:
+        return None
+    instructions = row["instructions"]
+    if not instructions or not instructions.strip():
+        return None
+    return instructions
 
 
 async def _load_task_context(task_id: str) -> str:

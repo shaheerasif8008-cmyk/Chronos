@@ -1,14 +1,14 @@
 """attachment parsing: parent link + parse status on artifacts
 
-Revision ID: 0017_attachment_parsing
-Revises: 0016_task_checkpoints
-Create Date: 2026-05-26
+Revision ID: 0019_attachment_parsing
+Revises: 0018_projects
+Create Date: 2026-05-28
 """
 from alembic import op
 import sqlalchemy as sa
 
-revision = "0017_attachment_parsing"
-down_revision = "0016_task_checkpoints"
+revision = "0019_attachment_parsing"
+down_revision = "0018_projects"
 branch_labels = None
 depends_on = None
 

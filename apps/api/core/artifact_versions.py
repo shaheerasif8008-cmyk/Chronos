@@ -3,14 +3,17 @@ from __future__ import annotations
 
 import difflib
 import io
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import insert, select, update
+from sqlalchemy.exc import IntegrityError
 
 from core.artifacts import _ensure_bucket, _minio_client, get_artifact
 from core.config import settings
 from core.db import engine, reflect_table
+
+_MAX_VERSION_ATTEMPTS = 4
 
 
 async def create_version(
@@ -25,58 +28,76 @@ async def create_version(
     """Write a new version of an existing artifact without overwriting prior bytes.
 
     Returns the updated artifact head metadata. Raises ValueError if not found.
-    """
-    head = await get_artifact(artifact_id)
-    if not head or str(head.get("organization_id")) != str(org_id) or head.get("is_deleted"):
-        raise ValueError("artifact not found")
 
-    next_version = int(head["version"]) + 1
+    Concurrency: ``next_version`` is derived from the head outside the write
+    transaction, so two concurrent edits can compute the same number. The
+    ``uq_artifact_version`` constraint rejects the loser; we catch it, re-read
+    the head, and retry with a freshly computed version (bounded). The head
+    UPDATE is guarded on the observed version so a stale writer never clobbers a
+    newer head.
+    """
     raw: bytes = content.encode() if isinstance(content, str) else content
     size = len(raw)
-    mime = mime_type or head.get("mime_type") or "text/plain"
-    minio_path = f"artifacts/{org_id}/{artifact_id}/v{next_version}"
-
-    try:
-        client = await _minio_client()
-        await _ensure_bucket(client)
-        await client.put_object(
-            settings.minio_bucket, minio_path, io.BytesIO(raw), length=size, content_type=mime
-        )
-    except Exception:
-        import pathlib as _pl
-        _d = _pl.Path("/tmp/chronos_artifacts") / artifact_id
-        _d.mkdir(parents=True, exist_ok=True)
-        (_d / f"v{next_version}").write_bytes(raw)
-        minio_path = f"local://{artifact_id}/v{next_version}"
-
     artifacts = await reflect_table("artifacts")
     versions = await reflect_table("artifact_versions")
-    async with engine.begin() as conn:
-        await conn.execute(
-            insert(versions).values(
-                organization_id=org_id,
-                region=head.get("region", "us"),
-                artifact_id=artifact_id,
-                version=next_version,
-                minio_path=minio_path,
-                mime_type=mime,
-                size_bytes=size,
-                edit_summary=edit_summary,
-                created_by=created_by,
+
+    last_error: IntegrityError | None = None
+    for _ in range(_MAX_VERSION_ATTEMPTS):
+        head = await get_artifact(artifact_id)
+        if not head or str(head.get("organization_id")) != str(org_id) or head.get("is_deleted"):
+            raise ValueError("artifact not found")
+
+        current_version = int(head["version"])
+        next_version = current_version + 1
+        mime = mime_type or head.get("mime_type") or "text/plain"
+        minio_path = f"artifacts/{org_id}/{artifact_id}/v{next_version}"
+
+        # Write bytes outside the DB transaction (never hold a row lock across upload).
+        try:
+            client = await _minio_client()
+            await _ensure_bucket(client)
+            await client.put_object(
+                settings.minio_bucket, minio_path, io.BytesIO(raw), length=size, content_type=mime
             )
-        )
-        await conn.execute(
-            update(artifacts)
-            .where(artifacts.c.id == artifact_id)
-            .values(
-                version=next_version,
-                minio_path=minio_path,
-                mime_type=mime,
-                size_bytes=size,
-                updated_at=datetime.utcnow(),
-            )
-        )
-    return await get_artifact(artifact_id)
+        except Exception:
+            import pathlib as _pl
+            _d = _pl.Path("/tmp/chronos_artifacts") / artifact_id
+            _d.mkdir(parents=True, exist_ok=True)
+            (_d / f"v{next_version}").write_bytes(raw)
+            minio_path = f"local://{artifact_id}/v{next_version}"
+
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    insert(versions).values(
+                        organization_id=org_id,
+                        region=head.get("region", "us"),
+                        artifact_id=artifact_id,
+                        version=next_version,
+                        minio_path=minio_path,
+                        mime_type=mime,
+                        size_bytes=size,
+                        edit_summary=edit_summary,
+                        created_by=created_by,
+                    )
+                )
+                await conn.execute(
+                    update(artifacts)
+                    .where(artifacts.c.id == artifact_id, artifacts.c.version == current_version)
+                    .values(
+                        version=next_version,
+                        minio_path=minio_path,
+                        mime_type=mime,
+                        size_bytes=size,
+                        updated_at=datetime.now(timezone.utc),
+                    )
+                )
+            return await get_artifact(artifact_id)
+        except IntegrityError as exc:
+            last_error = exc  # version collided — recompute and retry
+            continue
+
+    raise RuntimeError("artifact version contention: exceeded retry attempts") from last_error
 
 
 async def list_versions(artifact_id: str, org_id: str) -> list[dict[str, Any]]:

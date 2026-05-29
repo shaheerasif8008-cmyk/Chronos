@@ -1,13 +1,16 @@
 import importlib.util
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
-from jobs import context_update, profile_synthesis
+from core.exceptions import PermissionDenied
+
+from jobs import context_update, profile_synthesis, scheduled_tasks
 from core.db import engine, reflect_table
 from runtime import task_runner
-from routers import activity, approvals, artifact_share, artifacts, attachments, auth, chat, connectors, context, memory, settings, tasks, workflows
+from routers import activity, approvals, artifact_share, artifacts, attachments, auth, chat, connectors, context, memory, projects, schedules, search, settings, tasks, workflows
 
 app = FastAPI(title="Chronos API", version="0.1.0")
 
@@ -26,11 +29,14 @@ app.add_middleware(
 )
 
 app.include_router(auth.router)
+app.include_router(attachments.router)
 app.include_router(chat.router)
 app.include_router(memory.router)
+app.include_router(search.router)
 app.include_router(connectors.router)
 app.include_router(context.router)
 app.include_router(tasks.router)
+app.include_router(projects.router)
 app.include_router(activity.router)
 app.include_router(approvals.router)
 app.include_router(artifact_share.router)
@@ -38,6 +44,7 @@ app.include_router(artifacts.router)
 app.include_router(attachments.router)
 app.include_router(settings.router)
 app.include_router(workflows.router)
+app.include_router(schedules.router)
 
 
 def _init_observability() -> None:
@@ -82,14 +89,35 @@ def _init_observability() -> None:
 _init_observability()
 
 
+@app.exception_handler(PermissionDenied)
+async def _permission_denied_handler(_request: Request, exc: PermissionDenied) -> JSONResponse:
+    """Map authorization denials to HTTP 403 (enforcement raises rather than returns)."""
+    return JSONResponse(status_code=403, content={"detail": str(exc)})
+
+
 @app.on_event("startup")
 async def start_schedulers() -> None:
-    for scheduler in (profile_synthesis.scheduler, context_update.scheduler):
+    await _bootstrap_authz()
+    for scheduler in (profile_synthesis.scheduler, context_update.scheduler, scheduled_tasks.scheduler):
         if not scheduler.running:
             scheduler.start()
     task_runner.start_runner()
     await recover_incomplete_tasks()
     await recover_incomplete_workflows()
+
+
+async def _bootstrap_authz() -> None:
+    """Resolve/create the OpenFGA store and model when enforcement is enabled."""
+    from core import authz
+
+    if not authz.is_enabled():
+        return
+    try:
+        await authz.ensure_store_and_model()
+    except Exception:
+        # Startup must not crash if OpenFGA is briefly unavailable; checks fail
+        # closed at request time until the server is reachable.
+        pass
 
 
 async def recover_incomplete_tasks() -> list[str]:
@@ -117,7 +145,7 @@ async def recover_incomplete_workflows() -> list[str]:
 
 @app.on_event("shutdown")
 async def stop_schedulers() -> None:
-    for scheduler in (profile_synthesis.scheduler, context_update.scheduler):
+    for scheduler in (profile_synthesis.scheduler, context_update.scheduler, scheduled_tasks.scheduler):
         if scheduler.running:
             scheduler.shutdown(wait=False)
     await task_runner.stop_runner()

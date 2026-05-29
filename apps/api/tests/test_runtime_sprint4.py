@@ -693,7 +693,7 @@ async def test_operator_workflow_proof_task_api_reaches_pending_approval(monkeyp
     approvals = []
     scheduled = []
 
-    async def fake_create_task_record(*, goal, member, triggered_by, persona_id=None, workspace_id=None, model=None):
+    async def fake_create_task_record(*, goal, member, triggered_by, persona_id=None, workspace_id=None, model=None, **_kwargs):
         from runtime.planner import create_plan
 
         plan = await create_plan(goal, {"triggered_by": triggered_by}, member.organization_id)
@@ -808,13 +808,13 @@ async def test_chat_task_intent_routes_to_executor_without_chat_completion(monke
     scheduled = []
     saved = []
 
-    async def fake_save_message(conversation_id, role, content):
+    async def fake_save_message(conversation_id, role, content, **_kwargs):
         saved.append((conversation_id, role, content))
 
     async def fake_classify(message):
         return {"mode": "task", "confidence": 0.9, "goal": "research leads and draft outreach"}
 
-    async def fake_create_task_record(*, goal, member, triggered_by, persona_id=None, workspace_id=None, model=None, attachments_context=None):
+    async def fake_create_task_record(*, goal, member, triggered_by, persona_id=None, workspace_id=None, model=None, **_kwargs):
         assert goal == "research leads and draft outreach"
         assert persona_id == "sdr-outreach"
         assert triggered_by == "conversation-1"
@@ -836,9 +836,7 @@ async def test_chat_task_intent_routes_to_executor_without_chat_completion(monke
     monkeypatch.setattr(chat, "stream_completion", fake_stream_completion)
     monkeypatch.setattr(chat.audit, "log", fake_audit_log)
 
-    import routers.tasks as tasks_router
-
-    monkeypatch.setattr(tasks_router, "create_task_record", fake_create_task_record)
+    monkeypatch.setattr(chat, "create_task_record", fake_create_task_record)
 
     response = await chat.send_message(
         chat.ChatRequest(

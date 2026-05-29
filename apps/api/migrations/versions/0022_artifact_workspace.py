@@ -1,14 +1,14 @@
 """artifact workspace: versions, shares, artifact metadata columns
 
-Revision ID: 0018_artifact_workspace
-Revises: 0017_attachment_parsing
+Revision ID: 0022_artifact_workspace
+Revises: 0021_scheduled_tasks
 Create Date: 2026-05-29
 """
 from alembic import op
 import sqlalchemy as sa
 
-revision = "0018_artifact_workspace"
-down_revision = "0017_attachment_parsing"
+revision = "0022_artifact_workspace"
+down_revision = "0021_scheduled_tasks"
 branch_labels = None
 depends_on = None
 
@@ -55,9 +55,18 @@ def upgrade() -> None:
         sa.UniqueConstraint("token", name="uq_artifact_share_token"),
     )
     op.create_index("ix_artifact_shares_artifact", "artifact_shares", ["artifact_id"])
+    # At most one ACTIVE share per (artifact, org) — enforces idempotency under concurrency.
+    op.create_index(
+        "uq_artifact_shares_active",
+        "artifact_shares",
+        ["artifact_id", "organization_id"],
+        unique=True,
+        postgresql_where=sa.text("status = 'active'"),
+    )
 
 
 def downgrade() -> None:
+    op.drop_index("uq_artifact_shares_active", "artifact_shares")
     op.drop_index("ix_artifact_shares_artifact", "artifact_shares")
     op.drop_table("artifact_shares")
     op.drop_index("ix_artifact_versions_artifact", "artifact_versions")

@@ -37,9 +37,14 @@ export function ArtifactRenderer({ kind, mimeType, content, blobUrl, title }: Pr
     return <iframe sandbox="" srcDoc={srcdoc} className="w-full min-h-[320px] rounded-lg border" title="svg" />;
   }
   if (renderer === "html" && content) {
-    const srcdoc = content.includes("Content-Security-Policy")
-      ? content
-      : `<!doctype html><html><head>${SANDBOX_CSP.replace("default-src 'none'", "default-src 'none'; script-src 'unsafe-inline'")}</head><body>${content}</body></html>`;
+    // Never honor an artifact-supplied CSP — strip any incoming policy meta tags
+    // and always wrap the body in our own fixed sandbox shell.
+    const sanitized = content.replace(
+      /<meta[^>]+http-equiv=["']?content-security-policy["']?[^>]*>/gi,
+      ""
+    );
+    const csp = SANDBOX_CSP.replace("default-src 'none'", "default-src 'none'; script-src 'unsafe-inline'");
+    const srcdoc = `<!doctype html><html><head>${csp}</head><body>${sanitized}</body></html>`;
     return <iframe sandbox="allow-scripts" srcDoc={srcdoc} className="w-full min-h-[320px] rounded-lg border" title="html" />;
   }
   if (renderer === "json" && content) {

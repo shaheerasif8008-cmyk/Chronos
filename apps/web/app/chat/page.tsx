@@ -20,7 +20,7 @@ function apiBase() {
 }
 
 // ─── Types ───────────────────────────────────────────────────────────────────
-type Route = "chat" | "activity" | "approvals" | "memory" | "connectors" | "assistants" | "artifacts" | "settings";
+type Route = "chat" | "activity" | "approvals" | "memory" | "connectors" | "assistants" | "settings" | "projects" | "research" | "tasks" | "artifacts" | "agents" | "workflows" | "audit";
 type SettingsTab = "general" | "profile" | "organization" | "members" | "permissions" | "employees" | "runtime" | "memory-settings" | "tools-settings" | "approval-settings" | "notifications" | "security" | "billing" | "audit" | "developer" | "danger";
 type Conversation = { id: string; title: string | null; updated_at?: string; created_at?: string };
 type MessageRole = "user" | "assistant" | "system" | "tool";
@@ -34,11 +34,19 @@ type Message = {
   tool_traces?: ToolTrace[];
   reasoning_summaries?: ReasoningSummary[];
   artifacts?: ArtifactRef[];
+  citations?: Array<{ url?: string; text?: string; [key: string]: unknown }>;
+  model?: string;
+  mode?: string;
   thinking?: boolean;
+  pinned?: boolean;
+  parent_message_id?: string | null;
 };
 type ToolTrace = { id: string; tool: string; summary: string; status: MessageStatus };
 type ReasoningSummary = { id: string; iteration?: number; summary: string; status: MessageStatus };
 type ArtifactRef = { id: string; title: string; kind: string; mime_type?: string; size_bytes?: number };
+type ProjectSource = { id: string; title?: string | null; source_type?: string | null; parse_status?: string | null; index_status?: string | null; uri?: string | null; created_at?: string };
+type SourceChunkPreview = { chunk_index: number; content: string; token_count?: number | null };
+type SourceDetail = { id: string; title?: string | null; source_type?: string | null; uri?: string | null; artifact_id?: string | null; parse_status?: string | null; index_status?: string | null; warning?: string | null; chunk_count: number; chunks: SourceChunkPreview[] };
 type MemoryEntry = { id: string; scope: string; scope_id: string; content: string; source: string; importance_score?: number; created_by?: string | null; created_at?: string };
 type Connector = {
   id: string;
@@ -272,6 +280,13 @@ function routeFromPath(pathname: string | null): Route {
   if (pathname === "/assistants") return "assistants";
   if (pathname === "/artifacts") return "artifacts";
   if (pathname === "/settings") return "settings";
+  if (pathname === "/projects") return "projects";
+  if (pathname === "/research") return "research";
+  if (pathname === "/tasks") return "tasks";
+  if (pathname === "/artifacts") return "artifacts";
+  if (pathname === "/agents") return "agents";
+  if (pathname === "/workflows") return "workflows";
+  if (pathname === "/audit") return "audit";
   return "chat";
 }
 
@@ -285,6 +300,30 @@ const ACCENT_PALETTES: Record<string, { accent: string; hover: string; soft: str
   indigo: { accent: "oklch(0.55 0.16 270)",  hover: "oklch(0.50 0.17 270)",  soft: "oklch(0.94 0.04 270)", text: "oklch(0.35 0.15 270)" },
   slate:  { accent: "oklch(0.42 0.025 240)", hover: "oklch(0.36 0.03 240)",  soft: "oklch(0.94 0.01 240)", text: "oklch(0.30 0.025 240)" },
 };
+
+// ─── Search palette types (module scope) ─────────────────────────────────────
+type SearchResult = { type: string; id: string; title: string; snippet: string; url: string };
+
+const PALETTE_TYPE_LABELS: Record<string, string> = {
+  conversations: "Conversations",
+  messages: "Messages",
+  tasks: "Tasks",
+  artifacts: "Artifacts",
+  memory: "Memory",
+  sources: "Sources",
+};
+
+const CHAT_MODES = [
+  { id: "default",  label: "Default" },
+  { id: "research", label: "Research" },
+  { id: "agent",    label: "Agent" },
+  { id: "browser",  label: "Browser" },
+  { id: "computer", label: "Computer" },
+  { id: "data",     label: "Data" },
+  { id: "image",    label: "Image" },
+  { id: "voice",    label: "Voice" },
+  { id: "coding",   label: "Coding" },
+] as const;
 
 // ─── Auth helpers ─────────────────────────────────────────────────────────────
 function getToken() {
@@ -503,6 +542,7 @@ function ChronosAppInner() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [theme, setTheme] = useState<"light" | "dark">("light");
   const [accent, setAccent] = useState("coral");
+  const [searchPaletteOpen, setSearchPaletteOpen] = useState(false);
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark");
@@ -603,11 +643,12 @@ function ChronosAppInner() {
         pendingApprovals={pendingApprovals}
         onOpenSettings={openSettings}
         onSignOut={signOut}
+        onOpenSearch={() => setSearchPaletteOpen(true)}
         onRefreshConversations={() => void loadConversations()}
       />
 
       <main className="flex-1 min-w-0 flex flex-col" style={{ background: "var(--bg)" }}>
-        {route === "chat"       && <ChatScreen activeConvoId={activeConvoId} activePersonaId={activePersonaId} onPersonaChange={setActivePersonaId} onConvoCreated={(id) => loadConversations(id)} />}
+        {route === "chat"       && <ChatScreen activeConvoId={activeConvoId} activePersonaId={activePersonaId} onPersonaChange={setActivePersonaId} onConvoCreated={(id) => loadConversations(id)} paletteOpen={searchPaletteOpen} onPaletteOpenChange={setSearchPaletteOpen} />}
         {route === "activity"   && <ActivityScreen />}
         {route === "approvals"  && <ApprovalsScreen onDecision={loadPendingApprovals} />}
         {route === "memory"     && <MemoryScreen />}
@@ -622,6 +663,13 @@ function ChronosAppInner() {
           router.replace("/chat");
         }} />}
         {route === "settings"   && <SettingsScreen tab={settingsTab} setTab={setSettingsTab} theme={theme} setTheme={setTheme} accent={accent} setAccent={setAccent} signOut={signOut} />}
+        {route === "projects"   && <ProjectsScreen />}
+        {route === "research"   && <EmptyPanel label="Research" />}
+        {route === "tasks"      && <EmptyPanel label="Tasks" />}
+        {route === "artifacts"  && <EmptyPanel label="Artifacts" />}
+        {route === "agents"     && <EmptyPanel label="Agents" />}
+        {route === "workflows"  && <EmptyPanel label="Workflows" />}
+        {route === "audit"      && <EmptyPanel label="Audit" />}
       </main>
       <InChatArtifactPanel />
     </div>
@@ -631,7 +679,8 @@ function ChronosAppInner() {
 // ─── Sidebar ──────────────────────────────────────────────────────────────────
 function Sidebar({
   collapsed, onCollapse, onExpand, route, onNavigate, conversations, conversationsLoading, activeConvoId,
-  onSelectConvo, onNewConvo, onDeleteConvo, pendingApprovals, onOpenSettings, onSignOut, onRefreshConversations
+  onSelectConvo, onNewConvo, onDeleteConvo, pendingApprovals, onOpenSettings, onSignOut, onRefreshConversations,
+  onOpenSearch,
 }: {
   collapsed: boolean; onCollapse: () => void; onExpand: () => void;
   route: Route; onNavigate: (r: Route) => void;
@@ -639,6 +688,7 @@ function Sidebar({
   onSelectConvo: (id: string) => void; onNewConvo: () => void;
   onDeleteConvo: (id: string) => void; pendingApprovals: number;
   onOpenSettings: (tab: SettingsTab) => void; onSignOut: () => void;
+  onOpenSearch?: () => void;
   onRefreshConversations: () => void;
 }) {
   const [accountOpen, setAccountOpen] = useState(false);
@@ -651,6 +701,13 @@ function Sidebar({
     { id: "artifacts"  as Route, icon: <IC.Folder size={15}/>,     label: "Artifacts" },
     { id: "connectors" as Route, icon: <IC.Connectors size={15}/>, label: "Connectors" },
     { id: "assistants" as Route, icon: <IC.Personas size={15}/>,   label: "Assistants" },
+    { id: "projects"   as Route, icon: <IC.Folder size={15}/>,     label: "Projects" },
+    { id: "research"   as Route, icon: <IC.Search size={15}/>,     label: "Research" },
+    { id: "tasks"      as Route, icon: <IC.Check size={15}/>,      label: "Tasks" },
+    { id: "artifacts"  as Route, icon: <IC.Briefcase size={15}/>,  label: "Artifacts" },
+    { id: "agents"     as Route, icon: <IC.Sparkles size={15}/>,   label: "Agents" },
+    { id: "workflows"  as Route, icon: <IC.Refresh size={15}/>,    label: "Workflows" },
+    { id: "audit"      as Route, icon: <IC.Audit size={15}/>,      label: "Audit",      settingsTab: "audit" as SettingsTab },
   ];
 
   // Group conversations by recency
@@ -681,18 +738,22 @@ function Sidebar({
           <IC.Plus size={16}/>
         </button>
         <div className="w-8 h-px" style={{ background: "var(--border-soft)" }}/>
-        {nav.map(it => (
-          <button key={it.id} onClick={() => onNavigate(it.id)} title={it.label}
-                  className="btn btn-ghost btn-icon relative"
-                  style={{ background: route === it.id ? "var(--surface-2)" : "transparent",
-                           color: route === it.id ? "var(--text)" : "var(--text-muted)" }}>
-            {it.icon}
-            {it.badge ? (
-              <span className="absolute -top-0.5 -right-0.5 min-w-[14px] h-[14px] px-1 rounded-full text-[9px] font-semibold flex items-center justify-center"
-                    style={{ background: "var(--warn)", color: "white" }}>{it.badge}</span>
-            ) : null}
-          </button>
-        ))}
+        <div className="flex flex-col items-center gap-2 overflow-y-auto no-scrollbar w-full px-2">
+          {nav.map(it => (
+            <button key={it.id}
+                    onClick={() => it.settingsTab ? onOpenSettings(it.settingsTab) : onNavigate(it.id)}
+                    title={it.label}
+                    className="btn btn-ghost btn-icon relative flex-shrink-0"
+                    style={{ background: (it.settingsTab ? route === "settings" && it.id === "audit" : route === it.id) ? "var(--surface-2)" : "transparent",
+                             color: (it.settingsTab ? route === "settings" && it.id === "audit" : route === it.id) ? "var(--text)" : "var(--text-muted)" }}>
+              {it.icon}
+              {it.badge ? (
+                <span className="absolute -top-0.5 -right-0.5 min-w-[14px] h-[14px] px-1 rounded-full text-[9px] font-semibold flex items-center justify-center"
+                      style={{ background: "var(--warn)", color: "white" }}>{it.badge}</span>
+              ) : null}
+            </button>
+          ))}
+        </div>
       </aside>
     );
   }
@@ -715,19 +776,27 @@ function Sidebar({
       </div>
 
       {/* New conversation */}
-      <div className="px-3 pt-1 pb-2">
+      <div className="px-3 pt-1 pb-2 flex gap-1.5">
         <button onClick={onNewConvo}
-                className="w-full flex items-center gap-2.5 px-3 py-2 rounded-lg smooth surface border border-soft hover:border-[var(--border)] whitespace-nowrap">
+                className="flex-1 flex items-center gap-2.5 px-3 py-2 rounded-lg smooth surface border border-soft hover:border-[var(--border)] whitespace-nowrap">
           <IC.Plus size={15} stroke={2}/>
           <span className="text-[13.5px] font-medium">New conversation</span>
+        </button>
+        <button
+          onClick={() => onOpenSearch?.()}
+          title="Search (⌘K)"
+          className="btn btn-ghost btn-icon flex-shrink-0 surface border border-soft hover:border-[var(--border)]"
+        >
+          <IC.Search size={14}/>
         </button>
       </div>
 
       {/* Top nav */}
-      <div className="px-3 pt-2 pb-1 space-y-0.5">
+      <div className="px-3 pt-2 pb-1 space-y-0.5 overflow-y-auto no-scrollbar">
         {nav.map(it => (
-          <button key={it.id} onClick={() => onNavigate(it.id)}
-                  className={`nav-item w-full ${route === it.id ? "active" : ""}`}>
+          <button key={it.id}
+                  onClick={() => it.settingsTab ? onOpenSettings(it.settingsTab) : onNavigate(it.id)}
+                  className={`nav-item w-full ${it.settingsTab ? "" : route === it.id ? "active" : ""}`}>
             <span className="nav-icon flex-shrink-0">{it.icon}</span>
             <span className="flex-1 text-left">{it.label}</span>
             {it.badge ? (
@@ -881,16 +950,21 @@ function ChatScreen({
   activePersonaId,
   onPersonaChange,
   onConvoCreated,
+  paletteOpen,
+  onPaletteOpenChange,
 }: {
   activeConvoId: string | null;
   activePersonaId: string;
   onPersonaChange: (personaId: string) => void;
   onConvoCreated: (id: string) => void;
+  paletteOpen: boolean;
+  onPaletteOpenChange: (open: boolean) => void;
 }) {
   const [draft, setDraft] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
   const [chatModels, setChatModels] = useState<ChatModel[]>([]);
-  const [selectedModel, setSelectedModel] = useState("agent");
+  const [selectedModel, setSelectedModel] = useState("auto");
+  const [selectedMode, setSelectedMode] = useState<string>("default");
   const [streaming, setStreaming] = useState(false);
   const [activityOpen, setActivityOpen] = useState(false);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
@@ -901,6 +975,117 @@ function ChatScreen({
   const bottomRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const isEmpty = !activeConvoId && messages.length === 0;
+
+  // ── Command palette (⌘K) ──────────────────────────────────────────────────
+  const router = useRouter();
+  const [paletteQuery, setPaletteQuery] = useState("");
+  const [paletteResults, setPaletteResults] = useState<SearchResult[]>([]);
+  const [paletteSelectedIdx, setPaletteSelectedIdx] = useState(-1);
+  const paletteInputRef = useRef<HTMLInputElement>(null);
+  const paletteDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const paletteAbortRef = useRef<AbortController | null>(null);
+  const palettePrevFocusRef = useRef<Element | null>(null);
+
+  // Cmd/Ctrl+K global listener — toggles palette
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+        e.preventDefault();
+        onPaletteOpenChange(!paletteOpen);
+      }
+      if (e.key === "Escape" && paletteOpen) {
+        onPaletteOpenChange(false);
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [paletteOpen, onPaletteOpenChange]);
+
+  useEffect(() => {
+    if (paletteOpen) {
+      // Capture previously focused element so we can restore it on close
+      palettePrevFocusRef.current = document.activeElement;
+      setPaletteQuery("");
+      setPaletteResults([]);
+      setPaletteSelectedIdx(-1);
+      setTimeout(() => paletteInputRef.current?.focus(), 0);
+    } else {
+      // Abort any in-flight request
+      paletteAbortRef.current?.abort();
+      // Restore focus to previously focused element (best-effort)
+      if (palettePrevFocusRef.current && palettePrevFocusRef.current instanceof HTMLElement) {
+        palettePrevFocusRef.current.focus();
+      }
+      palettePrevFocusRef.current = null;
+    }
+  }, [paletteOpen]);
+
+  useEffect(() => {
+    if (paletteDebounceRef.current) clearTimeout(paletteDebounceRef.current);
+    if (!paletteQuery.trim()) { setPaletteResults([]); setPaletteSelectedIdx(-1); return; }
+
+    paletteDebounceRef.current = setTimeout(async () => {
+      paletteAbortRef.current?.abort();
+      const ctrl = new AbortController();
+      paletteAbortRef.current = ctrl;
+      try {
+        const res = await apiFetch(`/search?q=${encodeURIComponent(paletteQuery.trim())}`, { signal: ctrl.signal });
+        if (!res.ok) return;
+        const data = (await res.json()) as SearchResult[];
+        if (!ctrl.signal.aborted) { setPaletteResults(data); setPaletteSelectedIdx(-1); }
+      } catch (err) {
+        if ((err as Error).name === "AbortError") return;
+        console.error("[palette] search error:", err);
+        setPaletteResults([]);
+      }
+    }, 200);
+
+    return () => {
+      if (paletteDebounceRef.current) clearTimeout(paletteDebounceRef.current);
+    };
+  }, [paletteQuery]);
+
+  // Flat list of all results for keyboard index math
+  const paletteFlatResults = paletteResults;
+
+  function handlePaletteSelect(result: SearchResult) {
+    onPaletteOpenChange(false);
+    setPaletteQuery("");
+    router.push(result.url);
+  }
+
+  function handlePaletteKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (!paletteFlatResults.length) return;
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setPaletteSelectedIdx(i => Math.min(i + 1, paletteFlatResults.length - 1));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setPaletteSelectedIdx(i => Math.max(i - 1, -1));
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      if (paletteSelectedIdx >= 0 && paletteSelectedIdx < paletteFlatResults.length) {
+        handlePaletteSelect(paletteFlatResults[paletteSelectedIdx]);
+      }
+    }
+  }
+
+  // Group results by type in a stable order (uses module-scope PALETTE_TYPE_LABELS)
+  const paletteGrouped = paletteResults.reduce<Record<string, SearchResult[]>>((acc, r) => {
+    (acc[r.type] ??= []).push(r);
+    return acc;
+  }, {});
+  const paletteGroups = Object.keys(PALETTE_TYPE_LABELS)
+    .filter(k => paletteGrouped[k]?.length)
+    .map(k => ({ type: k, label: PALETTE_TYPE_LABELS[k], items: paletteGrouped[k] }));
+
+  // Build a flat index map so we can highlight the right item in grouped view
+  let _paletteFlatIdx = 0;
+  const paletteGroupsWithIdx = paletteGroups.map(g => ({
+    ...g,
+    items: g.items.map(item => ({ item, flatIdx: _paletteFlatIdx++ })),
+  }));
+  // ── End command palette ───────────────────────────────────────────────────
 
   const activePersona = PERSONAS.find(p => p.id === activePersonaId) ?? PERSONAS[0];
 
@@ -927,14 +1112,41 @@ function ChatScreen({
       const id = m.id != null ? String(m.id) : undefined;
       const role = String(m.role ?? "assistant") as MessageRole;
       const content = String(m.content ?? "");
+      // runtime_status overrides "complete" when present (e.g. "error", "paused").
+      // Validate against the known union to guard against stale or unknown values.
+      const KNOWN_STATUSES: ReadonlySet<string> = new Set<MessageStatus>(["streaming", "complete", "paused", "approval_pending", "error"]);
+      const rawStatus = m.runtime_status != null ? String(m.runtime_status) : "complete";
+      const status: MessageStatus = KNOWN_STATUSES.has(rawStatus) ? (rawStatus as MessageStatus) : "complete";
       const base: Message = {
         id,
         role,
         content,
-        status: "complete",
+        status,
         created_at: m.created_at != null ? String(m.created_at) : undefined,
+        model: m.model != null ? String(m.model) : undefined,
+        mode: m.mode != null ? String(m.mode) : undefined,
+        citations: Array.isArray(m.citations) ? (m.citations as Array<{ url?: string; text?: string }>) : undefined,
+        // Persisted tool_traces from DB (overridden by live SSE during streaming)
+        tool_traces: Array.isArray(m.tool_traces)
+          ? (m.tool_traces as ToolTrace[])
+          : undefined,
+        pinned: m.pinned === true,
+        parent_message_id: m.parent_message_id != null ? String(m.parent_message_id) : null,
       };
-      if (id && byMessage.has(id)) return { ...base, artifacts: byMessage.get(id) };
+      // artifact_refs from the message row are the authoritative refresh-time source.
+      // Merge with any per-message artifacts from the /artifacts endpoint (live-SSE path
+      // may have set message_id on artifact rows; artifact_refs is the loop-persisted copy).
+      const persistedRefs: ArtifactRef[] = Array.isArray(m.artifact_refs)
+        ? (m.artifact_refs as ArtifactRef[])
+        : [];
+      const byMessageRefs: ArtifactRef[] = (id && byMessage.has(id)) ? (byMessage.get(id) ?? []) : [];
+      // Deduplicate by id; prefer byMessage (has full metadata from artifacts table)
+      const seenIds = new Set(byMessageRefs.map(a => a.id));
+      const merged = [
+        ...byMessageRefs,
+        ...persistedRefs.filter(a => !seenIds.has(a.id)),
+      ];
+      if (merged.length > 0) return { ...base, artifacts: merged };
       return base;
     });
 
@@ -1025,6 +1237,8 @@ function ChatScreen({
     if (!draft.trim() || streaming) return;
     const text = draft.trim();
     setDraft("");
+    const pendingAttachmentIds = attachments.map(a => a.id);
+    setAttachments([]);
     setMessages(prev => [
       ...prev,
       { role: "user", content: text, status: "complete" },
@@ -1237,7 +1451,7 @@ function ChatScreen({
       const resp = await apiFetch("/chat/message", {
         method: "POST",
         headers: { Accept: "text/event-stream" },
-        body: JSON.stringify({ message: text, conversation_id: convoId, model: selectedModel, persona_id: activePersonaId, attachment_ids: pendingAttachmentIds }),
+        body: JSON.stringify({ message: text, conversation_id: convoId, model: selectedModel, mode: selectedMode, persona_id: activePersonaId, attachment_ids: pendingAttachmentIds }),
         signal: ab.signal,
       });
 
@@ -1354,8 +1568,8 @@ function ChatScreen({
             <div className="max-w-[780px] mx-auto space-y-10">
               {messages.map((m, i) => (
                 m.role === "user"
-                  ? <UserMessage key={m.id ?? `user-${i}`} content={m.content}/>
-                  : <AssistantMessage key={m.id ?? `assistant-${i}`} content={m.content} status={m.status ?? "complete"} persona={activePersona} toolTraces={m.tool_traces} reasoningSummaries={m.reasoning_summaries} artifacts={m.artifacts} thinking={m.thinking}/>
+                  ? <UserMessage key={m.id ?? `user-${i}`} message={m} conversationId={activeConvoId ?? ""} onRefresh={() => { if (activeConvoId) void loadMessagesFromServer(activeConvoId); }} onBranch={(newConvoId) => { onConvoCreated(newConvoId); }}/>
+                  : <AssistantMessage key={m.id ?? `assistant-${i}`} message={m} content={m.content} conversationId={activeConvoId ?? ""} status={m.status ?? "complete"} persona={activePersona} toolTraces={m.tool_traces} reasoningSummaries={m.reasoning_summaries} artifacts={m.artifacts} thinking={m.thinking} mode={m.mode} onRefresh={() => { if (activeConvoId) void loadMessagesFromServer(activeConvoId); }} onBranch={(newConvoId) => { onConvoCreated(newConvoId); }}/>
               ))}
               {streaming && messages[messages.length - 1]?.role !== "assistant" && (
                 <div className="flex gap-4">
@@ -1371,17 +1585,20 @@ function ChatScreen({
         {/* Composer */}
         <div className="px-6 pb-6 pt-2" style={{ background: "var(--bg)" }}>
           <div className="max-w-[780px] mx-auto">
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              className="hidden"
+              onChange={e => { if (e.target.files) void uploadFiles(e.target.files); e.target.value = ""; }}
+            />
             <div className="composer-shell">
               {attachments.length > 0 && (
-                <div className="flex flex-wrap gap-2 px-4 pt-3">
+                <div className="flex flex-wrap gap-2 px-4 pt-3 pb-1">
                   {attachments.map(a => (
                     <span key={a.id} className="surface border border-soft rounded-md px-2 py-1 text-[12px] flex items-center gap-1">
                       {a.name}
-                      <button
-                        type="button"
-                        aria-label={`Remove ${a.name}`}
-                        onClick={() => setAttachments(prev => prev.filter(x => x.id !== a.id))}
-                      >×</button>
+                      <button aria-label={`Remove ${a.name}`} onClick={() => setAttachments(prev => prev.filter(x => x.id !== a.id))}>×</button>
                     </span>
                   ))}
                 </div>
@@ -1397,19 +1614,7 @@ function ChatScreen({
               />
               <div className="flex items-center justify-between px-3 pb-2.5 pt-1">
                 <div className="flex items-center gap-1">
-                  <input
-                    ref={fileInputRef}
-                    type="file"
-                    multiple
-                    className="hidden"
-                    onChange={e => { if (e.target.files) void uploadFiles(e.target.files); e.target.value = ""; }}
-                  />
-                  <button
-                    type="button"
-                    aria-label="Attach files"
-                    onClick={() => fileInputRef.current?.click()}
-                    className="btn btn-ghost btn-sm btn-icon"
-                  ><IC.Attach size={15}/></button>
+                  <button type="button" aria-label="Attach files" className="btn btn-ghost btn-sm btn-icon" onClick={() => fileInputRef.current?.click()}><IC.Attach size={15}/></button>
                   <button className="btn btn-ghost btn-sm">
                     <IC.Sparkles size={14} style={{ color: "var(--accent)" }}/> Skills · 1
                   </button>
@@ -1430,6 +1635,20 @@ function ChatScreen({
                   >
                     {(chatModels.length ? chatModels : [{ id: "auto", label: "Auto", model: "auto" }]).map(model => (
                       <option key={model.id} value={model.id}>{modelOptionText(model)}</option>
+                    ))}
+                  </select>
+                  <label className="sr-only" htmlFor="chat-mode-select">Mode</label>
+                  <select
+                    id="chat-mode-select"
+                    aria-label="Mode"
+                    value={selectedMode}
+                    onChange={event => setSelectedMode(event.target.value)}
+                    disabled={streaming}
+                    className="surface border border-soft rounded-md px-2 py-1.5 text-[12.5px] outline-none disabled:opacity-60"
+                    style={{ color: "var(--text)" }}
+                  >
+                    {CHAT_MODES.map(m => (
+                      <option key={m.id} value={m.id}>{m.label}</option>
                     ))}
                   </select>
                 </div>
@@ -1457,19 +1676,338 @@ function ChatScreen({
       {activityOpen && (
         <ActivityDrawer taskId={activeTaskId} onClose={() => setActivityOpen(false)} />
       )}
+
+      {/* ⌘K Command palette */}
+      {paletteOpen && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          className="fixed inset-0 z-50 flex items-start justify-center pt-[15vh]"
+          style={{ background: "color-mix(in oklch, var(--text) 20%, transparent)" }}
+          onClick={() => onPaletteOpenChange(false)}
+        >
+          <div
+            className="surface border rounded-xl shadow-2xl w-full max-w-[560px] mx-4 overflow-hidden"
+            style={{ borderColor: "var(--border)" }}
+            onClick={e => e.stopPropagation()}
+          >
+            {/* Search input */}
+            <div className="flex items-center gap-2.5 px-4 py-3 border-b hairline">
+              <IC.Search size={15} style={{ color: "var(--text-dim)", flexShrink: 0 }}/>
+              <input
+                ref={paletteInputRef}
+                type="text"
+                value={paletteQuery}
+                onChange={e => setPaletteQuery(e.target.value)}
+                onKeyDown={handlePaletteKeyDown}
+                placeholder="Search conversations, memory, tasks…"
+                aria-label="Search"
+                className="flex-1 bg-transparent text-[14px] outline-none"
+                style={{ color: "var(--text)" }}
+              />
+              <kbd className="text-[11px] px-1.5 py-0.5 rounded border border-soft"
+                   style={{ color: "var(--text-dim)", background: "var(--surface-2)" }}>Esc</kbd>
+            </div>
+
+            {/* Results */}
+            <div className="max-h-[400px] overflow-y-auto">
+              {paletteQuery.trim() && paletteGroupsWithIdx.length === 0 && (
+                <div className="px-4 py-8 text-center text-[13.5px]" style={{ color: "var(--text-dim)" }}>
+                  No results for &ldquo;{paletteQuery}&rdquo;
+                </div>
+              )}
+              {paletteGroupsWithIdx.map(group => (
+                <div key={group.type}>
+                  <div className="px-4 pt-3 pb-1 text-[11.5px] font-medium uppercase tracking-wider"
+                       style={{ color: "var(--text-dim)" }}>
+                    {group.label}
+                  </div>
+                  {group.items.map(({ item: result, flatIdx }) => {
+                    const isSelected = flatIdx === paletteSelectedIdx;
+                    return (
+                      <button
+                        key={`${result.type}-${result.id}`}
+                        onClick={() => handlePaletteSelect(result)}
+                        className="w-full flex items-start gap-3 px-4 py-2.5 text-left smooth hover:bg-[var(--surface-2)]"
+                        style={{ background: isSelected ? "var(--accent-soft)" : undefined }}
+                      >
+                        <div className="flex-1 min-w-0">
+                          <div className="text-[13.5px] font-medium truncate">{result.title}</div>
+                          {result.snippet && result.snippet !== result.title && (
+                            <div className="text-[12px] truncate mt-0.5" style={{ color: "var(--text-dim)" }}>
+                              {result.snippet}
+                            </div>
+                          )}
+                        </div>
+                        <IC.ArrowRight size={13} style={{ color: "var(--text-dim)", flexShrink: 0, marginTop: 3 }}/>
+                      </button>
+                    );
+                  })}
+                </div>
+              ))}
+              {!paletteQuery.trim() && (
+                <div className="px-4 py-6 text-center text-[13px]" style={{ color: "var(--text-dim)" }}>
+                  Type to search across conversations, memory, tasks, and more.
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
-function UserMessage({ content }: { content: string }) {
+// ─── Message Action Menu ──────────────────────────────────────────────────────
+
+type MessageActionMenuProps = {
+  message: Message;
+  conversationId: string;
+  onRefresh: () => void;
+  onBranch: (newConvoId: string) => void;
+};
+
+function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: MessageActionMenuProps) {
+  const [open, setOpen] = useState(false);
+  const [toast, setToast] = useState<string | null>(null);
+  const [editMode, setEditMode] = useState(false);
+  const [editContent, setEditContent] = useState(message.content);
+  // Fix 3: track in-flight actions to prevent double-submits
+  const [inflight, setInflight] = useState<Set<string>>(new Set());
+  const menuRef = useRef<HTMLDivElement>(null);
+  // Fix 5: keep a ref to the trigger so we can return focus after Escape
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const mid = message.id;
+
+  // Close menu on outside click
+  useEffect(() => {
+    if (!open) return;
+    function onDown(e: MouseEvent) {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [open]);
+
+  // Fix 6: wrap toast cleanup in useEffect so the timer is cancelled on unmount
+  useEffect(() => {
+    if (!toast) return;
+    const id = setTimeout(() => setToast(null), 3000);
+    return () => clearTimeout(id);
+  }, [toast]);
+
+  function showToast(msg: string) {
+    setToast(msg);
+  }
+
+  // Fix 3: helpers for in-flight tracking
+  function startAction(key: string) {
+    setInflight(prev => new Set(prev).add(key));
+  }
+  function endAction(key: string) {
+    setInflight(prev => { const s = new Set(prev); s.delete(key); return s; });
+  }
+  function isBusy(key: string) { return inflight.has(key); }
+
+  async function handlePin() {
+    if (!mid || isBusy("pin")) return;
+    const endpoint = message.pinned ? "unpin" : "pin";
+    startAction("pin");
+    try {
+      await apiFetch(`/chat/conversations/${conversationId}/messages/${mid}/${endpoint}`, { method: "POST" });
+      onRefresh();
+      showToast(message.pinned ? "Unpinned" : "Pinned");
+    } catch { showToast("Failed"); }
+    finally { endAction("pin"); }
+    setOpen(false);
+  }
+
+  async function handleCopy() {
+    try { await navigator.clipboard.writeText(message.content); showToast("Copied"); } catch { showToast("Failed to copy"); }
+    setOpen(false);
+  }
+
+  async function handleEdit() {
+    setEditMode(true);
+    setEditContent(message.content);
+    setOpen(false);
+  }
+
+  async function submitEdit() {
+    if (!mid || isBusy("edit")) return;
+    startAction("edit");
+    try {
+      await apiFetch(`/chat/conversations/${conversationId}/messages/${mid}`, {
+        method: "PATCH",
+        body: JSON.stringify({ content: editContent }),
+      });
+      onRefresh();
+      setEditMode(false);
+      showToast("Saved");
+    } catch { showToast("Failed to save"); }
+    finally { endAction("edit"); }
+  }
+
+  async function handleBranch() {
+    if (!mid || isBusy("branch")) return;
+    startAction("branch");
+    try {
+      const res = await apiFetch(`/chat/conversations/${conversationId}/messages/${mid}/branch`, { method: "POST" });
+      const data = await res.json() as { conversation_id: string };
+      onBranch(data.conversation_id);
+      showToast("Branched into new conversation");
+    } catch { showToast("Branch failed"); }
+    finally { endAction("branch"); }
+    setOpen(false);
+  }
+
+  async function handleSaveMemory() {
+    if (!mid || isBusy("save-memory")) return;
+    startAction("save-memory");
+    try {
+      await apiFetch(`/chat/conversations/${conversationId}/messages/${mid}/save-memory`, {
+        method: "POST",
+        body: JSON.stringify({ scope: "org" }),
+      });
+      showToast("Saved to memory");
+    } catch { showToast("Failed"); }
+    finally { endAction("save-memory"); }
+    setOpen(false);
+  }
+
+  async function handleConvertTask() {
+    if (!mid || isBusy("convert-task")) return;
+    startAction("convert-task");
+    try {
+      const res = await apiFetch(`/chat/conversations/${conversationId}/messages/${mid}/convert-task`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      const data = await res.json() as { task_id: string };
+      showToast(`Task created: ${data.task_id.slice(0, 8)}…`);
+    } catch { showToast("Failed"); }
+    finally { endAction("convert-task"); }
+    setOpen(false);
+  }
+
+  function handleExport() {
+    // Client-side: export the single message content as JSON
+    const blob = new Blob([JSON.stringify({ id: mid, role: message.role, content: message.content }, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `message-${mid ?? "unknown"}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    // Fix 6: revoke immediately after the click gesture — no timer needed
+    URL.revokeObjectURL(url);
+    setOpen(false);
+  }
+
+  // Fix 5: Escape closes menu and returns focus to trigger
+  function handleKeyDown(e: React.KeyboardEvent) {
+    if (e.key === "Escape" && open) {
+      e.stopPropagation();
+      setOpen(false);
+      triggerRef.current?.focus();
+    }
+  }
+
+  if (editMode) {
+    return (
+      <div className="mt-2">
+        <textarea
+          value={editContent}
+          onChange={e => setEditContent(e.target.value)}
+          className="w-full border rounded-lg px-3 py-2 text-[14px] outline-none resize-none"
+          style={{ borderColor: "var(--border)", background: "var(--surface)", color: "var(--text)", minHeight: 72 }}
+          rows={3}
+        />
+        <div className="flex gap-2 mt-1.5">
+          <button onClick={submitEdit} disabled={isBusy("edit")} className="btn btn-accent btn-sm">Save</button>
+          <button onClick={() => setEditMode(false)} className="btn btn-ghost btn-sm">Cancel</button>
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className="flex gap-4 fadein">
+    // Fix 5 + Fix 7: focus-within keeps the trigger visible while the dropdown is open
+    // and when keyboard focus moves inside the menu, without needing JS state.
+    <div className="relative inline-block" ref={menuRef} onKeyDown={handleKeyDown}>
+      {toast && (
+        <div className="absolute -top-8 left-1/2 -translate-x-1/2 text-[12px] px-2.5 py-1 rounded-md whitespace-nowrap z-50"
+             style={{ background: "var(--surface-2)", color: "var(--text-muted)", border: "1px solid var(--border-soft)" }}>
+          {toast}
+        </div>
+      )}
+      {/* Fix 5: ARIA trigger attributes */}
+      <button
+        ref={triggerRef}
+        onClick={() => setOpen(o => !o)}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-label="Message actions"
+        className="p-1 rounded-md opacity-0 group-hover:opacity-100 focus-visible:opacity-100 smooth hover:bg-[var(--surface-2)]"
+        style={{ color: "var(--text-dim)" }}
+        title="Message actions"
+      >
+        <IC.More size={14}/>
+      </button>
+      {/* Fix 5: role="menu" on dropdown */}
+      {open && (
+        <div role="menu" className="absolute right-0 top-7 z-40 rounded-xl shadow-lg border py-1 min-w-[160px]"
+             style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
+          {/* Fix 3 + Fix 5: role="menuitem" + disabled when in-flight */}
+          <button role="menuitem" onClick={handlePin} disabled={isBusy("pin")} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5 disabled:opacity-50" style={{ color: "var(--text)" }}>
+            <IC.Lock size={13}/>{message.pinned ? "Unpin" : "Pin"}
+          </button>
+          <button role="menuitem" onClick={handleCopy} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5" style={{ color: "var(--text)" }}>
+            <IC.External size={13}/>Copy
+          </button>
+          {message.role === "user" && (
+            <button role="menuitem" onClick={handleEdit} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5" style={{ color: "var(--text)" }}>
+              <IC.Pencil size={13}/>Edit
+            </button>
+          )}
+          <button role="menuitem" onClick={handleBranch} disabled={isBusy("branch")} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5 disabled:opacity-50" style={{ color: "var(--text)" }}>
+            <IC.ArrowRight size={13}/>Branch here
+          </button>
+          <button role="menuitem" onClick={handleSaveMemory} disabled={isBusy("save-memory")} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5 disabled:opacity-50" style={{ color: "var(--text)" }}>
+            <IC.Memory size={13}/>Save to memory
+          </button>
+          <button role="menuitem" onClick={handleConvertTask} disabled={isBusy("convert-task")} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5 disabled:opacity-50" style={{ color: "var(--text)" }}>
+            <IC.Briefcase size={13}/>Convert to task
+          </button>
+          <div className="mx-2 my-1 border-t" style={{ borderColor: "var(--border-soft)" }}/>
+          <button role="menuitem" onClick={handleExport} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5" style={{ color: "var(--text-dim)" }}>
+            <IC.Folder size={13}/>Export
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── User Message ─────────────────────────────────────────────────────────────
+
+type MsgProps = { message: Message; conversationId: string; onRefresh: () => void; onBranch: (id: string) => void };
+
+function UserMessage({ message, conversationId, onRefresh, onBranch }: MsgProps) {
+  return (
+    <div className="flex gap-4 fadein group">
       <div className="avatar-u">A</div>
       <div className="flex-1 min-w-0 pt-0.5">
         <div className="flex items-baseline gap-2 mb-1.5">
           <span className="text-[14px] font-semibold">You</span>
+          {message.pinned && <IC.Lock size={12} style={{ color: "var(--accent)" }}/>}
+          {/* Fix 7: rely on Tailwind group-hover + focus-within instead of JS state */}
+          <div className="ml-auto transition-opacity opacity-0 group-hover:opacity-100 focus-within:opacity-100">
+            <MessageActionMenu message={message} conversationId={conversationId} onRefresh={onRefresh} onBranch={onBranch}/>
+          </div>
         </div>
-        <div className="prose-body" style={{ color: "var(--text)" }}>{content}</div>
+        <div className="prose-body" style={{ color: "var(--text)" }}>{message.content}</div>
       </div>
     </div>
   );
@@ -1600,17 +2138,25 @@ function ArtifactCard({ artifact }: { artifact: ArtifactRef }) {
   );
 }
 
-function AssistantMessage({ content, status, persona, toolTraces, reasoningSummaries, artifacts, thinking }: { content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[]; reasoningSummaries?: ReasoningSummary[]; artifacts?: ArtifactRef[]; thinking?: boolean }) {
+function AssistantMessage({ message, content, status, persona, toolTraces, reasoningSummaries, artifacts, thinking, mode, conversationId, onRefresh, onBranch }: { message: Message; content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[]; reasoningSummaries?: ReasoningSummary[]; artifacts?: ArtifactRef[]; thinking?: boolean; mode?: string; conversationId: string; onRefresh: () => void; onBranch: (id: string) => void }) {
   const hasTraces = !!(toolTraces && toolTraces.length > 0);
   const hasReasoning = !!(reasoningSummaries && reasoningSummaries.length > 0);
   const isStreaming = status === "streaming";
   return (
-    <div className="flex gap-4 fadein">
+    <div className="flex gap-4 fadein group">
       <PersonaAvatar name={persona.name} color={persona.color} size={28}/>
       <div className="flex-1 min-w-0 pt-0.5">
         <div className="flex items-baseline gap-2 mb-1.5">
           <span className="text-[14px] font-semibold">{persona.name}</span>
+          {mode && mode !== "default" && <Tag variant="info">{mode}</Tag>}
           {status === "error" && <Tag variant="danger">Error</Tag>}
+          {message.pinned && <IC.Lock size={12} style={{ color: "var(--accent)" }}/>}
+          {/* Fix 7: rely on Tailwind group-hover + focus-within instead of JS state */}
+          {!isStreaming && (
+            <div className="ml-auto transition-opacity opacity-0 group-hover:opacity-100 focus-within:opacity-100">
+              <MessageActionMenu message={message} conversationId={conversationId} onRefresh={onRefresh} onBranch={onBranch}/>
+            </div>
+          )}
         </div>
 
         {hasReasoning && (
@@ -1647,6 +2193,30 @@ function AssistantMessage({ content, status, persona, toolTraces, reasoningSumma
         {artifacts && artifacts.length > 0 && (
           <div className="mt-3 space-y-2">
             {artifacts.map(a => <ArtifactCard key={a.id} artifact={a} />)}
+          </div>
+        )}
+
+        {/* Sources — project knowledge citations grounding this answer */}
+        {message.citations && message.citations.length > 0 && (
+          <div className="mt-3 surface border border-soft rounded-lg p-2.5">
+            <div className="text-[11px] font-medium mb-1.5" style={{ color: "var(--text-dim)" }}>Sources</div>
+            <div className="space-y-1">
+              {message.citations.map((c, i) => {
+                const marker = (c.marker as string) || `S${i + 1}`;
+                const title = (c.source_title as string) || (c.text as string) || "Untitled source";
+                const snippet = (c.snippet as string) || "";
+                return (
+                  <details key={i} className="text-[12.5px]">
+                    <summary className="cursor-pointer smooth hover:text-[var(--text)]" style={{ color: "var(--text-muted)" }}>
+                      <span style={{ color: "var(--accent)" }}>[{marker}]</span> {title}
+                    </summary>
+                    {snippet && (
+                      <div className="mt-1 pl-3 text-[12px] whitespace-pre-wrap" style={{ color: "var(--text-dim)" }}>{snippet}</div>
+                    )}
+                  </details>
+                );
+              })}
+            </div>
           </div>
         )}
 
@@ -2994,6 +3564,582 @@ const SETTING_TABS: Array<{ id: SettingsTab; label: string; icon: ReactNode; key
   { id: "developer", label: "Developer", icon: <IC.Lightbulb size={15}/>, keywords: "feature flags api mode webhooks debug experimental environment model provider" },
   { id: "danger", label: "Danger zone", icon: <IC.Trash size={15}/>, keywords: "reset delete leave transfer ownership irreversible" },
 ];
+
+// ─── Projects ─────────────────────────────────────────────────────────────────
+
+type Project = {
+  id: string;
+  name: string;
+  instructions?: string | null;
+  visibility?: string | null;
+  memory_policy?: string | null;
+  default_tools?: unknown[];
+  created_at?: string;
+  created_by?: string | null;
+};
+
+type ProjectTab = "chat" | "sources" | "artifacts" | "tasks" | "research";
+
+function ProjectsScreen() {
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [loading, setLoading] = useState(true);
+  // null = list view; string = detail view for that project id
+  const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
+  const [showCreate, setShowCreate] = useState(false);
+  const [createName, setCreateName] = useState("");
+  const [createInstructions, setCreateInstructions] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [toast, setToast] = useState<{ kind: "ok" | "danger"; text: string } | null>(null);
+
+  // URL-based project detail: /projects?id=<uuid>
+  const pathname = usePathname();
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      const id = new URLSearchParams(window.location.search).get("id");
+      setActiveProjectId(id ?? null);
+    }
+  }, [pathname]);
+
+  // Keep detail view in sync with browser back/forward navigation.
+  useEffect(() => {
+    function onPopState() {
+      if (typeof window !== "undefined") {
+        const id = new URLSearchParams(window.location.search).get("id");
+        setActiveProjectId(id ?? null);
+      }
+    }
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = (await (await apiFetch("/projects/")).json()) as Project[];
+      setProjects(data);
+    } catch (e) {
+      setToast({ kind: "danger", text: e instanceof Error ? e.message : "Failed to load projects" });
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { void load(); }, [load]);
+
+  async function createProject() {
+    if (!createName.trim()) return;
+    setCreating(true);
+    try {
+      await apiFetch("/projects/", {
+        method: "POST",
+        body: JSON.stringify({ name: createName.trim(), instructions: createInstructions.trim() || null }),
+      });
+      setCreateName("");
+      setCreateInstructions("");
+      setShowCreate(false);
+      await load();
+      setToast({ kind: "ok", text: "Project created" });
+    } catch (e) {
+      setToast({ kind: "danger", text: e instanceof Error ? e.message : "Failed to create project" });
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  function openProject(id: string) {
+    setActiveProjectId(id);
+    if (typeof window !== "undefined") {
+      const url = new URL(window.location.href);
+      url.searchParams.set("id", id);
+      window.history.pushState({}, "", url.toString());
+    }
+  }
+
+  function closeProject() {
+    setActiveProjectId(null);
+    if (typeof window !== "undefined") {
+      const url = new URL(window.location.href);
+      url.searchParams.delete("id");
+      window.history.pushState({}, "", url.toString());
+    }
+  }
+
+  const activeProject = projects.find(p => p.id === activeProjectId) ?? null;
+
+  if (activeProjectId) {
+    return (
+      <ProjectDetailScreen
+        projectId={activeProjectId}
+        project={activeProject}
+        onBack={closeProject}
+      />
+    );
+  }
+
+  return (
+    <div className="flex-1 flex flex-col min-h-0">
+      <PageHeader
+        title="Projects"
+        subtitle="Organize conversations, tasks, and artifacts by project"
+        right={
+          <button className="btn btn-primary btn-sm" onClick={() => setShowCreate(v => !v)}>
+            <IC.Plus size={14} /> New project
+          </button>
+        }
+      />
+      {toast && (
+        <div className={`mx-10 mb-4 px-4 py-2.5 rounded-lg text-[13.5px] font-medium ${toast.kind === "ok" ? "bg-[var(--ok-soft)] text-[var(--ok-text)]" : "bg-[var(--danger-soft)] text-[var(--danger)]"}`}>
+          {toast.text}
+          <button className="ml-3 opacity-60 hover:opacity-100" onClick={() => setToast(null)}>✕</button>
+        </div>
+      )}
+      {showCreate && (
+        <div className="mx-10 mb-6 surface border border-soft rounded-xl p-5 flex flex-col gap-3">
+          <div className="font-medium text-[14px]">New project</div>
+          <input
+            className="input-field"
+            placeholder="Project name"
+            value={createName}
+            onChange={e => setCreateName(e.target.value)}
+            onKeyDown={e => { if (e.key === "Enter" && !creating) void createProject(); }}
+          />
+          <textarea
+            className="input-field resize-none"
+            rows={3}
+            placeholder="Instructions (optional) — describe the project goal, context, or constraints"
+            value={createInstructions}
+            onChange={e => setCreateInstructions(e.target.value)}
+          />
+          <div className="flex gap-2">
+            <button className="btn btn-primary btn-sm" disabled={creating || !createName.trim()} onClick={() => void createProject()}>
+              {creating ? "Creating…" : "Create"}
+            </button>
+            <button className="btn btn-sm" onClick={() => { setShowCreate(false); setCreateName(""); setCreateInstructions(""); }}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+      <div className="flex-1 overflow-auto px-10 pb-10">
+        {loading ? (
+          <div className="text-[13.5px] mt-6" style={{ color: "var(--text-dim)" }}>Loading projects…</div>
+        ) : projects.length === 0 ? (
+          <EmptyState icon={<IC.Folder size={22} />} title="No projects yet" sub="Create a project to organize conversations, tasks, and artifacts." />
+        ) : (
+          <div className="grid gap-3 mt-2" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))" }}>
+            {projects.map(proj => (
+              <button
+                key={proj.id}
+                className="surface border border-soft rounded-xl p-5 text-left hover:border-[var(--accent)] transition-colors group"
+                onClick={() => openProject(proj.id)}
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div className="font-medium text-[14px] truncate">{proj.name}</div>
+                  <IC.Chevron size={14} style={{ color: "var(--text-faint)", flexShrink: 0, marginTop: 2 }} />
+                </div>
+                {proj.instructions && (
+                  <p className="text-[12.5px] mt-1.5 line-clamp-2" style={{ color: "var(--text-dim)" }}>{proj.instructions}</p>
+                )}
+                <div className="flex gap-3 mt-3 text-[12px]" style={{ color: "var(--text-faint)" }}>
+                  <span>{proj.visibility ?? "private"}</span>
+                  {proj.created_at && <span>{new Date(proj.created_at).toLocaleDateString()}</span>}
+                </div>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const PROJECT_TABS: { id: ProjectTab; label: string }[] = [
+  { id: "chat",     label: "Chat" },
+  { id: "sources",  label: "Sources" },
+  { id: "artifacts",label: "Artifacts" },
+  { id: "tasks",    label: "Tasks" },
+  { id: "research", label: "Research" },
+];
+
+function ProjectDetailScreen({
+  projectId,
+  project,
+  onBack,
+}: {
+  projectId: string;
+  project: Project | null;
+  onBack: () => void;
+}) {
+  const [tab, setTab] = useState<ProjectTab>("chat");
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [artifacts, setArtifacts] = useState<ArtifactRef[]>([]);
+  const [sources, setSources] = useState<ProjectSource[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(false);
+
+  const refreshSources = useCallback(async () => {
+    const rows = (await (await apiFetch(`/projects/${projectId}/sources`)).json()) as ProjectSource[];
+    setSources(rows);
+  }, [projectId]);
+
+  useEffect(() => {
+    setLoading(true);
+    setLoadError(false);
+    Promise.all([
+      apiFetch(`/projects/${projectId}/conversations`).then(r => r.json()),
+      apiFetch(`/projects/${projectId}/tasks`).then(r => r.json()),
+      apiFetch(`/projects/${projectId}/artifacts`).then(r => r.json()),
+      apiFetch(`/projects/${projectId}/sources`).then(r => r.json()),
+    ])
+      .then(([convs, tsks, arts, srcs]) => {
+        setConversations(convs as Conversation[]);
+        setTasks(tsks as Task[]);
+        setArtifacts(arts as ArtifactRef[]);
+        setSources(srcs as ProjectSource[]);
+      })
+      .catch(() => { setLoadError(true); })
+      .finally(() => setLoading(false));
+  }, [projectId]);
+
+  return (
+    <div className="flex-1 flex flex-col min-h-0">
+      <PageHeader
+        title={project?.name ?? "Project"}
+        subtitle={project?.instructions ?? undefined}
+        right={
+          <button className="btn btn-sm" onClick={onBack}>
+            ← Back
+          </button>
+        }
+      />
+      {/* Tab bar */}
+      <div role="tablist" className="flex gap-0.5 px-10 mb-6 border-b hairline">
+        {PROJECT_TABS.map(t => (
+          <button
+            key={t.id}
+            role="tab"
+            aria-selected={tab === t.id}
+            onClick={() => setTab(t.id)}
+            className="px-4 py-2.5 text-[13.5px] font-medium transition-colors"
+            style={{
+              color: tab === t.id ? "var(--text)" : "var(--text-dim)",
+              borderBottom: tab === t.id ? "2px solid var(--accent)" : "2px solid transparent",
+              marginBottom: -1,
+            }}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+      <div className="flex-1 overflow-auto px-10 pb-10">
+        {loadError ? (
+          <div className="text-[13.5px] mt-4" style={{ color: "var(--danger)" }}>Couldn't load project details.</div>
+        ) : loading ? (
+          <div className="text-[13.5px]" style={{ color: "var(--text-dim)" }}>Loading…</div>
+        ) : tab === "chat" ? (
+          conversations.length === 0 ? (
+            <EmptyState icon={<IC.Chat size={22} />} title="No conversations" sub="Send a message in this project to see conversations here." />
+          ) : (
+            <div className="flex flex-col gap-2">
+              {conversations.map(conv => (
+                <div key={conv.id} className="surface border border-soft rounded-xl px-5 py-4">
+                  <div className="font-medium text-[14px]">{conv.title ?? "Untitled conversation"}</div>
+                  {conv.updated_at && <div className="text-[12px] mt-1" style={{ color: "var(--text-faint)" }}>{new Date(conv.updated_at).toLocaleString()}</div>}
+                </div>
+              ))}
+            </div>
+          )
+        ) : tab === "sources" ? (
+          <ProjectSourcesTab projectId={projectId} sources={sources} refresh={refreshSources} />
+        ) : tab === "artifacts" ? (
+          artifacts.length === 0 ? (
+            <EmptyState icon={<IC.Folder size={22} />} title="No artifacts" sub="Artifacts created in project conversations and tasks appear here." />
+          ) : (
+            <div className="flex flex-col gap-2">
+              {artifacts.map(art => (
+                <div key={art.id} className="surface border border-soft rounded-xl px-5 py-4 flex items-center gap-4">
+                  <div className="flex-1 min-w-0">
+                    <div className="font-medium text-[14px] truncate">{art.title ?? "Untitled"}</div>
+                    <div className="text-[12px] mt-0.5" style={{ color: "var(--text-faint)" }}>{art.kind}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )
+        ) : tab === "tasks" ? (
+          tasks.length === 0 ? (
+            <EmptyState icon={<IC.Activity size={22} />} title="No tasks" sub="Tasks linked to this project appear here." />
+          ) : (
+            <div className="flex flex-col gap-2">
+              {tasks.map(task => (
+                <div key={task.id} className="surface border border-soft rounded-xl px-5 py-4">
+                  <div className="font-medium text-[14px] truncate">{task.goal}</div>
+                  <div className="flex gap-3 mt-1 text-[12px]" style={{ color: "var(--text-faint)" }}>
+                    <span>{task.status}</span>
+                    {task.created_at && <span>{new Date(task.created_at).toLocaleString()}</span>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )
+        ) : (
+          <EmptyState title="Nothing here yet" sub="This feature is coming soon." />
+        )}
+      </div>
+    </div>
+  );
+}
+
+const SOURCE_STATUS_COLOR: Record<string, string> = {
+  indexed: "var(--accent)",
+  synced: "var(--accent)",
+  pending: "var(--text-faint)",
+  failed: "var(--danger)",
+  revoked: "var(--danger)",
+};
+
+function ProjectSourcesTab({
+  projectId,
+  sources,
+  refresh,
+}: {
+  projectId: string;
+  sources: ProjectSource[];
+  refresh: () => Promise<void>;
+}) {
+  const [adding, setAdding] = useState(false);
+  const [title, setTitle] = useState("");
+  const [tool, setTool] = useState("");
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [detail, setDetail] = useState<SourceDetail | null>(null);
+
+  const addConnector = async () => {
+    if (!title.trim() || !tool.trim()) return;
+    setBusyId("add"); setError(null);
+    try {
+      await apiFetch(`/projects/${projectId}/sources/connector`, {
+        method: "POST",
+        body: JSON.stringify({ title: title.trim(), tool: tool.trim(), args: {} }),
+      });
+      setTitle(""); setTool(""); setAdding(false);
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Couldn't add connector source");
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const syncSource = async (sid: string) => {
+    setBusyId(sid); setError(null);
+    try {
+      await apiFetch(`/projects/${projectId}/sources/${sid}/sync`, { method: "POST" });
+      await refresh();
+      if (detail?.id === sid) await openDetail(sid);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Sync failed");
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const openDetail = async (sid: string) => {
+    setError(null);
+    try {
+      const d = (await (await apiFetch(`/projects/${projectId}/sources/${sid}`)).json()) as SourceDetail;
+      setDetail(d);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Couldn't load source");
+    }
+  };
+
+  const reindexSource = async (sid: string) => {
+    setBusyId(sid); setError(null);
+    try {
+      await apiFetch(`/projects/${projectId}/sources/${sid}/reindex`, { method: "POST" });
+      await refresh();
+      await openDetail(sid);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Reindex failed");
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const deleteSource = async (sid: string) => {
+    setBusyId(sid); setError(null);
+    try {
+      await apiFetch(`/projects/${projectId}/sources/${sid}`, { method: "DELETE" });
+      setDetail(null);
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Delete failed");
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const downloadOriginal = async (artifactId: string, name: string) => {
+    try {
+      const blob = await (await apiFetch(`/artifacts/${artifactId}/content`)).blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = name;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 5_000);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Download failed");
+    }
+  };
+
+  if (detail) {
+    const status = detail.index_status ?? "pending";
+    return (
+      <div className="flex flex-col gap-4">
+        <div className="flex items-center justify-between">
+          <button className="btn btn-sm" onClick={() => setDetail(null)}>← All sources</button>
+          <div className="flex gap-2">
+            {detail.artifact_id && (
+              <button className="btn btn-sm" onClick={() => downloadOriginal(detail.artifact_id!, detail.title ?? "source")}>
+                Download original
+              </button>
+            )}
+            <button className="btn btn-sm" onClick={() => reindexSource(detail.id)} disabled={busyId === detail.id}>
+              {busyId === detail.id ? "Working…" : "Reindex"}
+            </button>
+            <button className="btn btn-sm btn-danger-soft" onClick={() => deleteSource(detail.id)} disabled={busyId === detail.id}>
+              Delete
+            </button>
+          </div>
+        </div>
+
+        <div className="surface border border-soft rounded-xl px-5 py-4">
+          <div className="font-medium text-[15px]">{detail.title ?? "Untitled source"}</div>
+          <div className="flex flex-wrap gap-3 mt-1.5 text-[12px]" style={{ color: "var(--text-faint)" }}>
+            <span>{detail.source_type ?? "upload"}</span>
+            <span>parse: {detail.parse_status ?? "—"}</span>
+            <span style={{ color: SOURCE_STATUS_COLOR[status] ?? "var(--text-faint)" }}>index: {status}</span>
+            <span>{detail.chunk_count} chunk{detail.chunk_count === 1 ? "" : "s"}</span>
+          </div>
+          {detail.warning && (
+            <div className="mt-3 text-[12.5px]" style={{ color: "var(--danger)" }}>{detail.warning}</div>
+          )}
+        </div>
+
+        {error && <div className="text-[12.5px]" style={{ color: "var(--danger)" }}>{error}</div>}
+
+        <div className="text-[12px] font-medium" style={{ color: "var(--text-dim)" }}>
+          Extracted text {detail.chunk_count > detail.chunks.length ? `(first ${detail.chunks.length} of ${detail.chunk_count} chunks)` : ""}
+        </div>
+        {detail.chunks.length === 0 ? (
+          <div className="text-[13px]" style={{ color: "var(--text-faint)" }}>No indexed chunks for this source.</div>
+        ) : (
+          <div className="flex flex-col gap-2">
+            {detail.chunks.map(ch => (
+              <div key={ch.chunk_index} className="surface border border-soft rounded-xl px-4 py-3">
+                <div className="text-[11px] mb-1" style={{ color: "var(--text-faint)" }}>Chunk {ch.chunk_index}</div>
+                <div className="text-[13px] whitespace-pre-wrap" style={{ color: "var(--text)" }}>{ch.content}</div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex items-center justify-between">
+        <div className="text-[13px]" style={{ color: "var(--text-dim)" }}>
+          Uploaded files and connector feeds indexed for this project.
+        </div>
+        <button className="btn btn-sm" onClick={() => setAdding(a => !a)}>
+          {adding ? "Cancel" : "Add connector source"}
+        </button>
+      </div>
+
+      {adding && (
+        <div className="surface border border-soft rounded-xl px-5 py-4 flex flex-col gap-3">
+          <input
+            className="input"
+            placeholder="Source title (e.g. Sales inbox)"
+            value={title}
+            onChange={e => setTitle(e.target.value)}
+          />
+          <input
+            className="input"
+            placeholder="Tool (e.g. gmail.search)"
+            value={tool}
+            onChange={e => setTool(e.target.value)}
+          />
+          <div className="flex justify-end">
+            <button
+              className="btn btn-sm btn-primary"
+              onClick={addConnector}
+              disabled={busyId === "add" || !title.trim() || !tool.trim()}
+            >
+              {busyId === "add" ? "Adding…" : "Add source"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {error && <div className="text-[12.5px]" style={{ color: "var(--danger)" }}>{error}</div>}
+
+      {sources.length === 0 ? (
+        <EmptyState icon={<IC.Folder size={22} />} title="No sources" sub="Upload a file in a project conversation or add a connector source to build project knowledge." />
+      ) : (
+        <div className="flex flex-col gap-2">
+          {sources.map(src => {
+            const status = src.index_status ?? "pending";
+            return (
+              <button
+                key={src.id}
+                onClick={() => openDetail(src.id)}
+                className="surface border border-soft rounded-xl px-5 py-4 flex items-center gap-4 text-left w-full transition-colors"
+              >
+                <div className="flex-1 min-w-0">
+                  <div className="font-medium text-[14px] truncate">{src.title ?? "Untitled source"}</div>
+                  <div className="flex gap-3 mt-0.5 text-[12px]" style={{ color: "var(--text-faint)" }}>
+                    <span>{src.source_type ?? "upload"}</span>
+                    <span style={{ color: SOURCE_STATUS_COLOR[status] ?? "var(--text-faint)" }}>{status}</span>
+                  </div>
+                </div>
+                {src.source_type === "connector" && status !== "revoked" && (
+                  <span
+                    role="button"
+                    tabIndex={0}
+                    className="btn btn-sm"
+                    onClick={e => { e.stopPropagation(); syncSource(src.id); }}
+                    onKeyDown={e => { if (e.key === "Enter") { e.stopPropagation(); syncSource(src.id); } }}
+                  >
+                    {busyId === src.id ? "Syncing…" : "Sync"}
+                  </span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function EmptyPanel({ label }: { label: string }) {
+  return (
+    <div className="flex-1 flex flex-col">
+      <PageHeader title={label} />
+      <div className="flex-1 flex items-center justify-center px-10 pb-10">
+        <div className="surface border border-soft rounded-2xl px-10 py-12 flex flex-col items-center gap-3 text-center max-w-sm">
+          <p className="text-[15px] font-medium">{label}</p>
+          <p className="text-[13.5px]" style={{ color: "var(--text-dim)" }}>Nothing here yet.</p>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function SettingsScreen({ tab, setTab, theme, setTheme, accent, setAccent, signOut }: {
   tab: SettingsTab; setTab: (t: SettingsTab) => void;

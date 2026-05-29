@@ -185,16 +185,6 @@ def _infer_mime(kind: str, content: str | bytes) -> str:
     return "text/plain"
 
 
-async def _local_fallback(artifact_id: str, raw: bytes, org_id: str) -> str:
-    """Write to /tmp when MinIO is unavailable. Returns the pseudo minio_path."""
-    import pathlib
-
-    scratch = pathlib.Path("/tmp/chronos_artifacts")
-    scratch.mkdir(parents=True, exist_ok=True)
-    (scratch / artifact_id).write_bytes(raw)
-    return f"local://{artifact_id}"
-
-
 async def set_parse_status(artifact_id: str, status: str) -> None:
     """Update an attachment's parse_status (pending|parsed|failed|unparseable)."""
     from sqlalchemy import update
@@ -208,14 +198,14 @@ async def set_parse_status(artifact_id: str, status: str) -> None:
 
 async def update_artifact_meta(artifact_id: str, org_id: str, **fields: Any) -> dict[str, Any] | None:
     """Update head metadata (e.g. title). Tenant-scoped. Returns updated row or None."""
-    from datetime import datetime
+    from datetime import datetime, timezone
     from sqlalchemy import update as _update
 
     allowed = {"title", "is_deleted"}
     values = {k: v for k, v in fields.items() if k in allowed}
     if not values:
         return await get_artifact(artifact_id)
-    values["updated_at"] = datetime.utcnow()
+    values["updated_at"] = datetime.now(timezone.utc)
     artifacts = await reflect_table("artifacts")
     async with engine.begin() as conn:
         await conn.execute(

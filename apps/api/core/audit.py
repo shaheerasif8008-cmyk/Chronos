@@ -17,13 +17,14 @@ async def log(
     resource_id: str | None = None,
     payload: dict[str, Any] | None = None,
     decision: str | None = None,
+    organization_id: str | None = None,
 ) -> str:
     audit_log = await reflect_table("audit_log")
     async with engine.begin() as conn:
         result = await conn.execute(
             insert(audit_log)
             .values(
-                organization_id=settings.org_id,
+                organization_id=organization_id or settings.org_id,
                 region=settings.region,
                 event_type=event_type,
                 actor_id=actor_id,

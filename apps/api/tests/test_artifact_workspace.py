@@ -9,8 +9,9 @@ def _db_reachable() -> bool:
     host, _, port_str = os.environ.get(
         "DATABASE_URL", "postgresql+asyncpg://chronos:chronos@localhost:5432/chronos"
     ).rpartition("@")[-1].partition("/")[0].rpartition(":")
+    port = int(port_str) if port_str.isdigit() else 5432
     try:
-        with socket.create_connection((host or "localhost", int(port_str or 5432)), timeout=1):
+        with socket.create_connection((host or "localhost", port), timeout=1):
             return True
     except OSError:
         return False

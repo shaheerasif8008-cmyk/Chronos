@@ -213,6 +213,9 @@ async def delete_artifact(artifact_id: str, member: Member = Depends(get_current
 async def duplicate_artifact(artifact_id: str, member: Member = Depends(get_current_member)):
     """Copy an artifact's current content into a new, independent artifact (version 1)."""
     meta = await _require(member, "artifact.read", artifact_id)
+    # Duplicating writes a brand-new artifact, so it requires create permission too.
+    if not await permissions.check(member, "artifact.create", "artifact:new"):
+        raise HTTPException(status_code=403, detail="Not authorized")
     content = await read_artifact_content(artifact_id)
     if content is None:
         raise HTTPException(status_code=404, detail="Artifact content not found")
