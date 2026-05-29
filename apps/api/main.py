@@ -8,10 +8,10 @@ from sqlalchemy import select
 from core.exceptions import PermissionDenied
 
 import asyncio
-from jobs import context_update, profile_synthesis
+from jobs import context_update, profile_synthesis, scheduled_tasks
 from core.db import engine, reflect_table
 from runtime.executor import TaskExecutor
-from routers import activity, approvals, artifacts, attachments, auth, chat, connectors, context, memory, projects, search, settings, tasks, workflows
+from routers import activity, approvals, artifacts, attachments, auth, chat, connectors, context, memory, projects, schedules, search, settings, tasks, workflows
 
 app = FastAPI(title="Chronos API", version="0.1.0")
 
@@ -43,6 +43,7 @@ app.include_router(approvals.router)
 app.include_router(artifacts.router)
 app.include_router(settings.router)
 app.include_router(workflows.router)
+app.include_router(schedules.router)
 
 
 def _init_observability() -> None:
@@ -96,7 +97,7 @@ async def _permission_denied_handler(_request: Request, exc: PermissionDenied) -
 @app.on_event("startup")
 async def start_schedulers() -> None:
     await _bootstrap_authz()
-    for scheduler in (profile_synthesis.scheduler, context_update.scheduler):
+    for scheduler in (profile_synthesis.scheduler, context_update.scheduler, scheduled_tasks.scheduler):
         if not scheduler.running:
             scheduler.start()
     await recover_incomplete_tasks()
@@ -142,7 +143,7 @@ async def recover_incomplete_workflows() -> list[str]:
 
 @app.on_event("shutdown")
 async def stop_schedulers() -> None:
-    for scheduler in (profile_synthesis.scheduler, context_update.scheduler):
+    for scheduler in (profile_synthesis.scheduler, context_update.scheduler, scheduled_tasks.scheduler):
         if scheduler.running:
             scheduler.shutdown(wait=False)
 
