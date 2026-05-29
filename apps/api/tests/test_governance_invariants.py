@@ -26,6 +26,7 @@ _ALLOWED_DIRECT_IMPORTERS = {
     "connectors/registry.py",     # registry wires connectors together
     "connectors/__init__.py",
     "connectors/framework",       # framework internals
+    "parsing/tool.py",            # doc connector — routed via broker, may read from fs connector
     "tests/",                     # tests may import connectors for mocking
 }
 
