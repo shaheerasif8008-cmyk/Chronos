@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     openrouter_api_base: str = "https://openrouter.ai/api/v1"
     embedding_model: str = "openrouter/nvidia/llama-nemotron-embed-vl-1b-v2:free"
     fast_model: str = "openrouter/minimax/minimax-m2.5:free"
+    vision_model: str = ""   # vision-capable model for OCR; empty disables OCR
     local_llm_timeout_seconds: float = 2.0
     memory_retrieve_timeout_seconds: float = 1.5
     task_runner_max_concurrency: int = 4

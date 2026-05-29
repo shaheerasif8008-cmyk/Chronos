@@ -148,6 +148,33 @@ CODE_PYTHON = _fn(
     ["code"],
 )
 
+# ── Documents ─────────────────────────────────────────────────────────────────
+
+DOC_PARSE = _fn(
+    "doc__parse",
+    "Parse a document or image into text. Use on a file the user attached, a file in "
+    "the task workspace, or an artifact produced earlier. Supports PDF, DOCX, XLSX, "
+    "PPTX, CSV, TXT, and images (OCR). Returns a text preview plus metadata; the full "
+    "text is stored and can be paged with doc__read.",
+    {
+        "artifact_id": {"type": "string", "description": "Artifact id of the file to parse."},
+        "path": {"type": "string", "description": "Path in the task workspace to parse (alternative to artifact_id)."},
+    },
+    [],
+)
+
+DOC_READ = _fn(
+    "doc__read",
+    "Read more of an already-parsed document beyond the preview. Use when the preview "
+    "was truncated and you need a specific section.",
+    {
+        "artifact_id": {"type": "string", "description": "Artifact id of the parsed document (the parsed_text artifact, or the source attachment)."},
+        "char_offset": {"type": "integer", "description": "Start offset into the full text (default 0).", "default": 0},
+        "max_chars": {"type": "integer", "description": "Maximum characters to return (default 8000).", "default": 8000},
+    },
+    ["artifact_id"],
+)
+
 # ── Sub-agent ─────────────────────────────────────────────────────────────────
 
 SPAWN_SUBAGENT = _fn(
@@ -184,6 +211,8 @@ ALL_TOOLS: list[dict[str, Any]] = [
     FS_READ,
     FS_WRITE,
     CODE_PYTHON,
+    DOC_PARSE,
+    DOC_READ,
     SPAWN_SUBAGENT,
 ]
 
@@ -196,6 +225,8 @@ SUBAGENT_TOOLS: list[dict[str, Any]] = [
     FS_READ,
     FS_WRITE,
     CODE_PYTHON,
+    DOC_PARSE,
+    DOC_READ,
 ]
 
 #: Names that always need explicit human approval before execution.

@@ -1,3 +1,4 @@
+import base64
 import json
 import logging
 import random
@@ -271,6 +272,38 @@ async def complete_text(prompt: str, *, model: str | None = None) -> str:
             pass
 
     raise RuntimeError("All models failed for complete_text — check OPENROUTER_API_KEY and model config")
+
+
+async def vision_ocr(image_bytes: bytes, mime: str) -> str:
+    """Extract text from an image via a litellm vision model.
+
+    Returns "" when no vision model is configured or the call fails — OCR is
+    best-effort and must never raise into a chat turn or task step.
+    """
+    if not settings.vision_model:
+        return ""
+    data_url = f"data:{mime};base64,{base64.b64encode(image_bytes).decode()}"
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "Extract all text from this image verbatim. Preserve reading "
+                        "order and layout. Return only the extracted text, no commentary."
+                    ),
+                },
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        }
+    ]
+    try:
+        kwargs = model_kwargs(settings.vision_model, messages=messages, stream=False)
+        response = await _with_retry(lambda: litellm.acompletion(**kwargs), max_retries=0)
+        return _message_content(response)
+    except Exception:
+        return ""
 
 
 async def tool_call(messages: list[dict[str, Any]], tools: list[dict[str, Any]], *, model: str | None = None) -> dict[str, Any]:

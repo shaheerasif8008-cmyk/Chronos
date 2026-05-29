@@ -20,7 +20,6 @@ Usage (from executor, router, or any async context):
 from __future__ import annotations
 
 import io
-import json
 import uuid
 from typing import Any
 
@@ -59,6 +58,8 @@ async def save_artifact(
     org_id: str = "default",
     region: str = "us",
     mime_type: str | None = None,
+    parent_artifact_id: str | None = None,
+    parse_status: str | None = None,
 ) -> str:
     """Persist an artifact to MinIO and record metadata in the artifacts table.
 
@@ -108,6 +109,8 @@ async def save_artifact(
                 minio_path=minio_path,
                 mime_type=mime_type,
                 size_bytes=size,
+                parent_artifact_id=parent_artifact_id,
+                parse_status=parse_status,
             )
             .returning(artifacts.c.id)
         )
@@ -170,3 +173,14 @@ async def _local_fallback(artifact_id: str, raw: bytes, org_id: str) -> str:
     scratch.mkdir(parents=True, exist_ok=True)
     (scratch / artifact_id).write_bytes(raw)
     return f"local://{artifact_id}"
+
+
+async def set_parse_status(artifact_id: str, status: str) -> None:
+    """Update an attachment's parse_status (pending|parsed|failed|unparseable)."""
+    from sqlalchemy import update
+
+    artifacts = await reflect_table("artifacts")
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(artifacts).where(artifacts.c.id == artifact_id).values(parse_status=status)
+        )
