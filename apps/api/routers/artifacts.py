@@ -209,6 +209,28 @@ async def delete_artifact(artifact_id: str, member: Member = Depends(get_current
     return {"ok": True}
 
 
+@router.post("/{artifact_id}/duplicate")
+async def duplicate_artifact(artifact_id: str, member: Member = Depends(get_current_member)):
+    """Copy an artifact's current content into a new, independent artifact (version 1)."""
+    meta = await _require(member, "artifact.read", artifact_id)
+    content = await read_artifact_content(artifact_id)
+    if content is None:
+        raise HTTPException(status_code=404, detail="Artifact content not found")
+    base_title = meta.get("title") or "Untitled"
+    new_id = await save_artifact(
+        content,
+        kind=str(meta.get("kind") or "file"),
+        title=f"{base_title} (copy)",
+        mime_type=meta.get("mime_type"),
+        conversation_id=meta.get("conversation_id"),
+        org_id=member.organization_id,
+        created_by=f"member:{member.id}",
+    )
+    await audit.log("artifact", member.id, "artifact.duplicate", resource_type="artifact",
+                    resource_id=new_id, payload={"source": artifact_id})
+    return await get_artifact(new_id)
+
+
 @router.post("/{artifact_id}/publish")
 async def publish_artifact(artifact_id: str, member: Member = Depends(get_current_member)):
     await _require(member, "artifact.publish", artifact_id)

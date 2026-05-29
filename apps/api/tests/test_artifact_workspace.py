@@ -155,3 +155,60 @@ async def test_public_share_boundary_serves_then_revokes():
     with _pytest.raises(HTTPException) as ei2:
         await get_shared_content(token)
     assert ei2.value.status_code == 404
+
+
+def _member(org_id: str):
+    """Build a Member for direct router-handler calls (auth dependency bypassed)."""
+    from core.models import Member
+
+    return Member(id=str(uuid.uuid4()), organization_id=org_id, email="t@t.io", role="user")
+
+
+@_requires_db
+@pytest.mark.asyncio
+async def test_router_blocks_cross_org_access():
+    """Tenant isolation at the route boundary: a member from another org gets 404 (not the artifact)."""
+    import pytest as _pytest
+    from fastapi import HTTPException
+
+    from core.artifacts import save_artifact
+    from routers.artifacts import (
+        EditBody,
+        edit_artifact,
+        get_artifact_metadata,
+    )
+
+    org_a = f"a-{uuid.uuid4().hex[:8]}"
+    org_b = f"b-{uuid.uuid4().hex[:8]}"
+    aid = await save_artifact("tenant a only", kind="markdown", title="A", org_id=org_a)
+
+    # Owner can read.
+    owner_meta = await get_artifact_metadata(aid, member=_member(org_a))
+    assert str(owner_meta["id"]) == aid
+
+    # Foreign org cannot read (404, never the row).
+    with _pytest.raises(HTTPException) as ei:
+        await get_artifact_metadata(aid, member=_member(org_b))
+    assert ei.value.status_code == 404
+
+    # Foreign org cannot edit either.
+    with _pytest.raises(HTTPException) as ei2:
+        await edit_artifact(aid, EditBody(content="hijack"), member=_member(org_b))
+    assert ei2.value.status_code == 404
+
+
+@_requires_db
+@pytest.mark.asyncio
+async def test_duplicate_creates_independent_copy():
+    from core.artifacts import read_artifact_content
+    from routers.artifacts import duplicate_artifact
+
+    org = f"test-{uuid.uuid4().hex[:8]}"
+    from core.artifacts import save_artifact
+
+    aid = await save_artifact("original", kind="markdown", title="Doc", org_id=org)
+    copy = await duplicate_artifact(aid, member=_member(org))
+    assert copy["id"] != aid
+    assert copy["title"] == "Doc (copy)"
+    assert copy["version"] == 1
+    assert await read_artifact_content(copy["id"]) == b"original"
