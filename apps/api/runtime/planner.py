@@ -133,6 +133,16 @@ class TaskPlanner:
         self.available_tools = default_available_tools() if available_tools is None else available_tools
 
     async def classify(self, goal: str, context: dict[str, Any] | None = None, org_id: str = "default") -> TaskClassification:
+        if _is_operator_workflow_proof(goal):
+            return TaskClassification(
+                complexity="complex",
+                requires_tools=["browser.search", "gmail.draft"],
+                requires_sub_agents=False,
+                requires_approval=True,
+                estimated_steps=3,
+                success_criteria="Reach the approval gate with deterministic outreach drafts.",
+            )
+
         prompt = f"""
 Classify this task goal before planning.
 Return only JSON with:

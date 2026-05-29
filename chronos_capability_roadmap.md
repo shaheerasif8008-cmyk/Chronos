@@ -1,18 +1,63 @@
 # Chronos Capability Roadmap
-## Closing the Gap on Claude, Manus, and ChatGPT
+## Closing the Gap on ChatGPT, Claude.ai, and Manus.ai
 
-**Scope:** 9 capability categories. For each: current state, the gap, and exactly what to build.
-**Standard:** Match or exceed the best available in each category.
+**Canonical goal:** Chronos is an enterprise AI platform targeting total practical parity with the combined capability set of ChatGPT, Claude.ai, and Manus.ai. The full north-star goal and completion bar live in `CHRONOS_TOTAL_PARITY_GOAL.md`; the controlling implementation contract lives in `docs/chronos_total_parity_matrix.md`.
+
+**Scope:** This roadmap is no longer limited to the original nine runtime categories. Those categories are foundation work inside the larger total parity program. Chronos must also ship projects, source knowledge, artifacts, deep research, multimodal input/output, broad connectors, full browser operation, cloud/local computer operation, coding-agent workflows, scheduled tasks, reusable agents/personas, collaboration/admin, mobile/desktop surfaces, compliance, and a final parity acceptance suite.
+
+**Standard:** Match or exceed the best available capability in each category while preserving Chronos's enterprise requirements: governed tools, scoped memory, approvals, auditability, tenant boundaries, durable state, truthful degraded modes, and real UI/API proof.
 
 ---
 
 ## How to Read This
 
-Each section follows the same structure:
+The original sections below describe important runtime and reliability gaps. Some of them are already completed or partially completed in the current checkout; treat their implementation details as foundation guidance, not the full product goal.
+
+Each detailed section follows this structure:
 - **Current state** — what exists in the codebase today
 - **The gap** — what the leading systems do that Chronos doesn't
 - **What to build** — concrete implementation spec
 - **Priority** — `P0` (blocking), `P1` (high), `P2` (important, can follow P1)
+
+## Current Foundation Status
+
+Already started or partially implemented:
+
+- Native model tool loop with parallel tool calls.
+- DAG task execution, conditional steps, approval gates, checkpoints, and replanning.
+- Broker-routed browser, Gmail, filesystem, code, MCP/generic connector paths.
+- Dynamic prompt-visible tool manifest.
+- Scoped memory retrieval with query expansion, recency/importance/source scoring, dedupe, and task scratchpad memory.
+- Artifact persistence for renderable `fs.write` outputs.
+- Approval pause/resume, audit logging, connector health/policy framework, and activity streaming.
+
+These are foundation pieces only. They do not by themselves satisfy total parity.
+
+## Phase 0 Acceptance Matrix
+
+`docs/chronos_total_parity_matrix.md` is the required starting point for parity implementation. It records each target capability, current state, owning subsystem, interface/persistence requirements, and acceptance proof. Before implementing a parity feature, map it to a matrix row; before calling it complete, satisfy that row's proof.
+
+## Missing Total-Parity Categories
+
+The original nine categories must be supplemented with the following product categories from `CHRONOS_TOTAL_PARITY_GOAL.md`:
+
+1. **Runtime reliability foundation** — queueing, cancellation, timeouts, durable traces, restart recovery, idempotency, and safety gates.
+2. **Unified product shell** — complete Chat, Projects, Research, Tasks, Artifacts, Memory, Connectors, Agents, Workflows, Approvals, Activity/Audit, and Settings/Admin surfaces.
+3. **Projects and knowledge sources** — project instructions, members, source upload/import/indexing, citations, connector-synced knowledge, and permission-aware retrieval.
+4. **Memory control center** — explicit/autonomous/project/workspace/org/persona/task memory with provenance, conflict/staleness handling, import/export, merge, and usage logs.
+5. **Artifact workspace** — preview, edit, AI edit, version, diff, restore, publish/share, download/export, and type-specific renderers.
+6. **Deep Research** — dedicated research runs with source controls, live timeline, citations, limitations, and exportable reports.
+7. **Multimodal and data analysis** — file upload, document intelligence, image input, image generation/editing, voice input/output, and Python-backed data analysis.
+8. **Connector and app ecosystem** — broad typed connectors, OAuth/API-key setup, synced/indexed sources, MCP/custom HTTP, health, policy, and audit.
+9. **Browser Operator** — persistent sessions, navigate/click/type/scroll/upload/download, live preview, user takeover, MFA/CAPTCHA handoff, and session revocation.
+10. **Cloud and local computer** — sandboxed cloud workspaces plus optional desktop bridge for user-authorized local folders/apps/commands.
+11. **Coding agent** — repo workspaces, branch/diff/test/commit/PR workflows, code task UI, and governed mutations.
+12. **Scheduled tasks, workflows, and monitors** — recurring tasks, event-triggered workflows, monitor alerts, run history, pause/resume, and recovery.
+13. **Agents/personas/workspace agents** — reusable agents with instructions, tools, projects, memory scopes, autonomy, approval policy, and publishing to Slack/Teams/email/API.
+14. **Collaboration and enterprise admin** — shared conversations, comments, assignments, mentions, approval routing, RBAC, retention, exports, and compliance reports.
+15. **Mobile, desktop, and notifications** — responsive web, desktop bridge/app, push/email/Slack/Teams notifications, and actionable approval/task links.
+16. **Security, privacy, and compliance** — secret redaction, tenant isolation, prompt-injection resistance, sandboxing, connector revocation, sensitive memory controls, and retention.
+17. **Final parity acceptance suite** — repeatable UI/API proof scenarios for ChatGPT-style, Claude-style, Manus-style, governance, connectors, and reliability parity.
 
 ---
 
@@ -167,7 +212,7 @@ async def _maybe_replan(self, task: Task, completed_steps: set, results: dict) -
 ## 2. Memory Routing
 
 ### Current State
-Memory retrieval is a single vector cosine search returning the top 10 results by semantic similarity to the current message. No scope filtering (Phase 1 stub), no importance weighting, no recency bias, no deduplication. If 10 memories exist and the top 10 are all variations of the same fact, all 10 get loaded.
+Original baseline: memory retrieval was a single vector cosine search returning the top 10 results by semantic similarity to the current message. The current checkout has since started scoped, expanded, ranked, and deduped retrieval; further work should treat that as the foundation for the full memory control center described above.
 
 ### The Gap
 
@@ -1252,9 +1297,9 @@ async def aggregate_results(
 
 ---
 
-## Implementation Order
+## Legacy Runtime Implementation Order
 
-The table below maps each category to its priority and approximate effort. Build in priority order within each phase.
+The table below is the original implementation order for the runtime foundation categories. Use it when working specifically on those categories, but do not treat it as the complete product roadmap.
 
 | Category | Priority | Effort | Blocks |
 |---|---|---|---|
@@ -1268,7 +1313,43 @@ The table below maps each category to its priority and approximate effort. Build
 | Async Task Handling (queue + cancellation) | P1 | 3 days | Resource leaks at scale |
 | Agent Coordination (bidirectional comms) | P2 | 4 days | Sub-agents being isolated |
 
-**P0 first.** These three are why Chronos feels dumb despite having a good LLM. Fix them and the product jumps a full tier without touching anything else.
+**P0 first inside runtime work.** These categories are why an agent with good models can still behave unreliably. They are foundational, but the total parity goal also requires the missing product categories listed above.
+
+## Total Parity Implementation Order
+
+Use this order for the full product program:
+
+1. Runtime reliability, trace persistence, recovery, and safety gates.
+2. Unified product shell and durable message/task UX.
+3. Projects, uploads, source indexing, permission-aware retrieval, and citations.
+4. Artifact workspace with preview/edit/version/publish.
+5. Deep Research with source controls and cited reports.
+6. Multimodal files/images/voice/data analysis.
+7. Connector directory, typed connector tools, and synced knowledge connectors.
+8. Browser Operator with persistent sessions and user takeover.
+9. Cloud Computer.
+10. Local Computer desktop bridge.
+11. Coding agent workflows.
+12. Scheduled tasks, workflows, and monitors.
+13. Agents, personas, and workspace-published agents.
+14. Collaboration, admin, compliance, and audit export.
+15. Mobile, desktop, and notifications.
+16. Final polish and parity acceptance suite.
+
+## Final Completion Bar
+
+Chronos is not total-parity complete until:
+
+- every category in `CHRONOS_TOTAL_PARITY_GOAL.md` has implementation proof;
+- backend tests pass;
+- web build passes;
+- Playwright parity tests pass;
+- security/governance tests pass;
+- no fake UI controls remain;
+- all risky actions are governed;
+- durable outputs reopen after refresh;
+- browser/computer/connector degraded states are truthful;
+- all product claims are backed by UI/API proof artifacts.
 
 ---
 

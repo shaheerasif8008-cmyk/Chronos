@@ -7,10 +7,9 @@ from sqlalchemy import select
 
 from core.exceptions import PermissionDenied
 
-import asyncio
 from jobs import context_update, profile_synthesis, scheduled_tasks
 from core.db import engine, reflect_table
-from runtime.executor import TaskExecutor
+from runtime import task_runner
 from routers import activity, approvals, artifacts, attachments, auth, chat, connectors, context, memory, projects, schedules, search, settings, tasks, workflows
 
 app = FastAPI(title="Chronos API", version="0.1.0")
@@ -41,6 +40,7 @@ app.include_router(projects.router)
 app.include_router(activity.router)
 app.include_router(approvals.router)
 app.include_router(artifacts.router)
+app.include_router(attachments.router)
 app.include_router(settings.router)
 app.include_router(workflows.router)
 app.include_router(schedules.router)
@@ -100,6 +100,7 @@ async def start_schedulers() -> None:
     for scheduler in (profile_synthesis.scheduler, context_update.scheduler, scheduled_tasks.scheduler):
         if not scheduler.running:
             scheduler.start()
+    task_runner.start_runner()
     await recover_incomplete_tasks()
     await recover_incomplete_workflows()
 
@@ -123,13 +124,13 @@ async def recover_incomplete_tasks() -> list[str]:
     async with engine.begin() as conn:
         rows = (
             await conn.execute(
-                select(tasks_table.c.id).where(tasks_table.c.status.in_(["pending", "planning", "running"]))
+                select(tasks_table.c.id).where(tasks_table.c.status.in_(["queued", "pending", "planning", "running"]))
             )
         ).all()
 
     task_ids = [str(row[0]) for row in rows]
     for task_id in task_ids:
-        asyncio.create_task(TaskExecutor().resume(task_id))
+        await task_runner.enqueue_task(task_id)
     return task_ids
 
 
@@ -146,6 +147,7 @@ async def stop_schedulers() -> None:
     for scheduler in (profile_synthesis.scheduler, context_update.scheduler, scheduled_tasks.scheduler):
         if scheduler.running:
             scheduler.shutdown(wait=False)
+    await task_runner.stop_runner()
 
 
 @app.get("/health")

@@ -1,10 +1,31 @@
 import base64
 import io
+import os
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from core import llm
+from core.models import AgentContext
+from parsing.engine import PREVIEW_CHAR_LIMIT, ParsedDocument, parse_document
+
+# ---------------------------------------------------------------------------
+# DB connectivity guard — used by the storage round-trip test only.
+# ---------------------------------------------------------------------------
+def _db_reachable() -> bool:
+    import socket
+
+    host, _, port_str = os.environ.get(
+        "DATABASE_URL", "postgresql+asyncpg://chronos:chronos@localhost:5432/chronos"
+    ).rpartition("@")[-1].partition("/")[0].rpartition(":")
+    try:
+        with socket.create_connection((host or "localhost", int(port_str or 5432)), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+_requires_db = pytest.mark.skipif(not _db_reachable(), reason="Postgres not reachable")
 
 
 @pytest.fixture(autouse=True)
@@ -15,14 +36,13 @@ def dispose_db_engine():
     connection pools are bound to the loop that created them, so a pool created
     in test N's loop is unusable in test N+1's loop. Disposing before each test
     forces a fresh pool in the current event loop, preventing 'Future attached
-    to a different loop' failures when DB tests follow non-DB tests.
+    to a different loop' / 'Event loop is closed' failures when DB tests follow
+    non-DB tests.
     """
     import core.db as _db
     _db.engine.sync_engine.pool.dispose()
     yield
 
-
-# ── Task 2: vision_ocr ────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_vision_ocr_returns_empty_when_no_model_configured():
@@ -45,11 +65,6 @@ async def test_vision_ocr_sends_data_url_and_returns_text():
     image_part = next(p for p in content if p["type"] == "image_url")
     assert image_part["image_url"]["url"].startswith("data:image/png;base64,")
     assert base64.b64encode(b"rawbytes").decode() in image_part["image_url"]["url"]
-
-
-# ── Task 3: parsing engine — text formats ────────────────────────────────────
-
-from parsing.engine import parse_document, ParsedDocument, PREVIEW_CHAR_LIMIT
 
 
 @pytest.mark.asyncio
@@ -86,10 +101,10 @@ async def test_preview_truncates_long_text():
     assert doc.full_text == big
 
 
-# ── Task 4: PDF and image OCR ─────────────────────────────────────────────────
-
 def _one_page_pdf_with_text(text: str) -> bytes:
     from pypdf import PdfWriter
+    # pypdf can't author text-bearing pages easily; use reportlab-free minimal route
+    # via a blank page, then monkeypatch extraction in the test instead.
     writer = PdfWriter()
     writer.add_blank_page(width=200, height=200)
     buf = io.BytesIO()
@@ -125,8 +140,6 @@ async def test_parse_image_uses_vision_ocr():
     assert doc.full_text == "receipt total $9"
     assert doc.parser_used == "image-ocr"
 
-
-# ── Task 5: DOCX, XLSX, PPTX ─────────────────────────────────────────────────
 
 def _make_docx(text: str) -> bytes:
     from docx import Document
@@ -177,8 +190,65 @@ async def test_parse_pptx():
     assert doc.parser_used == "pptx"
 
 
-# ── Task 6: artifact storage round-trip ──────────────────────────────────────
+@pytest.mark.asyncio
+async def test_parse_docx_with_table():
+    from docx import Document as DocxDocument
+    d = DocxDocument()
+    t = d.add_table(rows=2, cols=2)
+    t.rows[0].cells[0].text = "Name"
+    t.rows[0].cells[1].text = "Score"
+    t.rows[1].cells[0].text = "Alice"
+    t.rows[1].cells[1].text = "95"
+    buf = io.BytesIO()
+    d.save(buf)
+    doc = await parse_document(buf.getvalue(), "", "data.docx")
+    assert "Name | Score" in doc.full_text
+    assert "Alice | 95" in doc.full_text
 
+
+@pytest.mark.asyncio
+async def test_parse_xlsx_multi_sheet():
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws1 = wb.active
+    ws1.title = "Revenue"
+    ws1["A1"] = "Q1"
+    ws2 = wb.create_sheet("Costs")
+    ws2["A1"] = "Q2"
+    buf = io.BytesIO()
+    wb.save(buf)
+    doc = await parse_document(buf.getvalue(), "", "model.xlsx")
+    assert "# Sheet: Revenue" in doc.full_text
+    assert "# Sheet: Costs" in doc.full_text
+    assert doc.page_count == 2
+
+
+@pytest.mark.asyncio
+async def test_parse_pptx_multi_slide():
+    from pptx import Presentation
+    prs = Presentation()
+    layout = prs.slide_layouts[5]
+    s1 = prs.slides.add_slide(layout)
+    s1.shapes.title.text = "Intro"
+    s2 = prs.slides.add_slide(layout)
+    s2.shapes.title.text = "Body"
+    buf = io.BytesIO()
+    prs.save(buf)
+    doc = await parse_document(buf.getvalue(), "", "deck.pptx")
+    assert "# Slide 1" in doc.full_text
+    assert "# Slide 2" in doc.full_text
+    assert doc.page_count == 2
+
+
+@pytest.mark.asyncio
+async def test_parse_docx_corrupt_bytes():
+    doc = await parse_document(b"not a zip", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "bad.docx")
+    assert doc.parser_used == "none"
+    assert doc.note is not None
+    assert "docx" in doc.note
+
+
+@_requires_db
 @pytest.mark.asyncio
 async def test_save_artifact_records_parent_and_status():
     from core import artifacts
@@ -196,8 +266,6 @@ async def test_save_artifact_records_parent_and_status():
     assert meta["parse_status"] == "parsed"
 
 
-# ── Task 7: doc tools registered ─────────────────────────────────────────────
-
 def test_doc_tools_registered_and_broker_named():
     from runtime.tool_registry import ALL_TOOLS, SUBAGENT_TOOLS, to_broker_name, tool_name
 
@@ -210,11 +278,6 @@ def test_doc_tools_registered_and_broker_named():
     # convert cleanly to broker dot-notation
     assert to_broker_name("doc__parse") == "doc.parse"
     assert to_broker_name("doc__read") == "doc.read"
-
-
-# ── Task 8: doc connector + broker routing ───────────────────────────────────
-
-from core.models import AgentContext
 
 
 @pytest.mark.asyncio
@@ -241,7 +304,7 @@ async def test_doc_connector_read_pages_artifact(monkeypatch):
         return b"A" * 100
 
     async def fake_meta(artifact_id):
-        return {"mime_type": "text/plain", "title": "big.txt", "organization_id": "default"}
+        return {"mime_type": "text/plain", "title": "big.txt", "organization_id": "default", "kind": "attachment"}
 
     monkeypatch.setattr(doctool, "read_artifact_content", fake_read)
     monkeypatch.setattr(doctool, "get_artifact", fake_meta)
@@ -253,52 +316,8 @@ async def test_doc_connector_read_pages_artifact(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_doc_parse_routes_through_broker(monkeypatch):
-    from core import tool_broker as tb
-    from core.models import ToolResult
-
-    audited: list[str] = []
-
-    async def fake_log(event_type, actor, action, **kw):
-        audited.append(event_type)
-
-    async def fake_check(*a, **k):
-        return True
-
-    async def fake_rate_limit(*a, **k):
-        return None
-
-    async def fake_loop_check(*a, **k):
-        return None
-
-    async def fake_tool_policy(*a, **k):
-        return {}
-
-    monkeypatch.setattr(tb.audit, "log", fake_log)
-    monkeypatch.setattr(tb.permissions, "check", fake_check)
-    monkeypatch.setattr(tb, "_check_rate_limit", fake_rate_limit)
-    monkeypatch.setattr(tb, "_check_loop", fake_loop_check)
-    monkeypatch.setattr(tb, "tool_policy", fake_tool_policy)
-    # connector_tier is imported into tool_broker's namespace; patch it there.
-    monkeypatch.setattr(tb, "connector_tier", AsyncMock(return_value="live"))
-
-    async def fake_doc_exec(tool, args):
-        return ToolResult(data={"preview": "hi"}, summary="ok")
-
-    monkeypatch.setattr("parsing.tool.doc_connector.execute", fake_doc_exec)
-
-    agent = AgentContext(id="a1", org_id="default", task_id="t1", member_id="m1")
-    result = await tb.execute(agent, "doc.parse", {"artifact_id": "x"})
-    assert result.summary == "ok"
-    assert "tool_call" in audited and "tool_result" in audited
-
-
-# ── Task 9: upload endpoint ───────────────────────────────────────────────────
-
-@pytest.mark.asyncio
 async def test_upload_attachment_stores_and_returns_id(monkeypatch):
-    from routers import attachments
-    from core.models import Member
+    from routers import attachments as att_router
     from io import BytesIO
     from starlette.datastructures import UploadFile as StarletteUploadFile, Headers
 
@@ -315,24 +334,57 @@ async def test_upload_attachment_stores_and_returns_id(monkeypatch):
     async def fake_check(*a, **k):
         return True
 
-    monkeypatch.setattr(attachments, "save_artifact", fake_save)
-    monkeypatch.setattr(attachments.audit, "log", fake_log)
-    monkeypatch.setattr(attachments.permissions, "check", fake_check)
+    monkeypatch.setattr(att_router, "save_artifact", fake_save)
+    monkeypatch.setattr(att_router.audit, "log", fake_log)
+    monkeypatch.setattr(att_router.permissions, "check", fake_check)
 
+    # Adjust Member constructor kwargs to match core/models.py exactly.
+    from core.models import Member
     member = Member(id="m1", organization_id="default", email="a@b.c", role="user", name="A")
     upload = StarletteUploadFile(
         filename="report.pdf",
         file=BytesIO(b"%PDF-1.4 data"),
         headers=Headers({"content-type": "application/pdf"}),
     )
-    out = await attachments.upload_attachment(file=upload, conversation_id="c1", project_id=None, member=member)
+    out = await att_router.upload_attachment(file=upload, conversation_id="c1", project_id=None, member=member)
     assert out["attachment_id"] == "att-123"
     assert out["filename"] == "report.pdf"
     assert saved["kind"] == "attachment"
     assert saved["parse_status"] == "pending"
 
 
-# ── Task 10: attachments seed injection ──────────────────────────────────────
+@pytest.mark.asyncio
+async def test_doc_parse_routes_through_broker(monkeypatch):
+    from core import tool_broker as tb
+    from core.models import ToolResult
+
+    audited: list[str] = []
+
+    async def fake_log(event_type, actor, action, **kw):
+        audited.append(event_type)
+
+    async def fake_check(*a, **k):
+        return True
+
+    async def fake_tool_policy(*a, **k):
+        return {}
+
+    monkeypatch.setattr(tb.audit, "log", fake_log)
+    monkeypatch.setattr(tb.permissions, "check", fake_check)
+    monkeypatch.setattr(tb, "tool_policy", fake_tool_policy)
+    # connector_tier is imported into tool_broker's namespace; patch it there.
+    monkeypatch.setattr(tb, "connector_tier", AsyncMock(return_value="live"))
+
+    async def fake_doc_exec(tool, args):
+        return ToolResult(data={"preview": "hi"}, summary="ok")
+
+    monkeypatch.setattr("parsing.tool.doc_connector.execute", fake_doc_exec)
+
+    agent = AgentContext(id="a1", org_id="default", task_id="t1", member_id="m1")
+    result = await tb.execute(agent, "doc.parse", {"artifact_id": "x"})
+    assert result.summary == "ok"
+    assert "tool_call" in audited and "tool_result" in audited
+
 
 @pytest.mark.asyncio
 async def test_load_history_injects_attachments_block():
@@ -355,7 +407,37 @@ async def test_load_history_injects_attachments_block():
     assert history[-1]["content"] == "Summarize the attached report"  # goal is last
 
 
-# ── Task 12: tenant isolation ─────────────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_parse_attachments_sets_status_and_returns_preview(monkeypatch):
+    from routers import chat as chat_router
+
+    async def fake_get(artifact_id):
+        return {"mime_type": "text/plain", "title": "note.txt", "organization_id": "default", "parse_status": "pending"}
+
+    async def fake_read(artifact_id):
+        return b"important content"
+
+    async def fake_save(*a, **kw):
+        return "parsed-001"
+
+    async def fake_set_status(artifact_id, status):
+        pass
+
+    async def fake_audit_log(*a, **kw):
+        pass
+
+    monkeypatch.setattr(chat_router, "_get_artifact", fake_get)
+    monkeypatch.setattr(chat_router, "_read_artifact_content", fake_read)
+    monkeypatch.setattr(chat_router, "_save_artifact", fake_save)
+    monkeypatch.setattr(chat_router, "_set_parse_status", fake_set_status)
+    monkeypatch.setattr(chat_router.audit, "log", fake_audit_log)
+
+    result = await chat_router._parse_attachments(["att-1"], "conv-1", "default")
+    assert len(result) == 1
+    assert result[0]["preview"] == "important content"
+    assert result[0]["filename"] == "note.txt"
+    assert result[0]["parsed_artifact_id"] == "parsed-001"
+
 
 @pytest.mark.asyncio
 async def test_attachment_not_parseable_across_orgs(monkeypatch):
@@ -365,7 +447,24 @@ async def test_attachment_not_parseable_across_orgs(monkeypatch):
     async def fake_get_artifact(att_id):
         return {"id": att_id, "organization_id": "orgA", "mime_type": "text/plain", "title": "secret.txt"}
 
-    monkeypatch.setattr("core.artifacts.get_artifact", fake_get_artifact)
+    monkeypatch.setattr(chat, "_get_artifact", fake_get_artifact)
 
     out = await chat._parse_attachments(["att-A"], conversation_id="c1", org_id="orgB")
     assert out == []  # org mismatch → skipped, no parsed_text created
+
+
+@pytest.mark.asyncio
+async def test_doc_connector_rejects_cross_org_artifact(monkeypatch):
+    """DocConnector must reject artifact reads for a different org."""
+    from parsing import tool as doctool
+
+    async def fake_meta(artifact_id):
+        return {"organization_id": "orgA", "mime_type": "text/plain", "title": "secret.txt", "kind": "attachment"}
+
+    monkeypatch.setattr(doctool, "get_artifact", fake_meta)
+
+    with pytest.raises(PermissionError):
+        await doctool.doc_connector.execute("doc.parse", {"artifact_id": "x", "__org_id": "orgB"})
+
+    with pytest.raises(PermissionError):
+        await doctool.doc_connector.execute("doc.read", {"artifact_id": "x", "__org_id": "orgB"})

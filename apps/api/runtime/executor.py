@@ -13,10 +13,13 @@ import asyncio
 import ast
 import inspect
 import json
+import logging
 import re
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 from sqlalchemy import insert, select, update
 
@@ -91,17 +94,35 @@ class TaskExecutor:
             raise RuntimeError(f"Task not found: {task_id}")
         if task["status"] in {"complete", "failed", "cancelled"}:
             return
-        if _has_dag_plan(task.get("plan")):
-            await self._run_dag(task)
-            return
-        if _is_fresh_top_level(task):
-            routed = await self._preflight_and_route(task)
-            if routed is _PREFLIGHT_FAILED:
+        initial_step = int(task.get("current_step") or 0)
+        try:
+            await save_task(task_id, status="running", started_at=now_utc())
+            if _has_dag_plan(task.get("plan")):
+                await self._run_dag(task)
                 return
-            if routed is not None:
-                await self._run_dag(routed)
-                return
-        await run_loop(task)
+            if _is_fresh_top_level(task):
+                routed = await self._preflight_and_route(task)
+                if routed is _PREFLIGHT_FAILED:
+                    return
+                if routed is not None:
+                    await self._run_dag(routed)
+                    return
+            await run_loop(task)
+        except asyncio.CancelledError:
+            await save_task(task_id, status="cancelled", error="Task execution was cancelled.", completed_at=now_utc())
+            raise
+        except Exception as exc:
+            refreshed = await get_task(task_id)
+            if refreshed and refreshed.get("status") not in {"complete", "failed", "cancelled"}:
+                refreshed_step = int(refreshed.get("current_step") or 0)
+                if refreshed_step > initial_step:
+                    log.exception("Task %s interrupted after checkpoint; leaving it resumable", task_id)
+                    raise
+            error = f"executor_error: {type(exc).__name__}: {exc}"
+            log.exception("Task %s crashed in executor", task_id)
+            await save_task(task_id, status="failed", error=error, completed_at=now_utc())
+            await emit_activity(task_id, {"type": "task_failed", "error": error})
+            raise
 
     async def _preflight_and_route(self, task: dict[str, Any]) -> Any:
         """Category-4 pre-flight plus category-1 routing for fresh top-level tasks.
@@ -202,6 +223,17 @@ class TaskExecutor:
         )
 
         while True:
+            if await _task_cancelled(task_id):
+                await save_task(
+                    task_id,
+                    status="cancelled",
+                    error="task_cancelled",
+                    completed_at=datetime.now(timezone.utc),
+                    agent_state=_updated_dag_state(task, completed, skipped),
+                )
+                await emit_activity(task_id, {"type": "task_cancelled", "reason": "task_cancelled"})
+                return {"error": "task_cancelled"}
+
             ready = self._ready_steps(plan["steps"], completed | skipped, context)
             if not ready:
                 blocked = [
@@ -601,6 +633,14 @@ async def _maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
     return value
+
+
+async def _task_cancelled(task_id: str) -> bool:
+    try:
+        task = await get_task(task_id)
+    except Exception:
+        return False
+    return bool(task and task.get("status") == "cancelled")
 
 
 def _safe_condition(expression: str, context: dict[str, Any]) -> bool:

@@ -7,6 +7,7 @@ Signature is frozen: execute(agent, tool, args) → ToolResult.
 import hashlib
 import json
 import time
+from typing import Any
 
 from core import audit, permissions
 from core.connector_health import connector_tier
@@ -15,6 +16,7 @@ from core.exceptions import ApprovalRequired, LoopDetected, RateLimitExceeded, S
 from core.models import AgentContext, ToolResult
 from core.redis import redis_client
 from core.settings_store import tool_policy
+from core.untrusted_content import scan_untrusted_content
 
 # Tools that always require a human approval record — regardless of autonomy level.
 _ALWAYS_APPROVAL_TOOLS = {
@@ -35,6 +37,111 @@ _MAX_FINANCIAL_AMOUNT = 100.0
 _RATE_LIMIT = 10
 # Loop detection: same tool+args ≥ 10 times in 5-minute window.
 _LOOP_THRESHOLD = 10
+_WRITE_ACTION_MARKERS = (
+    ".draft",
+    ".send",
+    ".post",
+    ".publish",
+    ".write",
+    ".create",
+    ".update",
+    ".delete",
+    ".upload",
+    ".move",
+    ".copy",
+)
+_IDEMPOTENCY_TTL_SECONDS = 60 * 60 * 24
+_UNTRUSTED_PROVIDER_PREFIXES = {"browser", "gmail", "mcp"}
+
+
+def _is_external_write_tool(tool: str) -> bool:
+    return tool in _ALWAYS_APPROVAL_TOOLS or any(marker in tool for marker in _WRITE_ACTION_MARKERS)
+
+
+def _cache_key(org_id: str, tool: str, idempotency_key: str) -> str:
+    digest = hashlib.sha256(f"{org_id}:{tool}:{idempotency_key}".encode()).hexdigest()
+    return f"idempotency:{digest}"
+
+
+async def _load_idempotent_result(org_id: str, tool: str, idempotency_key: str | None) -> ToolResult | None:
+    if not idempotency_key:
+        return None
+    raw = await redis_client.get(_cache_key(org_id, tool, idempotency_key))
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if payload.get("tool") != tool:
+        return None
+    result = payload.get("result") or {}
+    if not isinstance(result, dict):
+        return None
+    return ToolResult(summary=str(result.get("summary") or ""), data=result.get("data") or {})
+
+
+async def _store_idempotent_result(
+    org_id: str,
+    tool: str,
+    idempotency_key: str | None,
+    result: ToolResult,
+) -> None:
+    if not idempotency_key:
+        return
+    payload = {
+        "tool": tool,
+        "result": {"summary": result.summary, "data": result.data},
+        "stored_at": int(time.time()),
+    }
+    await redis_client.set(
+        _cache_key(org_id, tool, idempotency_key),
+        json.dumps(payload, default=str),
+        ex=_IDEMPOTENCY_TTL_SECONDS,
+    )
+
+
+def _check_untrusted_source_policy(tool: str, args: dict[str, Any]) -> None:
+    if not args.pop("__triggered_by_untrusted_content", False):
+        return
+    if _is_external_write_tool(tool):
+        raise ApprovalRequired(tool, "untrusted external content cannot trigger write actions without approval")
+
+
+def _extract_text_fragments(value: Any, fragments: list[str], limit: int = 10) -> None:
+    if len(fragments) >= limit:
+        return
+    if isinstance(value, str) and value.strip():
+        fragments.append(value)
+        return
+    if isinstance(value, dict):
+        for nested in value.values():
+            _extract_text_fragments(nested, fragments, limit)
+            if len(fragments) >= limit:
+                return
+    elif isinstance(value, list):
+        for nested in value:
+            _extract_text_fragments(nested, fragments, limit)
+            if len(fragments) >= limit:
+                return
+
+
+def _mark_untrusted_connector_result(tool: str, result: ToolResult) -> ToolResult:
+    provider = tool.split(".")[0]
+    if provider not in _UNTRUSTED_PROVIDER_PREFIXES or _is_external_write_tool(tool) or result.data.get("untrusted_content"):
+        return result
+    fragments: list[str] = []
+    _extract_text_fragments(result.data, fragments)
+    if not fragments:
+        return result
+    scan = scan_untrusted_content("\n\n".join(fragments), source=f"{provider}:{tool}")
+    data = dict(result.data)
+    data["untrusted_content"] = scan
+    if scan.get("risk") == "prompt_injection":
+        summary = f"UNTRUSTED CONTENT WARNING: {result.summary}"
+    else:
+        summary = result.summary
+    return ToolResult(summary=summary, data=data)
 
 
 async def _check_rate_limit(org_id: str) -> None:
@@ -143,6 +250,8 @@ async def _route(agent: AgentContext, tool: str, args: dict, vault_ref: str, tie
 class ToolBroker:
     async def execute(self, agent: AgentContext, tool: str, args: dict) -> ToolResult:
         approved_by_gate = bool(args.pop("__approved_by_gate", False))
+        idempotency_key = args.pop("__idempotency_key", None)
+        _check_untrusted_source_policy(tool, args)
         args_hash = hashlib.sha256(json.dumps(args, sort_keys=True).encode()).hexdigest()
 
         # 1. Permission check (seam — always runs)
@@ -171,12 +280,27 @@ class ToolBroker:
         if policy.get("approval_required") is True and not approved_by_gate:
             raise ApprovalRequired(tool, "tool requires approval by settings policy")
 
+        if _is_external_write_tool(tool):
+            cached = await _load_idempotent_result(agent.org_id, tool, idempotency_key)
+            if cached:
+                await audit.log(
+                    "tool_result",
+                    agent.id,
+                    tool,
+                    payload={"summary": cached.summary, "idempotency": "replayed"},
+                )
+                return cached
+
         # 6. Audit: tool_call before execution
         await audit.log(
             "tool_call",
             agent.id,
             tool,
-            payload={"args_hash": args_hash},   # never log raw args — they may contain credentials
+            payload={
+                "args_hash": args_hash,
+                "idempotency_key": hashlib.sha256(str(idempotency_key).encode()).hexdigest()
+                if idempotency_key else None,
+            },   # never log raw args — they may contain credentials
         )
 
         # 7. Resolve the connector tier. Fixture/demo tiers keep tasks usable
@@ -194,6 +318,7 @@ class ToolBroker:
 
         # 8. Execute via connector
         result = await _route(agent, tool, args, vault_ref, tier)
+        result = _mark_untrusted_connector_result(tool, result)
 
         # 9. Audit: result summary (never log result.data — may contain sensitive content)
         await audit.log(
@@ -202,6 +327,8 @@ class ToolBroker:
             tool,
             payload={"summary": result.summary},
         )
+        if _is_external_write_tool(tool):
+            await _store_idempotent_result(agent.org_id, tool, idempotency_key, result)
 
         return result
 

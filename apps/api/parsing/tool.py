@@ -5,7 +5,6 @@ to from core.tool_broker like the filesystem and code connectors.
 """
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from core.artifacts import get_artifact, read_artifact_content
@@ -42,6 +41,8 @@ class DocConnector:
             meta = await get_artifact(str(artifact_id))
             if not meta:
                 raise FileNotFoundError(f"artifact {artifact_id}")
+            if str(meta.get("organization_id", "")) != str(args.get("__org_id", "default")):
+                raise PermissionError(f"artifact {artifact_id} does not belong to this organization")
             raw = await read_artifact_content(str(artifact_id)) or b""
             mime = str(meta.get("mime_type") or "")
             filename = str(meta.get("title") or "file")
@@ -74,6 +75,8 @@ class DocConnector:
         meta = await get_artifact(artifact_id)
         if not meta:
             raise FileNotFoundError(f"artifact {artifact_id}")
+        if str(meta.get("organization_id", "")) != str(args.get("__org_id", "default")):
+            raise PermissionError(f"artifact {artifact_id} does not belong to this organization")
         raw = await read_artifact_content(artifact_id) or b""
         # parsed_text artifacts already hold plain text; source files are parsed first.
         if str(meta.get("kind")) == "parsed_text":

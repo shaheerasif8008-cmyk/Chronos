@@ -18,6 +18,7 @@ ACTION_EVENT_TYPES = {
     "sub_agent_event",
     "task_complete",
     "task_failed",
+    "task_cancelled",
 }
 
 

@@ -18,6 +18,9 @@ PREVIEW_CHAR_LIMIT = 24_000
 #: Used by callers to distinguish "unparseable" from "failed".
 UNPARSEABLE_NOTE = "not parseable yet"
 
+#: Maximum pages that will be OCR'd in a single PDF (cost/latency guard).
+MAX_OCR_PAGES = 50
+
 _TEXT_MIMES = {"text/plain", "text/csv", "text/markdown", "application/csv"}
 _TEXT_EXTS = {".txt", ".csv", ".md", ".markdown", ".log", ".tsv"}
 _IMAGE_MIMES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
@@ -108,15 +111,17 @@ async def _parse_pdf(raw: bytes) -> ParsedDocument:
         return _finalize("", page_count=0, parser_used="none", note="could not read PDF (corrupt or encrypted)")
 
     used_ocr = False
+    ocr_page_count = 0
     out: list[str] = []
     for i, text in enumerate(texts):
         if text:
             out.append(text)
-        else:
+        elif ocr_page_count < MAX_OCR_PAGES:
             ocr = await _pdf_page_ocr(raw, i)
             if ocr:
                 used_ocr = True
                 out.append(ocr)
+            ocr_page_count += 1
     full = "\n\n".join(p for p in out if p)
     return _finalize(
         full,
@@ -124,6 +129,61 @@ async def _parse_pdf(raw: bytes) -> ParsedDocument:
         parser_used="pdf+ocr" if used_ocr else "pdf",
         note=None if full else "no extractable text in PDF",
     )
+
+
+def _parse_docx(raw: bytes) -> ParsedDocument:
+    from docx import Document
+    try:
+        d = Document(io.BytesIO(raw))
+    except Exception:
+        return _finalize("", page_count=0, parser_used="none",
+                         note="could not read docx (corrupt or encrypted)")
+    parts = [p.text for p in d.paragraphs if p.text.strip()]
+    for table in d.tables:
+        for row in table.rows:
+            cells = [c.text.strip() for c in row.cells]
+            if any(cells):
+                parts.append(" | ".join(cells))
+    return _finalize("\n".join(parts), page_count=1, parser_used="docx")  # python-docx has no page-count API
+
+
+def _parse_xlsx(raw: bytes) -> ParsedDocument:
+    from openpyxl import load_workbook
+    try:
+        wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+    except Exception:
+        return _finalize("", page_count=0, parser_used="none",
+                         note="could not read xlsx (corrupt or encrypted)")
+    try:
+        parts: list[str] = []
+        for ws in wb.worksheets:
+            parts.append(f"# Sheet: {ws.title}")
+            for row in ws.iter_rows(values_only=True):
+                cells = [str(c) if c is not None else "" for c in row]
+                if any(cells):
+                    parts.append(",".join(cells))
+        return _finalize("\n".join(parts), page_count=len(wb.worksheets), parser_used="xlsx")
+    finally:
+        wb.close()
+
+
+def _parse_pptx(raw: bytes) -> ParsedDocument:
+    from pptx import Presentation
+    try:
+        prs = Presentation(io.BytesIO(raw))
+    except Exception:
+        return _finalize("", page_count=0, parser_used="none",
+                         note="could not read pptx (corrupt or encrypted)")
+    slides = list(prs.slides)
+    parts: list[str] = []
+    for i, slide in enumerate(slides, start=1):
+        parts.append(f"# Slide {i}")
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                text = shape.text_frame.text.strip()
+                if text:
+                    parts.append(text)
+    return _finalize("\n".join(parts), page_count=len(slides), parser_used="pptx")
 
 
 async def _parse_image(raw: bytes, mime: str) -> ParsedDocument:
@@ -134,44 +194,3 @@ async def _parse_image(raw: bytes, mime: str) -> ParsedDocument:
         parser_used="image-ocr",
         note=None if text else "no text extracted from image",
     )
-
-
-def _parse_docx(raw: bytes) -> ParsedDocument:
-    from docx import Document
-
-    d = Document(io.BytesIO(raw))
-    parts = [p.text for p in d.paragraphs if p.text.strip()]
-    for table in d.tables:
-        for row in table.rows:
-            cells = [c.text.strip() for c in row.cells]
-            if any(cells):
-                parts.append(" | ".join(cells))
-    return _finalize("\n".join(parts), page_count=1, parser_used="docx")
-
-
-def _parse_xlsx(raw: bytes) -> ParsedDocument:
-    from openpyxl import load_workbook
-
-    wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
-    parts: list[str] = []
-    for ws in wb.worksheets:
-        parts.append(f"# Sheet: {ws.title}")
-        for row in ws.iter_rows(values_only=True):
-            cells = [str(c) for c in row if c is not None]
-            if cells:
-                parts.append(",".join(cells))
-    return _finalize("\n".join(parts), page_count=len(wb.worksheets), parser_used="xlsx")
-
-
-def _parse_pptx(raw: bytes) -> ParsedDocument:
-    from pptx import Presentation
-
-    prs = Presentation(io.BytesIO(raw))
-    slides = list(prs.slides)
-    parts: list[str] = []
-    for i, slide in enumerate(slides, start=1):
-        parts.append(f"# Slide {i}")
-        for shape in slide.shapes:
-            if shape.has_text_frame and shape.text_frame.text.strip():
-                parts.append(shape.text_frame.text.strip())
-    return _finalize("\n".join(parts), page_count=len(slides), parser_used="pptx")

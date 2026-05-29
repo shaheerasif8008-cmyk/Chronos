@@ -126,7 +126,7 @@ async def test_startup_recovery_schedules_only_resumable_tasks(monkeypatch):
 
     class FakeColumn:
         def in_(self, values):
-            assert values == ["pending", "planning", "running"]
+            assert values == ["queued", "pending", "planning", "running"]
             return "status-filter"
 
     class FakeTasks:
@@ -152,10 +152,6 @@ async def test_startup_recovery_schedules_only_resumable_tasks(monkeypatch):
         def begin(self):
             return FakeConn()
 
-    class FakeExecutor:
-        def resume(self, task_id):
-            return f"resume:{task_id}"
-
     async def fake_reflect_table(name):
         assert name == "tasks"
         return FakeTasks()
@@ -170,20 +166,18 @@ async def test_startup_recovery_schedules_only_resumable_tasks(monkeypatch):
 
         return FakeSelect()
 
-    def fake_create_task(coro):
-        scheduled.append(coro)
-        return coro
+    async def fake_enqueue_task(task_id):
+        scheduled.append(f"queue:{task_id}")
 
     monkeypatch.setattr(main, "reflect_table", fake_reflect_table)
     monkeypatch.setattr(main, "select", fake_select)
     monkeypatch.setattr(main, "engine", FakeEngine())
-    monkeypatch.setattr(main, "TaskExecutor", FakeExecutor)
-    monkeypatch.setattr(main.asyncio, "create_task", fake_create_task)
+    monkeypatch.setattr(main.task_runner, "enqueue_task", fake_enqueue_task)
 
     task_ids = await main.recover_incomplete_tasks()
 
     assert task_ids == ["pending-task", "running-task"]
-    assert scheduled == ["resume:pending-task", "resume:running-task"]
+    assert scheduled == ["queue:pending-task", "queue:running-task"]
 
 
 @pytest.mark.asyncio
@@ -672,8 +666,10 @@ async def test_browser_search_falls_back_to_fixture_results_on_live_timeout(monk
 
     result = await browser.browser_connector._search({"query": "data observability market", "max_results": 2})
 
-    assert result.summary == "Browser search fallback 'data observability market': 2 fixture results"
+    assert result.summary == "LIVE SEARCH UNAVAILABLE — returning 2 placeholder results. Do not treat these as real data."
     assert result.data["tier"] == "fixture"
+    assert result.data["is_fallback"] is True
+    assert "placeholder data" in result.data["warning"]
     assert len(result.data["results"]) == 2
 
 
@@ -711,9 +707,9 @@ async def test_operator_workflow_proof_task_api_reaches_pending_approval(monkeyp
         )
         return task_id
 
-    def fake_create_task(coro):
-        scheduled.append(coro)
-        return coro
+    async def fake_enqueue_task(queued_task_id, priority=10):
+        assert queued_task_id == task_id
+        scheduled.append(executor.TaskExecutor().run(queued_task_id))
 
     async def fake_get_task(requested_task_id):
         assert requested_task_id == task_id
@@ -766,7 +762,7 @@ async def test_operator_workflow_proof_task_api_reaches_pending_approval(monkeyp
         raise executor._PausedForApproval()
 
     monkeypatch.setattr(tasks, "create_task_record", fake_create_task_record)
-    monkeypatch.setattr(tasks.asyncio, "create_task", fake_create_task)
+    monkeypatch.setattr(tasks.task_runner, "enqueue_task", fake_enqueue_task)
     monkeypatch.setattr(executor, "get_task", fake_get_task)
     monkeypatch.setattr(executor, "save_task", fake_update_task)
     monkeypatch.setattr(executor, "emit_activity", fake_emit)
@@ -781,7 +777,7 @@ async def test_operator_workflow_proof_task_api_reaches_pending_approval(monkeyp
         Member(id="member-1", organization_id="default", region="us", email="operator@example.com"),
     )
 
-    assert response == {"task_id": task_id}
+    assert response == {"task_id": task_id, "status": "queued"}
     assert len(scheduled) == 1
 
     await scheduled[0]
@@ -816,14 +812,8 @@ async def test_chat_task_intent_routes_to_executor_without_chat_completion(monke
         assert triggered_by == "conversation-1"
         return "task-1"
 
-    class FakeExecutor:
-        def run(self, task_id):
-            assert task_id == "task-1"
-            return "run-task-1"
-
-    def fake_create_task(coro):
-        scheduled.append(coro)
-        return coro
+    async def fake_enqueue_task(task_id, priority=10):
+        scheduled.append(f"queue:{task_id}")
 
     async def fake_stream_completion(*args, **kwargs):
         raise AssertionError("task-mode request should not stream chat completion")
@@ -834,8 +824,7 @@ async def test_chat_task_intent_routes_to_executor_without_chat_completion(monke
 
     monkeypatch.setattr(chat, "_save_message", fake_save_message)
     monkeypatch.setattr(chat, "classify_intent", fake_classify)
-    monkeypatch.setattr(chat, "TaskExecutor", FakeExecutor)
-    monkeypatch.setattr(chat.asyncio, "create_task", fake_create_task)
+    monkeypatch.setattr(chat.task_runner, "enqueue_task", fake_enqueue_task)
     monkeypatch.setattr(chat, "stream_completion", fake_stream_completion)
     monkeypatch.setattr(chat.audit, "log", fake_audit_log)
 
@@ -858,5 +847,5 @@ async def test_chat_task_intent_routes_to_executor_without_chat_completion(monke
 
     assert "task_created" in body
     assert "task-1" in body
-    assert scheduled == ["run-task-1"]
+    assert scheduled == ["queue:task-1"]
     assert saved[0] == ("conversation-1", "user", "Can you pull together a lead brief and draft outreach?")

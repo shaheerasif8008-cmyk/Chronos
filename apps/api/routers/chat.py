@@ -19,6 +19,10 @@ from core.memory_writes import create_memory_entry, extract_explicit_memory_cont
 from core.modes import normalize_mode
 from core.models import Member, RequesterContext
 from core.redis import redis_client
+from core.artifacts import get_artifact as _get_artifact
+from core.artifacts import read_artifact_content as _read_artifact_content
+from core.artifacts import save_artifact as _save_artifact
+from core.artifacts import set_parse_status as _set_parse_status
 from memory.extraction import extract_and_save
 from memory.source_retrieval import (
     build_knowledge_block,
@@ -26,7 +30,8 @@ from memory.source_retrieval import (
     retrieve_source_chunks,
 )
 from runtime.agent_loop import format_task_answer
-from runtime.executor import TaskExecutor, activity_channel
+from runtime import task_runner
+from runtime.executor import activity_channel
 from routers.tasks import create_task_record
 
 logger = logging.getLogger(__name__)
@@ -173,6 +178,26 @@ async def list_messages(conversation_id: str, member: Member = Depends(get_curre
             )
         ).mappings().all()
     return [dict(row) for row in rows]
+
+
+@router.get("/conversations/{conversation_id}/latest-task")
+async def latest_conversation_task(conversation_id: str, member: Member = Depends(get_current_member)) -> dict | None:
+    await permissions.check(member, "view_conversation", conversation_id)
+    tasks = await reflect_table("tasks")
+    async with engine.begin() as conn:
+        row = (
+            await conn.execute(
+                select(tasks)
+                .where(
+                    tasks.c.triggered_by == conversation_id,
+                    tasks.c.organization_id == member.organization_id,
+                    tasks.c.parent_task_id.is_(None),
+                )
+                .order_by(tasks.c.created_at.desc())
+                .limit(1)
+            )
+        ).mappings().first()
+    return dict(row) if row else None
 
 
 @router.delete("/conversations/{conversation_id}")
@@ -530,13 +555,12 @@ async def _parse_attachments(attachment_ids: list[str], conversation_id: str, or
     """
     from sqlalchemy import select
 
-    from core.artifacts import get_artifact, read_artifact_content, save_artifact, set_parse_status
     from core.db import engine, reflect_table
     from parsing.engine import PREVIEW_CHAR_LIMIT, UNPARSEABLE_NOTE, parse_document
 
     out: list[dict] = []
     for att_id in attachment_ids:
-        meta = await get_artifact(att_id)
+        meta = await _get_artifact(att_id)
         if not meta or str(meta.get("organization_id")) != str(org_id):
             continue
 
@@ -553,7 +577,7 @@ async def _parse_attachments(attachment_ids: list[str], conversation_id: str, or
                     )
                 ).mappings().first()
             if child:
-                full = (await read_artifact_content(str(child["id"])) or b"").decode("utf-8", errors="replace")
+                full = (await _read_artifact_content(str(child["id"])) or b"").decode("utf-8", errors="replace")
                 out.append({
                     "attachment_id": att_id,
                     "parsed_artifact_id": str(child["id"]),
@@ -562,9 +586,13 @@ async def _parse_attachments(attachment_ids: list[str], conversation_id: str, or
                     "truncated": len(full) > PREVIEW_CHAR_LIMIT,
                     "note": None,
                 })
+                await audit.log(
+                    "attachment_parse_cache_hit", "system", "attachments.parse",
+                    resource_type="artifacts", resource_id=att_id,
+                )
                 continue
 
-        raw = await read_artifact_content(att_id) or b""
+        raw = await _read_artifact_content(att_id) or b""
         doc = await parse_document(raw, str(meta.get("mime_type") or ""), str(meta.get("title") or "file"))
         # Distinguish unsupported type (unparseable) from a recognized type that
         # errored — corrupt/encrypted (failed) — per the spec's status contract.
@@ -576,12 +604,17 @@ async def _parse_attachments(attachment_ids: list[str], conversation_id: str, or
             status = "failed"
         parsed_artifact_id = None
         if doc.full_text:
-            parsed_artifact_id = await save_artifact(
+            parsed_artifact_id = await _save_artifact(
                 doc.full_text, kind="parsed_text", title=f"{meta.get('title')} (text)",
                 conversation_id=conversation_id, parent_artifact_id=att_id,
                 parse_status="parsed", org_id=org_id, mime_type="text/plain",
             )
-        await set_parse_status(att_id, status)
+        await _set_parse_status(att_id, status)
+        await audit.log(
+            "attachment_parsed", "system", "attachments.parse",
+            resource_type="artifacts", resource_id=att_id,
+            payload={"parse_status": status, "parser_used": doc.parser_used},
+        )
         out.append({
             "attachment_id": att_id,
             "parsed_artifact_id": parsed_artifact_id,
@@ -709,10 +742,12 @@ async def _agent_loop_stream(
         project_knowledge=project_knowledge,
     )
 
-    # Subscribe BEFORE firing executor to guarantee no events are missed.
+    # Subscribe BEFORE firing executor, then wait briefly for subscription to
+    # propagate so Redis doesn't miss the first events due to race condition.
     pubsub = redis_client.pubsub()
     await pubsub.subscribe(activity_channel(task_id))
-    asyncio.create_task(TaskExecutor().run(task_id))
+    await asyncio.sleep(0.1)
+    await task_runner.enqueue_task(task_id)
 
     yield f"data: {json.dumps({'type': 'conversation', 'conversation_id': conversation_id})}\n\n"
     yield f"data: {json.dumps({'type': 'task_created', 'task_id': task_id})}\n\n"
@@ -720,6 +755,7 @@ async def _agent_loop_stream(
     TRACE_TYPES = {
         "tool_call", "tool_result", "tool_error", "step_start", "step_done",
         "awaiting_approval", "sub_agent_spawned", "sub_agent_complete", "thinking",
+        "route_decision", "model_step", "model_result",
     }
     final_answer: str | None = None
     task_succeeded: bool = True
@@ -861,7 +897,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
     requester_context.project_id = req.project_id if req.project_id is not None else db_project_id
     explicit_memory = extract_explicit_memory_content(req.message)
 
-    if explicit_memory:
+    if explicit_memory and not req.attachment_ids:
         async def explicit_stream():
             entry_id = await create_memory_entry(
                 content=explicit_memory,
@@ -883,14 +919,18 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
 
         return StreamingResponse(explicit_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
+    attachments_context: list[dict] = []
+    _attachment_ids = getattr(req, "attachment_ids", None) or []
+    if _attachment_ids:
+        attachments_context = await _parse_attachments(_attachment_ids, conversation_id, member.organization_id)
+
     intent = await classify_intent(req.message)
 
     # Tool-capable path: explicit "task" goals AND ordinary non-trivial chat both
     # run the agent loop so chat can search and act inline (Option 1). Only clearly
     # trivial, tool-free messages fall through to the fast token-streamed completion.
-    route_through_loop = (
-        intent["mode"] == "task" or not _is_trivial_chat(req.message) or bool(attachments_context)
-    )
+    # Messages with attachments always route through the loop for full context injection.
+    route_through_loop = intent["mode"] == "task" or not _is_trivial_chat(req.message) or bool(attachments_context)
     if route_through_loop:
         is_task = intent["mode"] == "task"
         return StreamingResponse(
