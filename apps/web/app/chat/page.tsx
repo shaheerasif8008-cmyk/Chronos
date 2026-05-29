@@ -41,6 +41,8 @@ type Message = {
 type ToolTrace = { id: string; tool: string; summary: string; status: MessageStatus };
 type ArtifactRef = { id: string; title: string; kind: string; mime_type?: string; size_bytes?: number };
 type ProjectSource = { id: string; title?: string | null; source_type?: string | null; parse_status?: string | null; index_status?: string | null; uri?: string | null; created_at?: string };
+type SourceChunkPreview = { chunk_index: number; content: string; token_count?: number | null };
+type SourceDetail = { id: string; title?: string | null; source_type?: string | null; uri?: string | null; artifact_id?: string | null; parse_status?: string | null; index_status?: string | null; warning?: string | null; chunk_count: number; chunks: SourceChunkPreview[] };
 type MemoryEntry = { id: string; scope: string; scope_id: string; content: string; source: string; importance_score?: number; created_by?: string | null; created_at?: string };
 type Connector = {
   id: string;
@@ -3448,6 +3450,7 @@ function ProjectSourcesTab({
   const [tool, setTool] = useState("");
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [detail, setDetail] = useState<SourceDetail | null>(null);
 
   const addConnector = async () => {
     if (!title.trim() || !tool.trim()) return;
@@ -3471,12 +3474,117 @@ function ProjectSourcesTab({
     try {
       await apiFetch(`/projects/${projectId}/sources/${sid}/sync`, { method: "POST" });
       await refresh();
+      if (detail?.id === sid) await openDetail(sid);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Sync failed");
     } finally {
       setBusyId(null);
     }
   };
+
+  const openDetail = async (sid: string) => {
+    setError(null);
+    try {
+      const d = (await (await apiFetch(`/projects/${projectId}/sources/${sid}`)).json()) as SourceDetail;
+      setDetail(d);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Couldn't load source");
+    }
+  };
+
+  const reindexSource = async (sid: string) => {
+    setBusyId(sid); setError(null);
+    try {
+      await apiFetch(`/projects/${projectId}/sources/${sid}/reindex`, { method: "POST" });
+      await refresh();
+      await openDetail(sid);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Reindex failed");
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const deleteSource = async (sid: string) => {
+    setBusyId(sid); setError(null);
+    try {
+      await apiFetch(`/projects/${projectId}/sources/${sid}`, { method: "DELETE" });
+      setDetail(null);
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Delete failed");
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const downloadOriginal = async (artifactId: string, name: string) => {
+    try {
+      const blob = await (await apiFetch(`/artifacts/${artifactId}/content`)).blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = name;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 5_000);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Download failed");
+    }
+  };
+
+  if (detail) {
+    const status = detail.index_status ?? "pending";
+    return (
+      <div className="flex flex-col gap-4">
+        <div className="flex items-center justify-between">
+          <button className="btn btn-sm" onClick={() => setDetail(null)}>← All sources</button>
+          <div className="flex gap-2">
+            {detail.artifact_id && (
+              <button className="btn btn-sm" onClick={() => downloadOriginal(detail.artifact_id!, detail.title ?? "source")}>
+                Download original
+              </button>
+            )}
+            <button className="btn btn-sm" onClick={() => reindexSource(detail.id)} disabled={busyId === detail.id}>
+              {busyId === detail.id ? "Working…" : "Reindex"}
+            </button>
+            <button className="btn btn-sm btn-danger-soft" onClick={() => deleteSource(detail.id)} disabled={busyId === detail.id}>
+              Delete
+            </button>
+          </div>
+        </div>
+
+        <div className="surface border border-soft rounded-xl px-5 py-4">
+          <div className="font-medium text-[15px]">{detail.title ?? "Untitled source"}</div>
+          <div className="flex flex-wrap gap-3 mt-1.5 text-[12px]" style={{ color: "var(--text-faint)" }}>
+            <span>{detail.source_type ?? "upload"}</span>
+            <span>parse: {detail.parse_status ?? "—"}</span>
+            <span style={{ color: SOURCE_STATUS_COLOR[status] ?? "var(--text-faint)" }}>index: {status}</span>
+            <span>{detail.chunk_count} chunk{detail.chunk_count === 1 ? "" : "s"}</span>
+          </div>
+          {detail.warning && (
+            <div className="mt-3 text-[12.5px]" style={{ color: "var(--danger)" }}>{detail.warning}</div>
+          )}
+        </div>
+
+        {error && <div className="text-[12.5px]" style={{ color: "var(--danger)" }}>{error}</div>}
+
+        <div className="text-[12px] font-medium" style={{ color: "var(--text-dim)" }}>
+          Extracted text {detail.chunk_count > detail.chunks.length ? `(first ${detail.chunks.length} of ${detail.chunk_count} chunks)` : ""}
+        </div>
+        {detail.chunks.length === 0 ? (
+          <div className="text-[13px]" style={{ color: "var(--text-faint)" }}>No indexed chunks for this source.</div>
+        ) : (
+          <div className="flex flex-col gap-2">
+            {detail.chunks.map(ch => (
+              <div key={ch.chunk_index} className="surface border border-soft rounded-xl px-4 py-3">
+                <div className="text-[11px] mb-1" style={{ color: "var(--text-faint)" }}>Chunk {ch.chunk_index}</div>
+                <div className="text-[13px] whitespace-pre-wrap" style={{ color: "var(--text)" }}>{ch.content}</div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col gap-4">
@@ -3524,7 +3632,11 @@ function ProjectSourcesTab({
           {sources.map(src => {
             const status = src.index_status ?? "pending";
             return (
-              <div key={src.id} className="surface border border-soft rounded-xl px-5 py-4 flex items-center gap-4">
+              <button
+                key={src.id}
+                onClick={() => openDetail(src.id)}
+                className="surface border border-soft rounded-xl px-5 py-4 flex items-center gap-4 text-left w-full transition-colors"
+              >
                 <div className="flex-1 min-w-0">
                   <div className="font-medium text-[14px] truncate">{src.title ?? "Untitled source"}</div>
                   <div className="flex gap-3 mt-0.5 text-[12px]" style={{ color: "var(--text-faint)" }}>
@@ -3533,15 +3645,17 @@ function ProjectSourcesTab({
                   </div>
                 </div>
                 {src.source_type === "connector" && status !== "revoked" && (
-                  <button
+                  <span
+                    role="button"
+                    tabIndex={0}
                     className="btn btn-sm"
-                    onClick={() => syncSource(src.id)}
-                    disabled={busyId === src.id}
+                    onClick={e => { e.stopPropagation(); syncSource(src.id); }}
+                    onKeyDown={e => { if (e.key === "Enter") { e.stopPropagation(); syncSource(src.id); } }}
                   >
                     {busyId === src.id ? "Syncing…" : "Sync"}
-                  </button>
+                  </span>
                 )}
-              </div>
+              </button>
             );
           })}
         </div>

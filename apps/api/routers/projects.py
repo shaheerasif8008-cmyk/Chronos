@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import delete, insert, or_, select, update
+from sqlalchemy.sql import func
 
 from core import audit, permissions
 from core.auth import get_current_member
@@ -409,6 +410,79 @@ async def _require_source(member: Member, project_id: str, sid: str) -> dict:
     if row is None:
         raise HTTPException(status_code=404, detail="Source not found")
     return dict(row)
+
+
+_CHUNK_PREVIEW_LIMIT = 10
+_CHUNK_PREVIEW_CHARS = 600
+
+
+@router.get("/{project_id}/sources/{sid}")
+async def get_source_detail(
+    project_id: str,
+    sid: str,
+    member: Member = Depends(get_current_member),
+) -> dict:
+    """Return one source's metadata, status/warnings, and a chunk preview.
+
+    Org + membership gated. Used by the source viewer: original artifact ref for
+    download, parse/index status, a derived warning, chunk count, and first-N chunks.
+    """
+    await _require_member(member, project_id)
+    await permissions.check(member, "view_project_sources", project_id)
+    source = await _require_source(member, project_id, sid)
+
+    chunks = await reflect_table("project_source_chunks")
+    async with engine.begin() as conn:
+        total = (
+            await conn.execute(
+                select(func.count())
+                .select_from(chunks)
+                .where(
+                    chunks.c.source_id == sid,
+                    chunks.c.organization_id == member.organization_id,
+                )
+            )
+        ).scalar_one()
+        preview_rows = (
+            await conn.execute(
+                select(chunks.c.chunk_index, chunks.c.content, chunks.c.token_count)
+                .where(
+                    chunks.c.source_id == sid,
+                    chunks.c.organization_id == member.organization_id,
+                )
+                .order_by(chunks.c.chunk_index.asc())
+                .limit(_CHUNK_PREVIEW_LIMIT)
+            )
+        ).mappings().all()
+
+    parse_status = source.get("parse_status")
+    warning = None
+    if parse_status in ("failed", "unparseable"):
+        warning = f"Document could not be fully parsed (parse_status={parse_status})."
+    elif source.get("index_status") == "failed":
+        warning = "Indexing failed; this source is not searchable."
+    elif source.get("index_status") == "revoked":
+        warning = "Connector access was revoked; this source is no longer searchable."
+
+    return {
+        "id": str(source["id"]),
+        "title": source.get("title"),
+        "source_type": source.get("source_type"),
+        "uri": source.get("uri"),
+        "artifact_id": str(source["artifact_id"]) if source.get("artifact_id") else None,
+        "parse_status": parse_status,
+        "index_status": source.get("index_status"),
+        "warning": warning,
+        "chunk_count": int(total or 0),
+        "chunks": [
+            {
+                "chunk_index": int(row["chunk_index"]),
+                "content": str(row["content"])[:_CHUNK_PREVIEW_CHARS],
+                "token_count": row.get("token_count"),
+            }
+            for row in preview_rows
+        ],
+    }
 
 
 @router.post("/{project_id}/sources/{sid}/reindex")
