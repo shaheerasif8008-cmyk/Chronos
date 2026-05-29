@@ -107,3 +107,51 @@ async def test_revoke_when_not_published_is_false():
     org = f"test-{uuid.uuid4().hex[:8]}"
     aid = await save_artifact("doc", kind="markdown", title="Q", org_id=org)
     assert await revoke_share(aid, org) is False
+
+
+@_requires_db
+@pytest.mark.asyncio
+async def test_create_read_download_roundtrip_survives_refetch():
+    """Artifact creation matrix row: create -> independent re-fetch (refresh) -> download bytes."""
+    from core.artifacts import get_artifact, read_artifact_content, save_artifact
+
+    org = f"test-{uuid.uuid4().hex[:8]}"
+    aid = await save_artifact("downloadable", kind="code", title="dl.py",
+                              mime_type="text/x-python", org_id=org, created_by="member:t")
+    meta = await get_artifact(aid)
+    assert meta and meta["title"] == "dl.py" and meta["mime_type"] == "text/x-python"
+    assert await read_artifact_content(aid) == b"downloadable"
+
+
+@_requires_db
+@pytest.mark.asyncio
+async def test_public_share_boundary_serves_then_revokes():
+    """Publish/share matrix row: a valid token serves content; an invalid/revoked token is blocked (404)."""
+    import pytest as _pytest
+    from fastapi import HTTPException
+
+    from core.artifacts import save_artifact
+    from core.artifact_shares import create_share, revoke_share
+    from routers.artifact_share import get_shared_content, get_shared_metadata
+
+    org = f"test-{uuid.uuid4().hex[:8]}"
+    aid = await save_artifact("shared bytes", kind="markdown", title="S", org_id=org)
+
+    # Unknown token is blocked.
+    with _pytest.raises(HTTPException) as ei:
+        await get_shared_metadata("does-not-exist")
+    assert ei.value.status_code == 404
+
+    # Publish -> token serves metadata + content.
+    share = await create_share(aid, org_id=org)
+    token = share["token"]
+    md = await get_shared_metadata(token)
+    assert str(md["id"]) == aid and md["title"] == "S"
+    resp = await get_shared_content(token)
+    assert resp.body == b"shared bytes"
+
+    # Unpublish -> same token now blocked (revocation actually invalidates).
+    assert await revoke_share(aid, org) is True
+    with _pytest.raises(HTTPException) as ei2:
+        await get_shared_content(token)
+    assert ei2.value.status_code == 404
