@@ -75,6 +75,13 @@ no per-step summary LLM call.
 3. **No-LLM traces.** Drop the per-iteration `publish_reasoning_summary` model
    call. Surface concrete trace events (tool name, args preview, result summary)
    derived from data already in hand.
+4. **Promotion to durable work is model-invoked via a `start_task` tool.** The
+   inline streaming turn handles quick tools itself. When the model judges the
+   work is a large, long-running job, it calls `start_task(goal)`, which enqueues
+   a durable background task on the existing worker; the chat then attaches to
+   that task's activity stream. `spawn__subagent` is reserved to within durable
+   tasks. This keeps promotion classifier-free (the model decides by acting) and
+   preserves the durability backbone.
 
 ## Design
 
@@ -93,6 +100,34 @@ A chat turn becomes a durable task lazily: the first tool call creates the `task
 row (for audit + approval resume), and from then on the turn is checkpointed like
 any task. A turn that never calls a tool is never persisted as a task — only the
 user and assistant `messages` rows are written, exactly like a normal chat.
+
+**Critical:** when the first tool call lazily creates the task row, it must
+persist the **full in-flight history** the inline turn already assembled (system
+prompt + memory + conversation history + the assistant tool-call message) into
+`agent_state.agent_history` — not a bare `goal`. Otherwise an approval that pauses
+mid-turn would resume in the background with thinner context than the turn was
+running with (`_load_history` rebuilds only a minimal seed from `goal`).
+
+### Inline vs. durable boundary (durability backbone)
+
+The queue + Redis activity path is **not** cruft — it is how long work survives a
+dropped connection or a restart. The boundary:
+
+- **Inline (ephemeral):** no-tool answers and short tool-use turns (search, fetch,
+  read, draft) stream in the request. Losing the connection loses only that turn —
+  acceptable, matches competitor chat behavior.
+- **Durable (background):** when the model calls the `start_task(goal)` tool, the
+  turn enqueues a durable task to `task_runner` (the existing worker + `run_loop`),
+  emits `task_created`, and the chat attaches to that task's existing Redis
+  activity stream. The job then survives disconnect/restart and resumes on startup
+  exactly as today. `spawn__subagent` remains available only inside durable tasks,
+  so an inline turn can never pull a multi-minute sub-agent job into the request
+  thread (today `_run_subagent` runs inline — this is the regression the boundary
+  prevents).
+
+This makes proof scenario #3 ("research 50 leads + draft outreach") a durable task:
+the model recognizes the scope, calls `start_task`, and the work proceeds in the
+background with streamed activity and drafts landing in approvals.
 
 ### Streaming with tools — the one subtle part
 
