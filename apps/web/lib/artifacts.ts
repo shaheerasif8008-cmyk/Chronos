@@ -88,3 +88,7 @@ export async function publishArtifact(id: string): Promise<{ token: string; shar
 export async function unpublishArtifact(id: string): Promise<{ revoked: boolean }> {
   return (await apiFetch(`/artifacts/${id}/unpublish`, { method: "POST" })).json();
 }
+
+export async function duplicateArtifact(id: string): Promise<Artifact> {
+  return (await apiFetch(`/artifacts/${id}/duplicate`, { method: "POST" })).json();
+}

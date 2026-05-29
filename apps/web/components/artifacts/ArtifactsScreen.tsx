@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { apiBase } from "../../lib/api";
 import {
   Artifact, ArtifactVersion, DiffResult,
-  aiEditArtifact, deleteArtifact, editArtifact, getArtifact, getContentBlob, getContentText,
+  aiEditArtifact, deleteArtifact, duplicateArtifact, editArtifact, getArtifact, getContentBlob, getContentText,
   getDiff, getShareStatus, listArtifacts, listVersions,
   publishArtifact, renameArtifact, restoreVersion, unpublishArtifact,
 } from "../../lib/artifacts";
@@ -33,6 +33,17 @@ export default function ArtifactsScreen() {
 
   const kinds = useMemo(() => Array.from(new Set(artifacts.map(a => a.kind))).sort(), [artifacts]);
 
+  const grouped = useMemo(() => {
+    const map = new Map<string, Artifact[]>();
+    for (const a of filtered) {
+      const key = a.conversation_id ? `Conversation ${a.conversation_id.slice(0, 8)}`
+        : a.task_id ? `Task ${a.task_id.slice(0, 8)}`
+        : "Ungrouped";
+      (map.get(key) ?? map.set(key, []).get(key)!).push(a);
+    }
+    return Array.from(map.entries());
+  }, [filtered]);
+
   return (
     <div className="flex h-full min-h-0">
       <aside className="w-[320px] flex-shrink-0 border-r flex flex-col" style={{ borderColor: "var(--border)" }}>
@@ -49,13 +60,18 @@ export default function ArtifactsScreen() {
         <div className="flex-1 overflow-auto p-2">
           {loading && <div className="text-[13px] p-3" style={{ color: "var(--text-dim)" }}>Loading…</div>}
           {!loading && filtered.length === 0 && <div className="text-[13px] p-3" style={{ color: "var(--text-dim)" }}>No artifacts yet.</div>}
-          {filtered.map(a => (
-            <button key={a.id} onClick={() => setSelectedId(a.id)}
-                    className={`w-full text-left px-3 py-2 rounded-lg mb-1 ${selectedId === a.id ? "active" : ""}`}
-                    style={{ background: selectedId === a.id ? "var(--accent-soft)" : "transparent" }}>
-              <div className="text-[13.5px] font-medium truncate">{a.title ?? "Untitled"}</div>
-              <div className="text-[11.5px]" style={{ color: "var(--text-dim)" }}>{a.kind} · v{a.version}</div>
-            </button>
+          {grouped.map(([label, items]) => (
+            <div key={label} className="mb-2">
+              <div className="px-2 py-1 text-[10.5px] font-semibold uppercase tracking-wide" style={{ color: "var(--text-dim)" }}>{label}</div>
+              {items.map(a => (
+                <button key={a.id} onClick={() => setSelectedId(a.id)}
+                        className={`w-full text-left px-3 py-2 rounded-lg mb-1 ${selectedId === a.id ? "active" : ""}`}
+                        style={{ background: selectedId === a.id ? "var(--accent-soft)" : "transparent" }}>
+                  <div className="text-[13.5px] font-medium truncate">{a.title ?? "Untitled"}</div>
+                  <div className="text-[11.5px]" style={{ color: "var(--text-dim)" }}>{a.kind} · v{a.version}</div>
+                </button>
+              ))}
+            </div>
           ))}
         </div>
       </aside>
@@ -68,7 +84,7 @@ export default function ArtifactsScreen() {
   );
 }
 
-function ArtifactDetail({ artifactId, onChanged, onDeleted }: { artifactId: string; onChanged: () => void; onDeleted: () => void }) {
+export function ArtifactDetail({ artifactId, onChanged, onDeleted }: { artifactId: string; onChanged: () => void; onDeleted: () => void }) {
   const [meta, setMeta] = useState<Artifact | null>(null);
   const [tab, setTab] = useState<Tab>("preview");
   const [text, setText] = useState<string | null>(null);
@@ -114,6 +130,7 @@ function ArtifactDetail({ artifactId, onChanged, onDeleted }: { artifactId: stri
   async function save() { setBusy(true); try { await editArtifact(artifactId, draft, "manual edit"); await load(); onChanged(); setTab("preview"); } finally { setBusy(false); } }
   async function aiEdit() { if (!aiInstruction.trim()) return; setBusy(true); try { await aiEditArtifact(artifactId, aiInstruction); setAiInstruction(""); await load(); onChanged(); setTab("preview"); } finally { setBusy(false); } }
   async function restore(v: number) { setBusy(true); try { await restoreVersion(artifactId, v); await load(); await loadVersions(); onChanged(); } finally { setBusy(false); } }
+  async function duplicate() { setBusy(true); try { await duplicateArtifact(artifactId); onChanged(); } finally { setBusy(false); } }
   async function rename() { const t = prompt("Rename artifact", meta?.title ?? ""); if (t != null) { await renameArtifact(artifactId, t); await load(); onChanged(); } }
   async function remove() { if (confirm("Delete this artifact?")) { await deleteArtifact(artifactId); onDeleted(); } }
   async function togglePublish() {
@@ -136,6 +153,7 @@ function ArtifactDetail({ artifactId, onChanged, onDeleted }: { artifactId: stri
           <div className="text-[11.5px]" style={{ color: "var(--text-dim)" }}>{meta.kind} · v{meta.version}{meta.mime_type ? ` · ${meta.mime_type}` : ""}</div>
         </div>
         <button onClick={rename} className="btn btn-ghost btn-sm">Rename</button>
+        <button onClick={duplicate} disabled={busy} className="btn btn-ghost btn-sm">Duplicate</button>
         <button onClick={togglePublish} disabled={busy} className="btn btn-secondary btn-sm">{share.published ? "Unpublish" : "Publish"}</button>
         <button onClick={remove} className="btn btn-ghost btn-sm">Delete</button>
       </header>

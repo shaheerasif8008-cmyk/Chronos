@@ -3,6 +3,7 @@
 import { Component, ReactNode, useEffect, useRef, useState, useMemo, useCallback } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import ArtifactsScreen from "../../components/artifacts/ArtifactsScreen";
+import InChatArtifactPanel from "../../components/artifacts/InChatArtifactPanel";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 const CONFIGURED_API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
@@ -622,6 +623,7 @@ function ChronosAppInner() {
         }} />}
         {route === "settings"   && <SettingsScreen tab={settingsTab} setTab={setSettingsTab} theme={theme} setTheme={setTheme} accent={accent} setAccent={setAccent} signOut={signOut} />}
       </main>
+      <InChatArtifactPanel />
     </div>
   );
 }
@@ -1592,6 +1594,7 @@ function ArtifactCard({ artifact }: { artifact: ArtifactRef }) {
           <IC.External size={13}/> Open
         </button>
       )}
+      <button onClick={() => window.dispatchEvent(new CustomEvent("chronos:open-artifact", { detail: { id: artifact.id } }))} className="btn btn-ghost btn-sm">Open here</button>
       <button onClick={handleDownload} disabled={busy} className="btn btn-ghost btn-sm">Download</button>
     </div>
   );
