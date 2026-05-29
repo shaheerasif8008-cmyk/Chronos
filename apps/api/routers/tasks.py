@@ -9,6 +9,7 @@ from sqlalchemy import insert, select, update
 
 from core import permissions
 from core.activity_events import list_task_events
+from core.modes import normalize_mode
 from core.auth import get_current_member
 from core.config import settings
 from core.db import engine, reflect_table
@@ -26,6 +27,8 @@ class CreateTaskRequest(BaseModel):
     persona_id: str | None = None
     workspace_id: str | None = None
     model: str | None = None
+    mode: str | None = None
+    project_id: str | None = None
 
 
 async def create_task_record(
@@ -36,7 +39,10 @@ async def create_task_record(
     persona_id: str | None = None,
     workspace_id: str | None = None,
     model: str | None = None,
+    mode: str | None = None,
+    project_id: str | None = None,
     attachments_context: list[dict] | None = None,
+    project_knowledge: str | None = None,
 ) -> str:
     """Insert a task row. The native model action loop orchestrates by default.
 
@@ -47,25 +53,30 @@ async def create_task_record(
 
     await permissions.check(member, "create_task", workspace_id or "default")
     resolved_model = resolve_agent_model(model)
+    normalized_mode = normalize_mode(mode)
     tasks = await reflect_table("tasks")
     async with engine.begin() as conn:
+        insert_values: dict = dict(
+            organization_id=settings.org_id,
+            region=settings.region,
+            persona_id=persona_id,
+            workspace_id=workspace_id,
+            triggered_by=triggered_by,
+            triggered_by_member_id=member.id,
+            status="queued",
+            goal=goal,
+            plan={},
+            agent_state={"agent_history": [], "iteration_count": 0, "model": resolved_model, "attachments": attachments_context or [], "project_knowledge": project_knowledge or ""},
+            current_step=0,
+            result={},
+            depth=0,
+            mode=normalized_mode,
+        )
+        if project_id is not None:
+            insert_values["project_id"] = project_id
         result = await conn.execute(
             insert(tasks)
-            .values(
-                organization_id=settings.org_id,
-                region=settings.region,
-                persona_id=persona_id,
-                workspace_id=workspace_id,
-                triggered_by=triggered_by,
-                triggered_by_member_id=member.id,
-                status="queued",
-                goal=goal,
-                plan={},
-                agent_state={"agent_history": [], "iteration_count": 0, "model": resolved_model, "attachments": attachments_context or []},
-                current_step=0,
-                result={},
-                depth=0,
-            )
+            .values(**insert_values)
             .returning(tasks.c.id)
         )
         return str(result.scalar_one())
@@ -80,6 +91,8 @@ async def create_task(req: CreateTaskRequest, member: Member = Depends(get_curre
         persona_id=req.persona_id,
         workspace_id=req.workspace_id,
         model=req.model,
+        mode=req.mode,
+        project_id=req.project_id,
     )
     await task_runner.enqueue_task(task_id)
     return {"task_id": task_id, "status": "queued"}

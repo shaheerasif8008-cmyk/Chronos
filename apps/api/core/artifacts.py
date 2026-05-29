@@ -165,6 +165,17 @@ def _infer_mime(kind: str, content: str | bytes) -> str:
     return "text/plain"
 
 
+async def set_parse_status(artifact_id: str, status: str) -> None:
+    """Update an attachment's parse_status (pending|parsed|failed|unparseable)."""
+    from sqlalchemy import update
+
+    artifacts = await reflect_table("artifacts")
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(artifacts).where(artifacts.c.id == artifact_id).values(parse_status=status)
+        )
+
+
 async def _local_fallback(artifact_id: str, raw: bytes, org_id: str) -> str:
     """Write to /tmp when MinIO is unavailable. Returns the pseudo minio_path."""
     import pathlib

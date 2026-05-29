@@ -28,6 +28,22 @@ def _db_reachable() -> bool:
 _requires_db = pytest.mark.skipif(not _db_reachable(), reason="Postgres not reachable")
 
 
+@pytest.fixture(autouse=True)
+def dispose_db_engine():
+    """Dispose the SQLAlchemy engine pool before each test in this module.
+
+    pytest-asyncio gives each test its own event loop (function scope). asyncpg
+    connection pools are bound to the loop that created them, so a pool created
+    in test N's loop is unusable in test N+1's loop. Disposing before each test
+    forces a fresh pool in the current event loop, preventing 'Future attached
+    to a different loop' / 'Event loop is closed' failures when DB tests follow
+    non-DB tests.
+    """
+    import core.db as _db
+    _db.engine.sync_engine.pool.dispose()
+    yield
+
+
 @pytest.mark.asyncio
 async def test_vision_ocr_returns_empty_when_no_model_configured():
     with patch.object(llm.settings, "vision_model", ""):
@@ -330,7 +346,7 @@ async def test_upload_attachment_stores_and_returns_id(monkeypatch):
         file=BytesIO(b"%PDF-1.4 data"),
         headers=Headers({"content-type": "application/pdf"}),
     )
-    out = await att_router.upload_attachment(file=upload, conversation_id="c1", member=member)
+    out = await att_router.upload_attachment(file=upload, conversation_id="c1", project_id=None, member=member)
     assert out["attachment_id"] == "att-123"
     assert out["filename"] == "report.pdf"
     assert saved["kind"] == "attachment"
