@@ -340,7 +340,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
     requester_context.workspace_id = req.workspace_id
     explicit_memory = extract_explicit_memory_content(req.message)
 
-    if explicit_memory:
+    if explicit_memory and not req.attachment_ids:
         async def explicit_stream():
             entry_id = await create_memory_entry(
                 content=explicit_memory,
