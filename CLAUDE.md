@@ -6,7 +6,9 @@ This file is the primary context source for all AI coding assistants (Codex, Cla
 
 ## What This Project Is
 
-**Chronos** is an autonomous AI agent platform for enterprises. It is a Manus-class task executor combined with Claude-style persistent organizational memory and enterprise governance (approvals, audit, permissions). One Chronos instance per organization learns the org through use, accumulates institutional memory, and becomes harder to replace over time.
+**Chronos** is a polished enterprise AI platform targeting the combined capability set of ChatGPT, Claude.ai, and Manus.ai. The product goal is total practical parity with those systems: general assistant UX, deep research, projects and source knowledge, memory, artifacts, multimodal input/output, connectors/apps, coding assistance, agentic task execution, full browser operation, cloud/local computer operation, scheduled work, collaboration, and enterprise governance.
+
+Chronos differentiates by making those capabilities reliable and governable for organizations. Every capability must run through governed autonomous execution, persistent organizational memory, approvals, auditability, tenant boundaries, and complete product UX. One Chronos instance per organization learns the org through use, accumulates institutional memory, and becomes harder to replace over time.
 
 **Company:** Cognisia  
 **Product:** Chronos (working name)  
@@ -14,29 +16,25 @@ This file is the primary context source for all AI coding assistants (Codex, Cla
 **Per-tenant subdomains:** `novatech.cognisiatech.com`
 
 **Reference documents (always attach to sessions):**
+- `CHRONOS_TOTAL_PARITY_GOAL.md` — canonical north-star product goal and completion bar
+- `chronos_capability_roadmap.md` — parity roadmap and implementation categories
 - `chronos_architecture_v2.md` — product decisions and system design
-- `chronos_build_plan.md` — sprint-by-sprint build order with exit criteria
+- `chronos_build_plan.md` — historical sprint-by-sprint build order and useful implementation context
 - `chronos_technical_architecture.md` — code patterns, request flows, schemas
 
 ---
 
-## Current Build Phase
+## Canonical Product Goal
 
-**Phase 1, Sprint 1 — Weeks 1-2: Skeleton + Seams**
+The active goal is the **Chronos Total Parity Program**:
 
-Build in this exact order:
-1. Monorepo structure (Next.js + FastAPI)
-2. Docker Compose (Postgres+pgvector, Redis, MinIO)
-3. Database migrations (organizations, members, conversations, messages, audit_log)
-4. Email OTP auth + JWT sessions
-5. litellm model layer with streaming SSE
-6. Conversation persistence
-7. **The three seam functions** (permission.check, memory.retrieve, tool_broker.execute)
-8. Context folder loader (reads `/context/{org_id}/*.md`)
-9. Chat UI (Next.js, streaming, conversation history)
-10. Seed script
+1. Build reliability first: durable runtime, queueing, cancellation, recovery, safety, trace persistence, and proof harnesses.
+2. Then reach total parity with ChatGPT, Claude.ai, and Manus.ai across assistant, research, projects, artifacts, memory, multimodal, connectors, browser/computer operation, coding, schedules, agents, collaboration, admin, mobile/desktop, and compliance.
+3. Preserve Chronos's enterprise posture: all risky actions are governed; all durable outputs are auditable; all tenant boundaries are enforced.
 
-Do not add any scope beyond this list. Do not start Sprint 2 until all Sprint 1 exit criteria pass.
+All future work is evaluated against this goal. Older phase/sprint language in `chronos_build_plan.md` and `chronos_technical_architecture.md` is historical context unless it supports the total parity goal.
+
+**Completion rule:** no feature is complete until it works through the real UI/API, persists durable state, respects tenant boundaries, emits audit evidence, survives refresh/restart where applicable, and has automated proof.
 
 ---
 
@@ -50,8 +48,8 @@ Do not add any scope beyond this list. Do not start Sprint 2 until all Sprint 1 
 # apps/api/core/permissions.py
 async def check(actor: Member, action: str, resource: str) -> bool:
     """
-    Phase 1: returns True, logs to audit_log.
-    Phase 3: queries OpenFGA with same signature.
+    Early builds may return True with audit logging.
+    Later builds may query OpenFGA or another policy engine.
     200+ call sites. The signature NEVER changes.
     """
     await audit.log("permission_check", actor.id, action,
@@ -66,8 +64,8 @@ async def check(actor: Member, action: str, resource: str) -> bool:
 # apps/api/core/memory.py
 async def retrieve(query: str, requester_context: RequesterContext) -> list[MemoryEntry]:
     """
-    Phase 1: unfiltered vector search. requester_context is ignored.
-    Phase 3: filters by authorized_scopes. Same signature.
+    Retrieves authorized memory for the current request context.
+    Implementations may evolve, but same signature.
     50+ call sites. The signature NEVER changes.
     """
     query_embedding = await embed(query)
@@ -88,8 +86,8 @@ async def retrieve(query: str, requester_context: RequesterContext) -> list[Memo
 # apps/api/core/tool_broker.py
 async def execute(agent: AgentContext, tool: str, args: dict) -> ToolResult:
     """
-    Phase 1: passes through with audit logging.
-    Phase 3+: adds rate limiting, approval gating, safety limits.
+    Executes tools through the single governed gateway.
+    Implementations may add rate limiting, approval gating, safety limits, and policy checks.
     Every tool call routes here. No direct connector calls. Ever.
     """
     await audit.log("tool_call", agent.id, tool, payload={"args": args})
@@ -113,7 +111,7 @@ RULE 5: Every table has region TEXT NOT NULL DEFAULT 'us'. No exceptions.
 RULE 6: audit_log is INSERT-only. REVOKE UPDATE, DELETE ON audit_log FROM app_user.
 RULE 7: Credentials NEVER appear in logs. Only vault_ref is logged.
 RULE 8: gmail.send always creates a draft first. Sending requires an approval record.
-RULE 9: organization_id is always set from config constant ORG_ID = "default" in Phase 1.
+RULE 9: organization_id must always be explicit, tenant-scoped, and enforced at API/query/tool boundaries.
 RULE 10: Do not build sub-agent UI before the task engine runs real tasks end-to-end.
 ```
 
@@ -128,12 +126,12 @@ Database:      Postgres 15 + pgvector extension
 Cache/pubsub:  Redis
 File storage:  MinIO (S3-compatible, local in dev)
 Frontend:      Next.js 14 (App Router), TypeScript, Tailwind
-Auth:          Email OTP + JWT (Phase 1). WorkOS/Clerk in Phase 3.
+Auth:          Email OTP + JWT currently; WorkOS/Clerk or equivalent enterprise auth later.
 Connectors:    MCP (primary interface). Composio for Gmail/HubSpot adapters.
 Browser:       Playwright (sandboxed subprocess)
 Observability: Langfuse (LLM calls), Sentry (errors)
 Scheduling:    APScheduler (in-process, not Celery)
-Permissions:   Stub returning True (Phase 1). OpenFGA in Phase 3.
+Permissions:   Permission seam currently lightweight; OpenFGA or equivalent policy engine later.
 ```
 
 ---
@@ -396,7 +394,7 @@ CREATE INDEX ON audit_log (organization_id, created_at DESC);
 ```python
 # apps/api/core/models.py
 class RequesterContext(BaseModel):
-    org_id: str = "default"          # Phase 1: always "default"
+    org_id: str = "default"          # local/default tenant unless request context supplies another
     member_id: str
     workspace_id: str | None = None
     persona_id: str | None = None
@@ -688,7 +686,7 @@ class SubAgentManager:
 # Never call connectors directly.
 # Always: await tool_broker.execute(agent, "gmail.send", args)
 
-# gmail.draft always, never gmail.send directly in Phase 1
+# gmail.draft always; never call gmail.send directly
 # gmail.send only reachable after approval record exists in DB
 
 # Credential vault: AES-256-GCM, stored in Redis (fast) + Postgres (backup)
@@ -700,7 +698,7 @@ class SubAgentManager:
 ## Environment Variables (.env)
 
 ```bash
-# Phase 1 constants
+# Local development defaults
 ORG_ID=default
 REGION=us
 
@@ -838,8 +836,8 @@ MEMORY_SCOPES = {
     "restricted":  "explicit ACL — specific members only",
 }
 
-# Phase 1: all writes default to scope="org" unless user specifies otherwise
-# Phase 3: scope filter applied at retrieval based on authorized_scopes
+# Default writes should use the narrowest useful scope.
+# Retrieval must enforce authorized scopes for the requester.
 ```
 
 ---
@@ -853,9 +851,9 @@ MEMORY_SCOPES = {
 
 ---
 
-## What Phase 1 Proves
+## What the Foundation Must Prove
 
-By the end of Sprint 4 (Week 8), one user should be able to:
+The early runtime foundation is still useful only if one user can:
 
 1. Tell Chronos an ICP description for lead generation
 2. Watch the activity log stream as Chronos plans and executes
@@ -865,7 +863,7 @@ By the end of Sprint 4 (Week 8), one user should be able to:
 6. Approve them in batch
 7. See the drafts appear in the connected Gmail account
 
-If this loop doesn't work end-to-end, Sprint 4 is not done.
+If this loop doesn't work end-to-end, the agent foundation is not reliable enough for the total parity goal.
 
 ---
 

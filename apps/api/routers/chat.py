@@ -23,7 +23,8 @@ from core.artifacts import save_artifact as _save_artifact
 from core.artifacts import set_parse_status as _set_parse_status
 from memory.extraction import extract_and_save
 from runtime.agent_loop import format_task_answer
-from runtime.executor import TaskExecutor, activity_channel
+from runtime import task_runner
+from runtime.executor import activity_channel
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -114,6 +115,26 @@ async def list_messages(conversation_id: str, member: Member = Depends(get_curre
             )
         ).mappings().all()
     return [dict(row) for row in rows]
+
+
+@router.get("/conversations/{conversation_id}/latest-task")
+async def latest_conversation_task(conversation_id: str, member: Member = Depends(get_current_member)) -> dict | None:
+    await permissions.check(member, "view_conversation", conversation_id)
+    tasks = await reflect_table("tasks")
+    async with engine.begin() as conn:
+        row = (
+            await conn.execute(
+                select(tasks)
+                .where(
+                    tasks.c.triggered_by == conversation_id,
+                    tasks.c.organization_id == member.organization_id,
+                    tasks.c.parent_task_id.is_(None),
+                )
+                .order_by(tasks.c.created_at.desc())
+                .limit(1)
+            )
+        ).mappings().first()
+    return dict(row) if row else None
 
 
 @router.delete("/conversations/{conversation_id}")
@@ -279,10 +300,12 @@ async def _agent_loop_stream(
         attachments_context=attachments_context,
     )
 
-    # Subscribe BEFORE firing executor to guarantee no events are missed.
+    # Subscribe BEFORE firing executor, then wait briefly for subscription to
+    # propagate so Redis doesn't miss the first events due to race condition.
     pubsub = redis_client.pubsub()
     await pubsub.subscribe(activity_channel(task_id))
-    asyncio.create_task(TaskExecutor().run(task_id))
+    await asyncio.sleep(0.1)
+    await task_runner.enqueue_task(task_id)
 
     yield f"data: {json.dumps({'type': 'conversation', 'conversation_id': conversation_id})}\n\n"
     yield f"data: {json.dumps({'type': 'task_created', 'task_id': task_id})}\n\n"
@@ -290,6 +313,7 @@ async def _agent_loop_stream(
     TRACE_TYPES = {
         "tool_call", "tool_result", "tool_error", "step_start", "step_done",
         "awaiting_approval", "sub_agent_spawned", "sub_agent_complete", "thinking",
+        "route_decision", "model_step", "model_result",
     }
     final_answer: str | None = None
     try:

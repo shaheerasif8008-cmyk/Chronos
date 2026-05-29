@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -12,7 +11,8 @@ from core.auth import get_current_member
 from core.config import settings
 from core.db import engine, reflect_table
 from core.models import Member
-from runtime.executor import TaskExecutor, emit_activity
+from runtime import task_runner
+from runtime.executor import emit_activity
 
 router = APIRouter(prefix="/approvals", tags=["approvals"])
 
@@ -100,5 +100,5 @@ async def decide_approval(
         },
         actor_id=member.id,
     )
-    asyncio.create_task(TaskExecutor().resume(row_dict["task_id"]))
+    await task_runner.enqueue_task(row_dict["task_id"])
     return {"status": "accepted", "approval_id": approval_id, "decision": req.decision, "resuming": True}

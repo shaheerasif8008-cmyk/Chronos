@@ -14,14 +14,17 @@ class Settings(BaseSettings):
     backup_api_key: str = ""
     backup_model: str = "openrouter/minimax/minimax-m2.5:free"
     openrouter_api_key: str = ""
-    openrouter_model: str = "openrouter/deepseek/deepseek-v4-pro"
-    agent_model: str = "openrouter/deepseek/deepseek-v4-pro"
+    openrouter_model: str = "openrouter/deepseek/deepseek-v4-flash:free"
+    agent_model: str = "openrouter/deepseek/deepseek-v4-flash:free"
     openrouter_api_base: str = "https://openrouter.ai/api/v1"
     embedding_model: str = "openrouter/nvidia/llama-nemotron-embed-vl-1b-v2:free"
     fast_model: str = "openrouter/minimax/minimax-m2.5:free"
     vision_model: str = ""   # vision-capable model for OCR; empty disables OCR
     local_llm_timeout_seconds: float = 2.0
     memory_retrieve_timeout_seconds: float = 1.5
+    task_runner_max_concurrency: int = 4
+    task_runner_max_attempts: int = 2
+    task_runner_timeout_seconds: float = 300.0
     jwt_secret: str = "change-me-in-dev"
     access_token_expire_minutes: int = 60
 

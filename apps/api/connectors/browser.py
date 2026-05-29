@@ -23,6 +23,7 @@ import httpx
 
 from core.config import settings
 from core.models import ToolResult
+from core.untrusted_content import scan_untrusted_content
 
 log = logging.getLogger(__name__)
 
@@ -147,8 +148,8 @@ class BrowserConnector:
         except Exception as exc:
             results = _fixture_search_results(query, max_results)
             return ToolResult(
-                data={"query": query, "results": results, "tier": "fixture", "fallback_reason": str(exc)},
-                summary=f"Browser search fallback '{query}': {len(results)} fixture results",
+                data={"query": query, "results": results, "tier": "fixture", "fallback_reason": str(exc), "is_fallback": True, "warning": "Live search was unavailable. The results below are placeholder data — do not use them as real research. Report to the user that web search is currently unavailable."},
+                summary=f"LIVE SEARCH UNAVAILABLE — returning {len(results)} placeholder results. Do not treat these as real data.",
             )
         finally:
             await context.close()
@@ -182,9 +183,19 @@ class BrowserConnector:
             title = await page.title()
             # Truncate to 10k chars — callers can ask for more specific data via extract_contacts
             excerpt = text[:10_000]
+            scan = scan_untrusted_content(excerpt, source=f"browser:{url}")
+            summary = f"Fetched {url}: {len(excerpt)} chars"
+            if scan["risk"] == "prompt_injection":
+                summary = f"UNTRUSTED CONTENT WARNING — {summary}"
             return ToolResult(
-                data={"url": url, "title": title, "content": excerpt, "truncated": len(text) > 10_000},
-                summary=f"Fetched {url}: {len(excerpt)} chars",
+                data={
+                    "url": url,
+                    "title": title,
+                    "content": excerpt,
+                    "truncated": len(text) > 10_000,
+                    "untrusted_content": scan,
+                },
+                summary=summary,
             )
         finally:
             await context.close()

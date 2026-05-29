@@ -1,6 +1,6 @@
 "use client";
 
-import { ReactNode, useEffect, useRef, useState, useMemo, useCallback } from "react";
+import { Component, ReactNode, useEffect, useRef, useState, useMemo, useCallback } from "react";
 import { usePathname, useRouter } from "next/navigation";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -95,7 +95,7 @@ type ConnectorApproval = {
   justification?: string;
   created_at?: string | null;
 };
-type Task = { id: string; status: string; goal: string; current_step: number; plan?: TaskStep[]; agent_state?: Record<string, unknown>; result?: Record<string, unknown>; error?: string | null; created_at?: string; parent_task_id?: string | null; depth?: number; iteration_count?: number };
+type Task = { id: string; status: string; goal: string; current_step: number; plan?: TaskStep[] | { steps?: TaskStep[] }; agent_state?: Record<string, unknown>; result?: Record<string, unknown>; error?: string | null; created_at?: string; parent_task_id?: string | null; depth?: number; iteration_count?: number };
 type TaskStep = { id: string; action: string; description: string; tool?: string | null };
 type ChatModel = { id: string; label: string; model: string; description?: string };
 type TaskStreamEvent = {
@@ -131,6 +131,122 @@ type ActivityAction = {
   created_at?: string | null;
   payload?: Record<string, unknown>;
 };
+
+const MODEL_STORAGE_KEY = "chronos.chat.selectedModel";
+
+function modelOptionText(model: ChatModel) {
+  if (model.model === model.id || model.model === model.label) return model.model;
+  return `${model.model} (${model.label})`;
+}
+
+function taskSteps(task: Task | null | undefined): TaskStep[] {
+  if (!task?.plan) return [];
+  return Array.isArray(task.plan) ? task.plan : task.plan.steps ?? [];
+}
+
+function taskMessageStatus(task: Task): MessageStatus {
+  if (task.status === "failed") return "error";
+  if (task.status === "awaiting_approval" || task.status === "paused") return "approval_pending";
+  if (task.status === "complete") return "complete";
+  return "streaming";
+}
+
+function taskMessageContent(task: Task): string {
+  if (task.status === "failed") return `The task stopped: ${task.error ?? "unknown error"}`;
+  if (task.status === "awaiting_approval") return "Waiting for approval before Chronos continues.";
+  if (task.status === "paused") return "Paused. Chronos will continue when the pause is cleared.";
+  if (task.status === "complete") {
+    const answer = task.result?.answer;
+    return typeof answer === "string" && answer.trim() ? answer.trim() : "Task completed.";
+  }
+  if (task.status === "queued" || task.status === "pending" || task.status === "planning") return "Queued. Chronos is preparing the task.";
+  return "";
+}
+
+function taskToolTraces(task: Task): ToolTrace[] {
+  const steps = taskSteps(task);
+  if (!steps.length) {
+    return [{
+      id: `${task.id}-task-state`,
+      tool: "task",
+      summary: task.status === "queued" || task.status === "pending" || task.status === "planning" ? "Preparing task plan..." : "Working...",
+      status: taskMessageStatus(task),
+    }];
+  }
+  return steps.map((step, index) => {
+    let status: MessageStatus = "complete";
+    if (task.status === "failed") status = "error";
+    else if (task.status === "awaiting_approval" && step.action === "approval_gate" && index >= task.current_step) status = "approval_pending";
+    else if (task.status !== "complete" && index >= task.current_step) status = index === task.current_step ? "streaming" : "paused";
+    return {
+      id: `${task.id}-${step.id}`,
+      tool: step.tool || step.action || "task",
+      summary: step.description,
+      status,
+    };
+  });
+}
+
+function traceToolLabel(traceType: string, event: { tool?: string | null }) {
+  if (event.tool) return event.tool;
+  if (traceType === "route_decision") return "orchestrator.route";
+  if (traceType === "model_step" || traceType === "thinking" || traceType === "model_result") return "agent.loop";
+  if (traceType === "step_start" || traceType === "step_done") return "planner.step";
+  if (traceType === "awaiting_approval") return "approval.gate";
+  if (traceType === "sub_agent_spawned" || traceType === "sub_agent_complete") return "sub_agent";
+  return traceType || "runtime";
+}
+
+function traceSummary(
+  traceType: string,
+  event: {
+    tool?: string | null;
+    summary?: string;
+    error?: string;
+    confidence?: number;
+    iteration?: number;
+    args_preview?: Record<string, unknown>;
+    step?: { description?: string };
+    approval_ids?: string[];
+    goal?: string;
+  },
+) {
+  if (traceType === "route_decision") {
+    const confidence = typeof event.confidence === "number" && event.confidence > 0
+      ? ` (${Math.round(event.confidence * 100)}%)`
+      : "";
+    return event.tool
+      ? `Selected first tool: ${event.tool.replace(/[._]/g, " ")}${confidence}`
+      : event.summary || "No first tool forced; using model-native loop";
+  }
+  if (traceType === "model_step" || traceType === "thinking") {
+    const iter = typeof event.iteration === "number" ? ` ${event.iteration}` : "";
+    return event.summary || `Reasoning iteration${iter}: context, memory, tools, and next action`;
+  }
+  if (traceType === "model_result") return event.summary || "Model returned a final answer";
+  if (traceType === "tool_call") return `${traceToolLabel(traceType, event).replace(/[._]/g, " ")}...`;
+  if (traceType === "tool_result") return event.summary ?? `${traceToolLabel(traceType, event)} done`;
+  if (traceType === "tool_error") return event.error ?? `${traceToolLabel(traceType, event)} failed`;
+  if (traceType === "step_start") return event.step?.description ?? "Planner step running";
+  if (traceType === "step_done") return event.summary ?? "Planner step complete";
+  if (traceType === "awaiting_approval") return `Waiting for approval on ${event.approval_ids?.length ?? 0} item(s)`;
+  if (traceType === "sub_agent_spawned") return `Sub-agent: ${event.goal ?? "working"}`;
+  if (traceType === "sub_agent_complete") return "Sub-agent finished";
+  return event.summary || traceType.replace(/_/g, " ");
+}
+
+function taskLiveMessage(task: Task): Message | null {
+  if (!["queued", "pending", "planning", "running", "awaiting_approval", "paused", "failed", "complete"].includes(task.status)) return null;
+  return {
+    id: `task-${task.id}`,
+    role: "assistant",
+    content: taskMessageContent(task),
+    status: taskMessageStatus(task),
+    created_at: task.created_at,
+    tool_traces: taskToolTraces(task),
+    thinking: ["queued", "pending", "planning", "running"].includes(task.status),
+  };
+}
 type SettingsOverview = {
   member: { id: string; email: string; name?: string | null; role: string; can_admin: boolean };
   organization: Record<string, unknown>;
@@ -334,8 +450,40 @@ function initialNewConversationOpen() {
   return window.location.pathname === "/chat" && params.get("new") === "1";
 }
 
+// ─── Error Boundary ────────────────────────────────────────────────────────────
+type ErrorBoundaryProps = { children: ReactNode };
+type ErrorBoundaryState = { hasError: boolean; error: Error | null };
+class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
+  constructor(props: ErrorBoundaryProps) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { hasError: true, error };
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="flex items-center justify-center" style={{ height: "100vh", background: "var(--bg)", color: "var(--text)" }}>
+          <div className="text-center max-w-md px-6">
+            <div className="w-12 h-12 rounded-full flex items-center justify-center mx-auto mb-4"
+                 style={{ background: "var(--danger-soft)", color: "var(--danger)" }}>
+              <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round"><circle cx="10" cy="10" r="7"/><path d="M10 7v4M10 13.5h.01"/></svg>
+            </div>
+            <h1 className="h-page mb-2">Something went wrong</h1>
+            <p className="text-[14px] mb-6" style={{ color: "var(--text-dim)" }}>{this.state.error?.message ?? "An unexpected error occurred."}</p>
+            <button onClick={() => { this.setState({ hasError: false, error: null }); window.location.href = "/chat"; }}
+                    className="btn btn-accent">Reload app</button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 // ─── Root App ─────────────────────────────────────────────────────────────────
-export default function ChronosApp() {
+function ChronosAppInner() {
   const router = useRouter();
   const pathname = usePathname();
   const [route, setRoute] = useState<Route>(() => routeFromPath(pathname));
@@ -345,6 +493,7 @@ export default function ChronosApp() {
   const [newConversationOpen, setNewConversationOpen] = useState(() => initialNewConversationOpen());
   const newConversationOpenRef = useRef(newConversationOpen);
   const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [conversationsLoading, setConversationsLoading] = useState(false);
   const [pendingApprovals, setPendingApprovals] = useState(0);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [theme, setTheme] = useState<"light" | "dark">("light");
@@ -364,7 +513,6 @@ export default function ChronosApp() {
 
   useEffect(() => {
     if (!getToken()) { router.replace("/login"); return; }
-    void loadConversations();
     void loadPendingApprovals();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -372,6 +520,10 @@ export default function ChronosApp() {
   useEffect(() => {
     setRoute(routeFromPath(pathname));
   }, [pathname]);
+
+  useEffect(() => {
+    if (route === "chat") void loadConversations();
+  }, [route]);
 
   useEffect(() => {
     newConversationOpenRef.current = newConversationOpen;
@@ -383,17 +535,25 @@ export default function ChronosApp() {
   }
 
   async function loadConversations(selectId?: string) {
-    try {
-      const data = (await (await apiFetch("/chat/conversations")).json()) as Conversation[];
-      setConversations(data);
-      if (selectId) {
-        setActiveConvoId(selectId);
-        setNewConversationOpen(false);
-        newConversationOpenRef.current = false;
-      } else if (!activeConvoId && !newConversationOpenRef.current && data[0]) {
-        setActiveConvoId(data[0].id);
+    setConversationsLoading(true);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const data = (await (await apiFetch("/chat/conversations")).json()) as Conversation[];
+        setConversations(data);
+        if (selectId) {
+          setActiveConvoId(selectId);
+          setNewConversationOpen(false);
+          newConversationOpenRef.current = false;
+        } else if (!activeConvoId && !newConversationOpenRef.current && data[0]) {
+          setActiveConvoId(data[0].id);
+        }
+        setConversationsLoading(false);
+        return;
+      } catch {
+        if (attempt < 2) await new Promise(r => setTimeout(r, 200 * (attempt + 1)));
       }
-    } catch { /* silently fail */ }
+    }
+    setConversationsLoading(false);
   }
 
   async function loadPendingApprovals() {
@@ -430,6 +590,7 @@ export default function ChronosApp() {
         route={route}
         onNavigate={navigateRoute}
         conversations={conversations}
+        conversationsLoading={conversationsLoading}
         activeConvoId={activeConvoId}
         onSelectConvo={(id) => { setActiveConvoId(id); setNewConversationOpen(false); newConversationOpenRef.current = false; navigateRoute("chat"); }}
         onNewConvo={() => { setActiveConvoId(null); setNewConversationOpen(true); newConversationOpenRef.current = true; navigateRoute("chat"); }}
@@ -437,23 +598,22 @@ export default function ChronosApp() {
         pendingApprovals={pendingApprovals}
         onOpenSettings={openSettings}
         onSignOut={signOut}
+        onRefreshConversations={() => void loadConversations()}
       />
 
       <main className="flex-1 min-w-0 flex flex-col" style={{ background: "var(--bg)" }}>
-        {route === "chat"       && <ChatScreen activeConvoId={activeConvoId} activePersonaId={activePersonaId} onConvoCreated={(id) => loadConversations(id)} />}
+        {route === "chat"       && <ChatScreen activeConvoId={activeConvoId} activePersonaId={activePersonaId} onPersonaChange={setActivePersonaId} onConvoCreated={(id) => loadConversations(id)} />}
         {route === "activity"   && <ActivityScreen />}
         {route === "approvals"  && <ApprovalsScreen onDecision={loadPendingApprovals} />}
         {route === "memory"     && <MemoryScreen />}
         {route === "connectors" && <ConnectorsScreen />}
         {route === "assistants" && <AssistantsScreen onStartConversation={(personaId) => {
-          const target = `/chat?persona=${encodeURIComponent(personaId)}&new=1`;
           setActivePersonaId(personaId);
           setActiveConvoId(null);
           setNewConversationOpen(true);
           newConversationOpenRef.current = true;
           setRoute("chat");
-          if (typeof window !== "undefined") window.location.href = target;
-          else router.push(target);
+          router.replace("/chat");
         }} />}
         {route === "settings"   && <SettingsScreen tab={settingsTab} setTab={setSettingsTab} theme={theme} setTheme={setTheme} accent={accent} setAccent={setAccent} signOut={signOut} />}
       </main>
@@ -463,15 +623,16 @@ export default function ChronosApp() {
 
 // ─── Sidebar ──────────────────────────────────────────────────────────────────
 function Sidebar({
-  collapsed, onCollapse, onExpand, route, onNavigate, conversations, activeConvoId,
-  onSelectConvo, onNewConvo, onDeleteConvo, pendingApprovals, onOpenSettings, onSignOut
+  collapsed, onCollapse, onExpand, route, onNavigate, conversations, conversationsLoading, activeConvoId,
+  onSelectConvo, onNewConvo, onDeleteConvo, pendingApprovals, onOpenSettings, onSignOut, onRefreshConversations
 }: {
   collapsed: boolean; onCollapse: () => void; onExpand: () => void;
   route: Route; onNavigate: (r: Route) => void;
-  conversations: Conversation[]; activeConvoId: string | null;
+  conversations: Conversation[]; conversationsLoading: boolean; activeConvoId: string | null;
   onSelectConvo: (id: string) => void; onNewConvo: () => void;
   onDeleteConvo: (id: string) => void; pendingApprovals: number;
   onOpenSettings: (tab: SettingsTab) => void; onSignOut: () => void;
+  onRefreshConversations: () => void;
 }) {
   const [accountOpen, setAccountOpen] = useState(false);
   const [convoMenu, setConvoMenu] = useState<string | null>(null);
@@ -573,9 +734,22 @@ function Sidebar({
 
       <div className="mt-3 mb-1 mx-3 border-t hairline"/>
 
+      <div className="px-3 flex items-center justify-between">
+        <span className="text-[11.5px] font-medium uppercase tracking-wider" style={{ color: "var(--text-dim)" }}>Conversations</span>
+        <button onClick={onRefreshConversations} className="btn btn-ghost btn-icon" title="Refresh conversations" style={{ width: 22, height: 22 }}>
+          <IC.Refresh size={12}/>
+        </button>
+      </div>
+
       {/* Conversation list */}
       <div className="flex-1 overflow-y-auto px-2 pt-1 no-scrollbar">
-        {groups.length === 0 && (
+        {groups.length === 0 && conversationsLoading && (
+          <p className="px-2.5 py-2 text-[13px] flex items-center gap-2" style={{ color: "var(--text-dim)" }}>
+            <span className="typing-wave inline-flex" style={{ height: 12 }}><span/><span/><span/></span>
+            Loading...
+          </p>
+        )}
+        {groups.length === 0 && !conversationsLoading && (
           <p className="px-2.5 py-2 text-[13px]" style={{ color: "var(--text-dim)" }}>No conversations yet.</p>
         )}
         {groups.map(g => (
@@ -697,20 +871,23 @@ function AccountMenu({ onClose, onSettings, onSignOut }: { onClose: () => void; 
 function ChatScreen({
   activeConvoId,
   activePersonaId,
+  onPersonaChange,
   onConvoCreated,
 }: {
   activeConvoId: string | null;
   activePersonaId: string;
+  onPersonaChange: (personaId: string) => void;
   onConvoCreated: (id: string) => void;
 }) {
   const [draft, setDraft] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
   const [chatModels, setChatModels] = useState<ChatModel[]>([]);
-  const [selectedModel, setSelectedModel] = useState("auto");
+  const [selectedModel, setSelectedModel] = useState("agent");
   const [streaming, setStreaming] = useState(false);
   const [activityOpen, setActivityOpen] = useState(false);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<{ id: string; name: string; size: number }[]>([]);
+  const [personaMenuOpen, setPersonaMenuOpen] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const streamingRef = useRef(false);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -723,10 +900,15 @@ function ChatScreen({
     conversationId: string,
     opts?: { streamedContent?: string; preserveLocal?: boolean },
   ) => {
-    const [rawMsgs, arts] = await Promise.all([
+    const [rawMsgs, arts, latestTask] = await Promise.all([
       apiFetch(`/chat/conversations/${conversationId}/messages`).then(r => r.json()),
       apiFetch(`/artifacts?conversation_id=${conversationId}`).then(r => r.json()).catch(() => []),
-    ]) as [Array<Record<string, unknown>>, Array<{ id: string; message_id?: string | null; title?: string; kind: string; mime_type?: string; size_bytes?: number }>];
+      apiFetch(`/chat/conversations/${conversationId}/latest-task`).then(r => r.json()).catch(() => null),
+    ]) as [
+      Array<Record<string, unknown>>,
+      Array<{ id: string; message_id?: string | null; title?: string; kind: string; mime_type?: string; size_bytes?: number }>,
+      (Task & { id?: string }) | null,
+    ];
     const byMessage = new Map<string, ArtifactRef[]>();
     for (const a of arts || []) {
       if (!a.message_id) continue;
@@ -752,11 +934,18 @@ function ChatScreen({
     if (!hasAssistant && opts?.streamedContent?.trim()) {
       normalized.push({ role: "assistant", content: opts.streamedContent.trim(), status: "complete" });
     }
+    if (!hasAssistant && !opts?.streamedContent?.trim() && latestTask) {
+      const liveMessage = taskLiveMessage(latestTask);
+      if (liveMessage) normalized.push(liveMessage);
+    }
 
     setMessages(prev => {
       if (opts?.preserveLocal && normalized.length < prev.length) return prev;
       return normalized;
     });
+    if (latestTask?.id) {
+      setActiveTaskId(latestTask.id);
+    }
   }, []);
 
   useEffect(() => {
@@ -765,11 +954,19 @@ function ChatScreen({
       .then((data: ChatModel[]) => {
         setChatModels(data);
         const preferred = data.find(model => model.id === "agent") ?? data.find(model => model.id === "openrouter") ?? data.find(model => model.id === "backup") ?? data.find(model => model.id === "fast") ?? data[0];
-        if (preferred && (!data.some(model => model.id === selectedModel) || selectedModel === "auto")) setSelectedModel(preferred.id);
+        const stored = window.localStorage.getItem(MODEL_STORAGE_KEY) || selectedModel;
+        const nextModel = data.some(model => model.id === stored) ? stored : preferred?.id;
+        if (nextModel && nextModel !== selectedModel) {
+          setSelectedModel(nextModel);
+        }
+        if (nextModel) {
+          window.localStorage.setItem(MODEL_STORAGE_KEY, nextModel);
+        }
       })
       .catch(() => {
         setChatModels([{ id: "auto", label: "Auto", model: "auto", description: "Default model routing" }]);
         setSelectedModel("auto");
+        window.localStorage.setItem(MODEL_STORAGE_KEY, "auto");
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -781,6 +978,8 @@ function ChatScreen({
     }
     // Don't clobber in-flight SSE updates when a new conversation id arrives mid-stream.
     if (streamingRef.current) return;
+    setActivityOpen(false);
+    setActiveTaskId(null);
     void loadMessagesFromServer(activeConvoId).catch(() => {});
   }, [activeConvoId, loadMessagesFromServer]);
 
@@ -818,7 +1017,11 @@ function ChatScreen({
     if (!draft.trim() || streaming) return;
     const text = draft.trim();
     setDraft("");
-    setMessages(prev => [...prev, { role: "user", content: text, status: "complete" }]);
+    setMessages(prev => [
+      ...prev,
+      { role: "user", content: text, status: "complete" },
+      { role: "assistant", content: "", status: "streaming", thinking: true },
+    ]);
     streamingRef.current = true;
     setStreaming(true);
 
@@ -828,7 +1031,7 @@ function ChatScreen({
 
     type StreamEvent = {
       type: string; content?: string; conversation_id?: string; task_id?: string;
-      event?: { type: string; tool?: string; summary?: string; error?: string; args_preview?: Record<string, unknown>; step?: { description?: string }; approval_ids?: string[]; goal?: string };
+      event?: { type: string; tool?: string | null; summary?: string; error?: string; confidence?: number; iteration?: number; args_preview?: Record<string, unknown>; step?: { description?: string }; approval_ids?: string[]; goal?: string };
       artifact?: { artifact_id: string; title?: string; kind?: string; mime_type?: string; size_bytes?: number };
     };
 
@@ -851,39 +1054,38 @@ function ChatScreen({
         setMessages(prev => {
           const updated = [...prev];
           const last = updated[updated.length - 1];
-          if (last?.role === "assistant") updated[updated.length - 1] = { ...last, thinking: true };
+          if (last?.role === "assistant") {
+            const existing = last.tool_traces ?? [];
+            const hasLoopTrace = existing.some(t => t.tool === "agent.loop" && t.status === "streaming");
+            updated[updated.length - 1] = {
+              ...last,
+              thinking: true,
+              tool_traces: hasLoopTrace
+                ? existing
+                : [...existing, {
+                    id: `thinking-agent.loop-${Date.now()}`,
+                    tool: "agent.loop",
+                    summary: "Reasoning over context, memory, tools, and next action",
+                    status: "streaming",
+                  }],
+            };
+          }
           return updated;
         });
       } else if (ev.type === "trace" && ev.event) {
         const te = ev.event;
         const traceType = te.type ?? "";
-        const tool = te.tool ?? (traceType === "step_start" ? "think" : traceType === "awaiting_approval" ? "approval" : "");
-        let summary = te.summary ?? "";
+        const tool = traceToolLabel(traceType, te);
+        let summary = traceSummary(traceType, te);
         let traceStatus: MessageStatus = "complete";
-        if (traceType === "tool_call") {
-          summary = `${tool.replace(/[._]/g, " ")}…`;
+        if (traceType === "tool_call" || traceType === "step_start" || traceType === "sub_agent_spawned" || traceType === "model_step" || traceType === "thinking") {
           traceStatus = "streaming";
-        } else if (traceType === "tool_result") {
-          summary = te.summary ?? `${tool} done`;
+        } else if (traceType === "tool_result" || traceType === "step_done" || traceType === "sub_agent_complete" || traceType === "route_decision" || traceType === "model_result") {
           traceStatus = "complete";
         } else if (traceType === "tool_error") {
-          summary = te.error ?? `${tool} failed`;
           traceStatus = "error";
-        } else if (traceType === "step_start") {
-          summary = te.step?.description ?? "Thinking…";
-          traceStatus = "streaming";
-        } else if (traceType === "step_done") {
-          summary = te.summary ?? "Step complete";
-          traceStatus = "complete";
         } else if (traceType === "awaiting_approval") {
-          summary = `Waiting for approval on ${te.approval_ids?.length ?? 0} item(s)`;
           traceStatus = "approval_pending";
-        } else if (traceType === "sub_agent_spawned") {
-          summary = `Sub-agent: ${te.goal ?? "working"}`;
-          traceStatus = "streaming";
-        } else if (traceType === "sub_agent_complete") {
-          summary = `Sub-agent finished`;
-          traceStatus = "complete";
         }
         const traceId = `${traceType}-${tool}-${Date.now()}`;
         setMessages(prev => {
@@ -900,8 +1102,9 @@ function ChatScreen({
               return [...updated.slice(0, -1), { ...last, tool_traces: newTraces, thinking: false }];
             }
           }
-          if (traceType === "step_done") {
-            const idx = [...existing].reverse().findIndex(t => t.tool === "think" && t.status === "streaming");
+          if (traceType === "step_done" || traceType === "model_result") {
+            const matchTool = traceType === "model_result" ? "agent.loop" : "planner.step";
+            const idx = [...existing].reverse().findIndex(t => t.tool === matchTool && t.status === "streaming");
             if (idx >= 0) {
               const actualIdx = existing.length - 1 - idx;
               const newTraces = [...existing];
@@ -929,17 +1132,43 @@ function ChatScreen({
           return [...updated.slice(0, -1), { ...last, artifacts: [...existing, ref] }];
         });
       } else if (ev.type === "task_created" && ev.task_id) {
-        setActiveTaskId(ev.task_id);
+        const taskId = ev.task_id;
+        setActiveTaskId(taskId);
+        setActivityOpen(true);
+        setMessages(prev => {
+          const updated = [...prev];
+          const last = updated[updated.length - 1];
+          if (last?.role !== "assistant") return updated;
+          const existing = last.tool_traces ?? [];
+          return [...updated.slice(0, -1), {
+            ...last,
+            tool_traces: [
+              ...existing,
+              {
+                id: `task-created-${taskId}`,
+                tool: "task.runtime",
+                summary: `Created task ${taskId.slice(0, 8)} and attached live activity stream`,
+                status: "streaming",
+              },
+            ],
+          }];
+        });
       } else if (ev.type === "done") {
         setMessages(prev => {
           const updated = [...prev];
           const last = updated[updated.length - 1];
           if (last?.role === "assistant") {
+            const traces = (last.tool_traces ?? []).map(trace =>
+              trace.tool === "task.runtime" && trace.status === "streaming"
+                ? { ...trace, summary: "Task stream finished", status: "complete" as MessageStatus }
+                : trace
+            );
             updated[updated.length - 1] = {
               ...last,
               status: "complete",
               content: partial || last.content,
               thinking: false,
+              tool_traces: traces,
             };
           }
           return updated;
@@ -973,6 +1202,8 @@ function ChatScreen({
       } catch { /* bad JSON */ }
     }
 
+    const myConvoId = convoId;
+
     try {
       const pendingAttachmentIds = attachments.map(a => a.id);
       setAttachments([]);
@@ -988,7 +1219,6 @@ function ChatScreen({
 
       const decoder = new TextDecoder();
       let sseBuffer = "";
-      setMessages(prev => [...prev, { role: "assistant", content: "", status: "streaming" }]);
 
       while (true) {
         const { done, value } = await reader.read();
@@ -996,7 +1226,14 @@ function ChatScreen({
         sseBuffer += decoder.decode(value, { stream: true });
         const lines = sseBuffer.split("\n");
         sseBuffer = lines.pop() ?? "";
-        for (const line of lines) consumeSseLine(line);
+        for (const line of lines) {
+          // Skip stale events — user navigated to a different conversation
+          if (activeConvoId !== myConvoId && convoId !== myConvoId) {
+            ab.abort();
+            return;
+          }
+          consumeSseLine(line);
+        }
       }
       if (sseBuffer.trim()) consumeSseLine(sseBuffer.trim());
     } catch (e) {
@@ -1022,18 +1259,60 @@ function ChatScreen({
         {/* Header */}
         <div className="px-6 h-[52px] flex items-center justify-between flex-shrink-0 border-b hairline" style={{ background: "var(--bg)" }}>
           <div className="flex items-center gap-3 min-w-0">
-            <button className="flex items-center gap-2.5 px-2 py-1 rounded-md smooth hover:bg-[var(--surface-2)]">
+            <div className="relative">
+            <button
+              type="button"
+              aria-haspopup="menu"
+              aria-expanded={personaMenuOpen}
+              onClick={() => setPersonaMenuOpen(open => !open)}
+              className="flex items-center gap-2.5 px-2 py-1 rounded-md smooth hover:bg-[var(--surface-2)]"
+            >
               <PersonaAvatar name={activePersona.name} color={activePersona.color} size={22}/>
               <span className="text-[14px] font-medium">{activePersona.name}</span>
               <IC.ChevronDown size={13} style={{ color: "var(--text-dim)" }}/>
             </button>
+            {personaMenuOpen && (
+              <div
+                role="menu"
+                className="absolute left-0 top-[34px] z-50 w-[280px] surface border border-soft rounded-lg shadow-xl overflow-hidden py-1"
+              >
+                {PERSONAS.map(persona => {
+                  const selected = persona.id === activePersona.id;
+                  return (
+                    <button
+                      key={persona.id}
+                      type="button"
+                      role="menuitemradio"
+                      aria-checked={selected}
+                      onClick={() => {
+                        onPersonaChange(persona.id);
+                        setPersonaMenuOpen(false);
+                      }}
+                      className="w-full px-3 py-2.5 text-left flex items-start gap-3 smooth hover:bg-[var(--surface-2)]"
+                    >
+                      <PersonaAvatar name={persona.name} color={persona.color} size={28}/>
+                      <span className="flex-1 min-w-0">
+                        <span className="flex items-center gap-2">
+                          <span className="text-[13.5px] font-medium">{persona.name}</span>
+                          {selected && <IC.Check size={13} style={{ color: "var(--accent)" }}/>}
+                        </span>
+                        <span className="block text-[12px] mt-0.5" style={{ color: "var(--text-dim)" }}>{persona.role}</span>
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+            </div>
           </div>
           <div className="flex items-center gap-1">
-            {!isEmpty && streaming && !activityOpen && (
+            {!isEmpty && activeTaskId && !activityOpen && (
               <button onClick={() => setActivityOpen(true)}
                       className="flex items-center gap-2 px-2.5 py-1.5 rounded-md smooth hover:bg-[var(--surface-2)]">
-                <StatusDot status="working"/>
-                <span className="text-[12.5px]" style={{ color: "var(--text-muted)" }}>Working</span>
+                {streaming ? <StatusDot status="working"/> : <IC.Activity size={13} style={{ color: "var(--text-dim)" }}/>}
+                <span className="text-[12.5px]" style={{ color: "var(--text-muted)" }}>
+                  {streaming ? "Working" : "Task"}
+                </span>
               </button>
             )}
             <button className="btn btn-ghost btn-icon"><IC.More size={15}/></button>
@@ -1042,7 +1321,7 @@ function ChatScreen({
 
         {/* Messages or empty state */}
         {isEmpty ? (
-          <EmptyChatState persona={activePersona} onSubmit={q => { setDraft(q); }} />
+          <EmptyChatState persona={activePersona} onSubmit={q => { setDraft(q); setTimeout(() => void sendMessage(), 0); }} />
         ) : (
           <div className="flex-1 overflow-y-auto px-6 py-10">
             <div className="max-w-[780px] mx-auto space-y-10">
@@ -1112,14 +1391,18 @@ function ChatScreen({
                     id="chat-model-select"
                     aria-label="Model"
                     value={selectedModel}
-                    onChange={event => setSelectedModel(event.target.value)}
+                    onChange={event => {
+                      setSelectedModel(event.target.value);
+                      window.localStorage.setItem(MODEL_STORAGE_KEY, event.target.value);
+                    }}
                     disabled={streaming}
-                    className="surface border border-soft rounded-md px-2 py-1.5 text-[12.5px] outline-none disabled:opacity-60"
+                    className="surface border border-soft rounded-md px-2 py-1.5 text-[12.5px] outline-none disabled:opacity-60 w-[300px] max-w-[42vw]"
+                    data-selected-model={chatModels.find(model => model.id === selectedModel)?.model ?? selectedModel}
                     style={{ color: "var(--text)" }}
                     title={chatModels.find(model => model.id === selectedModel)?.model ?? selectedModel}
                   >
                     {(chatModels.length ? chatModels : [{ id: "auto", label: "Auto", model: "auto" }]).map(model => (
-                      <option key={model.id} value={model.id}>{model.label}</option>
+                      <option key={model.id} value={model.id}>{modelOptionText(model)}</option>
                     ))}
                   </select>
                 </div>
@@ -1138,7 +1421,7 @@ function ChatScreen({
               </div>
             </div>
             <p className="text-center text-[11.5px] mt-3" style={{ color: "var(--text-faint)" }}>
-              Chronos won&apos;t send anything outside your workspace without your approval.
+              Chronos requires approval for external sends (email, social posts, publishing) and reports failed searches honestly.
             </p>
           </div>
         </div>
@@ -1398,7 +1681,7 @@ function ActivityDrawer({ taskId, onClose }: { taskId: string | null; onClose: (
     return () => controller.abort();
   }, [taskId]);
 
-  const steps = task?.plan ?? [];
+  const steps = Array.isArray(task?.plan) ? task.plan : task?.plan?.steps ?? [];
   const currentStep = task?.current_step ?? 0;
   const status = taskStatus(task, events, streamError);
   const approvalEvent = [...events].reverse().find(event => event.type === "awaiting_approval");
@@ -1527,7 +1810,10 @@ function mergeTaskEvent(task: Task | null, event: TaskStreamEvent): Task | null 
   }
   if (event.type === "awaiting_approval") return { ...task, status: "awaiting_approval" };
   if (event.type === "task_failed") return { ...task, status: "failed" };
-  if (event.type === "task_complete") return { ...task, status: "complete", current_step: task.plan?.length ?? task.current_step };
+  if (event.type === "task_complete") {
+    const steps = Array.isArray(task.plan) ? task.plan : task.plan?.steps;
+    return { ...task, status: "complete", current_step: steps?.length ?? task.current_step };
+  }
   return task;
 }
 
@@ -1537,7 +1823,7 @@ function taskStatus(task: Task | null, events: TaskStreamEvent[], streamError: s
   if (task.status === "awaiting_approval" || events.some(event => event.type === "awaiting_approval")) return { label: "Waiting on approval", dot: "awaiting" };
   if (task.status === "failed") return { label: "Stopped", dot: "failed" };
   if (task.status === "complete") return { label: "Complete", dot: "done" };
-  if (task.status === "pending" || task.status === "planning") return { label: "Queued", dot: "queued" };
+  if (task.status === "queued" || task.status === "pending" || task.status === "planning") return { label: "Queued", dot: "queued" };
   return { label: "Working...", dot: "working" };
 }
 
@@ -1643,7 +1929,7 @@ function ActivityScreen() {
   const filteredTasks = jobFilter === "all" ? tasks : tasks.filter(t => t.status === jobFilter);
 
   const statusLabel: Record<string, string> = {
-    running: "Working", awaiting_approval: "Waiting on you", complete: "Done", failed: "Stopped", pending: "Queued",
+    queued: "Queued", running: "Working", awaiting_approval: "Waiting on you", complete: "Done", failed: "Stopped", pending: "Queued",
   };
 
   return (
@@ -1692,7 +1978,7 @@ function ActivityScreen() {
                       {t.status === "awaiting_approval"   && <Dot color="var(--warn)" size={10}/>}
                       {t.status === "complete"            && <IC.Check size={16} stroke={2.2} style={{ color: "var(--ok)" }}/>}
                       {t.status === "failed"              && <IC.Info size={16} style={{ color: "var(--danger)" }}/>}
-                      {t.status === "pending"             && <Dot color="var(--text-faint)" size={8}/>}
+                      {(t.status === "queued" || t.status === "pending") && <Dot color="var(--text-faint)" size={8}/>}
                     </div>
                     <div className="flex-1 min-w-0">
                       <div className="text-[14.5px] font-medium mb-1 truncate">{t.goal}</div>
@@ -1797,6 +2083,9 @@ function TaskTimeline({ task, events }: { task: Task; events: ActivityAction[] }
 }
 
 function TimelineEvent({ event }: { event: ActivityAction }) {
+  const isError = event.status === "error" || event.type === "task_failed" || event.type === "tool_error";
+  const guidance = isError ? nextStepGuidance(event) : null;
+
   return (
     <div className="px-3 py-2.5 flex items-start gap-3">
       <Dot color={activityStatusColor(event.status, event.type)} size={7} pulse={event.status === "running"} ring={event.status === "running"}/>
@@ -1806,16 +2095,44 @@ function TimelineEvent({ event }: { event: ActivityAction }) {
           {event.tool && <Tag>{event.tool}</Tag>}
           {event.approval_id && <Tag variant="warn">approval</Tag>}
           {event.artifact_id && <Tag variant="info">artifact</Tag>}
+          {isError && <Tag variant="danger">failed</Tag>}
         </div>
         <div className="mt-1 text-[11.5px] flex items-center gap-2 flex-wrap" style={{ color: "var(--text-dim)" }}>
           <span>{labelTime(event.created_at)}</span>
           <span>{event.type}</span>
           {event.actor_id && <span>actor {event.actor_id}</span>}
-          {event.error && <span style={{ color: "var(--danger)" }}>{event.error}</span>}
+          {event.error && <div className="mt-1.5 w-full text-[12.5px] rounded-md px-3 py-2" style={{ color: "var(--danger)", background: "var(--danger-soft)" }}>{event.error}</div>}
         </div>
+        {guidance && (
+          <div className="mt-2 text-[12px] flex items-center gap-2 flex-wrap" style={{ color: "var(--text-muted)" }}>
+            {guidance.map((g, i) => (
+              <span key={i} className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full surface border border-soft">
+                {g.icon}{g.label}
+              </span>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );
+}
+
+function nextStepGuidance(event: ActivityAction): Array<{ icon: ReactNode; label: string }> {
+  const error = (event.error ?? "").toLowerCase();
+  const hints: Array<{ icon: ReactNode; label: string }> = [];
+  if (error.includes("missing_tools") || error.includes("not configured") || error.includes("not installed")) {
+    hints.push({ icon: <IC.Connectors size={11}/>, label: "Check Settings → Connectors to enable required integrations" });
+  }
+  if (error.includes("timeout") || error.includes("timed out")) {
+    hints.push({ icon: <IC.Refresh size={11}/>, label: "Tool timed out — Chronos may retry automatically" });
+  }
+  if (error.includes("rate_limit") || error.includes("rate limit") || error.includes("429")) {
+    hints.push({ icon: <IC.Clock size={11}/>, label: "Rate limited — waiting before retry" });
+  }
+  if (error.includes("auth") || error.includes("unauthorized") || error.includes("401") || error.includes("403")) {
+    hints.push({ icon: <IC.Lock size={11}/>, label: "Authentication issue — reconnect in Settings → Connectors" });
+  }
+  return hints;
 }
 
 function ActivityActionRow({ action, onTask }: { action: ActivityAction; onTask: () => void }) {
@@ -1966,10 +2283,22 @@ function ApprovalsScreen({ onDecision }: { onDecision: () => void }) {
           )}
         </div>
         <div className="flex-1 overflow-y-auto">
-          {loading && <p className="px-5 py-4 text-[13.5px]" style={{ color: "var(--text-dim)" }}>Loading…</p>}
+          {loading && (
+            <div className="px-5 py-4 space-y-3">
+              {[1,2,3].map(i => (
+                <div key={i} className="flex items-center gap-3 px-3 py-3 rounded-lg" style={{ background: "var(--surface)" }}>
+                  <div className="w-2 h-2 rounded-full" style={{ background: "var(--border-soft)" }}/>
+                  <div className="flex-1">
+                    <div className="h-3 rounded w-3/4" style={{ background: "var(--border-soft)" }}/>
+                    <div className="h-2.5 rounded w-1/2 mt-1.5" style={{ background: "var(--border-soft)" }}/>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
           {!loading && approvals.length === 0 && (
             <div className="px-5 py-8">
-              <EmptyState icon={<IC.Approvals size={20}/>} title="All caught up" sub="Approvals appear here when Chronos needs your go-ahead."/>
+              <EmptyState icon={<IC.Approvals size={20}/>} title="All caught up" sub="When Chronos needs your go-ahead on a draft or action, it shows up here."/>
             </div>
           )}
           {approvals.map(a => {
@@ -2056,6 +2385,12 @@ function ApprovalsScreen({ onDecision }: { onDecision: () => void }) {
 }
 
 // ─── Memory Screen ────────────────────────────────────────────────────────────
+const MEMORY_SCOPES = [
+  { id: "org", label: "Organization", description: "Shared across the entire organization" },
+  { id: "workspace", label: "Workspace", description: "Shared within your workspace" },
+  { id: "personal", label: "Personal", description: "Private to you" },
+];
+
 function MemoryScreen() {
   const [memories, setMemories] = useState<MemoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
@@ -2063,6 +2398,8 @@ function MemoryScreen() {
   const [search, setSearch] = useState("");
   const [adding, setAdding] = useState(false);
   const [newContent, setNewContent] = useState("");
+  const [newScope, setNewScope] = useState("org");
+  const [toast, setToast] = useState<{ kind: "ok" | "danger"; text: string } | null>(null);
 
   const loadMemories = useCallback(() => {
     setLoading(true);
@@ -2076,6 +2413,12 @@ function MemoryScreen() {
   useEffect(() => {
     loadMemories();
   }, [loadMemories]);
+
+  useEffect(() => {
+    if (!toast) return;
+    const timer = setTimeout(() => setToast(null), 4000);
+    return () => clearTimeout(timer);
+  }, [toast]);
 
   const scopes = Array.from(new Set(memories.map(m => m.scope))).filter(Boolean);
   const [scopeFilter, setScopeFilter] = useState("all");
@@ -2093,12 +2436,15 @@ function MemoryScreen() {
     try {
       await apiFetch("/memory/", {
         method: "POST",
-        body: JSON.stringify({ content: newContent, scope: "org", scope_id: "default", source: "manual" }),
+        body: JSON.stringify({ content: newContent, scope: newScope, scope_id: "default", source: "manual" }),
       });
       await loadMemories();
       setAdding(false);
       setNewContent("");
-    } catch { /* silently */ }
+      setToast({ kind: "ok", text: `Memory saved as "${newScope}" scope.` });
+    } catch {
+      setToast({ kind: "danger", text: "Failed to save memory." });
+    }
   }
 
   async function updateMemory(id: string, content: string, importance_score?: number) {
@@ -2164,6 +2510,14 @@ function MemoryScreen() {
       )}
 
       <div className="px-10 pb-10 space-y-3">
+        {toast && (
+          <div className="flex items-center gap-2 px-4 py-2.5 rounded-xl text-[13px] fadeup"
+               style={{ background: toast.kind === "ok" ? "var(--ok-soft)" : "var(--danger-soft)", color: toast.kind === "ok" ? "var(--ok)" : "var(--danger)" }}>
+            {toast.kind === "ok" ? <IC.Check size={15} stroke={2.2}/> : <IC.Info size={15}/>}
+            {toast.text}
+          </div>
+        )}
+
         {adding && (
           <div className="mem-card p-4 fadeup" style={{ borderColor: "var(--accent)" }}>
             <textarea value={newContent} onChange={e => setNewContent(e.target.value)} autoFocus
@@ -2171,7 +2525,24 @@ function MemoryScreen() {
                       className="w-full bg-transparent outline-none text-[14.5px] resize-none"
                       style={{ color: "var(--text)" }}/>
             <div className="flex items-center justify-between mt-2">
-              <span className="text-[12.5px]" style={{ color: "var(--text-dim)" }}>Saved to your workspace.</span>
+              <div className="flex items-center gap-2">
+                <label className="text-[12.5px]" style={{ color: "var(--text-dim)" }}>Scope:</label>
+                <select value={newScope} onChange={e => setNewScope(e.target.value)}
+                        className="text-[12.5px] surface border border-soft rounded-md px-2 py-1 outline-none"
+                        style={{ color: "var(--text)" }}>
+                  {MEMORY_SCOPES.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}
+                </select>
+                {newScope !== "org" && (
+                  <span className="text-[11.5px]" style={{ color: "var(--text-dim)" }}>
+                    {MEMORY_SCOPES.find(s => s.id === newScope)?.description}
+                  </span>
+                )}
+                {newScope === "org" && (
+                  <span className="text-[11.5px]" style={{ color: "var(--text-dim)" }}>
+                    Default — visible to everyone in the organization
+                  </span>
+                )}
+              </div>
               <div className="flex items-center gap-2">
                 <button onClick={() => { setAdding(false); setNewContent(""); }} className="btn btn-ghost btn-sm">Cancel</button>
                 <button onClick={() => void addMemory()} className="btn btn-accent btn-sm">Save memory</button>
@@ -2180,7 +2551,16 @@ function MemoryScreen() {
           </div>
         )}
 
-        {loading && <p className="text-[13.5px]" style={{ color: "var(--text-dim)" }}>Loading…</p>}
+        {loading && (
+          <div className="space-y-3">
+            {[1,2,3].map(i => (
+              <div key={i} className="mem-card p-4">
+                <div className="h-4 rounded w-3/4" style={{ background: "var(--border-soft)" }}/>
+                <div className="h-3 rounded w-1/3 mt-2" style={{ background: "var(--border-soft)" }}/>
+              </div>
+            ))}
+          </div>
+        )}
         {!loading && filtered.length === 0 && (
           <EmptyState icon={<IC.Memory size={20}/>} title="No memories yet"
                       sub={memories.length === 0 ? "Chronos saves memories automatically during conversations. You can also add them manually." : "No memories match your current filter."}/>
@@ -2363,7 +2743,13 @@ function ConnectorsScreen() {
           </div>
         )}
 
-        {!loading && (
+        {!loading && apps.length === 0 && (
+          <EmptyState icon={<IC.Connectors size={20}/>}
+            title="No integrations available"
+            sub="Configure OAuth credentials in your .env to enable integrations like Gmail, Slack, GitHub, and Notion."/>
+        )}
+
+        {!loading && apps.length > 0 && (
           <div className="grid grid-cols-3 gap-4">
             {apps.map(app => (
               <div
@@ -2428,9 +2814,11 @@ function ConnectorsScreen() {
           </div>
         )}
 
-        <p className="mt-8 text-[12px]" style={{ color: "var(--text-dim)" }}>
-          More integrations coming soon. Each connection uses OAuth2 — Chronos never sees your password.
-        </p>
+        {apps.length > 0 && (
+          <p className="mt-8 text-[12px]" style={{ color: "var(--text-dim)" }}>
+            More integrations coming soon. Each connection uses OAuth2 — Chronos never sees your password.
+          </p>
+        )}
       </div>
     </div>
   );
@@ -2829,4 +3217,12 @@ function ConfirmModal({ confirm, onClose }: { confirm: { title: string; text: st
   const [typed, setTyped] = useState("");
   const canRun = !confirm.required || typed === confirm.required;
   return <div className="fixed inset-0 z-[100] flex items-center justify-center" style={{ background: "rgba(0,0,0,.22)" }} role="dialog" aria-modal="true"><div className="surface border border-soft rounded-xl p-5 w-[420px]"><h2 className="text-[16px] font-semibold">{confirm.title}</h2><p className="text-[13px] mt-2" style={{ color: "var(--text-dim)" }}>{confirm.text}</p>{confirm.required && <TextInput ariaLabel="Confirmation text" wide value={typed} onChange={setTyped}/>}<div className="flex justify-end gap-2 mt-5"><button className="btn btn-sm" onClick={onClose}>Cancel</button><button className="btn btn-danger-soft btn-sm" disabled={!canRun} onClick={() => { void confirm.action(typed).then(onClose); }}>Confirm</button></div></div></div>;
+}
+
+export default function ChronosApp() {
+  return (
+    <ErrorBoundary>
+      <ChronosAppInner />
+    </ErrorBoundary>
+  );
 }
