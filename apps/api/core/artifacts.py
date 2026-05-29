@@ -204,3 +204,28 @@ async def set_parse_status(artifact_id: str, status: str) -> None:
         await conn.execute(
             update(artifacts).where(artifacts.c.id == artifact_id).values(parse_status=status)
         )
+
+
+async def update_artifact_meta(artifact_id: str, org_id: str, **fields: Any) -> dict[str, Any] | None:
+    """Update head metadata (e.g. title). Tenant-scoped. Returns updated row or None."""
+    from datetime import datetime
+    from sqlalchemy import update as _update
+
+    allowed = {"title", "is_deleted"}
+    values = {k: v for k, v in fields.items() if k in allowed}
+    if not values:
+        return await get_artifact(artifact_id)
+    values["updated_at"] = datetime.utcnow()
+    artifacts = await reflect_table("artifacts")
+    async with engine.begin() as conn:
+        await conn.execute(
+            _update(artifacts)
+            .where(artifacts.c.id == artifact_id, artifacts.c.organization_id == org_id)
+            .values(**values)
+        )
+    return await get_artifact(artifact_id)
+
+
+async def soft_delete_artifact(artifact_id: str, org_id: str) -> bool:
+    res = await update_artifact_meta(artifact_id, org_id, is_deleted=True)
+    return res is not None

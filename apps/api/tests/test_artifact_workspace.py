@@ -46,3 +46,37 @@ async def test_save_artifact_writes_head_and_initial_version():
     assert len(rows) == 1
     assert rows[0]["version"] == 1
     assert rows[0]["edit_summary"] == "initial"
+
+
+@_requires_db
+@pytest.mark.asyncio
+async def test_edit_creates_new_version_without_clobbering():
+    from core.artifacts import read_artifact_content, save_artifact
+    from core.artifact_versions import create_version, read_version_content, restore_version, diff_versions
+
+    org = f"test-{uuid.uuid4().hex[:8]}"
+    aid = await save_artifact("v1 body", kind="markdown", title="E", org_id=org)
+    updated = await create_version(aid, "v2 body", org_id=org, edit_summary="edit")
+    assert updated["version"] == 2
+    assert await read_version_content(aid, 1, org) == b"v1 body"
+    assert await read_version_content(aid, 2, org) == b"v2 body"
+    assert await read_artifact_content(aid) == b"v2 body"
+    d = await diff_versions(aid, 1, 2, org)
+    assert d["is_binary"] is False
+    assert "v1 body" in d["diff"] and "v2 body" in d["diff"]
+    restored = await restore_version(aid, 1, org_id=org)
+    assert restored["version"] == 3
+    assert await read_artifact_content(aid) == b"v1 body"
+
+
+@_requires_db
+@pytest.mark.asyncio
+async def test_cross_tenant_version_isolation():
+    from core.artifacts import save_artifact
+    from core.artifact_versions import read_version_content
+
+    org_a = f"a-{uuid.uuid4().hex[:8]}"
+    org_b = f"b-{uuid.uuid4().hex[:8]}"
+    aid = await save_artifact("secret", kind="markdown", title="X", org_id=org_a)
+    assert await read_version_content(aid, 1, org_b) is None
+    assert await read_version_content(aid, 1, org_a) == b"secret"
