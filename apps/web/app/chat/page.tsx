@@ -40,6 +40,7 @@ type Message = {
 };
 type ToolTrace = { id: string; tool: string; summary: string; status: MessageStatus };
 type ArtifactRef = { id: string; title: string; kind: string; mime_type?: string; size_bytes?: number };
+type ProjectSource = { id: string; title?: string | null; source_type?: string | null; parse_status?: string | null; index_status?: string | null; uri?: string | null; created_at?: string };
 type MemoryEntry = { id: string; scope: string; scope_id: string; content: string; source: string; importance_score?: number; created_by?: string | null; created_at?: string };
 type Connector = {
   id: string;
@@ -3308,8 +3309,14 @@ function ProjectDetailScreen({
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [artifacts, setArtifacts] = useState<ArtifactRef[]>([]);
+  const [sources, setSources] = useState<ProjectSource[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
+
+  const refreshSources = useCallback(async () => {
+    const rows = (await (await apiFetch(`/projects/${projectId}/sources`)).json()) as ProjectSource[];
+    setSources(rows);
+  }, [projectId]);
 
   useEffect(() => {
     setLoading(true);
@@ -3318,11 +3325,13 @@ function ProjectDetailScreen({
       apiFetch(`/projects/${projectId}/conversations`).then(r => r.json()),
       apiFetch(`/projects/${projectId}/tasks`).then(r => r.json()),
       apiFetch(`/projects/${projectId}/artifacts`).then(r => r.json()),
+      apiFetch(`/projects/${projectId}/sources`).then(r => r.json()),
     ])
-      .then(([convs, tsks, arts]) => {
+      .then(([convs, tsks, arts, srcs]) => {
         setConversations(convs as Conversation[]);
         setTasks(tsks as Task[]);
         setArtifacts(arts as ArtifactRef[]);
+        setSources(srcs as ProjectSource[]);
       })
       .catch(() => { setLoadError(true); })
       .finally(() => setLoading(false));
@@ -3376,6 +3385,8 @@ function ProjectDetailScreen({
               ))}
             </div>
           )
+        ) : tab === "sources" ? (
+          <ProjectSourcesTab projectId={projectId} sources={sources} refresh={refreshSources} />
         ) : tab === "artifacts" ? (
           artifacts.length === 0 ? (
             <EmptyState icon={<IC.Folder size={22} />} title="No artifacts" sub="Artifacts created in project conversations and tasks appear here." />
@@ -3411,6 +3422,130 @@ function ProjectDetailScreen({
           <EmptyState title="Nothing here yet" sub="This feature is coming soon." />
         )}
       </div>
+    </div>
+  );
+}
+
+const SOURCE_STATUS_COLOR: Record<string, string> = {
+  indexed: "var(--accent)",
+  synced: "var(--accent)",
+  pending: "var(--text-faint)",
+  failed: "var(--danger)",
+  revoked: "var(--danger)",
+};
+
+function ProjectSourcesTab({
+  projectId,
+  sources,
+  refresh,
+}: {
+  projectId: string;
+  sources: ProjectSource[];
+  refresh: () => Promise<void>;
+}) {
+  const [adding, setAdding] = useState(false);
+  const [title, setTitle] = useState("");
+  const [tool, setTool] = useState("");
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const addConnector = async () => {
+    if (!title.trim() || !tool.trim()) return;
+    setBusyId("add"); setError(null);
+    try {
+      await apiFetch(`/projects/${projectId}/sources/connector`, {
+        method: "POST",
+        body: JSON.stringify({ title: title.trim(), tool: tool.trim(), args: {} }),
+      });
+      setTitle(""); setTool(""); setAdding(false);
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Couldn't add connector source");
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const syncSource = async (sid: string) => {
+    setBusyId(sid); setError(null);
+    try {
+      await apiFetch(`/projects/${projectId}/sources/${sid}/sync`, { method: "POST" });
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Sync failed");
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex items-center justify-between">
+        <div className="text-[13px]" style={{ color: "var(--text-dim)" }}>
+          Uploaded files and connector feeds indexed for this project.
+        </div>
+        <button className="btn btn-sm" onClick={() => setAdding(a => !a)}>
+          {adding ? "Cancel" : "Add connector source"}
+        </button>
+      </div>
+
+      {adding && (
+        <div className="surface border border-soft rounded-xl px-5 py-4 flex flex-col gap-3">
+          <input
+            className="input"
+            placeholder="Source title (e.g. Sales inbox)"
+            value={title}
+            onChange={e => setTitle(e.target.value)}
+          />
+          <input
+            className="input"
+            placeholder="Tool (e.g. gmail.search)"
+            value={tool}
+            onChange={e => setTool(e.target.value)}
+          />
+          <div className="flex justify-end">
+            <button
+              className="btn btn-sm btn-primary"
+              onClick={addConnector}
+              disabled={busyId === "add" || !title.trim() || !tool.trim()}
+            >
+              {busyId === "add" ? "Adding…" : "Add source"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {error && <div className="text-[12.5px]" style={{ color: "var(--danger)" }}>{error}</div>}
+
+      {sources.length === 0 ? (
+        <EmptyState icon={<IC.Folder size={22} />} title="No sources" sub="Upload a file in a project conversation or add a connector source to build project knowledge." />
+      ) : (
+        <div className="flex flex-col gap-2">
+          {sources.map(src => {
+            const status = src.index_status ?? "pending";
+            return (
+              <div key={src.id} className="surface border border-soft rounded-xl px-5 py-4 flex items-center gap-4">
+                <div className="flex-1 min-w-0">
+                  <div className="font-medium text-[14px] truncate">{src.title ?? "Untitled source"}</div>
+                  <div className="flex gap-3 mt-0.5 text-[12px]" style={{ color: "var(--text-faint)" }}>
+                    <span>{src.source_type ?? "upload"}</span>
+                    <span style={{ color: SOURCE_STATUS_COLOR[status] ?? "var(--text-faint)" }}>{status}</span>
+                  </div>
+                </div>
+                {src.source_type === "connector" && status !== "revoked" && (
+                  <button
+                    className="btn btn-sm"
+                    onClick={() => syncSource(src.id)}
+                    disabled={busyId === src.id}
+                  >
+                    {busyId === src.id ? "Syncing…" : "Sync"}
+                  </button>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }

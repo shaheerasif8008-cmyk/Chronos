@@ -508,6 +508,85 @@ async def delete_source(
     return {"deleted": True, "source_id": sid, "deleted_chunks": deleted_chunks}
 
 
+class ConnectorSourceRequest(BaseModel):
+    title: str
+    tool: str
+    args: dict = {}
+    connector_id: str | None = None
+
+
+@router.post("/{project_id}/sources/connector")
+async def add_connector_source(
+    project_id: str,
+    req: ConnectorSourceRequest,
+    member: Member = Depends(get_current_member),
+) -> dict:
+    """Register a connector feed source. Its fetch spec lives in ``permissions``."""
+    await _require_member(member, project_id)
+    await permissions.check(member, "add_project_source", project_id)
+
+    project_sources = await reflect_table("project_sources")
+    async with engine.begin() as conn:
+        result = await conn.execute(
+            insert(project_sources)
+            .values(
+                organization_id=member.organization_id,
+                region=settings.region,
+                project_id=project_id,
+                source_type="connector",
+                connector_id=req.connector_id,
+                title=req.title,
+                uri=req.tool,
+                permissions={"tool": req.tool, "args": req.args},
+                parse_status="pending",
+                index_status="pending",
+                created_by=member.id,
+            )
+            .returning(project_sources.c.id)
+        )
+        source_id = str(result.scalar_one())
+
+    await audit.log(
+        "source_added",
+        member.id,
+        "projects.add_connector_source",
+        resource_type="project_sources",
+        resource_id=source_id,
+        payload={"project_id": project_id, "source_type": "connector", "tool": req.tool},
+    )
+    return {"source_id": source_id}
+
+
+@router.post("/{project_id}/sources/{sid}/sync")
+async def sync_source(
+    project_id: str,
+    sid: str,
+    member: Member = Depends(get_current_member),
+) -> dict:
+    """Pull + index a connector source's documents through the tool broker."""
+    await _require_member(member, project_id)
+    await _require_source(member, project_id, sid)
+    await permissions.check(member, "sync_project_source", project_id)
+
+    from jobs.source_sync import sync_connector_source
+
+    summary = await sync_connector_source(sid, member.organization_id)
+    await audit.log(
+        "source_synced",
+        member.id,
+        "projects.sync_source",
+        resource_type="project_sources",
+        resource_id=sid,
+        payload={
+            "project_id": project_id,
+            "synced": summary.get("synced"),
+            "indexed": summary.get("indexed"),
+            "index_status": summary.get("index_status"),
+        },
+    )
+    return summary
+
+
 @router.get("/{project_id}/tasks")
 async def get_project_tasks(
     project_id: str,
