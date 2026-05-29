@@ -2,6 +2,7 @@
 
 import { Component, ReactNode, useEffect, useRef, useState, useMemo, useCallback } from "react";
 import { usePathname, useRouter } from "next/navigation";
+import ArtifactsScreen from "../../components/artifacts/ArtifactsScreen";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 const CONFIGURED_API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
@@ -18,7 +19,7 @@ function apiBase() {
 }
 
 // ─── Types ───────────────────────────────────────────────────────────────────
-type Route = "chat" | "activity" | "approvals" | "memory" | "connectors" | "assistants" | "settings";
+type Route = "chat" | "activity" | "approvals" | "memory" | "connectors" | "assistants" | "artifacts" | "settings";
 type SettingsTab = "general" | "profile" | "organization" | "members" | "permissions" | "employees" | "runtime" | "memory-settings" | "tools-settings" | "approval-settings" | "notifications" | "security" | "billing" | "audit" | "developer" | "danger";
 type Conversation = { id: string; title: string | null; updated_at?: string; created_at?: string };
 type MessageRole = "user" | "assistant" | "system" | "tool";
@@ -268,6 +269,7 @@ function routeFromPath(pathname: string | null): Route {
   if (pathname === "/memory") return "memory";
   if (pathname === "/connectors") return "connectors";
   if (pathname === "/assistants") return "assistants";
+  if (pathname === "/artifacts") return "artifacts";
   if (pathname === "/settings") return "settings";
   return "chat";
 }
@@ -608,6 +610,7 @@ function ChronosAppInner() {
         {route === "activity"   && <ActivityScreen />}
         {route === "approvals"  && <ApprovalsScreen onDecision={loadPendingApprovals} />}
         {route === "memory"     && <MemoryScreen />}
+        {route === "artifacts"  && <ArtifactsScreen />}
         {route === "connectors" && <ConnectorsScreen />}
         {route === "assistants" && <AssistantsScreen onStartConversation={(personaId) => {
           setActivePersonaId(personaId);
@@ -643,6 +646,7 @@ function Sidebar({
     { id: "activity"   as Route, icon: <IC.Activity size={15}/>,   label: "Activity" },
     { id: "approvals"  as Route, icon: <IC.Approvals size={15}/>,  label: "Approvals",  badge: pendingApprovals || null, badgeKind: "warn" },
     { id: "memory"     as Route, icon: <IC.Memory size={15}/>,     label: "Memory" },
+    { id: "artifacts"  as Route, icon: <IC.Folder size={15}/>,     label: "Artifacts" },
     { id: "connectors" as Route, icon: <IC.Connectors size={15}/>, label: "Connectors" },
     { id: "assistants" as Route, icon: <IC.Personas size={15}/>,   label: "Assistants" },
   ];
