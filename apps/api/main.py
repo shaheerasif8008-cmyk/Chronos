@@ -7,7 +7,7 @@ from sqlalchemy import select
 from jobs import context_update, profile_synthesis
 from core.db import engine, reflect_table
 from runtime import task_runner
-from routers import activity, approvals, artifacts, attachments, auth, chat, connectors, context, memory, settings, tasks, workflows
+from routers import activity, approvals, artifact_share, artifacts, attachments, auth, chat, connectors, context, memory, settings, tasks, workflows
 
 app = FastAPI(title="Chronos API", version="0.1.0")
 
@@ -33,6 +33,7 @@ app.include_router(context.router)
 app.include_router(tasks.router)
 app.include_router(activity.router)
 app.include_router(approvals.router)
+app.include_router(artifact_share.router)
 app.include_router(artifacts.router)
 app.include_router(attachments.router)
 app.include_router(settings.router)

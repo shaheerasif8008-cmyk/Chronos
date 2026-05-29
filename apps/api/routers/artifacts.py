@@ -14,6 +14,7 @@ from core.artifacts import (
     soft_delete_artifact,
     update_artifact_meta,
 )
+from core.artifact_shares import create_share, get_share_for_artifact, revoke_share
 from core.artifact_versions import (
     create_version,
     diff_versions,
@@ -206,3 +207,30 @@ async def delete_artifact(artifact_id: str, member: Member = Depends(get_current
     await soft_delete_artifact(artifact_id, member.organization_id)
     await audit.log("artifact", member.id, "artifact.delete", resource_type="artifact", resource_id=artifact_id)
     return {"ok": True}
+
+
+@router.post("/{artifact_id}/publish")
+async def publish_artifact(artifact_id: str, member: Member = Depends(get_current_member)):
+    await _require(member, "artifact.publish", artifact_id)
+    share = await create_share(artifact_id, org_id=member.organization_id, created_by=f"member:{member.id}")
+    await audit.log("artifact", member.id, "artifact.publish", resource_type="artifact",
+                    resource_id=artifact_id, decision="published")
+    return {"token": share["token"], "status": share["status"], "share_path": f"/shared/{share['token']}"}
+
+
+@router.post("/{artifact_id}/unpublish")
+async def unpublish_artifact(artifact_id: str, member: Member = Depends(get_current_member)):
+    await _require(member, "artifact.publish", artifact_id)
+    revoked = await revoke_share(artifact_id, member.organization_id)
+    await audit.log("artifact", member.id, "artifact.unpublish", resource_type="artifact",
+                    resource_id=artifact_id, decision="revoked")
+    return {"revoked": revoked}
+
+
+@router.get("/{artifact_id}/share")
+async def share_status(artifact_id: str, member: Member = Depends(get_current_member)):
+    await _require(member, "artifact.read", artifact_id)
+    share = await get_share_for_artifact(artifact_id, member.organization_id)
+    if not share:
+        return {"published": False}
+    return {"published": True, "token": share["token"], "share_path": f"/shared/{share['token']}"}

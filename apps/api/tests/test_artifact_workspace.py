@@ -80,3 +80,30 @@ async def test_cross_tenant_version_isolation():
     aid = await save_artifact("secret", kind="markdown", title="X", org_id=org_a)
     assert await read_version_content(aid, 1, org_b) is None
     assert await read_version_content(aid, 1, org_a) == b"secret"
+
+
+@_requires_db
+@pytest.mark.asyncio
+async def test_publish_then_unpublish_revokes_token():
+    from core.artifacts import save_artifact
+    from core.artifact_shares import create_share, get_active_share_by_token, revoke_share
+
+    org = f"test-{uuid.uuid4().hex[:8]}"
+    aid = await save_artifact("public doc", kind="markdown", title="P", org_id=org)
+    share = await create_share(aid, org_id=org)
+    token = share["token"]
+    assert await get_active_share_by_token(token) is not None
+    assert (await create_share(aid, org_id=org))["token"] == token
+    assert await revoke_share(aid, org) is True
+    assert await get_active_share_by_token(token) is None
+
+
+@_requires_db
+@pytest.mark.asyncio
+async def test_revoke_when_not_published_is_false():
+    from core.artifacts import save_artifact
+    from core.artifact_shares import revoke_share
+
+    org = f"test-{uuid.uuid4().hex[:8]}"
+    aid = await save_artifact("doc", kind="markdown", title="Q", org_id=org)
+    assert await revoke_share(aid, org) is False
