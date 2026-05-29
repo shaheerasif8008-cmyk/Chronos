@@ -30,10 +30,12 @@ type Message = {
   status?: MessageStatus;
   created_at?: string;
   tool_traces?: ToolTrace[];
+  reasoning_summaries?: ReasoningSummary[];
   artifacts?: ArtifactRef[];
   thinking?: boolean;
 };
 type ToolTrace = { id: string; tool: string; summary: string; status: MessageStatus };
+type ReasoningSummary = { id: string; iteration?: number; summary: string; status: MessageStatus };
 type ArtifactRef = { id: string; title: string; kind: string; mime_type?: string; size_bytes?: number };
 type MemoryEntry = { id: string; scope: string; scope_id: string; content: string; source: string; importance_score?: number; created_by?: string | null; created_at?: string };
 type Connector = {
@@ -1072,6 +1074,23 @@ function ChatScreen({
           }
           return updated;
         });
+      } else if (ev.type === "trace" && ev.event && ev.event.type === "reasoning_summary") {
+        const te = ev.event;
+        const summary = String(te.summary ?? "").trim();
+        if (!summary) return;
+        setMessages(prev => {
+          const updated = [...prev];
+          const last = updated[updated.length - 1];
+          if (last?.role !== "assistant") return updated;
+          const existing = last.reasoning_summaries ?? [];
+          const id = `reasoning-${te.iteration ?? existing.length + 1}-${Date.now()}`;
+          updated[updated.length - 1] = {
+            ...last,
+            thinking: true,
+            reasoning_summaries: [...existing, { id, iteration: te.iteration, summary, status: "streaming" }],
+          };
+          return updated;
+        });
       } else if (ev.type === "trace" && ev.event) {
         const te = ev.event;
         const traceType = te.type ?? "";
@@ -1163,12 +1182,14 @@ function ChatScreen({
                 ? { ...trace, summary: "Task stream finished", status: "complete" as MessageStatus }
                 : trace
             );
+            const reasoning = (last.reasoning_summaries ?? []).map(item => ({ ...item, status: "complete" as MessageStatus }));
             updated[updated.length - 1] = {
               ...last,
               status: "complete",
               content: partial || last.content,
               thinking: false,
               tool_traces: traces,
+              reasoning_summaries: reasoning,
             };
           }
           return updated;
@@ -1328,7 +1349,7 @@ function ChatScreen({
               {messages.map((m, i) => (
                 m.role === "user"
                   ? <UserMessage key={m.id ?? `user-${i}`} content={m.content}/>
-                  : <AssistantMessage key={m.id ?? `assistant-${i}`} content={m.content} status={m.status ?? "complete"} persona={activePersona} toolTraces={m.tool_traces} artifacts={m.artifacts} thinking={m.thinking}/>
+                  : <AssistantMessage key={m.id ?? `assistant-${i}`} content={m.content} status={m.status ?? "complete"} persona={activePersona} toolTraces={m.tool_traces} reasoningSummaries={m.reasoning_summaries} artifacts={m.artifacts} thinking={m.thinking}/>
               ))}
               {streaming && messages[messages.length - 1]?.role !== "assistant" && (
                 <div className="flex gap-4">
@@ -1472,6 +1493,41 @@ function TraceRow({ trace }: { trace: ToolTrace }) {
   );
 }
 
+function ReasoningPanel({ summaries, streaming }: { summaries: ReasoningSummary[]; streaming: boolean }) {
+  const [open, setOpen] = useState(true);
+  if (!summaries.length) return null;
+  const latest = summaries[summaries.length - 1];
+  const isRunning = streaming && summaries.some(item => item.status === "streaming");
+
+  return (
+    <div className="mb-3 rounded-lg border overflow-hidden" style={{ borderColor: "var(--border-soft)", background: "var(--surface)" }}>
+      <button
+        type="button"
+        onClick={() => setOpen(value => !value)}
+        className="w-full flex items-center gap-2.5 px-3 py-2 text-left smooth hover:bg-[var(--surface-2)]"
+        style={{ color: "var(--text-muted)" }}
+      >
+        <Dot color="var(--accent)" size={6} pulse={isRunning} ring={isRunning} />
+        <span className="font-mono text-[11px]" style={{ color: "var(--text-dim)" }}>reasoning</span>
+        <span className="flex-1 text-[12.5px] truncate" style={{ color: "var(--text-muted)" }}>
+          {latest.iteration ? `Iteration ${latest.iteration}: ` : ""}{latest.summary.split("\n")[0].replace(/^[-*]\s*/, "")}
+        </span>
+        <IC.ChevronDown size={12} style={{ color: "var(--text-dim)", transform: open ? "rotate(180deg)" : undefined, transition: "transform .15s", flexShrink: 0 }}/>
+      </button>
+      {open && (
+        <div className="px-3 pb-3 pt-1 space-y-2 border-t hairline">
+          {summaries.map(item => (
+            <div key={item.id} className="text-[12.5px] leading-relaxed whitespace-pre-wrap" style={{ color: "var(--text-muted)" }}>
+              {item.iteration && <span className="font-mono text-[11px] mr-2" style={{ color: "var(--text-dim)" }}>#{item.iteration}</span>}
+              {item.summary}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ArtifactCard({ artifact }: { artifact: ArtifactRef }) {
   const [busy, setBusy] = useState(false);
   const mime = artifact.mime_type ?? "";
@@ -1537,8 +1593,9 @@ function ArtifactCard({ artifact }: { artifact: ArtifactRef }) {
   );
 }
 
-function AssistantMessage({ content, status, persona, toolTraces, artifacts, thinking }: { content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[]; artifacts?: ArtifactRef[]; thinking?: boolean }) {
+function AssistantMessage({ content, status, persona, toolTraces, reasoningSummaries, artifacts, thinking }: { content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[]; reasoningSummaries?: ReasoningSummary[]; artifacts?: ArtifactRef[]; thinking?: boolean }) {
   const hasTraces = !!(toolTraces && toolTraces.length > 0);
+  const hasReasoning = !!(reasoningSummaries && reasoningSummaries.length > 0);
   const isStreaming = status === "streaming";
   return (
     <div className="flex gap-4 fadein">
@@ -1548,6 +1605,10 @@ function AssistantMessage({ content, status, persona, toolTraces, artifacts, thi
           <span className="text-[14px] font-semibold">{persona.name}</span>
           {status === "error" && <Tag variant="danger">Error</Tag>}
         </div>
+
+        {hasReasoning && (
+          <ReasoningPanel summaries={reasoningSummaries!} streaming={isStreaming} />
+        )}
 
         {/* Inline tool traces — like Claude's tool use steps */}
         {hasTraces && (

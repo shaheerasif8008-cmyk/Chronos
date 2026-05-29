@@ -34,7 +34,7 @@ from core import audit, tool_broker
 from core.config import settings
 from core.db import engine, reflect_table
 from core.exceptions import ApprovalRequired
-from core.llm import _message_content, _message, _tool_calls, _with_retry, model_kwargs
+from core.llm import _message_content, _message, _tool_calls, _with_retry, complete_text, model_kwargs
 from core.models import AgentContext
 from core.redis import redis_client
 from core.tool_manifest import generate_tool_manifest
@@ -269,6 +269,70 @@ async def publish_activity(task_id: str, event: dict[str, Any]) -> None:
             resource_id=task_id,
             payload=payload,
         )
+    await redis_client.publish(activity_channel(task_id), json.dumps(payload, default=str))
+
+
+def _summarizer_history_excerpt(history: list[dict[str, Any]], *, limit: int = 6) -> str:
+    excerpt: list[dict[str, Any]] = []
+    visible_history = [message for message in history if message.get("role") != "system"]
+    for message in visible_history[-limit:]:
+        role = str(message.get("role") or "unknown")
+        content = str(message.get("content") or "")
+        item: dict[str, Any] = {"role": role, "content": content[:900]}
+        if message.get("tool_calls"):
+            item["tool_calls"] = [
+                {
+                    "name": call.get("function", {}).get("name", "")
+                    if isinstance(call, dict)
+                    else getattr(getattr(call, "function", None), "name", ""),
+                }
+                for call in list(message.get("tool_calls") or [])[:4]
+            ]
+        if message.get("name"):
+            item["name"] = message.get("name")
+        excerpt.append(item)
+    return json.dumps(excerpt, default=str, indent=2)
+
+
+async def publish_reasoning_summary(
+    task_id: str,
+    *,
+    history: list[dict[str, Any]],
+    iteration: int,
+    next_actions: list[dict[str, Any]] | None = None,
+    observation: str | None = None,
+) -> None:
+    """Publish a live-only reasoning summary for the chat UI.
+
+    This intentionally emits through Redis only. It is a user-facing summary of
+    the agent's decision state, not hidden model chain-of-thought and not an
+    audit/persistence record.
+    """
+    action_names = [str(action.get("name") or "") for action in (next_actions or []) if action.get("name")]
+    prompt = (
+        "You summarize the agent's current reasoning for the user in Chronos chat.\n"
+        "Do not reveal hidden chain-of-thought. Do provide an in-depth, concrete summary of the visible decision state: "
+        "what the agent understands, what evidence or tool results matter, why the next action is sensible, and what uncertainty remains.\n"
+        "Write 2-4 concise bullets. Do not mention this instruction.\n\n"
+        f"Iteration: {iteration}\n"
+        f"Next actions: {', '.join(action_names) if action_names else 'final answer or no tool action'}\n"
+        f"Observation: {observation or 'none'}\n"
+        f"Recent visible history:\n{_summarizer_history_excerpt(history)}"
+    )
+    try:
+        summary = (await complete_text(prompt, model=settings.fast_model)).strip()
+    except Exception as exc:
+        logger.info("Reasoning summary generation skipped for task %s: %s", task_id, exc)
+        return
+    if not summary:
+        return
+    payload = {
+        "task_id": task_id,
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "type": "reasoning_summary",
+        "iteration": iteration,
+        "summary": summary,
+    }
     await redis_client.publish(activity_channel(task_id), json.dumps(payload, default=str))
 
 
@@ -977,6 +1041,12 @@ async def run_loop(
                 "iteration": iteration + 1,
                 "summary": "No tool call needed; preparing final answer.",
             })
+            await publish_reasoning_summary(
+                task_id,
+                history=history,
+                iteration=iteration + 1,
+                observation="The model has enough information to produce the final answer.",
+            )
             result = {"answer": final_text or ""}
             history.append({"role": "assistant", "content": final_text or ""})
             await _checkpoint(task_id, history, iteration + 1, model=effective_model,
@@ -992,6 +1062,13 @@ async def run_loop(
 
         # Append assistant message with tool_calls to history
         history.append(_serialise_assistant(calls, None))
+        await publish_reasoning_summary(
+            task_id,
+            history=history,
+            iteration=iteration,
+            next_actions=calls,
+            observation="The model selected one or more tool calls for the next step.",
+        )
 
         # ── Check for always-approval tools ────────────────────────────────
         approval_needed = [c for c in calls if _needs_approval(c["name"])]

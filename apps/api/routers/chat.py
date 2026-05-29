@@ -313,7 +313,7 @@ async def _agent_loop_stream(
     TRACE_TYPES = {
         "tool_call", "tool_result", "tool_error", "step_start", "step_done",
         "awaiting_approval", "sub_agent_spawned", "sub_agent_complete", "thinking",
-        "route_decision", "model_step", "model_result",
+        "route_decision", "model_step", "model_result", "reasoning_summary",
     }
     final_answer: str | None = None
     try:
