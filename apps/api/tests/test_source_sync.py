@@ -265,3 +265,72 @@ async def test_revoke_no_sources_is_a_noop(monkeypatch):
     assert count == 0
     assert dsc.await_count == 0
     assert "update" not in ops
+
+
+# ─── normalize_documents — connector-shape breadth ───────────────────────────────
+
+def test_normalize_passthrough_documents_shape():
+    from jobs.source_sync import normalize_documents
+
+    docs = normalize_documents({"documents": [{"external_id": "d1", "title": "T", "content": "body"}]})
+    assert docs == [{"external_id": "d1", "title": "T", "content": "body", "permissions": {}}]
+
+
+def test_normalize_gmail_threads_shape():
+    from jobs.source_sync import normalize_documents
+
+    # gmail.search returns {"threads": [{"id", "snippet", ...}]} — no "documents".
+    docs = normalize_documents({"threads": [{"id": "t1", "snippet": "hi there team"}]})
+    assert docs[0]["external_id"] == "t1"
+    assert docs[0]["content"] == "hi there team"
+    assert docs[0]["title"] == "hi there team"
+
+
+def test_normalize_graph_value_and_bare_list():
+    from jobs.source_sync import normalize_documents
+
+    graph = normalize_documents({"value": [{"id": "m1", "subject": "Re: invoice", "body": "see attached"}]})
+    assert graph[0]["external_id"] == "m1"
+    assert graph[0]["title"] == "Re: invoice"
+    assert graph[0]["content"] == "see attached"
+
+    bare = normalize_documents([{"id": "x", "text": "plain"}])
+    assert bare[0]["content"] == "plain"
+
+
+def test_normalize_content_fallback_to_json_record():
+    from jobs.source_sync import normalize_documents
+
+    # No text-like field → keep the record verbatim rather than fabricating.
+    docs = normalize_documents({"rows": [{"id": "r1", "amount": 42, "vendor": "ACME"}]})
+    assert docs[0]["external_id"] == "r1"
+    assert "ACME" in docs[0]["content"] and "42" in docs[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_sync_indexes_real_gmail_search_threads(monkeypatch):
+    """A real connector (gmail.search) returning threads syncs end-to-end."""
+    from jobs import source_sync as ss
+    from core.models import ToolResult
+
+    threads = [
+        {"id": "t1", "snippet": "Invoice from ACME due Friday"},
+        {"id": "t2", "snippet": "Receipt for your order"},
+    ]
+    ops: list[str] = []
+    engine = _build_engine([_feed(tool="gmail.search"), None, "doc-1", None, "doc-2", None], ops)
+    _patch_module(monkeypatch, ss, engine, ops)
+
+    broker = AsyncMock(return_value=ToolResult(data={"threads": threads}, summary="2 results"))
+    monkeypatch.setattr(ss.tool_broker, "execute", broker)
+    index = AsyncMock(return_value={"index_status": "indexed", "chunk_count": 1})
+    monkeypatch.setattr(ss, "index_source", index)
+
+    out = await ss.sync_connector_source("feed-1", "default")
+
+    # Fetched gmail.search through the broker; both threads indexed.
+    assert broker.await_args.args[1] == "gmail.search"
+    assert index.await_count == 2
+    assert out["synced"] == 2
+    assert out["indexed"] == 2
+    assert out["index_status"] == "synced"

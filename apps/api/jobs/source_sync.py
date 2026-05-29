@@ -8,6 +8,8 @@ never fabricated. Revoking a connector deletes its chunks so retrieval loses acc
 """
 from __future__ import annotations
 
+import json
+
 from sqlalchemy import delete, insert, select, update
 from sqlalchemy.sql import func
 
@@ -118,14 +120,81 @@ async def _upsert_doc_source(
         return str(result.scalar_one())
 
 
+# Connector ToolResults arrive in many shapes. These are the list-bearing keys
+# we recognize, in priority order, so a sync doesn't have to be hand-tuned per
+# connector. gmail.search returns {"threads": [...]}, MS Graph {"value": [...]},
+# generic HTTP often {"items"/"results"/"rows": [...]}.
+_LIST_KEYS = ("documents", "threads", "messages", "items", "results", "rows", "value", "records", "entries")
+# Per-item field aliases → canonical (external_id, title, content).
+_ID_KEYS = ("external_id", "id", "uri", "url", "key")
+_TITLE_KEYS = ("title", "subject", "name", "summary", "snippet")
+_CONTENT_KEYS = ("content", "body", "text", "snippet", "description")
+
+
+def _extract_items(data: dict | list) -> list:
+    """Find the list of records in a connector ToolResult payload."""
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict):
+        return []
+    for key in _LIST_KEYS:
+        value = data.get(key)
+        if isinstance(value, list):
+            return value
+    # Fall back to the first list-valued field, if any.
+    for value in data.values():
+        if isinstance(value, list):
+            return value
+    return []
+
+
+def _first(item: dict, keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = item.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def _canonical_doc(item: object, index: int) -> dict:
+    """Map one connector record into the canonical {external_id, title, content} doc."""
+    if not isinstance(item, dict):
+        text = str(item)
+        return {"external_id": f"doc-{index}", "title": text[:80] or "Untitled document", "content": text, "permissions": {}}
+    external_id = _first(item, _ID_KEYS) or f"doc-{index}"
+    content = _first(item, _CONTENT_KEYS)
+    title = _first(item, _TITLE_KEYS) or (content[:80] if content else "") or "Untitled document"
+    if not content:
+        # Nothing text-like to index on its own — keep the record verbatim so the
+        # indexer still has something honest to chunk rather than fabricating.
+        content = json.dumps({k: v for k, v in item.items() if not str(k).startswith("__")}, default=str)
+    return {
+        "external_id": external_id,
+        "title": title,
+        "content": content,
+        "permissions": item.get("permissions") or {},
+    }
+
+
+def normalize_documents(data: dict | list) -> list[dict]:
+    """Normalize a connector ToolResult payload into canonical docs.
+
+    Generalizes beyond the ``{"documents": [...]}`` shape so any connector whose
+    result carries a list of records (gmail threads, Graph ``value``, generic
+    ``items``/``results``/``rows``) can sync without bespoke code.
+    """
+    return [_canonical_doc(item, i) for i, item in enumerate(_extract_items(data))]
+
+
 async def sync_connector_source(source_id: str, org_id: str) -> dict:
     """Pull documents for a connector feed and index each via the Task 9 pipeline.
 
     The feed row stores its fetch spec in ``permissions``: ``{"tool": "...", "args": {}}``.
-    Documents are fetched through ``tool_broker.execute`` (never a direct connector call)
-    and are expected at ``result.data["documents"]`` — a list of
-    ``{"external_id", "title", "content", "permissions"?}`` dicts. A broker failure marks
-    the feed failed and fabricates nothing.
+    Documents are fetched through ``tool_broker.execute`` (never a direct connector call).
+    The ToolResult payload is normalized (``normalize_documents``) into canonical
+    ``{"external_id", "title", "content"}`` docs, so connectors that return
+    ``threads``/``messages``/``items``/``value`` sync without bespoke code. A broker
+    failure marks the feed failed and fabricates nothing.
     """
     feed = await _load_connector_source(source_id, org_id)
     if feed is None:
@@ -164,7 +233,7 @@ async def sync_connector_source(source_id: str, org_id: str) -> dict:
         )
         return {"source_id": source_id, "synced": 0, "index_status": "failed"}
 
-    documents = (result.data or {}).get("documents") or []
+    documents = normalize_documents(result.data or {})
 
     # Index each document. save_artifact is imported lazily to mirror the on-demand
     # artifact I/O elsewhere in the source pipeline and keep import order simple.
