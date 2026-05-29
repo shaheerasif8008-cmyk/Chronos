@@ -68,6 +68,15 @@ class Settings(BaseSettings):
     minio_secure: bool = False
     minio_bucket: str = "chronos"
 
+    # Authorization (OpenFGA). Enforcement is OFF by default so the Phase-1 stub
+    # behavior (allow-all) is preserved until an operator opts in. When
+    # permissions_enforce is true AND openfga_api_url is set, permission.check
+    # queries OpenFGA and raises PermissionDenied on a deny.
+    permissions_enforce: bool = False
+    openfga_api_url: str = ""          # e.g. http://localhost:8080 — empty disables
+    openfga_store_id: str = ""         # resolved/created at bootstrap if empty
+    openfga_model_id: str = ""         # resolved/written at bootstrap if empty
+
     # Sub-agent concurrency
     concurrent_sub_agents: int = 5
 

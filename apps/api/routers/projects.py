@@ -88,6 +88,9 @@ async def create_project(
                 role="owner",
             )
         )
+    # Seed the authorization model so the creator owns the new project (no-op
+    # unless OpenFGA is configured).
+    await permissions.grant_project_role(member.id, "owner", project_id, member.organization_id)
     await audit.log(
         "project_created",
         member.id,
@@ -293,6 +296,11 @@ async def add_project_member(
                 )
             )
 
+    # Mirror the membership into the authorization model (no-op unless OpenFGA
+    # is configured).
+    await permissions.grant_project_role(
+        req.member_id, req.role or "member", project_id, member.organization_id
+    )
     await audit.log(
         "project_member_added",
         member.id,
@@ -337,6 +345,10 @@ async def remove_project_member(
             )
         )
 
+    # Remove both possible relations from the authorization model (no-op unless
+    # OpenFGA is configured); we don't know which role the row carried here.
+    await permissions.revoke_project_role(mid, "owner", project_id)
+    await permissions.revoke_project_role(mid, "member", project_id)
     await audit.log(
         "project_member_removed",
         member.id,

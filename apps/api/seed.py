@@ -48,6 +48,22 @@ async def upsert_seed() -> None:
                 )
             )
 
+    # Seed the OpenFGA org-admin tuple for the admin member (no-op unless an
+    # OpenFGA server is configured). Admins inherit project access via the model.
+    from core import permissions
+
+    async with engine.begin() as conn:
+        admin_id = (
+            await conn.execute(
+                select(members.c.id).where(
+                    members.c.organization_id == settings.org_id,
+                    members.c.email == settings.admin_email,
+                )
+            )
+        ).scalar_one_or_none()
+    if admin_id is not None:
+        await permissions.grant_org_membership(str(admin_id), settings.org_id, admin=True)
+
     context_dir = ROOT / "context" / settings.org_id
     context_dir.mkdir(parents=True, exist_ok=True)
     org_md = context_dir / "org.md"

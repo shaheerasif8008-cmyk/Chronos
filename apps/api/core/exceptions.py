@@ -42,6 +42,16 @@ class VaultError(ChronosError):
     """Raised when credential vault operations fail."""
 
 
+class PermissionDenied(ChronosError):
+    """Raised when an authorization check denies an action (OpenFGA enforcement)."""
+
+    def __init__(self, actor_id: str, action: str, resource: str) -> None:
+        self.actor_id = actor_id
+        self.action = action
+        self.resource = resource
+        super().__init__(f"Permission denied: {actor_id} cannot {action} on {resource}")
+
+
 class ConnectorNotFound(ChronosError):
     """Raised when no connector record matches the requested org/provider."""
 

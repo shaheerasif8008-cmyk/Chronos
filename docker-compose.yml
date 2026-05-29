@@ -37,3 +37,23 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  # OpenFGA — authorization engine behind the permission seam.
+  # Dev uses the in-memory datastore (tuples reset on restart; the API
+  # re-seeds them on member/project creation). Set OPENFGA_API_URL=http://localhost:8080
+  # and PERMISSIONS_ENFORCE=true in the API env to turn enforcement on.
+  openfga:
+    image: openfga/openfga:latest
+    command: run
+    environment:
+      OPENFGA_DATASTORE_ENGINE: memory
+      OPENFGA_LOG_LEVEL: warn
+    ports:
+      - "8080:8080"   # HTTP API
+      - "8081:8081"   # gRPC
+      - "3010:3000"   # Playground
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/grpc_health_probe", "-addr=:8081"]
+      interval: 5s
+      timeout: 5s
+      retries: 10

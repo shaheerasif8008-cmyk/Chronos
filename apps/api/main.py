@@ -1,8 +1,11 @@
 import importlib.util
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy import select
+
+from core.exceptions import PermissionDenied
 
 import asyncio
 from jobs import context_update, profile_synthesis
@@ -84,13 +87,34 @@ def _init_observability() -> None:
 _init_observability()
 
 
+@app.exception_handler(PermissionDenied)
+async def _permission_denied_handler(_request: Request, exc: PermissionDenied) -> JSONResponse:
+    """Map authorization denials to HTTP 403 (enforcement raises rather than returns)."""
+    return JSONResponse(status_code=403, content={"detail": str(exc)})
+
+
 @app.on_event("startup")
 async def start_schedulers() -> None:
+    await _bootstrap_authz()
     for scheduler in (profile_synthesis.scheduler, context_update.scheduler):
         if not scheduler.running:
             scheduler.start()
     await recover_incomplete_tasks()
     await recover_incomplete_workflows()
+
+
+async def _bootstrap_authz() -> None:
+    """Resolve/create the OpenFGA store and model when enforcement is enabled."""
+    from core import authz
+
+    if not authz.is_enabled():
+        return
+    try:
+        await authz.ensure_store_and_model()
+    except Exception:
+        # Startup must not crash if OpenFGA is briefly unavailable; checks fail
+        # closed at request time until the server is reachable.
+        pass
 
 
 async def recover_incomplete_tasks() -> list[str]:
