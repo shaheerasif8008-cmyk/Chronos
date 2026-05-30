@@ -75,6 +75,22 @@ _UNTRUSTED_WRITE_NAMES = {
     "fs__write",
 }
 
+# Strong references to fire-and-forget background tasks so they are not
+# garbage-collected mid-flight; failures are logged rather than lost.
+_BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
+
+
+def _spawn_background(coro: Any) -> None:
+    task = asyncio.create_task(coro)
+    _BACKGROUND_TASKS.add(task)
+
+    def _on_done(t: asyncio.Task[Any]) -> None:
+        _BACKGROUND_TASKS.discard(t)
+        if not t.cancelled() and t.exception() is not None:
+            logger.warning("Background task failed: %s", t.exception())
+
+    task.add_done_callback(_on_done)
+
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
@@ -1000,7 +1016,7 @@ async def stream_chat_turn(
         if not calls:
             answer = final_text or ""
             await persist_assistant_message(conversation_id, answer, requester_context, mode=mode)
-            asyncio.create_task(extract_and_save(conversation_id, message, answer, requester_context))
+            _spawn_background(extract_and_save(conversation_id, message, answer, requester_context))
             yield {"type": "done"}
             return
 
