@@ -34,7 +34,7 @@ from core import audit, tool_broker
 from core.config import settings
 from core.db import engine, reflect_table
 from core.exceptions import ApprovalRequired
-from core.llm import _message_content, _message, _tool_calls, _with_retry, complete_text, model_kwargs
+from core.llm import _message_content, _message, _tool_calls, _with_retry, complete_text, model_kwargs, resolve_agent_model, stream_step
 from core.models import AgentContext
 from core.redis import redis_client
 from core.tool_manifest import generate_tool_manifest
@@ -42,10 +42,14 @@ from core.tool_router import ToolRoutingDecision, route as route_tool
 from runtime.tool_registry import (
     ALL_TOOLS,
     ALWAYS_APPROVAL_TOOL_NAMES,
+    INLINE_CHAT_TOOLS,
     SUBAGENT_TOOLS,
+    _START_TASK_TOOL_NAME,
     _SUBAGENT_TOOL_NAME,
     to_broker_name,
 )
+from runtime import task_runner
+from memory.extraction import extract_and_save
 
 logger = logging.getLogger(__name__)
 
@@ -961,6 +965,168 @@ async def _mark_approval(approval_id: str, payload: dict[str, Any], approvals_ta
         await conn.execute(
             update(approvals_table).where(approvals_table.c.id == approval_id).values(action_payload=payload)
         )
+
+
+# ── Inline chat turn ──────────────────────────────────────────────────────────
+
+async def persist_assistant_message(conversation_id: str, content: str, requester_context: Any) -> None:
+    """Save an inline chat turn's final answer as an assistant message. Never raises."""
+    try:
+        await _save_assistant_message(
+            conversation_id,
+            content,
+            {"id": None, "organization_id": requester_context.org_id, "region": "us"},
+        )
+    except Exception as exc:  # persistence must never break the turn
+        logger.warning("Failed to persist inline assistant message: %s", exc)
+
+
+async def create_task_from_history(
+    *,
+    goal: str,
+    history: list[dict[str, Any]],
+    requester_context: Any,
+    conversation_id: str,
+    model: str | None,
+    status: str = "running",
+) -> str:
+    """Create a tasks row seeded with the full in-flight history (not a bare goal).
+
+    Used for lazy persistence on the first inline tool call and for start_task
+    promotion. The stored agent_history is what resume/approval rebuilds from.
+    """
+    tasks = await reflect_table("tasks")
+    async with engine.begin() as conn:
+        result = await conn.execute(
+            insert(tasks)
+            .values(
+                organization_id=requester_context.org_id,
+                region="us",
+                persona_id=requester_context.persona_id,
+                workspace_id=requester_context.workspace_id,
+                triggered_by=conversation_id,
+                triggered_by_member_id=requester_context.member_id,
+                status=status,
+                goal=goal,
+                plan={},
+                agent_state={
+                    "agent_history": history,
+                    "iteration_count": 0,
+                    "model": resolve_agent_model(model),
+                },
+                current_step=0,
+                result={},
+                depth=0,
+            )
+            .returning(tasks.c.id)
+        )
+        return str(result.scalar_one())
+
+
+async def stream_chat_turn(
+    *,
+    conversation_id: str,
+    message: str,
+    context_messages: list[dict[str, Any]],
+    requester_context: Any,
+    model: str | None,
+):
+    """Stream one chat turn inline.
+
+    Yields SSE-ready event dicts: conversation / token / trace / artifact /
+    task_created / awaiting_approval / done. Creates a tasks row lazily on the
+    first tool call (with full history). Promotes to a durable background task
+    when the model calls start_task.
+    """
+    yield {"type": "conversation", "conversation_id": conversation_id}
+
+    history: list[dict[str, Any]] = list(context_messages) + [{"role": "user", "content": message}]
+    effective_model = resolve_agent_model(model)
+    task_id: str | None = None
+    task: dict[str, Any] | None = None
+    iteration = 0
+
+    while iteration < MAX_ITERATIONS:
+        iteration += 1
+        final_text: str | None = None
+        calls: list[dict[str, Any]] = []
+        try:
+            async for ev in stream_step(history, INLINE_CHAT_TOOLS, effective_model):
+                if ev["type"] == "token":
+                    yield {"type": "token", "content": ev["content"]}
+                elif ev["type"] == "text_done":
+                    final_text = ev["text"]
+                elif ev["type"] == "tool_calls":
+                    calls = ev["calls"]
+        except Exception as exc:
+            logger.error("Inline turn model error: %s", exc)
+            msg = "Sorry — I hit a model error and couldn't finish that. Please try again."
+            await persist_assistant_message(conversation_id, msg, requester_context)
+            yield {"type": "token", "content": msg}
+            yield {"type": "done"}
+            return
+
+        if not calls:
+            answer = final_text or ""
+            await persist_assistant_message(conversation_id, answer, requester_context)
+            asyncio.create_task(extract_and_save(conversation_id, message, answer, requester_context))
+            yield {"type": "done"}
+            return
+
+        promote = next((c for c in calls if c["name"] == _START_TASK_TOOL_NAME), None)
+        if promote:
+            goal = _parse_args(promote["args_str"]).get("goal") or message
+            bg_id = await create_task_from_history(
+                goal=goal, history=history, requester_context=requester_context,
+                conversation_id=conversation_id, model=model, status="queued",
+            )
+            await task_runner.enqueue_task(bg_id)
+            yield {"type": "task_created", "task_id": bg_id, "background": True}
+            yield {"type": "done"}
+            return
+
+        history.append(_serialise_assistant(calls, final_text))
+        if task_id is None:
+            task_id = await create_task_from_history(
+                goal=message, history=history, requester_context=requester_context,
+                conversation_id=conversation_id, model=model, status="running",
+            )
+            task = await get_task(task_id)
+            yield {"type": "task_created", "task_id": task_id, "background": False}
+
+        agent = AgentContext.from_task(task)
+
+        approval_needed = [c for c in calls if _needs_approval(c["name"])]
+        if approval_needed:
+            await _open_approval_gate(task, approval_needed, history, iteration, model=effective_model)
+            yield {"type": "awaiting_approval", "task_id": task_id}
+            yield {"type": "done"}
+            return
+
+        for call in calls:
+            yield {"type": "trace", "event": {"type": "tool_call", "tool": call["name"],
+                                              "args_preview": _args_preview(_parse_args(call["args_str"]))}}
+            try:
+                tool_msg = await _execute_tool(call, task, agent)
+            except ApprovalRequired:
+                await _open_approval_gate(task, [call], history, iteration, model=effective_model)
+                yield {"type": "awaiting_approval", "task_id": task_id}
+                yield {"type": "done"}
+                return
+            history.append(tool_msg)
+            summary = ""
+            try:
+                summary = json.loads(tool_msg["content"]).get("summary", "")
+            except Exception:
+                pass
+            yield {"type": "trace", "event": {"type": "tool_result", "tool": call["name"], "summary": summary}}
+
+        await _checkpoint(task_id, history, iteration, model=effective_model, current_step=iteration)
+
+    msg = "This is taking many steps. Try narrowing the request, or ask me to run it as a background task."
+    await persist_assistant_message(conversation_id, msg, requester_context)
+    yield {"type": "token", "content": msg}
+    yield {"type": "done"}
 
 
 # ── Core loop ─────────────────────────────────────────────────────────────────
