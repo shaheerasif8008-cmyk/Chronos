@@ -198,6 +198,20 @@ SPAWN_SUBAGENT = _fn(
     ["goal"],
 )
 
+START_TASK = _fn(
+    "start_task",
+    "Promote the current request into a durable background task. Call this ONLY "
+    "when the work is large and long-running (multi-step research, batch outreach, "
+    "anything that will take minutes or spawn sub-agents). The task runs in the "
+    "background, survives disconnects, streams its activity, and routes risky "
+    "actions through approvals. For quick questions or a single lookup, just "
+    "answer or use a tool directly — do NOT call start_task.",
+    {
+        "goal": {"type": "string", "description": "Clear, self-contained goal for the durable task."},
+    },
+    ["goal"],
+)
+
 # ── Registry sets ─────────────────────────────────────────────────────────────
 
 #: Full tool set available to top-level agent loops.
@@ -235,6 +249,25 @@ ALWAYS_APPROVAL_TOOL_NAMES: frozenset[str] = frozenset(
 )
 
 _SUBAGENT_TOOL_NAME = "spawn__subagent"
+
+#: Tools available to an inline chat turn: quick tools + promotion. No recursive
+#: sub-agent spawning inline — large work promotes via start_task instead.
+INLINE_CHAT_TOOLS: list[dict[str, Any]] = [
+    BROWSER_SEARCH,
+    BROWSER_FETCH,
+    BROWSER_EXTRACT_CONTACTS,
+    GMAIL_DRAFT,
+    GMAIL_SEARCH,
+    FS_LIST,
+    FS_READ,
+    FS_WRITE,
+    CODE_PYTHON,
+    DOC_PARSE,
+    DOC_READ,
+    START_TASK,
+]
+
+_START_TASK_TOOL_NAME = "start_task"
 
 
 def to_broker_name(registry_name: str) -> str:

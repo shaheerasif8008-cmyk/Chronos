@@ -37,16 +37,12 @@ def _wire_resume(monkeypatch, executor, task):
     async def fake_resume_after_approval(task_id):
         calls["resume_after_approval"].append(task_id)
 
-    async def fake_resume_dag(self, t):
-        calls["resume_dag"].append(t)
-
     async def fake_run(self, task_id):
         calls["run"].append(task_id)
 
     monkeypatch.setattr(executor, "get_task", fake_get_task)
     monkeypatch.setattr(executor, "run_loop", fake_run_loop)
     monkeypatch.setattr(executor, "resume_after_approval", fake_resume_after_approval)
-    monkeypatch.setattr(executor.TaskExecutor, "_resume_dag", fake_resume_dag)
     monkeypatch.setattr(executor.TaskExecutor, "run", fake_run)
     return calls
 
@@ -65,7 +61,7 @@ async def test_resume_reenters_native_loop_when_history_present(monkeypatch):
     await executor.TaskExecutor().resume("task-5")
 
     assert calls["run_loop"] and not calls["resume_after_approval"]
-    assert not calls["resume_dag"] and not calls["run"]
+    assert not calls["run"]
 
 
 @pytest.mark.asyncio
@@ -79,19 +75,6 @@ async def test_resume_delegates_to_run_for_unstarted_native_task(monkeypatch):
 
     assert calls["run"] == ["task-5"]            # fresh run → pre-flight + routing
     assert not calls["run_loop"]
-
-
-@pytest.mark.asyncio
-async def test_resume_routes_dag_task_to_resume_dag(monkeypatch):
-    from runtime import executor
-
-    plan = {"steps": [{"id": "s1", "action": "think", "description": "x", "tool": None, "args": {}, "approval_required": False, "depends_on": []}], "context": {}}
-    task = _native_task(status="running", history=[{"role": "user", "content": "hi"}], plan=plan)
-    calls = _wire_resume(monkeypatch, executor, task)
-
-    await executor.TaskExecutor().resume("task-5")
-
-    assert calls["resume_dag"] and not calls["run_loop"] and not calls["resume_after_approval"]
 
 
 @pytest.mark.asyncio
@@ -117,77 +100,6 @@ async def test_resume_ignores_terminal_task(monkeypatch):
     await executor.TaskExecutor().resume("task-5")
 
     assert not any(calls.values())
-
-
-# ── Step 3: named checkpoints ────────────────────────────────────────────────
-
-
-def test_normalize_plan_preserves_checkpoint_key():
-    from runtime import planner
-
-    plan = planner.normalize_plan(
-        {
-            "steps": [
-                {"id": "s1", "action": "think", "checkpoint": "phase1", "depends_on": []}
-            ],
-            "context": {},
-        }
-    )
-    assert plan["steps"][0]["checkpoint"] == "phase1"
-
-
-@pytest.mark.asyncio
-async def test_dag_step_with_checkpoint_creates_named_snapshot(monkeypatch):
-    from core.models import ToolResult
-    from runtime import executor
-
-    plan = {
-        "steps": [
-            {
-                "id": "s1",
-                "action": "tool_call",
-                "tool": "browser.search",
-                "args": {"query": "x"},
-                "output_key": "res",
-                "checkpoint": "phase1",
-                "depends_on": [],
-            }
-        ],
-        "context": {},
-    }
-    task = _native_task(status="pending", plan=plan)
-    checkpoints = []
-
-    async def fake_get_task(task_id):
-        return dict(task)
-
-    async def fake_save_task(task_id, **values):
-        task.update(values)
-
-    async def fake_emit(task_id, event, actor_id="chronos"):
-        return None
-
-    async def fake_execute(agent, tool, args):
-        return ToolResult(summary="ok", data={"hits": 3})
-
-    async def fake_create_checkpoint(t, name, snapshot, step_index):
-        checkpoints.append((name, snapshot, step_index))
-        return "cp-1"
-
-    monkeypatch.setattr(executor, "get_task", fake_get_task)
-    monkeypatch.setattr(executor, "save_task", fake_save_task)
-    monkeypatch.setattr(executor, "emit_activity", fake_emit)
-    monkeypatch.setattr(executor.tool_broker, "execute", fake_execute)
-    monkeypatch.setattr(executor, "create_checkpoint", fake_create_checkpoint)
-    monkeypatch.setattr(executor.TaskExecutor, "_maybe_replan", lambda self, t, c, ctx, m: None)
-
-    await executor.TaskExecutor().run("task-5")
-
-    assert len(checkpoints) == 1
-    name, snapshot, step_index = checkpoints[0]
-    assert name == "phase1"
-    assert step_index == 1
-    assert snapshot["res"] == {"hits": 3}      # public context frozen at checkpoint
 
 
 # ── Step 4: sub-agent state inheritance ──────────────────────────────────────
@@ -255,30 +167,3 @@ async def test_load_history_no_block_without_inheritance(monkeypatch):
 
     assert len(history) == 2
     assert history[1]["content"] == "just do it"
-
-
-@pytest.mark.asyncio
-async def test_dag_spawn_injects_live_context_into_subagent(monkeypatch):
-    from runtime import agent_loop, executor
-
-    captured = {}
-
-    async def fake_run_subagent(task, args, depth):
-        captured["args"] = args
-        return {}
-
-    async def fake_emit(task_id, event, actor_id="chronos"):
-        return None
-
-    monkeypatch.setattr(agent_loop, "_run_subagent", fake_run_subagent)
-    monkeypatch.setattr(executor, "emit_activity", fake_emit)
-
-    task = _native_task(status="running")
-    step = {"id": "sp", "action": "spawn_sub_agent", "args": {"goal": "sub", "inherit_keys": ["leads"]}}
-    context = {"leads": [{"x": 1}], "noise": "ignored"}
-
-    await executor.TaskExecutor()._execute_dag_step(task, step, context, None, None, set(), set())
-
-    inherited = captured["args"]["_inherited_context"]
-    assert inherited["parent_context"] == {"leads": [{"x": 1}]}
-    assert inherited["parent_goal"] == "do the thing"

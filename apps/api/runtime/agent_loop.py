@@ -34,25 +34,27 @@ from core import audit, tool_broker
 from core.config import settings
 from core.db import engine, reflect_table
 from core.exceptions import ApprovalRequired
-from core.llm import _message_content, _message, _tool_calls, _with_retry, complete_text, model_kwargs
+from core.llm import _message_content, _message, _tool_calls, _with_retry, model_kwargs, resolve_agent_model, stream_step
 from core.models import AgentContext
 from core.redis import redis_client
 from core.tool_manifest import generate_tool_manifest
-from core.tool_router import ToolRoutingDecision, route as route_tool
 from runtime.tool_registry import (
     ALL_TOOLS,
     ALWAYS_APPROVAL_TOOL_NAMES,
+    INLINE_CHAT_TOOLS,
     SUBAGENT_TOOLS,
+    _START_TASK_TOOL_NAME,
     _SUBAGENT_TOOL_NAME,
     to_broker_name,
 )
+from runtime import task_runner
+from memory.extraction import extract_and_save
 
 logger = logging.getLogger(__name__)
 
 MAX_ITERATIONS = 40
 MAX_DEPTH = 3
 DURABLE_TRACE_TYPES = {
-    "route_decision",
     "model_step",
     "model_result",
     "tool_call",
@@ -72,6 +74,22 @@ _UNTRUSTED_WRITE_NAMES = {
     "gmail__send",
     "fs__write",
 }
+
+# Strong references to fire-and-forget background tasks so they are not
+# garbage-collected mid-flight; failures are logged rather than lost.
+_BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
+
+
+def _spawn_background(coro: Any) -> None:
+    task = asyncio.create_task(coro)
+    _BACKGROUND_TASKS.add(task)
+
+    def _on_done(t: asyncio.Task[Any]) -> None:
+        _BACKGROUND_TASKS.discard(t)
+        if not t.cancelled() and t.exception() is not None:
+            logger.warning("Background task failed: %s", t.exception())
+
+    task.add_done_callback(_on_done)
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
@@ -190,7 +208,7 @@ async def _persist_to_conversation(task: dict[str, Any], content: str) -> str | 
         return None
 
 
-async def _save_assistant_message(conversation_id: str, content: str, task: dict[str, Any]) -> str | None:
+async def _save_assistant_message(conversation_id: str, content: str, task: dict[str, Any], *, mode: str | None = None) -> str | None:
     """Insert the task's final answer as an assistant message in the conversation.
 
     This is the source of truth — it runs in the agent loop's background task,
@@ -220,6 +238,7 @@ async def _save_assistant_message(conversation_id: str, content: str, task: dict
                 role="assistant",
                 content=content,
                 token_count=len(content.split()),
+                mode=mode,
             )
             .returning(messages.c.id)
         )
@@ -281,70 +300,6 @@ async def publish_activity(task_id: str, event: dict[str, Any]) -> None:
     await redis_client.publish(activity_channel(task_id), json.dumps(payload, default=str))
 
 
-def _summarizer_history_excerpt(history: list[dict[str, Any]], *, limit: int = 6) -> str:
-    excerpt: list[dict[str, Any]] = []
-    visible_history = [message for message in history if message.get("role") != "system"]
-    for message in visible_history[-limit:]:
-        role = str(message.get("role") or "unknown")
-        content = str(message.get("content") or "")
-        item: dict[str, Any] = {"role": role, "content": content[:900]}
-        if message.get("tool_calls"):
-            item["tool_calls"] = [
-                {
-                    "name": call.get("function", {}).get("name", "")
-                    if isinstance(call, dict)
-                    else getattr(getattr(call, "function", None), "name", ""),
-                }
-                for call in list(message.get("tool_calls") or [])[:4]
-            ]
-        if message.get("name"):
-            item["name"] = message.get("name")
-        excerpt.append(item)
-    return json.dumps(excerpt, default=str, indent=2)
-
-
-async def publish_reasoning_summary(
-    task_id: str,
-    *,
-    history: list[dict[str, Any]],
-    iteration: int,
-    next_actions: list[dict[str, Any]] | None = None,
-    observation: str | None = None,
-) -> None:
-    """Publish a live-only reasoning summary for the chat UI.
-
-    This intentionally emits through Redis only. It is a user-facing summary of
-    the agent's decision state, not hidden model chain-of-thought and not an
-    audit/persistence record.
-    """
-    action_names = [str(action.get("name") or "") for action in (next_actions or []) if action.get("name")]
-    prompt = (
-        "You summarize the agent's current reasoning for the user in Chronos chat.\n"
-        "Do not reveal hidden chain-of-thought. Do provide an in-depth, concrete summary of the visible decision state: "
-        "what the agent understands, what evidence or tool results matter, why the next action is sensible, and what uncertainty remains.\n"
-        "Write 2-4 concise bullets. Do not mention this instruction.\n\n"
-        f"Iteration: {iteration}\n"
-        f"Next actions: {', '.join(action_names) if action_names else 'final answer or no tool action'}\n"
-        f"Observation: {observation or 'none'}\n"
-        f"Recent visible history:\n{_summarizer_history_excerpt(history)}"
-    )
-    try:
-        summary = (await complete_text(prompt, model=settings.fast_model)).strip()
-    except Exception as exc:
-        logger.info("Reasoning summary generation skipped for task %s: %s", task_id, exc)
-        return
-    if not summary:
-        return
-    payload = {
-        "task_id": task_id,
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "type": "reasoning_summary",
-        "iteration": iteration,
-        "summary": summary,
-    }
-    await redis_client.publish(activity_channel(task_id), json.dumps(payload, default=str))
-
-
 # ── Message history ───────────────────────────────────────────────────────────
 
 async def _agent_system_message(tools: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -353,23 +308,22 @@ async def _agent_system_message(tools: list[dict[str, Any]] | None = None) -> di
     return {
         "role": "system",
         "content": (
-            "You are Chronos running an autonomous enterprise task. "
-            f"Current date: {current_date}. "
-            "Use the available tools to accomplish the goal. "
-            "For latest, current, recent, news, or time-sensitive questions, use browser__search "
-            "with a query anchored to the current date instead of relying on model memory. "
-            "You may call multiple independent tools in parallel in a single response. "
-            "When you have gathered enough information to fully answer the goal, respond with "
-            "a clear final answer — do not make unnecessary additional tool calls. "
-            "All external actions are governed by the broker; some require human approval. "
-            "Be direct and operational.\n\n"
+            "You are Chronos, an enterprise AI assistant. Answer quick questions "
+            "directly and conversationally. Use tools only when they genuinely help: "
+            "use browser__search for the latest / current / recent / time-sensitive facts "
+            f"(Current date: {current_date}) instead of relying on model memory; "
+            "read or write files, draft emails. You may call multiple independent tools in "
+            "parallel. Do not narrate tool use you are not doing, and stop calling tools once "
+            "you can answer. "
+            "If a request is a large, multi-step, long-running job (deep research, batch "
+            "outreach, anything spanning many steps or sub-agents), call start_task to run it "
+            "as a durable background task instead of doing it all inline. "
+            "All external actions are governed by the broker; some require human approval.\n\n"
             "CRITICAL RULE — Honesty about search results:\n"
             "- If a search returns 0 results, say so. Do not fabricate statistics, sources, or data.\n"
             "- If a tool result contains `is_fallback: true` or a `warning` field, the live search failed. "
-            "Report this to the user honestly. Do not use placeholder/fixture data as real information.\n"
-            "- If you cannot find real data to answer a question, say \"I could not find that information\" "
-            "rather than making up plausible-looking numbers or sources.\n"
-            "- Fabricating statistics, study results, or sources undermines user trust and is never acceptable.\n\n"
+            "Report this honestly. Do not present placeholder/fixture data as real.\n"
+            "- If you cannot find real data, say \"I could not find that information\" rather than inventing it.\n\n"
             f"{manifest}"
         ),
     }
@@ -475,7 +429,6 @@ async def _llm_step(
     history: list[dict[str, Any]],
     tools: list[dict[str, Any]],
     model: str,
-    routing_decision: ToolRoutingDecision | None = None,
 ) -> tuple[str | None, list[dict[str, Any]]]:
     """Call the LLM and return (final_text | None, list_of_tool_calls).
 
@@ -485,10 +438,7 @@ async def _llm_step(
     """
     kwargs = model_kwargs(model, messages=history, stream=False)
     kwargs["tools"] = tools
-    if routing_decision and routing_decision.tool and routing_decision.confidence >= 0.75:
-        kwargs["tool_choice"] = {"type": "function", "function": {"name": routing_decision.tool}}
-    else:
-        kwargs["tool_choice"] = "auto"
+    kwargs["tool_choice"] = "auto"
     response = await _with_retry(lambda: litellm.acompletion(**kwargs))
 
     msg = _message(response)
@@ -623,21 +573,6 @@ def _append_replan_instruction(
                 "and continue from the current state. Do not repeat the same failing call unless "
                 "new evidence justifies it. Error summary: "
                 f"{json.dumps(errors, default=str)}"
-            ),
-        }
-    )
-
-
-def _append_routing_instruction(history: list[dict[str, Any]], decision: ToolRoutingDecision) -> None:
-    if not decision.tool or decision.confidence < 0.6:
-        return
-    history.append(
-        {
-            "role": "system",
-            "content": (
-                "Tool routing observation: the best first tool appears to be "
-                f"`{decision.tool}` with confidence {decision.confidence:.2f}. "
-                f"Reason: {decision.reasoning}. Use it if the current state still matches."
             ),
         }
     )
@@ -975,6 +910,178 @@ async def _mark_approval(approval_id: str, payload: dict[str, Any], approvals_ta
         )
 
 
+# ── Inline chat turn ──────────────────────────────────────────────────────────
+
+async def persist_assistant_message(
+    conversation_id: str, content: str, requester_context: Any, *, mode: str | None = None
+) -> None:
+    """Save an inline chat turn's final answer as an assistant message. Never raises."""
+    try:
+        await _save_assistant_message(
+            conversation_id,
+            content,
+            {"id": None, "organization_id": requester_context.org_id, "region": "us"},
+            mode=mode,
+        )
+    except Exception as exc:  # persistence must never break the turn
+        logger.warning("Failed to persist inline assistant message: %s", exc)
+
+
+async def create_task_from_history(
+    *,
+    goal: str,
+    history: list[dict[str, Any]],
+    requester_context: Any,
+    conversation_id: str,
+    model: str | None,
+    status: str = "running",
+) -> str:
+    """Create a tasks row seeded with the full in-flight history (not a bare goal).
+
+    Used for lazy persistence on the first inline tool call and for start_task
+    promotion. The stored agent_history is what resume/approval rebuilds from.
+    """
+    tasks = await reflect_table("tasks")
+    async with engine.begin() as conn:
+        result = await conn.execute(
+            insert(tasks)
+            .values(
+                organization_id=requester_context.org_id,
+                region="us",
+                persona_id=requester_context.persona_id,
+                workspace_id=requester_context.workspace_id,
+                triggered_by=conversation_id,
+                triggered_by_member_id=requester_context.member_id,
+                status=status,
+                goal=goal,
+                plan={},
+                agent_state={
+                    "agent_history": history,
+                    "iteration_count": 0,
+                    "model": resolve_agent_model(model),
+                },
+                current_step=0,
+                result={},
+                depth=0,
+            )
+            .returning(tasks.c.id)
+        )
+        return str(result.scalar_one())
+
+
+async def stream_chat_turn(
+    *,
+    conversation_id: str,
+    message: str,
+    context_messages: list[dict[str, Any]],
+    requester_context: Any,
+    model: str | None,
+    mode: str | None = None,
+):
+    """Stream one chat turn inline.
+
+    Yields SSE-ready event dicts: conversation / token / trace / artifact /
+    task_created / awaiting_approval / done. Creates a tasks row lazily on the
+    first tool call (with full history). Promotes to a durable background task
+    when the model calls start_task.
+    """
+    yield {"type": "conversation", "conversation_id": conversation_id}
+
+    history: list[dict[str, Any]] = list(context_messages) + [{"role": "user", "content": message}]
+    effective_model = resolve_agent_model(model)
+    task_id: str | None = None
+    task: dict[str, Any] | None = None
+    iteration = 0
+
+    while iteration < MAX_ITERATIONS:
+        iteration += 1
+        final_text: str | None = None
+        calls: list[dict[str, Any]] = []
+        try:
+            async for ev in stream_step(history, INLINE_CHAT_TOOLS, effective_model):
+                if ev["type"] == "token":
+                    yield {"type": "token", "content": ev["content"]}
+                elif ev["type"] == "text_done":
+                    final_text = ev["text"]
+                elif ev["type"] == "tool_calls":
+                    calls = ev["calls"]
+        except Exception as exc:
+            logger.error("Inline turn model error: %s", exc)
+            msg = "Sorry — I hit a model error and couldn't finish that. Please try again."
+            await persist_assistant_message(conversation_id, msg, requester_context, mode=mode)
+            yield {"type": "token", "content": msg}
+            yield {"type": "done"}
+            return
+
+        if not calls:
+            answer = final_text or ""
+            await persist_assistant_message(conversation_id, answer, requester_context, mode=mode)
+            _spawn_background(extract_and_save(conversation_id, message, answer, requester_context))
+            yield {"type": "done"}
+            return
+
+        promote = next((c for c in calls if c["name"] == _START_TASK_TOOL_NAME), None)
+        if promote:
+            goal = _parse_args(promote["args_str"]).get("goal") or message
+            bg_id = await create_task_from_history(
+                goal=goal, history=history, requester_context=requester_context,
+                conversation_id=conversation_id, model=model, status="queued",
+            )
+            await task_runner.enqueue_task(bg_id)
+            yield {"type": "task_created", "task_id": bg_id, "background": True}
+            yield {"type": "done"}
+            return
+
+        history.append(_serialise_assistant(calls, final_text))
+        if task_id is None:
+            task_id = await create_task_from_history(
+                goal=message, history=history, requester_context=requester_context,
+                conversation_id=conversation_id, model=model, status="running",
+            )
+            task = await get_task(task_id)
+            yield {"type": "task_created", "task_id": task_id, "background": False}
+
+        agent = AgentContext.from_task(task)
+
+        approval_needed = [c for c in calls if _needs_approval(c["name"])]
+        # Mirror run_loop's escalation: once untrusted (prompt-injected) content is in
+        # history, any external write must be gated even if it isn't always-approval.
+        if _history_has_prompt_injection(history):
+            approval_needed.extend(
+                c for c in calls if _call_is_external_write(c) and c not in approval_needed
+            )
+        if approval_needed:
+            await _open_approval_gate(task, approval_needed, history, iteration, model=effective_model)
+            yield {"type": "awaiting_approval", "task_id": task_id}
+            yield {"type": "done"}
+            return
+
+        for call in calls:
+            yield {"type": "trace", "event": {"type": "tool_call", "tool": call["name"],
+                                              "args_preview": _args_preview(_parse_args(call["args_str"]))}}
+            try:
+                tool_msg = await _execute_tool(call, task, agent)
+            except ApprovalRequired:
+                await _open_approval_gate(task, [call], history, iteration, model=effective_model)
+                yield {"type": "awaiting_approval", "task_id": task_id}
+                yield {"type": "done"}
+                return
+            history.append(tool_msg)
+            summary = ""
+            try:
+                summary = json.loads(tool_msg["content"]).get("summary", "")
+            except Exception:
+                pass
+            yield {"type": "trace", "event": {"type": "tool_result", "tool": call["name"], "summary": summary}}
+
+        await _checkpoint(task_id, history, iteration, model=effective_model, current_step=iteration)
+
+    msg = "This is taking many steps. Try narrowing the request, or ask me to run it as a background task."
+    await persist_assistant_message(conversation_id, msg, requester_context, mode=mode)
+    yield {"type": "token", "content": msg}
+    yield {"type": "done"}
+
+
 # ── Core loop ─────────────────────────────────────────────────────────────────
 
 async def run_loop(
@@ -1000,16 +1107,6 @@ async def run_loop(
 
     history = await _load_history(task, effective_tools)
     iteration = int(task.get("iteration_count") or 0)
-    routing_decision: ToolRoutingDecision | None = None
-    if iteration == 0:
-        routing_decision = await route_tool(str(task["goal"]), [tool["function"]["name"] for tool in effective_tools])
-        _append_routing_instruction(history, routing_decision)
-        await publish_activity(task_id, {
-            "type": "route_decision",
-            "tool": routing_decision.tool,
-            "confidence": routing_decision.confidence,
-            "summary": routing_decision.reasoning,
-        })
 
     await save_task(task_id, status="running",
                     started_at=task.get("started_at") or datetime.now(timezone.utc))
@@ -1037,8 +1134,7 @@ async def run_loop(
         })
         await publish_activity(task_id, {"type": "thinking"})
         try:
-            final_text, calls = await _llm_step(history, effective_tools, effective_model, routing_decision)
-            routing_decision = None
+            final_text, calls = await _llm_step(history, effective_tools, effective_model)
         except Exception as exc:
             logger.error("LLM error in agent loop for task %s: %s", task_id, exc)
             await save_task(task_id, status="failed", error=str(exc))
@@ -1056,12 +1152,6 @@ async def run_loop(
                 "iteration": iteration + 1,
                 "summary": "No tool call needed; preparing final answer.",
             })
-            await publish_reasoning_summary(
-                task_id,
-                history=history,
-                iteration=iteration + 1,
-                observation="The model has enough information to produce the final answer.",
-            )
             result = {"answer": final_text or ""}
             history.append({"role": "assistant", "content": final_text or ""})
             await _checkpoint(task_id, history, iteration + 1, model=effective_model,
@@ -1080,13 +1170,6 @@ async def run_loop(
 
         # Append assistant message with tool_calls to history
         history.append(_serialise_assistant(calls, None))
-        await publish_reasoning_summary(
-            task_id,
-            history=history,
-            iteration=iteration,
-            next_actions=calls,
-            observation="The model selected one or more tool calls for the next step.",
-        )
 
         # ── Check for always-approval tools ────────────────────────────────
         approval_needed = [c for c in calls if _needs_approval(c["name"])]

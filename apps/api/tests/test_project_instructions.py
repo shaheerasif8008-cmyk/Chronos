@@ -438,26 +438,18 @@ async def test_send_message_pushes_req_project_id_into_requester_context(monkeyp
     def fake_extract_explicit(message):
         return None
 
-    async def fake_classify_intent(message):
-        return {"mode": "chat", "confidence": 0.9, "goal": ""}
 
-    async def fake_stream_completion(context, model_id=None):
-        yield "hello"
+    async def fake_stream_chat_turn(**kwargs):
+        yield {"type": "done"}
 
-    async def fake_extract_and_save(*args, **kwargs):
-        pass
 
     monkeypatch.setattr(chat, "assemble_context", fake_assemble_context)
     monkeypatch.setattr(chat.permissions, "check", fake_check)
     monkeypatch.setattr(chat, "_create_conversation", fake_create_conversation)
     monkeypatch.setattr(chat, "_save_message", fake_save_message)
     monkeypatch.setattr(chat, "extract_explicit_memory_content", fake_extract_explicit)
-    monkeypatch.setattr(chat, "classify_intent", fake_classify_intent)
-    monkeypatch.setattr(chat, "stream_completion", fake_stream_completion)
-    monkeypatch.setattr(chat, "extract_and_save", fake_extract_and_save)
+    monkeypatch.setattr(chat, "stream_chat_turn", fake_stream_chat_turn)
     monkeypatch.setattr(chat.audit, "log", AsyncMock())
-    # Force trivial so it lands on the fast path that calls assemble_context
-    monkeypatch.setattr(chat, "_is_trivial_chat", lambda msg: True)
 
     class FakeReq:
         message = "hi"
@@ -468,7 +460,6 @@ async def test_send_message_pushes_req_project_id_into_requester_context(monkeyp
         workspace_id = None
         project_id = "proj-from-req"
 
-    import asyncio
     response = await chat.send_message(FakeReq(), member)
     # Drain the streaming response to ensure generator runs
     body = b""
@@ -508,24 +499,17 @@ async def test_send_message_hydrates_project_id_from_existing_conversation(monke
     def fake_extract_explicit(message):
         return None
 
-    async def fake_classify_intent(message):
-        return {"mode": "chat", "confidence": 0.9, "goal": ""}
 
-    async def fake_stream_completion(context, model_id=None):
-        yield "hello"
+    async def fake_stream_chat_turn(**kwargs):
+        yield {"type": "done"}
 
-    async def fake_extract_and_save(*args, **kwargs):
-        pass
 
     monkeypatch.setattr(chat, "assemble_context", fake_assemble_context)
     monkeypatch.setattr(chat.permissions, "check", fake_check)
     monkeypatch.setattr(chat, "_save_message", fake_save_message)
     monkeypatch.setattr(chat, "extract_explicit_memory_content", fake_extract_explicit)
-    monkeypatch.setattr(chat, "classify_intent", fake_classify_intent)
-    monkeypatch.setattr(chat, "stream_completion", fake_stream_completion)
-    monkeypatch.setattr(chat, "extract_and_save", fake_extract_and_save)
+    monkeypatch.setattr(chat, "stream_chat_turn", fake_stream_chat_turn)
     monkeypatch.setattr(chat.audit, "log", AsyncMock())
-    monkeypatch.setattr(chat, "_is_trivial_chat", lambda msg: True)
 
     class FakeReq:
         message = "hi"
@@ -705,25 +689,18 @@ async def test_send_message_skips_hydration_when_no_conversation_id(monkeypatch)
     def fake_extract_explicit(message):
         return None
 
-    async def fake_classify_intent(message):
-        return {"mode": "chat", "confidence": 0.9, "goal": ""}
 
-    async def fake_stream_completion(context, model_id=None):
-        yield "hello"
+    async def fake_stream_chat_turn(**kwargs):
+        yield {"type": "done"}
 
-    async def fake_extract_and_save(*args, **kwargs):
-        pass
 
     monkeypatch.setattr(chat, "assemble_context", fake_assemble_context)
     monkeypatch.setattr(chat.permissions, "check", fake_check)
     monkeypatch.setattr(chat, "_create_conversation", fake_create_conversation)
     monkeypatch.setattr(chat, "_save_message", fake_save_message)
     monkeypatch.setattr(chat, "extract_explicit_memory_content", fake_extract_explicit)
-    monkeypatch.setattr(chat, "classify_intent", fake_classify_intent)
-    monkeypatch.setattr(chat, "stream_completion", fake_stream_completion)
-    monkeypatch.setattr(chat, "extract_and_save", fake_extract_and_save)
+    monkeypatch.setattr(chat, "stream_chat_turn", fake_stream_chat_turn)
     monkeypatch.setattr(chat.audit, "log", AsyncMock())
-    monkeypatch.setattr(chat, "_is_trivial_chat", lambda msg: True)
 
     class FakeReq:
         message = "hi"

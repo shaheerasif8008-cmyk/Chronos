@@ -220,52 +220,6 @@ def test_extract_explicit_memory_content_handles_supported_phrases():
 
 
 @pytest.mark.asyncio
-async def test_intent_classification_uses_fast_model(monkeypatch):
-    from core import intent
-
-    async def fake_complete_json(prompt, model=None):
-        assert model == intent.settings.fast_model
-        return json.dumps({"mode": "task", "confidence": 0.91, "goal": "research a market"})
-
-    monkeypatch.setattr(intent, "complete_json", fake_complete_json)
-
-    classified = await intent.classify_intent("Can you research a market?")
-
-    assert classified["mode"] == "task"
-    assert classified["confidence"] == 0.91
-
-
-@pytest.mark.asyncio
-async def test_current_web_questions_route_to_task_before_model(monkeypatch):
-    from core import intent
-
-    async def fake_complete_json(prompt, model=None):
-        raise AssertionError("live web requests should not depend on model intent classification")
-
-    monkeypatch.setattr(intent, "complete_json", fake_complete_json)
-
-    classified = await intent.classify_intent("what is the latest news on AI agents?")
-
-    assert classified["mode"] == "task"
-    assert classified["confidence"] >= 0.8
-    assert classified["goal"] == "what is the latest news on AI agents?"
-
-
-@pytest.mark.asyncio
-async def test_timeless_explanation_questions_stay_chat(monkeypatch):
-    from core import intent
-
-    async def fake_complete_json(prompt, model=None):
-        return json.dumps({"mode": "chat", "confidence": 0.94, "goal": ""})
-
-    monkeypatch.setattr(intent, "complete_json", fake_complete_json)
-
-    classified = await intent.classify_intent("what is photosynthesis?")
-
-    assert classified["mode"] == "chat"
-
-
-@pytest.mark.asyncio
 async def test_skill_selection_uses_fast_model(monkeypatch):
     from skills import loader
 

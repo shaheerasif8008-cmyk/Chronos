@@ -203,9 +203,11 @@ async def test_create_task_record_normalizes_unknown_mode(monkeypatch):
 # ── 3. Fast-path send_message persists request mode on assistant message ──────
 
 @pytest.mark.asyncio
-async def test_send_message_fast_path_persists_mode(monkeypatch):
-    """On the trivial-chat fast path, the assistant message is saved with
-    the mode from the request body, not the hardcoded 'chat' literal.
+async def test_send_message_threads_mode_into_inline_turn(monkeypatch):
+    """send_message threads the request mode into the inline streaming turn.
+
+    The turn persists it onto the assistant message (agent_loop.persist_assistant_message),
+    so the request's mode — not a hardcoded literal — ends up on the saved row.
     """
     from routers import chat
     from core.models import Member
@@ -217,11 +219,11 @@ async def test_send_message_fast_path_persists_mode(monkeypatch):
         role="admin",
     )
 
-    saved_args: list[dict] = []
+    captured: dict = {}
 
-    async def fake_save_message(conv_id, role, content, **kwargs):
-        if role == "assistant":
-            saved_args.append({"conv_id": conv_id, "role": role, **kwargs})
+    async def fake_stream_chat_turn(**kwargs):
+        captured["mode"] = kwargs.get("mode")
+        yield {"type": "done"}
 
     async def fake_permissions_check(*args, **kwargs):
         return True
@@ -229,41 +231,25 @@ async def test_send_message_fast_path_persists_mode(monkeypatch):
     async def fake_create_conversation(member, title, **kwargs):
         return "conv-new"
 
+    async def fake_save_message(*args, **kwargs):
+        return None
+
     async def fake_assemble_context(conv_id, msg, ctx):
         return [{"role": "user", "content": msg}]
 
-    async def fake_stream_completion(context, model_id=None):
-        yield "Hello"
-
-    async def fake_extract_and_save(*args, **kwargs):
-        pass
-
-    async def fake_extract_explicit(msg):
-        return None  # type: ignore
-
-    async def fake_classify_intent(msg):
-        return {"mode": "chat"}
-
-    # Force trivial-chat gate so we hit the fast path
-    monkeypatch.setattr(chat, "_is_trivial_chat", lambda msg: True)
-    monkeypatch.setattr(chat, "_save_message", fake_save_message)
     monkeypatch.setattr(chat.permissions, "check", fake_permissions_check)
     monkeypatch.setattr(chat, "_create_conversation", fake_create_conversation)
+    monkeypatch.setattr(chat, "_save_message", fake_save_message)
     monkeypatch.setattr(chat, "assemble_context", fake_assemble_context)
-    monkeypatch.setattr(chat, "stream_completion", fake_stream_completion)
-    monkeypatch.setattr(chat, "extract_and_save", fake_extract_and_save)
     monkeypatch.setattr(chat, "extract_explicit_memory_content", lambda msg: None)
-    monkeypatch.setattr(chat, "classify_intent", fake_classify_intent)
-    monkeypatch.setattr(chat, "normalize_chat_model", lambda m: m or "auto")
+    monkeypatch.setattr(chat, "stream_chat_turn", fake_stream_chat_turn)
 
     req = chat.ChatRequest(message="hi", mode="coding")
 
-    # Consume the StreamingResponse
     response = await chat.send_message(req, member)
     async for _ in response.body_iterator:
         pass
 
-    assert saved_args, "No assistant message was saved"
-    assert saved_args[0].get("mode") == "coding", (
-        f"Expected mode='coding' on assistant message, got: {saved_args[0]}"
+    assert captured.get("mode") == "coding", (
+        f"Expected mode='coding' threaded into the inline turn, got: {captured}"
     )
