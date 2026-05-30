@@ -33,7 +33,7 @@ async def _with_retry(coro_factory, *, max_retries: int = _MAX_RETRIES) -> Any:
             delay = _BASE_BACKOFF_SECONDS * (2 ** attempt) + random.uniform(0, 0.5)
             logger.warning("LLM rate limit (attempt %d/%d), retrying in %.1fs", attempt + 1, max_retries, delay)
             await asyncio.sleep(delay)
-        except Exception as exc:
+        except Exception:
             # Non-retryable error — raise immediately.
             raise
     raise last_exc  # type: ignore[misc]

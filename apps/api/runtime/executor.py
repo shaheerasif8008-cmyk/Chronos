@@ -27,6 +27,23 @@ from runtime.agent_loop import (
 
 log = logging.getLogger(__name__)
 
+# Public surface — several names are re-exported from agent_loop for modules that
+# import them from here (e.g. routers/tasks.py imports activity_channel).
+__all__ = [
+    "TaskExecutor",
+    "activity_channel",
+    "emit_activity",
+    "get_task",
+    "update_task",
+    "insert_task",
+    "approvals_ready_for_drafting",
+    "AGENT_LOOP_APPROVAL_STEP_ID",
+    "now_utc",
+    "run_loop",
+    "resume_after_approval",
+    "save_task",
+]
+
 AGENT_LOOP_APPROVAL_STEP_ID = "agent_loop"
 
 
