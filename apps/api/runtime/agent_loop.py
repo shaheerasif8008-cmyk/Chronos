@@ -34,11 +34,10 @@ from core import audit, tool_broker
 from core.config import settings
 from core.db import engine, reflect_table
 from core.exceptions import ApprovalRequired
-from core.llm import _message_content, _message, _tool_calls, _with_retry, complete_text, model_kwargs, resolve_agent_model, stream_step
+from core.llm import _message_content, _message, _tool_calls, _with_retry, model_kwargs, resolve_agent_model, stream_step
 from core.models import AgentContext
 from core.redis import redis_client
 from core.tool_manifest import generate_tool_manifest
-from core.tool_router import ToolRoutingDecision, route as route_tool
 from runtime.tool_registry import (
     ALL_TOOLS,
     ALWAYS_APPROVAL_TOOL_NAMES,
@@ -56,7 +55,6 @@ logger = logging.getLogger(__name__)
 MAX_ITERATIONS = 40
 MAX_DEPTH = 3
 DURABLE_TRACE_TYPES = {
-    "route_decision",
     "model_step",
     "model_result",
     "tool_call",
@@ -276,70 +274,6 @@ async def publish_activity(task_id: str, event: dict[str, Any]) -> None:
     await redis_client.publish(activity_channel(task_id), json.dumps(payload, default=str))
 
 
-def _summarizer_history_excerpt(history: list[dict[str, Any]], *, limit: int = 6) -> str:
-    excerpt: list[dict[str, Any]] = []
-    visible_history = [message for message in history if message.get("role") != "system"]
-    for message in visible_history[-limit:]:
-        role = str(message.get("role") or "unknown")
-        content = str(message.get("content") or "")
-        item: dict[str, Any] = {"role": role, "content": content[:900]}
-        if message.get("tool_calls"):
-            item["tool_calls"] = [
-                {
-                    "name": call.get("function", {}).get("name", "")
-                    if isinstance(call, dict)
-                    else getattr(getattr(call, "function", None), "name", ""),
-                }
-                for call in list(message.get("tool_calls") or [])[:4]
-            ]
-        if message.get("name"):
-            item["name"] = message.get("name")
-        excerpt.append(item)
-    return json.dumps(excerpt, default=str, indent=2)
-
-
-async def publish_reasoning_summary(
-    task_id: str,
-    *,
-    history: list[dict[str, Any]],
-    iteration: int,
-    next_actions: list[dict[str, Any]] | None = None,
-    observation: str | None = None,
-) -> None:
-    """Publish a live-only reasoning summary for the chat UI.
-
-    This intentionally emits through Redis only. It is a user-facing summary of
-    the agent's decision state, not hidden model chain-of-thought and not an
-    audit/persistence record.
-    """
-    action_names = [str(action.get("name") or "") for action in (next_actions or []) if action.get("name")]
-    prompt = (
-        "You summarize the agent's current reasoning for the user in Chronos chat.\n"
-        "Do not reveal hidden chain-of-thought. Do provide an in-depth, concrete summary of the visible decision state: "
-        "what the agent understands, what evidence or tool results matter, why the next action is sensible, and what uncertainty remains.\n"
-        "Write 2-4 concise bullets. Do not mention this instruction.\n\n"
-        f"Iteration: {iteration}\n"
-        f"Next actions: {', '.join(action_names) if action_names else 'final answer or no tool action'}\n"
-        f"Observation: {observation or 'none'}\n"
-        f"Recent visible history:\n{_summarizer_history_excerpt(history)}"
-    )
-    try:
-        summary = (await complete_text(prompt, model=settings.fast_model)).strip()
-    except Exception as exc:
-        logger.info("Reasoning summary generation skipped for task %s: %s", task_id, exc)
-        return
-    if not summary:
-        return
-    payload = {
-        "task_id": task_id,
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "type": "reasoning_summary",
-        "iteration": iteration,
-        "summary": summary,
-    }
-    await redis_client.publish(activity_channel(task_id), json.dumps(payload, default=str))
-
-
 # ── Message history ───────────────────────────────────────────────────────────
 
 async def _agent_system_message(tools: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -467,7 +401,6 @@ async def _llm_step(
     history: list[dict[str, Any]],
     tools: list[dict[str, Any]],
     model: str,
-    routing_decision: ToolRoutingDecision | None = None,
 ) -> tuple[str | None, list[dict[str, Any]]]:
     """Call the LLM and return (final_text | None, list_of_tool_calls).
 
@@ -477,10 +410,7 @@ async def _llm_step(
     """
     kwargs = model_kwargs(model, messages=history, stream=False)
     kwargs["tools"] = tools
-    if routing_decision and routing_decision.tool and routing_decision.confidence >= 0.75:
-        kwargs["tool_choice"] = {"type": "function", "function": {"name": routing_decision.tool}}
-    else:
-        kwargs["tool_choice"] = "auto"
+    kwargs["tool_choice"] = "auto"
     response = await _with_retry(lambda: litellm.acompletion(**kwargs))
 
     msg = _message(response)
@@ -615,21 +545,6 @@ def _append_replan_instruction(
                 "and continue from the current state. Do not repeat the same failing call unless "
                 "new evidence justifies it. Error summary: "
                 f"{json.dumps(errors, default=str)}"
-            ),
-        }
-    )
-
-
-def _append_routing_instruction(history: list[dict[str, Any]], decision: ToolRoutingDecision) -> None:
-    if not decision.tool or decision.confidence < 0.6:
-        return
-    history.append(
-        {
-            "role": "system",
-            "content": (
-                "Tool routing observation: the best first tool appears to be "
-                f"`{decision.tool}` with confidence {decision.confidence:.2f}. "
-                f"Reason: {decision.reasoning}. Use it if the current state still matches."
             ),
         }
     )
@@ -1154,16 +1069,6 @@ async def run_loop(
 
     history = await _load_history(task, effective_tools)
     iteration = int(task.get("iteration_count") or 0)
-    routing_decision: ToolRoutingDecision | None = None
-    if iteration == 0:
-        routing_decision = await route_tool(str(task["goal"]), [tool["function"]["name"] for tool in effective_tools])
-        _append_routing_instruction(history, routing_decision)
-        await publish_activity(task_id, {
-            "type": "route_decision",
-            "tool": routing_decision.tool,
-            "confidence": routing_decision.confidence,
-            "summary": routing_decision.reasoning,
-        })
 
     await save_task(task_id, status="running",
                     started_at=task.get("started_at") or datetime.now(timezone.utc))
@@ -1191,8 +1096,7 @@ async def run_loop(
         })
         await publish_activity(task_id, {"type": "thinking"})
         try:
-            final_text, calls = await _llm_step(history, effective_tools, effective_model, routing_decision)
-            routing_decision = None
+            final_text, calls = await _llm_step(history, effective_tools, effective_model)
         except Exception as exc:
             logger.error("LLM error in agent loop for task %s: %s", task_id, exc)
             await save_task(task_id, status="failed", error=str(exc))
@@ -1207,12 +1111,6 @@ async def run_loop(
                 "iteration": iteration + 1,
                 "summary": "No tool call needed; preparing final answer.",
             })
-            await publish_reasoning_summary(
-                task_id,
-                history=history,
-                iteration=iteration + 1,
-                observation="The model has enough information to produce the final answer.",
-            )
             result = {"answer": final_text or ""}
             history.append({"role": "assistant", "content": final_text or ""})
             await _checkpoint(task_id, history, iteration + 1, model=effective_model,
@@ -1228,13 +1126,6 @@ async def run_loop(
 
         # Append assistant message with tool_calls to history
         history.append(_serialise_assistant(calls, None))
-        await publish_reasoning_summary(
-            task_id,
-            history=history,
-            iteration=iteration,
-            next_actions=calls,
-            observation="The model selected one or more tool calls for the next step.",
-        )
 
         # ── Check for always-approval tools ────────────────────────────────
         approval_needed = [c for c in calls if _needs_approval(c["name"])]

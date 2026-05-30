@@ -256,13 +256,10 @@ async def test_native_loop_adds_controller_replan_instruction_after_tool_error(m
     async def fake_emit(task_id, event, actor_id="chronos"):
         return None
 
-    async def fake_reasoning_summary(*args, **kwargs):
-        return None
-
     async def fake_persist(task_arg, content):
         return None
 
-    async def fake_llm_step(history, tools, model, routing_decision=None):
+    async def fake_llm_step(history, tools, model):
         if len(step_calls) == 1:
             assert any(
                 message.get("role") == "system" and "revise the next action" in message.get("content", "")
@@ -281,7 +278,6 @@ async def test_native_loop_adds_controller_replan_instruction_after_tool_error(m
     monkeypatch.setattr(agent_loop, "save_task", fake_save_task)
     monkeypatch.setattr(agent_loop, "publish_activity", fake_publish)
     monkeypatch.setattr(agent_loop, "emit_activity", fake_emit)
-    monkeypatch.setattr(agent_loop, "publish_reasoning_summary", fake_reasoning_summary)
     monkeypatch.setattr(agent_loop, "_persist_to_conversation", fake_persist)
     monkeypatch.setattr(agent_loop, "_llm_step", fake_llm_step)
     monkeypatch.setattr(agent_loop, "_execute_tool", fake_execute_tool)
@@ -294,61 +290,6 @@ async def test_native_loop_adds_controller_replan_instruction_after_tool_error(m
     assert state["mode"] == "model_native"
     assert state["needs_replan"] is True
     assert state["last_tool_errors"] == [{"tool": "browser__search", "error": "temporary search failure"}]
-
-
-@pytest.mark.asyncio
-async def test_native_loop_confidence_routes_first_tool_call(monkeypatch):
-    from core.tool_router import ToolRoutingDecision
-    from runtime import agent_loop
-
-    task = {
-        "id": "task-routed",
-        "organization_id": "default",
-        "region": "us",
-        "triggered_by_member_id": "member-1",
-        "workspace_id": "workspace-1",
-        "persona_id": None,
-        "status": "pending",
-        "goal": "what is the latest funding news?",
-        "plan": {},
-        "agent_state": {},
-        "iteration_count": 0,
-        "started_at": None,
-        "depth": 0,
-    }
-    seen_decisions = []
-
-    async def fake_route(message, available_tools):
-        assert "browser__search" in available_tools
-        return ToolRoutingDecision(
-            tool="browser__search",
-            confidence=0.91,
-            reasoning="Latest news requires live search.",
-        )
-
-    async def fake_llm_step(history, tools, model, routing_decision=None):
-        seen_decisions.append(routing_decision)
-        assert any("Tool routing observation" in message.get("content", "") for message in history)
-        return "Done.", []
-
-    async def fake_save_task(task_id, **values):
-        task.update(values)
-
-    async def noop(*args, **kwargs):
-        return None
-
-    monkeypatch.setattr(agent_loop, "route_tool", fake_route)
-    monkeypatch.setattr(agent_loop, "_llm_step", fake_llm_step)
-    monkeypatch.setattr(agent_loop, "save_task", fake_save_task)
-    monkeypatch.setattr(agent_loop, "publish_activity", noop)
-    monkeypatch.setattr(agent_loop, "emit_activity", noop)
-    monkeypatch.setattr(agent_loop, "publish_reasoning_summary", noop)
-    monkeypatch.setattr(agent_loop, "_persist_to_conversation", noop)
-
-    await agent_loop.run_loop(task)
-
-    assert seen_decisions[0].tool == "browser__search"
-    assert seen_decisions[0].confidence == 0.91
 
 
 def test_dag_tool_args_resolve_template_references_for_composition():

@@ -154,7 +154,6 @@ async def test_run_loop_stops_before_model_step_when_task_is_cancelled(monkeypat
     monkeypatch.setattr(agent_loop, "_llm_step", fail_llm_step)
     monkeypatch.setattr(agent_loop, "emit_activity", fake_emit)
     monkeypatch.setattr(agent_loop, "publish_activity", fake_publish)
-    monkeypatch.setattr(agent_loop, "publish_reasoning_summary", fake_publish)
 
     result = await agent_loop.run_loop(task)
 
@@ -253,45 +252,6 @@ async def test_publish_activity_persists_replayable_model_trace(monkeypatch):
     assert audited[0][2] == "model_step"
     assert audited[0][3]["resource_type"] == "tasks"
     assert audited[0][3]["resource_id"] == "task-trace"
-
-
-@pytest.mark.asyncio
-async def test_reasoning_summary_activity_is_live_only(monkeypatch):
-    from runtime import agent_loop
-
-    published = []
-    audited = []
-
-    async def fake_publish(channel, payload):
-        published.append((channel, json.loads(payload)))
-
-    async def fake_audit_log(event_type, actor_id, action, **kwargs):
-        audited.append((event_type, actor_id, action, kwargs))
-        return "audit-1"
-
-    async def fake_complete_text(prompt, *, model=None):
-        assert "summarize the agent's current reasoning" in prompt
-        assert "hidden controller instruction" not in prompt
-        return "I am checking current context, then I will use search because the request is time-sensitive."
-
-    monkeypatch.setattr(agent_loop.redis_client, "publish", fake_publish)
-    monkeypatch.setattr(agent_loop.audit, "log", fake_audit_log)
-    monkeypatch.setattr(agent_loop, "complete_text", fake_complete_text)
-
-    await agent_loop.publish_reasoning_summary(
-        "task-reasoning",
-        history=[
-            {"role": "system", "content": "hidden controller instruction"},
-            {"role": "user", "content": "Find the latest funding news."},
-        ],
-        iteration=1,
-        next_actions=[{"name": "browser__search"}],
-    )
-
-    assert [event[1]["type"] for event in published] == ["reasoning_summary"]
-    assert published[0][1]["summary"].startswith("I am checking current context")
-    assert published[0][1]["iteration"] == 1
-    assert audited == []
 
 
 @pytest.mark.asyncio
@@ -411,14 +371,6 @@ async def test_run_loop_gates_write_after_untrusted_prompt_injection(monkeypatch
         (None, [{"id": "call-draft", "name": "gmail__draft", "args_str": "{}"}]),
     ]
 
-    class FakeRoute:
-        tool = None
-        confidence = 0.0
-        reasoning = ""
-
-    async def fake_route(*args, **kwargs):
-        return FakeRoute()
-
     async def fake_save_task(task_id, **values):
         updates.append(values)
         task.update(values)
@@ -458,7 +410,6 @@ async def test_run_loop_gates_write_after_untrusted_prompt_injection(monkeypatch
     async def fake_publish(*args, **kwargs):
         return None
 
-    monkeypatch.setattr(agent_loop, "route_tool", fake_route)
     monkeypatch.setattr(agent_loop, "save_task", fake_save_task)
     monkeypatch.setattr(agent_loop, "is_task_cancelled", fake_cancelled)
     monkeypatch.setattr(agent_loop, "_llm_step", fake_llm_step)
@@ -466,7 +417,6 @@ async def test_run_loop_gates_write_after_untrusted_prompt_injection(monkeypatch
     monkeypatch.setattr(agent_loop, "_open_approval_gate", fake_open_gate)
     monkeypatch.setattr(agent_loop, "emit_activity", fake_emit)
     monkeypatch.setattr(agent_loop, "publish_activity", fake_publish)
-    monkeypatch.setattr(agent_loop, "publish_reasoning_summary", fake_publish)
 
     result = await agent_loop.run_loop(task)
 
