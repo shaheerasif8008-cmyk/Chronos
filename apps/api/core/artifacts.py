@@ -60,6 +60,7 @@ async def save_artifact(
     mime_type: str | None = None,
     parent_artifact_id: str | None = None,
     parse_status: str | None = None,
+    created_by: str | None = None,
 ) -> str:
     """Persist an artifact to MinIO and record metadata in the artifacts table.
 
@@ -74,7 +75,8 @@ async def save_artifact(
     raw: bytes = content.encode() if isinstance(content, str) else content
     size = len(raw)
 
-    minio_path = f"artifacts/{org_id}/{artifact_id}"
+    version = 1
+    minio_path = f"artifacts/{org_id}/{artifact_id}/v{version}"
 
     # --- Upload to MinIO ---
     try:
@@ -88,16 +90,19 @@ async def save_artifact(
             content_type=mime_type,
         )
     except Exception:
-        # MinIO may not be available in all environments (tests, CI).
-        # Fall back to local filesystem in the scratch dir.
-        minio_path = await _local_fallback(artifact_id, raw, org_id)
+        import pathlib as _pathlib
 
-    # --- Insert metadata row ---
+        _scratch = _pathlib.Path("/tmp/chronos_artifacts") / artifact_id
+        _scratch.mkdir(parents=True, exist_ok=True)
+        (_scratch / f"v{version}").write_bytes(raw)
+        minio_path = f"local://{artifact_id}/v{version}"
+
+    # --- Insert artifact head row + initial version row ---
     artifacts = await reflect_table("artifacts")
+    artifact_versions = await reflect_table("artifact_versions")
     async with engine.begin() as conn:
-        result = await conn.execute(
-            insert(artifacts)
-            .values(
+        await conn.execute(
+            insert(artifacts).values(
                 id=artifact_id,
                 organization_id=org_id,
                 region=region,
@@ -109,12 +114,26 @@ async def save_artifact(
                 minio_path=minio_path,
                 mime_type=mime_type,
                 size_bytes=size,
+                version=version,
                 parent_artifact_id=parent_artifact_id,
                 parse_status=parse_status,
+                created_by=created_by,
             )
-            .returning(artifacts.c.id)
         )
-        return str(result.scalar_one())
+        await conn.execute(
+            insert(artifact_versions).values(
+                organization_id=org_id,
+                region=region,
+                artifact_id=artifact_id,
+                version=version,
+                minio_path=minio_path,
+                mime_type=mime_type,
+                size_bytes=size,
+                edit_summary="initial",
+                created_by=created_by,
+            )
+        )
+    return artifact_id
 
 
 async def get_artifact(artifact_id: str) -> dict[str, Any] | None:
@@ -144,7 +163,8 @@ async def read_artifact_content(artifact_id: str) -> bytes | None:
     # Local fallback.
     import pathlib
 
-    local = pathlib.Path("/tmp/chronos_artifacts") / artifact_id
+    fname = path.split("local://")[-1] if path.startswith("local://") else f"{artifact_id}_v{meta.get('version', 1)}"
+    local = pathlib.Path("/tmp/chronos_artifacts") / fname
     if local.exists():
         return local.read_bytes()
     return None
@@ -165,16 +185,6 @@ def _infer_mime(kind: str, content: str | bytes) -> str:
     return "text/plain"
 
 
-async def _local_fallback(artifact_id: str, raw: bytes, org_id: str) -> str:
-    """Write to /tmp when MinIO is unavailable. Returns the pseudo minio_path."""
-    import pathlib
-
-    scratch = pathlib.Path("/tmp/chronos_artifacts")
-    scratch.mkdir(parents=True, exist_ok=True)
-    (scratch / artifact_id).write_bytes(raw)
-    return f"local://{artifact_id}"
-
-
 async def set_parse_status(artifact_id: str, status: str) -> None:
     """Update an attachment's parse_status (pending|parsed|failed|unparseable)."""
     from sqlalchemy import update
@@ -184,3 +194,28 @@ async def set_parse_status(artifact_id: str, status: str) -> None:
         await conn.execute(
             update(artifacts).where(artifacts.c.id == artifact_id).values(parse_status=status)
         )
+
+
+async def update_artifact_meta(artifact_id: str, org_id: str, **fields: Any) -> dict[str, Any] | None:
+    """Update head metadata (e.g. title). Tenant-scoped. Returns updated row or None."""
+    from datetime import datetime, timezone
+    from sqlalchemy import update as _update
+
+    allowed = {"title", "is_deleted"}
+    values = {k: v for k, v in fields.items() if k in allowed}
+    if not values:
+        return await get_artifact(artifact_id)
+    values["updated_at"] = datetime.now(timezone.utc)
+    artifacts = await reflect_table("artifacts")
+    async with engine.begin() as conn:
+        await conn.execute(
+            _update(artifacts)
+            .where(artifacts.c.id == artifact_id, artifacts.c.organization_id == org_id)
+            .values(**values)
+        )
+    return await get_artifact(artifact_id)
+
+
+async def soft_delete_artifact(artifact_id: str, org_id: str) -> bool:
+    res = await update_artifact_meta(artifact_id, org_id, is_deleted=True)
+    return res is not None

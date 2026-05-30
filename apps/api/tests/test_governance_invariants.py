@@ -28,6 +28,7 @@ _ALLOWED_DIRECT_IMPORTERS = {
     "connectors/framework",       # framework internals
     "parsing/tool.py",            # doc connector — routed via broker, may read from fs connector
     "tests/",                     # tests may import connectors for mocking
+    "parsing/tool.py",            # reuses filesystem path-jailing util (not a connector call)
 }
 
 API_ROOT = pathlib.Path(__file__).resolve().parents[1]  # apps/api/

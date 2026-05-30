@@ -176,24 +176,32 @@ def format_task_answer(result: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-async def _persist_to_conversation(task: dict[str, Any], content: str) -> None:
-    """Persist a final message to the task's conversation if applicable. Never raises."""
+async def _persist_to_conversation(task: dict[str, Any], content: str) -> str | None:
+    """Persist a final message to the task's conversation if applicable. Never raises.
+
+    Returns the inserted message id on success, or None if the task has no
+    conversation or persistence fails.
+    """
     conv_id = _conversation_id_for(task)
     if not conv_id:
-        return
+        return None
     try:
-        await _save_assistant_message(conv_id, content, task)
+        return await _save_assistant_message(conv_id, content, task)
     except Exception as exc:  # persistence must never break the loop
         logger.warning("Failed to persist message to conversation: %s", exc)
+        return None
 
 
-async def _save_assistant_message(conversation_id: str, content: str, task: dict[str, Any]) -> None:
+async def _save_assistant_message(conversation_id: str, content: str, task: dict[str, Any], *, mode: str | None = None) -> str | None:
     """Insert the task's final answer as an assistant message in the conversation.
 
     This is the source of truth — it runs in the agent loop's background task,
     so the result survives even if the chat SSE connection was closed. Any
     artifacts this task produced are linked to the new message so they reload
     on refresh.
+
+    Returns the newly inserted message id (str), or None if the conversation
+    does not exist.
     """
     messages = await reflect_table("messages")
     conversations = await reflect_table("conversations")
@@ -204,7 +212,7 @@ async def _save_assistant_message(conversation_id: str, content: str, task: dict
             await conn.execute(select(conversations.c.id).where(conversations.c.id == conversation_id))
         ).first()
         if not exists:
-            return
+            return None
         result = await conn.execute(
             insert(messages)
             .values(
@@ -214,6 +222,7 @@ async def _save_assistant_message(conversation_id: str, content: str, task: dict
                 role="assistant",
                 content=content,
                 token_count=len(content.split()),
+                mode=mode,
             )
             .returning(messages.c.id)
         )
@@ -229,6 +238,7 @@ async def _save_assistant_message(conversation_id: str, content: str, task: dict
             .where(artifacts.c.task_id == task["id"], artifacts.c.message_id.is_(None))
             .values(message_id=message_id)
         )
+    return message_id
 
 
 # ── Activity emission ─────────────────────────────────────────────────────────
@@ -373,6 +383,9 @@ async def _load_history(task: dict[str, Any], tools: list[dict[str, Any]] | None
     attachments = state.get("attachments") if isinstance(state, dict) else None
     if isinstance(attachments, list) and attachments:
         seed.append({"role": "user", "content": _format_attachments_context(attachments)})
+    project_knowledge = state.get("project_knowledge") if isinstance(state, dict) else None
+    if isinstance(project_knowledge, str) and project_knowledge.strip():
+        seed.append({"role": "user", "content": project_knowledge})
     seed.append({"role": "user", "content": str(task["goal"])})
     return seed
 
@@ -883,13 +896,16 @@ async def _mark_approval(approval_id: str, payload: dict[str, Any], approvals_ta
 
 # ── Inline chat turn ──────────────────────────────────────────────────────────
 
-async def persist_assistant_message(conversation_id: str, content: str, requester_context: Any) -> None:
+async def persist_assistant_message(
+    conversation_id: str, content: str, requester_context: Any, *, mode: str | None = None
+) -> None:
     """Save an inline chat turn's final answer as an assistant message. Never raises."""
     try:
         await _save_assistant_message(
             conversation_id,
             content,
             {"id": None, "organization_id": requester_context.org_id, "region": "us"},
+            mode=mode,
         )
     except Exception as exc:  # persistence must never break the turn
         logger.warning("Failed to persist inline assistant message: %s", exc)
@@ -944,6 +960,7 @@ async def stream_chat_turn(
     context_messages: list[dict[str, Any]],
     requester_context: Any,
     model: str | None,
+    mode: str | None = None,
 ):
     """Stream one chat turn inline.
 
@@ -975,14 +992,14 @@ async def stream_chat_turn(
         except Exception as exc:
             logger.error("Inline turn model error: %s", exc)
             msg = "Sorry — I hit a model error and couldn't finish that. Please try again."
-            await persist_assistant_message(conversation_id, msg, requester_context)
+            await persist_assistant_message(conversation_id, msg, requester_context, mode=mode)
             yield {"type": "token", "content": msg}
             yield {"type": "done"}
             return
 
         if not calls:
             answer = final_text or ""
-            await persist_assistant_message(conversation_id, answer, requester_context)
+            await persist_assistant_message(conversation_id, answer, requester_context, mode=mode)
             asyncio.create_task(extract_and_save(conversation_id, message, answer, requester_context))
             yield {"type": "done"}
             return
@@ -1044,7 +1061,7 @@ async def stream_chat_turn(
         await _checkpoint(task_id, history, iteration, model=effective_model, current_step=iteration)
 
     msg = "This is taking many steps. Try narrowing the request, or ask me to run it as a background task."
-    await persist_assistant_message(conversation_id, msg, requester_context)
+    await persist_assistant_message(conversation_id, msg, requester_context, mode=mode)
     yield {"type": "token", "content": msg}
     yield {"type": "done"}
 
@@ -1105,8 +1122,11 @@ async def run_loop(
         except Exception as exc:
             logger.error("LLM error in agent loop for task %s: %s", task_id, exc)
             await save_task(task_id, status="failed", error=str(exc))
-            await _persist_to_conversation(task, f"The task stopped due to a model error: {exc}")
-            await emit_activity(task_id, {"type": "task_failed", "error": f"LLM error: {exc}"})
+            failed_msg_id = await _persist_to_conversation(task, f"The task stopped due to a model error: {exc}")
+            failed_event: dict[str, Any] = {"type": "task_failed", "error": f"LLM error: {exc}"}
+            if failed_msg_id:
+                failed_event["message_id"] = failed_msg_id
+            await emit_activity(task_id, failed_event)
             return {"error": str(exc)}
 
         # ── Final answer ────────────────────────────────────────────────────
@@ -1123,8 +1143,11 @@ async def run_loop(
                               completed_at=datetime.now(timezone.utc))
             # Persist the answer to the conversation (source of truth, survives
             # SSE disconnects). Only top-level conversation-triggered tasks.
-            await _persist_to_conversation(task, format_task_answer(result))
-            await emit_activity(task_id, {"type": "task_complete", "result": result})
+            message_id = await _persist_to_conversation(task, format_task_answer(result))
+            event: dict[str, Any] = {"type": "task_complete", "result": result}
+            if message_id:
+                event["message_id"] = message_id
+            await emit_activity(task_id, event)
             return result
 
         iteration += 1
@@ -1202,9 +1225,12 @@ async def run_loop(
     # Max iterations exceeded
     error = "max_iterations_exceeded"
     await save_task(task_id, status="failed", error=error, completed_at=datetime.now(timezone.utc))
-    await _persist_to_conversation(
+    maxiter_msg_id = await _persist_to_conversation(
         task, "The task ran for the maximum number of steps without finishing. "
         "Try narrowing the goal or breaking it into smaller requests."
     )
-    await emit_activity(task_id, {"type": "task_failed", "error": error})
+    maxiter_event: dict[str, Any] = {"type": "task_failed", "error": error}
+    if maxiter_msg_id:
+        maxiter_event["message_id"] = maxiter_msg_id
+    await emit_activity(task_id, maxiter_event)
     return {"error": error}

@@ -26,7 +26,7 @@ async def test_no_tool_turn_streams_and_creates_no_task(monkeypatch):
         return "task-x"
 
     saved_msgs = []
-    async def fake_save_assistant(conv_id, content, ctx):
+    async def fake_save_assistant(conv_id, content, ctx, mode=None):
         saved_msgs.append(content)
 
     async def fake_extract(*a, **k):
