@@ -181,6 +181,77 @@ def _tool_calls(message: Any) -> list[Any]:
     return getattr(message, "tool_calls", None) or []
 
 
+def _delta(chunk: Any) -> Any:
+    if isinstance(chunk, dict):
+        return chunk.get("choices", [{}])[0].get("delta", {})
+    return chunk.choices[0].delta
+
+
+def _delta_content(delta: Any) -> str:
+    if isinstance(delta, dict):
+        return delta.get("content") or ""
+    return getattr(delta, "content", None) or ""
+
+
+def _delta_tool_calls(delta: Any) -> list[Any]:
+    if isinstance(delta, dict):
+        return delta.get("tool_calls") or []
+    return getattr(delta, "tool_calls", None) or []
+
+
+def _frag_fields(frag: Any) -> tuple[int, str | None, str | None, str]:
+    """Return (index, id, name, args_fragment) from a streamed tool_call delta."""
+    if isinstance(frag, dict):
+        fn = frag.get("function") or {}
+        return int(frag.get("index") or 0), frag.get("id"), fn.get("name"), fn.get("arguments") or ""
+    fn = getattr(frag, "function", None)
+    return (
+        int(getattr(frag, "index", 0) or 0),
+        getattr(frag, "id", None),
+        getattr(fn, "name", None),
+        getattr(fn, "arguments", "") or "",
+    )
+
+
+async def stream_step(messages: list[dict[str, Any]], tools: list[dict[str, Any]], model: str):
+    """Stream one model step.
+
+    Yields ``{"type": "token", "content": str}`` for answer turns, then a terminal
+    ``{"type": "text_done", "text": str}``. For action turns yields no tokens and a
+    terminal ``{"type": "tool_calls", "calls": [{"id","name","args_str"}, ...]}``.
+    """
+    kwargs = model_kwargs(model, messages=messages, stream=True)
+    kwargs["tools"] = tools
+    kwargs["tool_choice"] = "auto"
+    stream = await _with_retry(lambda: litellm.acompletion(**kwargs))
+
+    text_parts: list[str] = []
+    acc: dict[int, dict[str, Any]] = {}
+    async for chunk in stream:
+        delta = _delta(chunk)
+        content = _delta_content(delta)
+        if content:
+            text_parts.append(content)
+            yield {"type": "token", "content": content}
+        for frag in _delta_tool_calls(delta):
+            idx, fid, name, args = _frag_fields(frag)
+            slot = acc.setdefault(idx, {"id": None, "name": None, "args": ""})
+            if fid:
+                slot["id"] = fid
+            if name:
+                slot["name"] = name
+            slot["args"] += args
+
+    if acc:
+        calls = [
+            {"id": s["id"] or f"call_{i}", "name": s["name"] or "", "args_str": s["args"] or "{}"}
+            for i, s in sorted(acc.items())
+        ]
+        yield {"type": "tool_calls", "calls": calls}
+    else:
+        yield {"type": "text_done", "text": "".join(text_parts)}
+
+
 async def stream_completion(messages: list[dict[str, str]], *, model_id: str | None = None):
     selected = normalize_chat_model(model_id)
     if selected != "auto":
