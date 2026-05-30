@@ -253,6 +253,9 @@ async def test_agent_loop_uses_model_decisions_and_broker_checkpoint(monkeypatch
     async def fake_emit(task_id, event, actor_id="chronos"):
         return None
 
+    async def fake_reasoning_summary(*args, **kwargs):
+        return None
+
     async def fake_persist(task_arg, content):
         return None
 
@@ -270,6 +273,7 @@ async def test_agent_loop_uses_model_decisions_and_broker_checkpoint(monkeypatch
     monkeypatch.setattr(agent_loop, "save_task", fake_save_task)
     monkeypatch.setattr(agent_loop, "publish_activity", fake_emit)
     monkeypatch.setattr(agent_loop, "emit_activity", fake_emit)
+    monkeypatch.setattr(agent_loop, "publish_reasoning_summary", fake_reasoning_summary)
     monkeypatch.setattr(agent_loop, "_persist_to_conversation", fake_persist)
     monkeypatch.setattr(agent_loop, "_llm_step", fake_llm_step)
     monkeypatch.setattr(agent_loop.tool_broker, "execute", fake_execute)
@@ -318,6 +322,9 @@ async def test_agent_loop_pauses_and_checkpoints_on_approval(monkeypatch):
     async def fake_emit(task_id, event, actor_id="chronos"):
         return None
 
+    async def fake_reasoning_summary(*args, **kwargs):
+        return None
+
     async def fake_llm_step(messages, tools, model=None, routing_decision=None):
         return None, [
             {
@@ -334,6 +341,7 @@ async def test_agent_loop_pauses_and_checkpoints_on_approval(monkeypatch):
     monkeypatch.setattr(agent_loop, "save_task", fake_save_task)
     monkeypatch.setattr(agent_loop, "publish_activity", fake_emit)
     monkeypatch.setattr(agent_loop, "emit_activity", fake_emit)
+    monkeypatch.setattr(agent_loop, "publish_reasoning_summary", fake_reasoning_summary)
     monkeypatch.setattr(agent_loop, "_llm_step", fake_llm_step)
     monkeypatch.setattr(agent_loop, "_open_approval_gate", fake_open_approval)
 

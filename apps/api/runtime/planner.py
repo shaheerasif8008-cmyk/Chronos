@@ -171,8 +171,6 @@ Goal: {goal}
     ) -> dict[str, Any]:
         classification = await self.classify(goal, context, org_id)
         missing = _missing_tools(classification.requires_tools, self.available_tools)
-        if missing:
-            raise PlanningError(f"Missing tools for task classification: {', '.join(missing)}")
 
         if _is_operator_workflow_proof(goal):
             plan = normalize_plan(_operator_workflow_proof_plan(goal))
@@ -201,6 +199,8 @@ Goal: {goal}
             fallback = _demo_plan(goal) if classification.requires_approval or _is_outreach_goal(goal) else _research_plan(goal)
             plan = normalize_plan(fallback)
             plan["context"]["allow_replan"] = False
+        if missing:
+            plan.setdefault("context", {})["classification_tool_hints_unavailable"] = missing
 
         validation = validate_plan(plan, self.available_tools)
         if not validation.valid:

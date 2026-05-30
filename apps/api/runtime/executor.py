@@ -48,10 +48,6 @@ from runtime.planner import (
 # ── Public name kept for imports in approvals.py, sub_agent.py, tests ─────────
 AGENT_LOOP_APPROVAL_STEP_ID = "agent_loop"
 
-# Sentinel returned by _preflight_and_route when the task was failed pre-flight.
-_PREFLIGHT_FAILED = object()
-
-
 class _PausedForApproval(Exception):
     """Internal control flow for DAG steps that created approval records."""
 
@@ -102,8 +98,6 @@ class TaskExecutor:
                 return
             if _is_fresh_top_level(task):
                 routed = await self._preflight_and_route(task)
-                if routed is _PREFLIGHT_FAILED:
-                    return
                 if routed is not None:
                     await self._run_dag(routed)
                     return
@@ -129,7 +123,6 @@ class TaskExecutor:
 
         Classifies the goal, dispatches complex goals to the DAG planner, and lets
         everything else fall through to the native loop. Returns:
-          * ``_PREFLIGHT_FAILED`` — the task was failed (required a missing tool),
           * a task dict with ``plan`` populated — a DAG plan was built (complex goal),
           * ``None`` — use the native agent loop (simple/medium goal).
 
@@ -144,18 +137,19 @@ class TaskExecutor:
         except Exception:
             return None
         if missing:
-            error = (
-                f"missing_tools: {', '.join(missing)} — "
-                "connect the required integrations in Settings → Connectors."
+            await emit_activity(
+                task["id"],
+                {
+                    "type": "preflight_tool_hints_unavailable",
+                    "tools": missing,
+                    "summary": "Classifier named non-registry tool hints; continuing with the registered tool library.",
+                },
             )
-            await save_task(task["id"], status="failed", error=error, result={}, completed_at=now_utc())
-            await emit_activity(task["id"], {"type": "task_failed", "error": error})
-            return _PREFLIGHT_FAILED
         if classification.complexity != "complex":
             return None
         try:
             plan = await create_plan(goal, context, org_id)
-        except PlanningError as exc:
+        except Exception as exc:
             await emit_activity(task["id"], {"type": "planner_fallback", "error": str(exc)})
             return None
         await save_task(task["id"], plan=plan)

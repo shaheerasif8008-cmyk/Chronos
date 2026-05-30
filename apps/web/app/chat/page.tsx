@@ -2,6 +2,8 @@
 
 import { Component, ReactNode, useEffect, useRef, useState, useMemo, useCallback } from "react";
 import { usePathname, useRouter } from "next/navigation";
+import ArtifactsScreen from "../../components/artifacts/ArtifactsScreen";
+import InChatArtifactPanel from "../../components/artifacts/InChatArtifactPanel";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 const CONFIGURED_API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
@@ -30,6 +32,7 @@ type Message = {
   status?: MessageStatus;
   created_at?: string;
   tool_traces?: ToolTrace[];
+  reasoning_summaries?: ReasoningSummary[];
   artifacts?: ArtifactRef[];
   citations?: Array<{ url?: string; text?: string; [key: string]: unknown }>;
   model?: string;
@@ -39,6 +42,7 @@ type Message = {
   parent_message_id?: string | null;
 };
 type ToolTrace = { id: string; tool: string; summary: string; status: MessageStatus };
+type ReasoningSummary = { id: string; iteration?: number; summary: string; status: MessageStatus };
 type ArtifactRef = { id: string; title: string; kind: string; mime_type?: string; size_bytes?: number };
 type ProjectSource = { id: string; title?: string | null; source_type?: string | null; parse_status?: string | null; index_status?: string | null; uri?: string | null; created_at?: string };
 type SourceChunkPreview = { chunk_index: number; content: string; token_count?: number | null };
@@ -274,6 +278,7 @@ function routeFromPath(pathname: string | null): Route {
   if (pathname === "/memory") return "memory";
   if (pathname === "/connectors") return "connectors";
   if (pathname === "/assistants") return "assistants";
+  if (pathname === "/artifacts") return "artifacts";
   if (pathname === "/settings") return "settings";
   if (pathname === "/projects") return "projects";
   if (pathname === "/research") return "research";
@@ -647,6 +652,7 @@ function ChronosAppInner() {
         {route === "activity"   && <ActivityScreen />}
         {route === "approvals"  && <ApprovalsScreen onDecision={loadPendingApprovals} />}
         {route === "memory"     && <MemoryScreen />}
+        {route === "artifacts"  && <ArtifactsScreen />}
         {route === "connectors" && <ConnectorsScreen />}
         {route === "assistants" && <AssistantsScreen onStartConversation={(personaId) => {
           setActivePersonaId(personaId);
@@ -665,6 +671,7 @@ function ChronosAppInner() {
         {route === "workflows"  && <EmptyPanel label="Workflows" />}
         {route === "audit"      && <EmptyPanel label="Audit" />}
       </main>
+      <InChatArtifactPanel />
     </div>
   );
 }
@@ -691,6 +698,7 @@ function Sidebar({
     { id: "activity"   as Route, icon: <IC.Activity size={15}/>,   label: "Activity" },
     { id: "approvals"  as Route, icon: <IC.Approvals size={15}/>,  label: "Approvals",  badge: pendingApprovals || null, badgeKind: "warn" },
     { id: "memory"     as Route, icon: <IC.Memory size={15}/>,     label: "Memory" },
+    { id: "artifacts"  as Route, icon: <IC.Folder size={15}/>,     label: "Artifacts" },
     { id: "connectors" as Route, icon: <IC.Connectors size={15}/>, label: "Connectors" },
     { id: "assistants" as Route, icon: <IC.Personas size={15}/>,   label: "Assistants" },
     { id: "projects"   as Route, icon: <IC.Folder size={15}/>,     label: "Projects" },
@@ -1286,6 +1294,23 @@ function ChatScreen({
           }
           return updated;
         });
+      } else if (ev.type === "trace" && ev.event && ev.event.type === "reasoning_summary") {
+        const te = ev.event;
+        const summary = String(te.summary ?? "").trim();
+        if (!summary) return;
+        setMessages(prev => {
+          const updated = [...prev];
+          const last = updated[updated.length - 1];
+          if (last?.role !== "assistant") return updated;
+          const existing = last.reasoning_summaries ?? [];
+          const id = `reasoning-${te.iteration ?? existing.length + 1}-${Date.now()}`;
+          updated[updated.length - 1] = {
+            ...last,
+            thinking: true,
+            reasoning_summaries: [...existing, { id, iteration: te.iteration, summary, status: "streaming" }],
+          };
+          return updated;
+        });
       } else if (ev.type === "trace" && ev.event) {
         const te = ev.event;
         const traceType = te.type ?? "";
@@ -1377,12 +1402,14 @@ function ChatScreen({
                 ? { ...trace, summary: "Task stream finished", status: "complete" as MessageStatus }
                 : trace
             );
+            const reasoning = (last.reasoning_summaries ?? []).map(item => ({ ...item, status: "complete" as MessageStatus }));
             updated[updated.length - 1] = {
               ...last,
               status: "complete",
               content: partial || last.content,
               thinking: false,
               tool_traces: traces,
+              reasoning_summaries: reasoning,
             };
           }
           return updated;
@@ -1542,7 +1569,7 @@ function ChatScreen({
               {messages.map((m, i) => (
                 m.role === "user"
                   ? <UserMessage key={m.id ?? `user-${i}`} message={m} conversationId={activeConvoId ?? ""} onRefresh={() => { if (activeConvoId) void loadMessagesFromServer(activeConvoId); }} onBranch={(newConvoId) => { onConvoCreated(newConvoId); }}/>
-                  : <AssistantMessage key={m.id ?? `assistant-${i}`} message={m} content={m.content} conversationId={activeConvoId ?? ""} status={m.status ?? "complete"} persona={activePersona} toolTraces={m.tool_traces} artifacts={m.artifacts} thinking={m.thinking} mode={m.mode} onRefresh={() => { if (activeConvoId) void loadMessagesFromServer(activeConvoId); }} onBranch={(newConvoId) => { onConvoCreated(newConvoId); }}/>
+                  : <AssistantMessage key={m.id ?? `assistant-${i}`} message={m} content={m.content} conversationId={activeConvoId ?? ""} status={m.status ?? "complete"} persona={activePersona} toolTraces={m.tool_traces} reasoningSummaries={m.reasoning_summaries} artifacts={m.artifacts} thinking={m.thinking} mode={m.mode} onRefresh={() => { if (activeConvoId) void loadMessagesFromServer(activeConvoId); }} onBranch={(newConvoId) => { onConvoCreated(newConvoId); }}/>
               ))}
               {streaming && messages[messages.length - 1]?.role !== "assistant" && (
                 <div className="flex gap-4">
@@ -2010,6 +2037,41 @@ function TraceRow({ trace }: { trace: ToolTrace }) {
   );
 }
 
+function ReasoningPanel({ summaries, streaming }: { summaries: ReasoningSummary[]; streaming: boolean }) {
+  const [open, setOpen] = useState(true);
+  if (!summaries.length) return null;
+  const latest = summaries[summaries.length - 1];
+  const isRunning = streaming && summaries.some(item => item.status === "streaming");
+
+  return (
+    <div className="mb-3 rounded-lg border overflow-hidden" style={{ borderColor: "var(--border-soft)", background: "var(--surface)" }}>
+      <button
+        type="button"
+        onClick={() => setOpen(value => !value)}
+        className="w-full flex items-center gap-2.5 px-3 py-2 text-left smooth hover:bg-[var(--surface-2)]"
+        style={{ color: "var(--text-muted)" }}
+      >
+        <Dot color="var(--accent)" size={6} pulse={isRunning} ring={isRunning} />
+        <span className="font-mono text-[11px]" style={{ color: "var(--text-dim)" }}>reasoning</span>
+        <span className="flex-1 text-[12.5px] truncate" style={{ color: "var(--text-muted)" }}>
+          {latest.iteration ? `Iteration ${latest.iteration}: ` : ""}{latest.summary.split("\n")[0].replace(/^[-*]\s*/, "")}
+        </span>
+        <IC.ChevronDown size={12} style={{ color: "var(--text-dim)", transform: open ? "rotate(180deg)" : undefined, transition: "transform .15s", flexShrink: 0 }}/>
+      </button>
+      {open && (
+        <div className="px-3 pb-3 pt-1 space-y-2 border-t hairline">
+          {summaries.map(item => (
+            <div key={item.id} className="text-[12.5px] leading-relaxed whitespace-pre-wrap" style={{ color: "var(--text-muted)" }}>
+              {item.iteration && <span className="font-mono text-[11px] mr-2" style={{ color: "var(--text-dim)" }}>#{item.iteration}</span>}
+              {item.summary}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ArtifactCard({ artifact }: { artifact: ArtifactRef }) {
   const [busy, setBusy] = useState(false);
   const mime = artifact.mime_type ?? "";
@@ -2070,13 +2132,15 @@ function ArtifactCard({ artifact }: { artifact: ArtifactRef }) {
           <IC.External size={13}/> Open
         </button>
       )}
+      <button onClick={() => window.dispatchEvent(new CustomEvent("chronos:open-artifact", { detail: { id: artifact.id } }))} className="btn btn-ghost btn-sm">Open here</button>
       <button onClick={handleDownload} disabled={busy} className="btn btn-ghost btn-sm">Download</button>
     </div>
   );
 }
 
-function AssistantMessage({ message, content, status, persona, toolTraces, artifacts, thinking, mode, conversationId, onRefresh, onBranch }: { message: Message; content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[]; artifacts?: ArtifactRef[]; thinking?: boolean; mode?: string; conversationId: string; onRefresh: () => void; onBranch: (id: string) => void }) {
+function AssistantMessage({ message, content, status, persona, toolTraces, reasoningSummaries, artifacts, thinking, mode, conversationId, onRefresh, onBranch }: { message: Message; content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[]; reasoningSummaries?: ReasoningSummary[]; artifacts?: ArtifactRef[]; thinking?: boolean; mode?: string; conversationId: string; onRefresh: () => void; onBranch: (id: string) => void }) {
   const hasTraces = !!(toolTraces && toolTraces.length > 0);
+  const hasReasoning = !!(reasoningSummaries && reasoningSummaries.length > 0);
   const isStreaming = status === "streaming";
   return (
     <div className="flex gap-4 fadein group">
@@ -2094,6 +2158,10 @@ function AssistantMessage({ message, content, status, persona, toolTraces, artif
             </div>
           )}
         </div>
+
+        {hasReasoning && (
+          <ReasoningPanel summaries={reasoningSummaries!} streaming={isStreaming} />
+        )}
 
         {/* Inline tool traces — like Claude's tool use steps */}
         {hasTraces && (

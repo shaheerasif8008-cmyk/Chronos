@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import random
 
 from fastapi import APIRouter, HTTPException, Response
