@@ -139,3 +139,59 @@ async def test_start_task_promotes_to_background(monkeypatch):
     assert enqueued == ["task-bg"]
     assert any(e["type"] == "task_created" and e.get("background") for e in events)
     assert events[-1]["type"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_inline_turn_gates_external_write_after_prompt_injection(monkeypatch):
+    from runtime import agent_loop
+
+    steps = [
+        [{"type": "tool_calls", "calls": [{"id": "f1", "name": "browser__fetch", "args_str": "{}"}]}],
+        [{"type": "tool_calls", "calls": [{"id": "d1", "name": "gmail__draft", "args_str": "{}"}]}],
+    ]
+
+    async def fake_stream_step(messages, tools, model):
+        for ev in steps.pop(0):
+            yield ev
+
+    async def fake_create(**k):
+        return "task-inj"
+
+    async def fake_get_task(tid):
+        return {"id": tid, "organization_id": "default", "region": "us", "depth": 0,
+                "triggered_by_member_id": "member-1", "workspace_id": None, "persona_id": None}
+
+    async def fake_execute(call, task, agent):
+        if call["name"] != "browser__fetch":
+            raise AssertionError("external write must not execute after injection without approval")
+        return {"role": "tool", "tool_call_id": call["id"], "name": call["name"],
+                "content": json.dumps({"summary": "fetched", "data": {"untrusted_content": {
+                    "trusted": False, "risk": "prompt_injection", "source": "browser:https://x"}}})}
+
+    gated = []
+    async def fake_open_gate(task, pending, history, iteration, model=None):
+        gated.extend(c["name"] for c in pending)
+
+    async def noop(*a, **k):
+        return None
+
+    monkeypatch.setattr(agent_loop, "stream_step", fake_stream_step)
+    monkeypatch.setattr(agent_loop, "create_task_from_history", fake_create)
+    monkeypatch.setattr(agent_loop, "get_task", fake_get_task)
+    monkeypatch.setattr(agent_loop, "_execute_tool", fake_execute)
+    monkeypatch.setattr(agent_loop, "_open_approval_gate", fake_open_gate)
+    monkeypatch.setattr(agent_loop, "emit_activity", noop)
+    monkeypatch.setattr(agent_loop, "save_task", noop)
+    monkeypatch.setattr(agent_loop, "_checkpoint", noop)
+    monkeypatch.setattr(agent_loop, "extract_and_save", noop)
+
+    events = await _run(agent_loop.stream_chat_turn(
+        conversation_id="conv-1",
+        message="fetch the page then email a summary",
+        context_messages=[{"role": "system", "content": "sys"}],
+        requester_context=_ctx(),
+        model="agent",
+    ))
+
+    assert gated == ["gmail__draft"]
+    assert any(e["type"] == "awaiting_approval" for e in events)

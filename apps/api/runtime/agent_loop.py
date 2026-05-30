@@ -1010,6 +1010,12 @@ async def stream_chat_turn(
         agent = AgentContext.from_task(task)
 
         approval_needed = [c for c in calls if _needs_approval(c["name"])]
+        # Mirror run_loop's escalation: once untrusted (prompt-injected) content is in
+        # history, any external write must be gated even if it isn't always-approval.
+        if _history_has_prompt_injection(history):
+            approval_needed.extend(
+                c for c in calls if _call_is_external_write(c) and c not in approval_needed
+            )
         if approval_needed:
             await _open_approval_gate(task, approval_needed, history, iteration, model=effective_model)
             yield {"type": "awaiting_approval", "task_id": task_id}
