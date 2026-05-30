@@ -91,6 +91,8 @@ if __name__ == "__main__":
 Run: `python -m scripts.spike_streaming_tools`
 Expected: answer turn → `content_chunks > 0, toolcall_chunks == 0`; action turn → `toolcall_chunks > 0`, and the printed tool_call deltas carry `index`, `id`, `function.name`, `function.arguments` fragments.
 
+**SPIKE RESULT (2026-05-29, run by controller against real OpenRouter `deepseek-v4-pro`):** answer turn → `content_chunks=19, toolcall_chunks=0`; action turn → `content_chunks=0, toolcall_chunks=21`, deltas carry `id`, `function.name`, accumulable `arguments`, `index=0`. **Streamed tool-call deltas usable: YES.** Task 2 streams tool-decision turns via accumulation; no non-streaming fallback required. Task 1 steps below are satisfied — skip re-running.
+
 - [ ] **Step 3: Record the result + decision in this plan**
 
 Edit this file, under this task, add:
