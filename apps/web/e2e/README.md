@@ -39,6 +39,9 @@ npx playwright test chat.spec.ts               # one spec
 | `chat.spec.ts` | send → live model stream → durable persistence |
 | `artifacts.spec.ts` | create → edit → version → diff → restore |
 | `memory.spec.ts` | add → retrieve → edit → delete |
+| `activity.spec.ts` | task execution timeline persists across refresh |
+| `model-selection.spec.ts` | model choice persists across reload |
+| `connectors.spec.ts` | directory renders catalog + reflects a connected app (seeded) |
 | `approvals.spec.ts` | inbox renders a pending approval → Approve decides it |
 
 ### Approvals spec needs a seeded approval
@@ -59,3 +62,15 @@ E2E_SEED_APPROVAL_ID="$APPROVAL_ID" E2E_SEED_TASK_ID="$TASK_ID" \
 The broker approval **gate** and the **decide → resume** path are proven
 separately and deterministically in
 `apps/api/tests/test_approval_flow_http.py`.
+
+### Connectors spec needs a seeded connector
+
+`connectors.spec.ts` proves the directory reflects a connected app. The real
+connect path is OAuth (not E2E-driven), so seed an active connector first:
+
+```bash
+cd apps/api && . .venv/bin/activate
+export DATABASE_URL="postgresql+asyncpg://chronos:chronos@localhost:55433/chronos"
+python seed_connector.py                       # seeds an active gmail connector
+cd ../web && npx playwright test connectors.spec.ts
+```
