@@ -180,8 +180,14 @@ async def health() -> dict:
         from miniopy_async import Minio  # type: ignore[import]
         client = Minio(cfg.minio_endpoint, access_key=cfg.minio_access_key,
                        secret_key=cfg.minio_secret_key, secure=cfg.minio_secure)
-        await client.bucket_exists(cfg.minio_bucket)
-        checks["minio"] = "ok"
+        try:
+            await client.bucket_exists(cfg.minio_bucket)
+            checks["minio"] = "ok"
+        finally:
+            try:
+                await client.close_session()
+            except Exception:
+                pass
     except Exception as exc:
         checks["minio"] = f"error: {exc}"
 

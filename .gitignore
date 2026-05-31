@@ -8,4 +8,8 @@ node_modules/
 dist/
 build/
 
+# Playwright E2E artifacts
+test-results/
+playwright-report/
+
 .DS_Store

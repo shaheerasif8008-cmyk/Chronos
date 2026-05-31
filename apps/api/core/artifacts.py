@@ -41,6 +41,20 @@ async def _minio_client():
     )
 
 
+async def _close_minio(client) -> None:
+    """Close the async MinIO client's aiohttp session (best effort).
+
+    miniopy_async opens an aiohttp ClientSession per client; without this the
+    session leaks and emits "Unclosed client session" on GC.
+    """
+    if client is None:
+        return
+    try:
+        await client.close_session()
+    except Exception:
+        pass
+
+
 async def _ensure_bucket(client) -> None:
     exists = await client.bucket_exists(settings.minio_bucket)
     if not exists:
@@ -79,6 +93,7 @@ async def save_artifact(
     minio_path = f"artifacts/{org_id}/{artifact_id}/v{version}"
 
     # --- Upload to MinIO ---
+    client = None
     try:
         client = await _minio_client()
         await _ensure_bucket(client)
@@ -96,6 +111,8 @@ async def save_artifact(
         _scratch.mkdir(parents=True, exist_ok=True)
         (_scratch / f"v{version}").write_bytes(raw)
         minio_path = f"local://{artifact_id}/v{version}"
+    finally:
+        await _close_minio(client)
 
     # --- Insert artifact head row + initial version row ---
     artifacts = await reflect_table("artifacts")
@@ -153,12 +170,15 @@ async def read_artifact_content(artifact_id: str) -> bytes | None:
     path: str = meta["minio_path"]
 
     # Try MinIO first.
+    client = None
     try:
         client = await _minio_client()
         response = await client.get_object(settings.minio_bucket, path)
         return await response.read()
     except Exception:
         pass
+    finally:
+        await _close_minio(client)
 
     # Local fallback.
     import pathlib
