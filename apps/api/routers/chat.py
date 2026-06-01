@@ -6,7 +6,7 @@ from typing import Any
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, insert, select, update
+from sqlalchemy import delete, insert, or_, select, update
 
 from core import audit, permissions
 from core.auth import get_current_member
@@ -26,6 +26,7 @@ from memory.extraction import extract_and_save
 from runtime.agent_loop import format_task_answer, stream_chat_turn
 from runtime import task_runner
 from runtime.executor import activity_channel
+from routers.tasks import create_task_record
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -319,8 +320,6 @@ async def _agent_loop_stream(
     When `requester_context`/`user_message_for_memory` are supplied (chat-routed
     runs), autonomous memory extraction fires too, matching the fast path.
     """
-    from routers.tasks import create_task_record
-
     task_id = await create_task_record(
         goal=goal,
         member=member,
@@ -498,3 +497,288 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
         media_type="text/event-stream",
         headers=_SSE_HEADERS,
     )
+
+
+# ─── Per-message controls ──────────────────────────────────────────────────────
+
+class EditMessageRequest(BaseModel):
+    content: str
+
+
+class SaveToMemoryRequest(BaseModel):
+    scope: str = "org"
+
+
+class ConvertToTaskRequest(BaseModel):
+    model: str | None = None
+    mode: str | None = None
+
+
+async def _check_conversation_ownership(
+    conn: Any,
+    conversations: Any,
+    conversation_id: str,
+    member: Member,
+) -> dict:
+    """Return conversation row or raise 404 if not owned by member/org."""
+    from fastapi import HTTPException
+    row = (
+        await conn.execute(
+            select(conversations).where(
+                conversations.c.id == conversation_id,
+                conversations.c.member_id == member.id,
+                conversations.c.organization_id == member.organization_id,
+            )
+        )
+    ).mappings().first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return dict(row)
+
+
+@router.post("/conversations/{conversation_id}/messages/{message_id}/pin")
+async def pin_message(
+    conversation_id: str,
+    message_id: str,
+    member: Member = Depends(get_current_member),
+) -> dict:
+    await permissions.check(member, "pin_message", conversation_id)
+    conversations = await reflect_table("conversations")
+    messages = await reflect_table("messages")
+    async with engine.begin() as conn:
+        await _check_conversation_ownership(conn, conversations, conversation_id, member)
+        await conn.execute(
+            update(messages)
+            .where(messages.c.id == message_id, messages.c.conversation_id == conversation_id)
+            .values(pinned=True)
+        )
+    await audit.log(
+        "message_pinned",
+        member.id,
+        "chat.pin_message",
+        resource_type="messages",
+        resource_id=message_id,
+    )
+    return {"pinned": True}
+
+
+@router.post("/conversations/{conversation_id}/messages/{message_id}/unpin")
+async def unpin_message(
+    conversation_id: str,
+    message_id: str,
+    member: Member = Depends(get_current_member),
+) -> dict:
+    await permissions.check(member, "unpin_message", conversation_id)
+    conversations = await reflect_table("conversations")
+    messages = await reflect_table("messages")
+    async with engine.begin() as conn:
+        await _check_conversation_ownership(conn, conversations, conversation_id, member)
+        await conn.execute(
+            update(messages)
+            .where(messages.c.id == message_id, messages.c.conversation_id == conversation_id)
+            .values(pinned=False)
+        )
+    await audit.log(
+        "message_unpinned",
+        member.id,
+        "chat.unpin_message",
+        resource_type="messages",
+        resource_id=message_id,
+    )
+    return {"pinned": False}
+
+
+@router.patch("/conversations/{conversation_id}/messages/{message_id}")
+async def edit_message(
+    conversation_id: str,
+    message_id: str,
+    req: EditMessageRequest,
+    member: Member = Depends(get_current_member),
+) -> dict:
+    from fastapi import HTTPException
+    await permissions.check(member, "edit_message", conversation_id)
+    conversations = await reflect_table("conversations")
+    messages = await reflect_table("messages")
+    async with engine.begin() as conn:
+        await _check_conversation_ownership(conn, conversations, conversation_id, member)
+        msg_row = (
+            await conn.execute(
+                select(messages).where(
+                    messages.c.id == message_id,
+                    messages.c.conversation_id == conversation_id,
+                )
+            )
+        ).mappings().first()
+        if msg_row is None:
+            raise HTTPException(status_code=404, detail="Message not found")
+        if msg_row["role"] != "user":
+            raise HTTPException(status_code=400, detail="Only user messages can be edited")
+        prev_content = msg_row["content"]
+        await conn.execute(
+            update(messages)
+            .where(messages.c.id == message_id)
+            .values(content=req.content)
+        )
+    await audit.log(
+        "message_edited",
+        member.id,
+        "chat.edit_message",
+        resource_type="messages",
+        resource_id=message_id,
+        payload={"prev_length": len(prev_content), "new_length": len(req.content)},
+    )
+    return {"content": req.content}
+
+
+@router.post("/conversations/{conversation_id}/messages/{message_id}/branch")
+async def branch_conversation(
+    conversation_id: str,
+    message_id: str,
+    member: Member = Depends(get_current_member),
+) -> dict:
+    await permissions.check(member, "branch_conversation", conversation_id)
+    conversations = await reflect_table("conversations")
+    messages = await reflect_table("messages")
+    async with engine.begin() as conn:
+        conv_row = await _check_conversation_ownership(conn, conversations, conversation_id, member)
+        # Fetch the branch point message
+        src_msg = (
+            await conn.execute(
+                select(messages).where(
+                    messages.c.id == message_id,
+                    messages.c.conversation_id == conversation_id,
+                )
+            )
+        ).mappings().first()
+        if src_msg is None:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=404, detail="Message not found")
+        src_msg = dict(src_msg)
+        # Fetch all messages up to and including the branch point using or_
+        prior_msgs = (
+            await conn.execute(
+                select(messages).where(
+                    or_(
+                        messages.c.id == message_id,
+                        messages.c.created_at <= src_msg["created_at"],
+                    ),
+                    messages.c.conversation_id == conversation_id,
+                ).order_by(messages.c.created_at.asc())
+            )
+        ).mappings().all()
+        # Create new conversation
+        new_conv_result = await conn.execute(
+            insert(conversations).values(
+                organization_id=member.organization_id,
+                region=settings.region,
+                member_id=member.id,
+                title=f"Branch: {conv_row.get('title', '')}",
+            ).returning(conversations.c.id)
+        )
+        new_conv_id = str(new_conv_result.scalar_one())
+        # Copy messages into new conversation
+        if prior_msgs:
+            for msg in prior_msgs:
+                msg_dict = dict(msg)
+                msg_dict.pop("id", None)
+                msg_dict["conversation_id"] = new_conv_id
+                msg_dict["organization_id"] = member.organization_id
+                await conn.execute(insert(messages).values(**msg_dict))
+    await audit.log(
+        "conversation_branched",
+        member.id,
+        "chat.branch_conversation",
+        resource_type="conversations",
+        resource_id=new_conv_id,
+        payload={"source_conversation_id": conversation_id, "branch_message_id": message_id},
+    )
+    return {"conversation_id": new_conv_id}
+
+
+@router.post("/conversations/{conversation_id}/messages/{message_id}/save-to-memory")
+async def save_message_to_memory(
+    conversation_id: str,
+    message_id: str,
+    req: SaveToMemoryRequest,
+    member: Member = Depends(get_current_member),
+) -> dict:
+    await permissions.check(member, "save_to_memory", conversation_id)
+    conversations = await reflect_table("conversations")
+    messages = await reflect_table("messages")
+    async with engine.begin() as conn:
+        conv_row = await _check_conversation_ownership(conn, conversations, conversation_id, member)
+        msg_row = (
+            await conn.execute(
+                select(messages).where(
+                    messages.c.id == message_id,
+                    messages.c.conversation_id == conversation_id,
+                )
+            )
+        ).mappings().first()
+        if msg_row is None:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=404, detail="Message not found")
+        msg_row = dict(msg_row)
+    scope_id = member.id if req.scope == "personal" else member.organization_id
+    requester_context = RequesterContext.from_member(member)
+    entry_id = await create_memory_entry(
+        content=msg_row["content"],
+        requester_context=requester_context,
+        source="explicit",
+        scope=req.scope,
+        scope_id=scope_id,
+        importance_score=0.8,
+        conversation_id=conversation_id,
+        created_by=member.id,
+    )
+    await audit.log(
+        "message_saved_to_memory",
+        member.id,
+        "chat.save_message_to_memory",
+        resource_type="messages",
+        resource_id=message_id,
+        payload={"scope": req.scope, "memory_entry_id": str(entry_id)},
+    )
+    return {"memory_entry_id": entry_id}
+
+
+@router.post("/conversations/{conversation_id}/messages/{message_id}/convert-to-task")
+async def convert_message_to_task(
+    conversation_id: str,
+    message_id: str,
+    req: ConvertToTaskRequest,
+    member: Member = Depends(get_current_member),
+) -> dict:
+    await permissions.check(member, "convert_to_task", conversation_id)
+    conversations = await reflect_table("conversations")
+    messages = await reflect_table("messages")
+    async with engine.begin() as conn:
+        await _check_conversation_ownership(conn, conversations, conversation_id, member)
+        msg_row = (
+            await conn.execute(
+                select(messages).where(
+                    messages.c.id == message_id,
+                    messages.c.conversation_id == conversation_id,
+                )
+            )
+        ).mappings().first()
+        if msg_row is None:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=404, detail="Message not found")
+        msg_row = dict(msg_row)
+    task_id = await create_task_record(
+        goal=msg_row["content"],
+        member=member,
+        triggered_by=conversation_id,
+        model=req.model,
+        mode=req.mode,
+    )
+    await audit.log(
+        "message_converted_to_task",
+        member.id,
+        "chat.convert_message_to_task",
+        resource_type="messages",
+        resource_id=message_id,
+        payload={"task_id": str(task_id), "conversation_id": conversation_id},
+    )
+    return {"task_id": task_id}
