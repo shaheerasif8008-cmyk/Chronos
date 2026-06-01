@@ -36,3 +36,24 @@ async def test_messages_table_has_structured_response_column():
             )
         ).scalar_one()
     assert row == envelope
+
+
+def test_envelope_serializes_with_defaults():
+    from core.structured_response import StructuredResponse
+
+    env = StructuredResponse(response_type="direct_answer", status="complete", summary="Paris.")
+    dumped = env.model_dump()
+    assert dumped["response_type"] == "direct_answer"
+    assert dumped["status"] == "complete"
+    assert dumped["key_findings"] == []
+    assert dumped["artifacts"] == []
+    assert dumped["actions"] == []
+    assert dumped["approval_status"] is None
+
+
+def test_envelope_rejects_unknown_status():
+    import pytest as _pytest
+    from core.structured_response import StructuredResponse
+
+    with _pytest.raises(ValueError):
+        StructuredResponse(response_type="task_complete", status="banana", summary="x")
