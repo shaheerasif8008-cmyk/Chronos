@@ -15,8 +15,9 @@
 **Run all tests with the repo virtualenv at `/Users/shaheer/Downloads/Chronos-may18/.venv` (Python 3.12, all deps + alembic installed).**
 
 ```bash
-VENV=/Users/shaheer/Downloads/Chronos-may18/.venv
-cd apps/api && $VENV/bin/python -m pytest <args>
+# From the repo root; falls back to the conventional .venv location.
+VENV=${VIRTUAL_ENV:-"$(git rev-parse --show-toplevel)/.venv"}
+cd apps/api && "$VENV/bin/python" -m pytest <args>
 ```
 
 - Do **NOT** use system `python3` (3.9 — crashes on `str | None` annotations in `core/permissions.py`).

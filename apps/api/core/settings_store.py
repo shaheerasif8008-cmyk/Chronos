@@ -109,6 +109,9 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "debug_logging": False,
         "experimental_features": False,
     },
+    "response_format": {
+        "verbosity": "detailed",
+    },
 }
 
 

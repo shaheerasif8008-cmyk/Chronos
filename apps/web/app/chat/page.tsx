@@ -2,6 +2,7 @@
 
 import { Component, ReactNode, useEffect, useRef, useState, useMemo, useCallback } from "react";
 import { usePathname, useRouter } from "next/navigation";
+import Link from "next/link";
 import ArtifactsScreen from "../../components/artifacts/ArtifactsScreen";
 import InChatArtifactPanel from "../../components/artifacts/InChatArtifactPanel";
 
@@ -1187,7 +1188,16 @@ function ChatScreen({
 
     setMessages(prev => {
       if (opts?.preserveLocal && normalized.length < prev.length) return prev;
-      return normalized;
+      // Preserve a just-streamed structured_response if the refreshed DB row
+      // doesn't have one yet (avoids cards vanishing on a resync that wins a race).
+      const prevById = new Map(prev.filter(m => m.id).map(m => [m.id!, m]));
+      return normalized.map(message => {
+        if (!message.id) return message;
+        const existing = prevById.get(message.id);
+        return !message.structured_response && existing?.structured_response
+          ? { ...message, structured_response: existing.structured_response }
+          : message;
+      });
     });
     if (latestTask?.id) {
       setActiveTaskId(latestTask.id);
@@ -2236,9 +2246,9 @@ function InlineApprovalCard({ sr }: { sr: StructuredResponse }) {
       <div style={{ color: "var(--text-muted)" }}>
         A draft is prepared but not sent. Review and approve it in the Approvals inbox.
       </div>
-      <a href="/approvals" className="inline-flex items-center gap-1 mt-2 text-[12.5px]" style={{ color: "var(--accent)" }}>
+      <Link href="/approvals" className="inline-flex items-center gap-1 mt-2 text-[12.5px]" style={{ color: "var(--accent)" }}>
         Open Approvals <IC.ArrowRight size={13} />
-      </a>
+      </Link>
     </div>
   );
 }

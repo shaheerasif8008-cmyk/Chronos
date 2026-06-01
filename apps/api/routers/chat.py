@@ -1,8 +1,10 @@
 from __future__ import annotations
 import asyncio
 import json
+import logging
 import uuid
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Coroutine
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
@@ -30,6 +32,26 @@ from runtime.executor import activity_channel
 from routers.tasks import create_task_record
 
 router = APIRouter(prefix="/chat", tags=["chat"])
+
+logger = logging.getLogger(__name__)
+
+# Hold strong references to background tasks so they aren't garbage-collected
+# mid-flight (per the asyncio.create_task docs / RUF006).
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
+
+
+def _spawn_background(coro: Coroutine, *, label: str) -> None:
+    """Fire-and-forget a coroutine, logging any exception instead of swallowing it."""
+    task = asyncio.create_task(coro)
+    _BACKGROUND_TASKS.add(task)
+
+    def _done(t: asyncio.Task) -> None:
+        _BACKGROUND_TASKS.discard(t)
+        if not t.cancelled() and t.exception() is not None:
+            logger.exception("Background task %s failed", label, exc_info=t.exception())
+
+    task.add_done_callback(_done)
+
 
 _SSE_HEADERS = {
     "Cache-Control": "no-cache",
@@ -118,7 +140,7 @@ async def _save_message(
         await conn.execute(
             update(conversations)
             .where(conversations.c.id == conversation_id)
-            .values(updated_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc))
+            .values(updated_at=datetime.now(timezone.utc))
         )
         if _member_id is not None and _org_id is not None:
             row = (
@@ -462,8 +484,9 @@ async def _agent_loop_stream(
             yield f"data: {json.dumps({'type': 'token', 'content': final_answer[i:i + chunk_size]})}\n\n"
             await asyncio.sleep(0)
         if requester_context is not None and user_message_for_memory is not None:
-            asyncio.create_task(
-                extract_and_save(conversation_id, user_message_for_memory, final_answer, requester_context)
+            _spawn_background(
+                extract_and_save(conversation_id, user_message_for_memory, final_answer, requester_context),
+                label=f"extract_and_save:{conversation_id}",
             )
 
     yield f"data: {json.dumps({'type': 'done'})}\n\n"
@@ -743,7 +766,11 @@ async def branch_conversation(
                 select(messages).where(
                     or_(
                         messages.c.id == message_id,
-                        messages.c.created_at <= src_msg["created_at"],
+                        messages.c.created_at < src_msg["created_at"],
+                        # Deterministic tie-break when timestamps collide. UUID ids
+                        # aren't time-ordered, but this keeps selection stable.
+                        (messages.c.created_at == src_msg["created_at"])
+                        & (messages.c.id <= message_id),
                     ),
                     messages.c.conversation_id == conversation_id,
                 ).order_by(messages.c.created_at.asc())

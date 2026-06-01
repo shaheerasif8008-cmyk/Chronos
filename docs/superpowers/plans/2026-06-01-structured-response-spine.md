@@ -24,7 +24,7 @@
 
 **Backend (new):**
 - `apps/api/core/structured_response.py` — Pydantic envelope + runtime-fact extraction + truth guard + `compose()`. One responsibility: producing a `StructuredResponse`.
-- `apps/api/migrations/versions/0023_message_structured_response.py` — adds `messages.structured_response` JSONB.
+- `apps/api/migrations/versions/0023_message_structured_response.py` — adds `messages.structured_response` JSONB. **(As implemented this shipped as `0024_message_structured_response.py` with `down_revision = "0022_artifact_workspace"`, because the alembic chain had to be reconciled — two heads + a missing revision — during execution. References to `0023` below are the plan-as-written.)**
 - `apps/api/tests/test_structured_response.py` — unit + integration tests for the module and the round-trip.
 
 **Backend (modified):**
