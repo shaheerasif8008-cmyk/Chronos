@@ -2163,10 +2163,94 @@ function ArtifactCard({ artifact }: { artifact: ArtifactRef }) {
   );
 }
 
-function AssistantMessage({ message, content, status, persona, toolTraces, reasoningSummaries, artifacts, thinking, mode, structuredResponse: _structuredResponse, conversationId, onRefresh, onBranch }: { message: Message; content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[]; reasoningSummaries?: ReasoningSummary[]; artifacts?: ArtifactRef[]; thinking?: boolean; mode?: string; structuredResponse?: StructuredResponse | null; conversationId: string; onRefresh: () => void; onBranch: (id: string) => void }) {
+const STATUS_VARIANT: Record<string, "default" | "ok" | "warn" | "danger" | "info" | "accent"> = {
+  complete: "ok", in_progress: "accent", needs_input: "warn", needs_approval: "warn",
+  partial: "warn", blocked: "danger", failed: "danger", cancelled: "default",
+};
+const STATUS_LABEL: Record<string, string> = {
+  complete: "Complete", in_progress: "In progress", needs_input: "Needs input",
+  needs_approval: "Needs approval", partial: "Partially complete", blocked: "Blocked",
+  failed: "Failed", cancelled: "Cancelled",
+};
+
+function StatusBanner({ sr }: { sr: StructuredResponse }) {
+  const variant = STATUS_VARIANT[sr.status] ?? "info";
+  return (
+    <div className="flex items-center gap-2 mb-2">
+      <Tag variant={variant}>{STATUS_LABEL[sr.status] ?? sr.status}</Tag>
+      {sr.approval_status === "drafted_not_sent" && <Tag variant="warn">Not sent</Tag>}
+      {sr.confidence && <Tag variant="info">{sr.confidence} confidence</Tag>}
+    </div>
+  );
+}
+
+function FindingsRisksCard({ sr }: { sr: StructuredResponse }) {
+  const findings = sr.key_findings ?? [];
+  const assumptions = sr.assumptions ?? [];
+  const risks = sr.risks ?? [];
+  if (!findings.length && !assumptions.length && !risks.length) return null;
+  return (
+    <div className="mt-3 surface border border-soft rounded-lg p-3 space-y-2 text-[13px]">
+      {findings.length > 0 && (
+        <div>
+          <div className="text-[11px] font-medium mb-1" style={{ color: "var(--text-dim)" }}>Key findings</div>
+          <ul className="list-disc pl-4 space-y-0.5">{findings.map((f, i) => <li key={i}>{f}</li>)}</ul>
+        </div>
+      )}
+      {assumptions.length > 0 && (
+        <div>
+          <div className="text-[11px] font-medium mb-1" style={{ color: "var(--text-dim)" }}>Assumptions</div>
+          <ul className="list-disc pl-4 space-y-0.5">{assumptions.map((a, i) => <li key={i}>{a}</li>)}</ul>
+        </div>
+      )}
+      {risks.length > 0 && (
+        <div>
+          <div className="text-[11px] font-medium mb-1" style={{ color: "var(--warn)" }}>Risks &amp; caveats</div>
+          <ul className="list-disc pl-4 space-y-0.5" style={{ color: "var(--text-muted)" }}>
+            {risks.map((r, i) => <li key={i}>{r}</li>)}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function InlineApprovalCard({ sr }: { sr: StructuredResponse }) {
+  if (sr.approval_status !== "drafted_not_sent") return null;
+  return (
+    <div className="mt-3 surface border rounded-lg p-3 text-[13px]" style={{ borderColor: "var(--warn)" }}>
+      <div className="flex items-center gap-2 mb-1">
+        <IC.Lock size={13} style={{ color: "var(--warn)" }} />
+        <span className="font-medium">Approval required</span>
+      </div>
+      <div style={{ color: "var(--text-muted)" }}>
+        A draft is prepared but not sent. Review and approve it in the Approvals inbox.
+      </div>
+      <a href="/approvals" className="inline-flex items-center gap-1 mt-2 text-[12.5px]" style={{ color: "var(--accent)" }}>
+        Open Approvals <IC.ArrowRight size={13} />
+      </a>
+    </div>
+  );
+}
+
+function NextActionRow({ sr }: { sr: StructuredResponse }) {
+  if (!sr.next_action) return null;
+  return (
+    <div className="mt-3 flex items-start gap-2 text-[13px]">
+      <IC.ArrowRight size={14} style={{ color: "var(--accent)", marginTop: 2 }} />
+      <span><span className="font-medium">Next: </span>{sr.next_action}</span>
+    </div>
+  );
+}
+
+function AssistantMessage({ message, content, status, persona, toolTraces, reasoningSummaries, artifacts, thinking, mode, structuredResponse, conversationId, onRefresh, onBranch }: { message: Message; content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[]; reasoningSummaries?: ReasoningSummary[]; artifacts?: ArtifactRef[]; thinking?: boolean; mode?: string; structuredResponse?: StructuredResponse | null; conversationId: string; onRefresh: () => void; onBranch: (id: string) => void }) {
   const hasTraces = !!(toolTraces && toolTraces.length > 0);
   const hasReasoning = !!(reasoningSummaries && reasoningSummaries.length > 0);
   const isStreaming = status === "streaming";
+  const sr = structuredResponse ?? null;
+  // Plain answers stay plain. Cards only for real work or unfinished/abnormal state.
+  const showCards = !!sr && !isStreaming &&
+    (sr.response_type === "task_complete" || sr.status !== "complete");
   return (
     <div className="flex gap-4 fadein group">
       <PersonaAvatar name={persona.name} color={persona.color} size={28}/>
@@ -2183,6 +2267,8 @@ function AssistantMessage({ message, content, status, persona, toolTraces, reaso
             </div>
           )}
         </div>
+
+        {showCards && <StatusBanner sr={sr!} />}
 
         {hasReasoning && (
           <ReasoningPanel summaries={reasoningSummaries!} streaming={isStreaming} />
@@ -2220,6 +2306,10 @@ function AssistantMessage({ message, content, status, persona, toolTraces, reaso
             {artifacts.map(a => <ArtifactCard key={a.id} artifact={a} />)}
           </div>
         )}
+
+        {showCards && <FindingsRisksCard sr={sr!} />}
+        {showCards && <InlineApprovalCard sr={sr!} />}
+        {showCards && <NextActionRow sr={sr!} />}
 
         {/* Sources — project knowledge citations grounding this answer */}
         {message.citations && message.citations.length > 0 && (
