@@ -192,9 +192,6 @@ def format_task_answer(result: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-import json as _json_for_summaries
-
-
 def collect_tool_summaries(history: list[dict[str, Any]]) -> list[str]:
     """Extract one summary string per tool result in the loop history.
 
@@ -211,7 +208,7 @@ def collect_tool_summaries(history: list[dict[str, Any]]) -> list[str]:
         content = msg.get("content")
         if isinstance(content, str):
             try:
-                summary = str(_json_for_summaries.loads(content).get("summary") or "")
+                summary = str(json.loads(content).get("summary") or "")
             except Exception:
                 summary = ""
         out.append(f"{name}: {summary}".strip())
