@@ -1,5 +1,5 @@
 from __future__ import annotations
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from datetime import datetime
 
 
@@ -18,8 +18,10 @@ class RequesterContext(BaseModel):
     workspace_id: str | None = None
     persona_id: str | None = None
     task_id: str | None = None
+    project_id: str | None = None
     role: str = "user"
     memory_context: str = "chat"
+    surfaced_citations: list = Field(default_factory=list)
 
     @classmethod
     def from_member(cls, member: Member) -> "RequesterContext":

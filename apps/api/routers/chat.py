@@ -23,7 +23,7 @@ from core.artifacts import read_artifact_content as _read_artifact_content
 from core.artifacts import save_artifact as _save_artifact
 from core.artifacts import set_parse_status as _set_parse_status
 from memory.extraction import extract_and_save
-from runtime.agent_loop import format_task_answer
+from runtime.agent_loop import format_task_answer, stream_chat_turn
 from runtime import task_runner
 from runtime.executor import activity_channel
 
@@ -40,22 +40,27 @@ class ChatRequest(BaseModel):
     message: str
     conversation_id: str | None = None
     model: str | None = None
+    mode: str | None = None
     persona_id: str | None = None
     workspace_id: str | None = None
+    project_id: str | None = None
     attachment_ids: list[str] = Field(default_factory=list)
 
 
-async def _create_conversation(member: Member, title: str) -> str:
+async def _create_conversation(member: Member, title: str, project_id: str | None = None) -> str:
     conversations = await reflect_table("conversations")
+    values: dict = dict(
+        organization_id=settings.org_id,
+        region=settings.region,
+        member_id=member.id,
+        title=title[:80],
+    )
+    if project_id is not None:
+        values["project_id"] = project_id
     async with engine.begin() as conn:
         result = await conn.execute(
             insert(conversations)
-            .values(
-                organization_id=settings.org_id,
-                region=settings.region,
-                member_id=member.id,
-                title=title[:80],
-            )
+            .values(**values)
             .returning(conversations.c.id)
         )
         return str(result.scalar_one())
@@ -64,7 +69,16 @@ async def _create_conversation(member: Member, title: str) -> str:
 async def _save_message(
     conversation_id: str, role: str, content: str, *,
     structured_response: dict | None = None,
-) -> None:
+    _member_id: str | None = None,
+    _org_id: str | None = None,
+) -> dict | None:
+    """Save a message and update the conversation timestamp.
+
+    When *_member_id* and *_org_id* are provided the function also fetches
+    the conversation row (scoped to that member/org) and returns it as a
+    plain dict so callers can hydrate ``project_id`` without an extra query.
+    Returns None when those kwargs are absent.
+    """
     messages = await reflect_table("messages")
     conversations = await reflect_table("conversations")
     async with engine.begin() as conn:
@@ -84,6 +98,18 @@ async def _save_message(
             .where(conversations.c.id == conversation_id)
             .values(updated_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc))
         )
+        if _member_id is not None and _org_id is not None:
+            row = (
+                await conn.execute(
+                    select(conversations).where(
+                        conversations.c.id == conversation_id,
+                        conversations.c.member_id == _member_id,
+                        conversations.c.organization_id == _org_id,
+                    )
+                )
+            ).mappings().first()
+            return dict(row) if row else None
+    return None
 
 
 @router.get("/models")
@@ -363,16 +389,43 @@ async def _agent_loop_stream(
 
 @router.post("/message")
 async def send_message(req: ChatRequest, member: Member = Depends(get_current_member)) -> StreamingResponse:
+    from fastapi import HTTPException
+
     await permissions.check(member, "chat", req.conversation_id or "new_conversation")
     selected_model = normalize_chat_model(req.model)
-    conversation_id = req.conversation_id or await _create_conversation(member, req.message)
-    await _save_message(conversation_id, "user", req.message)
+
+    # ── Conversation creation / project_id hydration ────────────────────────
+    if req.conversation_id:
+        # Existing conversation: save user message and fetch conversation row
+        # (single round-trip) so we can hydrate project_id without an extra query.
+        conv_row = await _save_message(
+            req.conversation_id, "user", req.message,
+            _member_id=member.id, _org_id=member.organization_id,
+        )
+        conversation_id = req.conversation_id
+        # Validate / hydrate project_id from the stored conversation row.
+        stored_project_id = conv_row.get("project_id") if conv_row else None
+        if req.project_id is not None and stored_project_id is not None and req.project_id != stored_project_id:
+            raise HTTPException(
+                status_code=422,
+                detail="project_id does not match conversation",
+            )
+        effective_project_id = req.project_id if req.project_id is not None else stored_project_id
+    else:
+        # New conversation: create it (with project_id if supplied), then save
+        # the user message WITHOUT a RETURNING fetch (_member_id omitted).
+        conversation_id = await _create_conversation(member, req.message, project_id=req.project_id)
+        await _save_message(conversation_id, "user", req.message)
+        effective_project_id = req.project_id
+
     requester_context = RequesterContext.from_member(member)
     requester_context.persona_id = req.persona_id
     requester_context.workspace_id = req.workspace_id
+    requester_context.project_id = effective_project_id
     explicit_memory = extract_explicit_memory_content(req.message)
 
-    if explicit_memory and not req.attachment_ids:
+    _attachment_ids_for_memory = getattr(req, "attachment_ids", []) or []
+    if explicit_memory and not _attachment_ids_for_memory:
         async def explicit_stream():
             entry_id = await create_memory_entry(
                 content=explicit_memory,
@@ -394,9 +447,10 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
 
         return StreamingResponse(explicit_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
+    attachment_ids: list[str] = getattr(req, "attachment_ids", []) or []
     attachments_context: list[dict] = []
-    if req.attachment_ids:
-        attachments_context = await _parse_attachments(req.attachment_ids, conversation_id, member.organization_id)
+    if attachment_ids:
+        attachments_context = await _parse_attachments(attachment_ids, conversation_id, member.organization_id)
 
     intent = await classify_intent(req.message)
 
@@ -426,36 +480,21 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
 
     context = await assemble_context(conversation_id, req.message, requester_context)
 
-    async def stream():
-        yield f"data: {json.dumps({'type': 'conversation', 'conversation_id': conversation_id})}\n\n"
-        full = ""
-        async for token in stream_completion(context, model_id=selected_model):
-            full += token
-            yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
-            await asyncio.sleep(0)
-        assistant_response = full.strip()
-        from core.structured_response import build_runtime_facts, compose, resolve_verbosity
-        try:
-            facts = build_runtime_facts(
-                result={"answer": assistant_response}, task_status="complete",
-                tool_summaries=[], approval_exists=False,
-            )
-            verbosity = await resolve_verbosity(requester_context)
-            envelope = await compose(
-                response_type="direct_answer", answer_text=assistant_response,
-                facts=facts, verbosity=verbosity,
-            )
-            envelope_dict = envelope.model_dump()
-        except Exception:
-            envelope_dict = None
-        await _save_message(conversation_id, "assistant", assistant_response,
-                            structured_response=envelope_dict)
-        await audit.log("chat_response", member.id, "chat.message", resource_id=conversation_id)
-        asyncio.create_task(
-            extract_and_save(conversation_id, req.message, assistant_response, requester_context)
-        )
-        if envelope_dict is not None:
-            yield f"data: {json.dumps({'type': 'structured_response', 'structured_response': envelope_dict})}\n\n"
-        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+    async def _sse_wrap(gen):
+        async for event in gen:
+            yield f"data: {json.dumps(event)}\n\n"
 
-    return StreamingResponse(stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
+    return StreamingResponse(
+        _sse_wrap(
+            stream_chat_turn(
+                conversation_id=conversation_id,
+                message=req.message,
+                context_messages=context[:-1],  # exclude the appended user message
+                requester_context=requester_context,
+                model=selected_model,
+                mode=req.mode,
+            )
+        ),
+        media_type="text/event-stream",
+        headers=_SSE_HEADERS,
+    )
