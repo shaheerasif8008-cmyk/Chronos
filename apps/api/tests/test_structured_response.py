@@ -57,3 +57,55 @@ def test_envelope_rejects_unknown_status():
 
     with _pytest.raises(ValueError):
         StructuredResponse(response_type="task_complete", status="banana", summary="x")
+
+
+def test_build_runtime_facts_extracts_artifacts_and_status():
+    from core.structured_response import build_runtime_facts
+
+    facts = build_runtime_facts(
+        result={"answer": "done", "artifacts": [
+            {"id": "a1", "title": "Risk Memo", "kind": "memo"}]},
+        task_status="complete",
+        tool_summaries=["browser__search done", "gmail.draft created draft"],
+        approval_exists=True,
+    )
+    assert facts.status == "complete"
+    assert [a.id for a in facts.artifacts] == ["a1"]
+    # gmail.draft → "drafted" verb; never "sent" without a send tool-result
+    assert any(a.verb == "drafted" for a in facts.actions)
+    assert all(a.verb != "sent" for a in facts.actions)
+    assert facts.approval_status == "drafted_not_sent"
+
+
+def test_derive_response_type_distinguishes_answer_from_work():
+    from core.structured_response import build_runtime_facts, derive_response_type
+
+    # No tools, no artifacts, no approval → plain answer even via the loop.
+    plain = build_runtime_facts(result={"answer": "Paris."}, task_status="complete",
+                                tool_summaries=[], approval_exists=False)
+    assert derive_response_type(plain) == "direct_answer"
+
+    # Used a tool → real work.
+    worked = build_runtime_facts(result={"answer": "done"}, task_status="complete",
+                                 tool_summaries=["browser__search: done"], approval_exists=False)
+    assert derive_response_type(worked) == "task_complete"
+
+
+def test_truth_guard_blocks_unverified_send():
+    from core.structured_response import build_runtime_facts, apply_truth_guard, StructuredResponse
+
+    facts = build_runtime_facts(
+        result={"answer": "I sent the email."},
+        task_status="complete",
+        tool_summaries=["gmail.draft created draft"],   # NO send result
+        approval_exists=False,
+    )
+    # Model prose claims it was sent; runtime has no send action.
+    env = StructuredResponse(
+        response_type="task_complete", status="complete",
+        summary="I sent the email to the client.",
+    )
+    guarded = apply_truth_guard(env, facts)
+    # No "sent" action is fabricated; an advisory is appended to risks.
+    assert all(a.verb != "sent" for a in guarded.actions)
+    assert any("not sent" in r.lower() or "draft" in r.lower() for r in guarded.risks)
