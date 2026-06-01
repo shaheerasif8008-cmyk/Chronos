@@ -15,7 +15,7 @@ from core.config import settings
 from core.context import assemble_context
 from core.db import engine, reflect_table
 from core.intent import classify_intent
-from core.llm import available_chat_models, normalize_chat_model, stream_completion
+from core.llm import available_chat_models, normalize_chat_model
 from core.memory_writes import create_memory_entry, extract_explicit_memory_content
 from core.models import Member, RequesterContext
 from core.redis import redis_client
@@ -789,7 +789,7 @@ async def save_message_to_memory(
     conversations = await reflect_table("conversations")
     messages = await reflect_table("messages")
     async with engine.begin() as conn:
-        conv_row = await _check_conversation_ownership(conn, conversations, conversation_id, member)
+        await _check_conversation_ownership(conn, conversations, conversation_id, member)
         msg_row = (
             await conn.execute(
                 select(messages).where(
