@@ -985,11 +985,21 @@ function ChatScreen({
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<{ id: string; name: string; size: number }[]>([]);
   const [personaMenuOpen, setPersonaMenuOpen] = useState(false);
+  const [responseVerbosity, setResponseVerbosity] = useState<"concise" | "detailed">("detailed");
   const abortRef = useRef<AbortController | null>(null);
   const streamingRef = useRef(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const isEmpty = !activeConvoId && messages.length === 0;
+
+  useEffect(() => {
+    apiFetch("/settings/")
+      .then(r => r.json())
+      .then((d: { sections?: { response_format?: { verbosity?: string } } }) => {
+        if (d.sections?.response_format?.verbosity === "concise") setResponseVerbosity("concise");
+      })
+      .catch(() => { /* default detailed */ });
+  }, []);
 
   // ── Command palette (⌘K) ──────────────────────────────────────────────────
   const router = useRouter();
@@ -1594,7 +1604,7 @@ function ChatScreen({
               {messages.map((m, i) => (
                 m.role === "user"
                   ? <UserMessage key={m.id ?? `user-${i}`} message={m} conversationId={activeConvoId ?? ""} onRefresh={() => { if (activeConvoId) void loadMessagesFromServer(activeConvoId); }} onBranch={(newConvoId) => { onConvoCreated(newConvoId); }}/>
-                  : <AssistantMessage key={m.id ?? `assistant-${i}`} message={m} content={m.content} conversationId={activeConvoId ?? ""} status={m.status ?? "complete"} persona={activePersona} toolTraces={m.tool_traces} reasoningSummaries={m.reasoning_summaries} artifacts={m.artifacts} thinking={m.thinking} mode={m.mode} structuredResponse={m.structured_response} onRefresh={() => { if (activeConvoId) void loadMessagesFromServer(activeConvoId); }} onBranch={(newConvoId) => { onConvoCreated(newConvoId); }}/>
+                  : <AssistantMessage key={m.id ?? `assistant-${i}`} message={m} content={m.content} conversationId={activeConvoId ?? ""} status={m.status ?? "complete"} persona={activePersona} toolTraces={m.tool_traces} reasoningSummaries={m.reasoning_summaries} artifacts={m.artifacts} thinking={m.thinking} mode={m.mode} structuredResponse={m.structured_response} verbosity={responseVerbosity} onRefresh={() => { if (activeConvoId) void loadMessagesFromServer(activeConvoId); }} onBranch={(newConvoId) => { onConvoCreated(newConvoId); }}/>
               ))}
               {streaming && messages[messages.length - 1]?.role !== "assistant" && (
                 <div className="flex gap-4">
@@ -2243,7 +2253,7 @@ function NextActionRow({ sr }: { sr: StructuredResponse }) {
   );
 }
 
-function AssistantMessage({ message, content, status, persona, toolTraces, reasoningSummaries, artifacts, thinking, mode, structuredResponse, conversationId, onRefresh, onBranch }: { message: Message; content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[]; reasoningSummaries?: ReasoningSummary[]; artifacts?: ArtifactRef[]; thinking?: boolean; mode?: string; structuredResponse?: StructuredResponse | null; conversationId: string; onRefresh: () => void; onBranch: (id: string) => void }) {
+function AssistantMessage({ message, content, status, persona, toolTraces, reasoningSummaries, artifacts, thinking, mode, structuredResponse, verbosity, conversationId, onRefresh, onBranch }: { message: Message; content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[]; reasoningSummaries?: ReasoningSummary[]; artifacts?: ArtifactRef[]; thinking?: boolean; mode?: string; structuredResponse?: StructuredResponse | null; verbosity?: "concise" | "detailed"; conversationId: string; onRefresh: () => void; onBranch: (id: string) => void }) {
   const hasTraces = !!(toolTraces && toolTraces.length > 0);
   const hasReasoning = !!(reasoningSummaries && reasoningSummaries.length > 0);
   const isStreaming = status === "streaming";
@@ -2307,7 +2317,7 @@ function AssistantMessage({ message, content, status, persona, toolTraces, reaso
           </div>
         )}
 
-        {showCards && <FindingsRisksCard sr={sr!} />}
+        {showCards && verbosity !== "concise" && <FindingsRisksCard sr={sr!} />}
         {showCards && <InlineApprovalCard sr={sr!} />}
         {showCards && <NextActionRow sr={sr!} />}
 
