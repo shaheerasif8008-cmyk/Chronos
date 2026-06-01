@@ -109,3 +109,63 @@ def test_truth_guard_blocks_unverified_send():
     # No "sent" action is fabricated; an advisory is appended to risks.
     assert all(a.verb != "sent" for a in guarded.actions)
     assert any("not sent" in r.lower() or "draft" in r.lower() for r in guarded.risks)
+
+
+@pytest.mark.asyncio
+async def test_compose_merges_prose_and_truth(monkeypatch):
+    import json as _json
+    from core import structured_response as sr
+
+    async def fake_complete_json(prompt, *, model=None):
+        return _json.dumps({
+            "summary": "Contract review complete. Indemnity is the main risk.",
+            "key_findings": ["Uncapped indemnity", "Weak termination rights"],
+            "assumptions": ["Reviewed as a general commercial agreement"],
+            "risks": ["Jurisdiction-specific enforceability not verified"],
+            "next_action": "Review the memo and approve the email draft.",
+            "confidence": "medium",
+        })
+
+    monkeypatch.setattr(sr, "complete_json", fake_complete_json)
+
+    facts = sr.build_runtime_facts(
+        result={"answer": "done", "artifacts": [{"id": "a1", "title": "Risk Memo", "kind": "memo"}]},
+        task_status="complete",
+        tool_summaries=["gmail.draft created draft"],
+        approval_exists=True,
+    )
+    env = await sr.compose(
+        response_type="task_complete",
+        answer_text="Contract review complete...",
+        facts=facts,
+        verbosity="detailed",
+    )
+    assert env.response_type == "task_complete"
+    assert env.status == "complete"                       # runtime
+    assert env.approval_status == "drafted_not_sent"      # runtime
+    assert [a.id for a in env.artifacts] == ["a1"]        # runtime
+    assert "Uncapped indemnity" in env.key_findings       # model prose
+    assert env.next_action and "approve" in env.next_action.lower()
+
+
+@pytest.mark.asyncio
+async def test_compose_concise_drops_secondary_sections(monkeypatch):
+    import json as _json
+    from core import structured_response as sr
+
+    async def fake_complete_json(prompt, *, model=None):
+        return _json.dumps({
+            "summary": "Done.", "key_findings": ["x"], "assumptions": ["y"],
+            "risks": ["z"], "next_action": "Do the thing.", "confidence": "high",
+        })
+
+    monkeypatch.setattr(sr, "complete_json", fake_complete_json)
+    facts = sr.build_runtime_facts(result={"answer": "done"}, task_status="complete",
+                                   tool_summaries=[], approval_exists=False)
+    env = await sr.compose(response_type="direct_answer", answer_text="Done.",
+                           facts=facts, verbosity="concise")
+    # concise: keep summary + next_action, drop findings/assumptions/risks
+    assert env.summary == "Done."
+    assert env.key_findings == []
+    assert env.assumptions == []
+    assert env.risks == []

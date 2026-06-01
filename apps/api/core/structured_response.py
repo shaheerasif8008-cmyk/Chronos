@@ -6,7 +6,9 @@ See docs/superpowers/plans/2026-06-01-structured-response-spine.md for the contr
 """
 from __future__ import annotations
 
+import json
 from pydantic import BaseModel, Field, field_validator
+from core.llm import complete_json
 
 RESPONSE_TYPES = {"direct_answer", "task_complete"}
 STATUSES = {
@@ -172,3 +174,62 @@ def apply_truth_guard(env: StructuredResponse, facts: RuntimeFacts) -> Structure
     if not facts.used_tools and env.confidence == "high":
         env.confidence = "medium"
     return env
+
+
+_COMPOSE_PROMPT = """You are formatting an assistant answer into structured fields for an \
+enterprise work UI. Do NOT invent actions, sends, or approvals — those are filled by the \
+runtime, not you. Only describe what the answer text supports.
+
+Return JSON with exactly these keys:
+- "summary": one or two sentences leading with the outcome. No "Here are the results".
+- "key_findings": list of short strings (the most important results). [] if none.
+- "assumptions": list of short strings (assumptions that materially affect the output). [] if none.
+- "risks": list of short strings (risks / caveats for high-stakes work). [] if none.
+- "next_action": one concrete next step as a string, or null.
+- "confidence": "high", "medium", or "low".
+
+ANSWER TEXT:
+{answer}
+"""
+
+
+async def compose(
+    *,
+    response_type: str,
+    answer_text: str,
+    facts: RuntimeFacts,
+    verbosity: str = "detailed",
+) -> StructuredResponse:
+    """Produce a StructuredResponse: model prose + runtime truth, guarded.
+
+    `verbosity` is "concise" or "detailed" (from the response_format setting).
+    On any LLM/parse failure, fall back to a minimal envelope wrapping the raw answer.
+    """
+    try:
+        raw = await complete_json(_COMPOSE_PROMPT.format(answer=answer_text[:6000]))
+        prose = json.loads(raw)
+    except Exception:
+        prose = {"summary": answer_text.strip() or "Done.", "key_findings": [],
+                 "assumptions": [], "risks": [], "next_action": None, "confidence": None}
+
+    def _strlist(key: str) -> list[str]:
+        val = prose.get(key)
+        return [str(x) for x in val] if isinstance(val, list) else []
+
+    env = StructuredResponse(
+        response_type=response_type,
+        status=facts.status,
+        summary=str(prose.get("summary") or answer_text.strip() or "Done."),
+        key_findings=_strlist("key_findings"),
+        assumptions=_strlist("assumptions"),
+        risks=_strlist("risks"),
+        next_action=(str(prose["next_action"]) if prose.get("next_action") else None),
+        confidence=(prose.get("confidence") if prose.get("confidence") in CONFIDENCE_LEVELS else None),
+    )
+
+    if verbosity == "concise":
+        env.key_findings = []
+        env.assumptions = []
+        env.risks = []
+
+    return apply_truth_guard(env, facts)
