@@ -1,6 +1,7 @@
 from __future__ import annotations
 import asyncio
 import json
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends
@@ -72,6 +73,16 @@ async def _save_message(
     structured_response: dict | None = None,
     _member_id: str | None = None,
     _org_id: str | None = None,
+    model: str | None = None,
+    mode: str | None = None,
+    citations: list | None = None,
+    tool_traces: list | None = None,
+    memory_refs: list | None = None,
+    artifact_refs: list | None = None,
+    approval_state: str | None = None,
+    runtime_status: str | None = None,
+    parent_message_id: str | None = None,
+    pinned: bool = False,
 ) -> dict | None:
     """Save a message and update the conversation timestamp.
 
@@ -92,6 +103,16 @@ async def _save_message(
                 content=content,
                 structured_response=structured_response,
                 token_count=len(content.split()),
+                model=model,
+                mode=mode,
+                citations=citations,
+                tool_traces=tool_traces,
+                memory_refs=memory_refs,
+                artifact_refs=artifact_refs,
+                approval_state=approval_state,
+                runtime_status=runtime_status,
+                parent_message_id=parent_message_id,
+                pinned=pinned,
             )
         )
         await conn.execute(
@@ -111,6 +132,68 @@ async def _save_message(
             ).mappings().first()
             return dict(row) if row else None
     return None
+
+
+def _normalize_traces(raw: list[dict]) -> list[dict]:
+    """Merge paired tool_call/tool_result events into single ToolTrace dicts.
+
+    Rules:
+    - ``thinking`` events are skipped entirely.
+    - ``tool_call`` events are held in a pending dict keyed by tool name.
+    - ``tool_result`` / ``tool_error`` events close the matching pending entry,
+      producing one output row with status "complete" or "error".
+    - Unmatched tool_calls (no result yet) are emitted with status "pending".
+    - Non-tool events (e.g. ``sub_agent_spawned``) that have a "tool" field
+      are included; otherwise they are skipped.
+    - Every output row is guaranteed to have: id, tool, summary, status.
+    """
+    pending: dict[str, dict] = {}  # tool_name → partial row
+    out: list[dict] = []
+
+    for event in raw:
+        etype = event.get("type", "")
+
+        if etype == "thinking":
+            continue
+
+        if etype == "tool_call":
+            tool = event.get("tool", "")
+            pending[tool] = {
+                "id": str(uuid.uuid4()),
+                "tool": tool,
+                "summary": event.get("summary", ""),
+                "status": "pending",
+            }
+
+        elif etype in ("tool_result", "tool_error"):
+            tool = event.get("tool", "")
+            row = pending.pop(tool, None)
+            if row is None:
+                row = {"id": str(uuid.uuid4()), "tool": tool, "summary": "", "status": "pending"}
+            if etype == "tool_result":
+                row["summary"] = event.get("summary", row.get("summary", ""))
+                row["status"] = "complete"
+            else:
+                row["summary"] = event.get("error", event.get("summary", row.get("summary", "")))
+                row["status"] = "error"
+            out.append(row)
+
+        else:
+            # Non-tool events: only include if they have a "tool" field
+            tool = event.get("tool")
+            if tool:
+                out.append({
+                    "id": str(uuid.uuid4()),
+                    "tool": tool,
+                    "summary": event.get("summary", ""),
+                    "status": event.get("status", "complete"),
+                })
+
+    # Flush any unmatched pending tool_calls
+    for row in pending.values():
+        out.append(row)
+
+    return out
 
 
 @router.get("/models")
