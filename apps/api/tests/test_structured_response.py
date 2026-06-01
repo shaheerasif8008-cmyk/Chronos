@@ -196,3 +196,60 @@ async def test_resolve_verbosity_reads_saved_setting(monkeypatch):
     monkeypatch.setattr(sr, "get_settings_doc", fake_get_settings_doc)
     ctx = RequesterContext(org_id="default", member_id="member-1", role="user")
     assert await sr.resolve_verbosity(ctx) == "concise"
+
+
+@pytest.mark.asyncio
+async def test_collect_tool_summaries_from_history():
+    from runtime.agent_loop import collect_tool_summaries
+
+    history = [
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}]},
+        {"role": "tool", "tool_call_id": "c1", "name": "gmail.draft",
+         "content": '{"summary": "created draft to client"}'},
+        {"role": "assistant", "content": "Drafted the email."},
+    ]
+    summaries = collect_tool_summaries(history)
+    assert any("gmail.draft" in s or "draft" in s.lower() for s in summaries)
+
+
+@pytest.mark.asyncio
+async def test_persist_to_conversation_stores_envelope(monkeypatch):
+    import uuid
+    from sqlalchemy import insert, select
+    from core.config import settings
+    from core.db import engine, reflect_table
+    from runtime import agent_loop
+
+    conversations = await reflect_table("conversations")
+    messages = await reflect_table("messages")
+    async with engine.begin() as conn:
+        conv_id = (
+            await conn.execute(
+                insert(conversations).values(
+                    organization_id=settings.org_id, region=settings.region,
+                    member_id="member-1", title="t",
+                ).returning(conversations.c.id)
+            )
+        ).scalar_one()
+
+    task = {
+        "id": str(uuid.uuid4()),
+        "organization_id": settings.org_id,
+        "region": "us",
+        "mode": None,
+        "triggered_by_member_id": None,
+    }
+    monkeypatch.setattr(agent_loop, "_conversation_id_for", lambda t: str(conv_id))
+
+    envelope = {"response_type": "task_complete", "status": "complete", "summary": "done"}
+    await agent_loop._persist_to_conversation(task, "done", structured_response=envelope)
+
+    async with engine.begin() as conn:
+        row = (
+            await conn.execute(
+                select(messages.c.structured_response).where(
+                    messages.c.conversation_id == conv_id, messages.c.role == "assistant"
+                )
+            )
+        ).scalar_one()
+    assert row == envelope
