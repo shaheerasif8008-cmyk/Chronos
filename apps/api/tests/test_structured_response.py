@@ -169,3 +169,30 @@ async def test_compose_concise_drops_secondary_sections(monkeypatch):
     assert env.key_findings == []
     assert env.assumptions == []
     assert env.risks == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_verbosity_defaults_to_detailed(monkeypatch):
+    from core import structured_response as sr
+    from core.models import RequesterContext
+
+    async def fake_get_settings_doc(member, section, *, scope=None, scope_id=None):
+        return {}  # nothing saved
+
+    monkeypatch.setattr(sr, "get_settings_doc", fake_get_settings_doc)
+    ctx = RequesterContext(org_id="default", member_id="member-1", role="user")
+    assert await sr.resolve_verbosity(ctx) == "detailed"
+
+
+@pytest.mark.asyncio
+async def test_resolve_verbosity_reads_saved_setting(monkeypatch):
+    from core import structured_response as sr
+    from core.models import RequesterContext
+
+    async def fake_get_settings_doc(member, section, *, scope=None, scope_id=None):
+        assert section == "response_format"
+        return {"verbosity": "concise"}
+
+    monkeypatch.setattr(sr, "get_settings_doc", fake_get_settings_doc)
+    ctx = RequesterContext(org_id="default", member_id="member-1", role="user")
+    assert await sr.resolve_verbosity(ctx) == "concise"

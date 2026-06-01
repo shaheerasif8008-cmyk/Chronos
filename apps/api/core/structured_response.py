@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 from pydantic import BaseModel, Field, field_validator
 from core.llm import complete_json
+from core.settings_store import get_settings_doc
+from core.models import Member, RequesterContext
 
 RESPONSE_TYPES = {"direct_answer", "task_complete"}
 STATUSES = {
@@ -233,3 +235,18 @@ async def compose(
         env.risks = []
 
     return apply_truth_guard(env, facts)
+
+
+_VALID_VERBOSITY = {"concise", "detailed"}
+
+
+async def resolve_verbosity(ctx: RequesterContext) -> str:
+    """Read the member's response_format.verbosity setting. Defaults to 'detailed'."""
+    member = Member(id=ctx.member_id, organization_id=ctx.org_id,
+                    email="", role=ctx.role, name=None)
+    try:
+        doc = await get_settings_doc(member, "response_format")
+    except Exception:
+        return "detailed"
+    v = (doc or {}).get("verbosity")
+    return v if v in _VALID_VERBOSITY else "detailed"
