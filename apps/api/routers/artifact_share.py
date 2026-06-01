@@ -24,8 +24,7 @@ async def get_shared_metadata(token: str):
     if not meta or meta.get("is_deleted"):
         raise HTTPException(status_code=404, detail="Artifact not found")
     await audit.log("artifact", None, "artifact.share_view", resource_type="artifact",
-                    resource_id=str(share["artifact_id"]), payload={"token": token[:6] + "..."},
-                    organization_id=str(share["organization_id"]))
+                    resource_id=str(share["artifact_id"]), payload={"token": token[:6] + "..."})
     return {"id": meta["id"], "title": meta.get("title"), "kind": meta.get("kind"),
             "mime_type": meta.get("mime_type"), "size_bytes": meta.get("size_bytes"),
             "version": meta.get("version")}

@@ -100,26 +100,31 @@ async def save_artifact(
     # --- Insert artifact head row + initial version row ---
     artifacts = await reflect_table("artifacts")
     artifact_versions = await reflect_table("artifact_versions")
+    artifact_values: dict = dict(
+        id=artifact_id,
+        organization_id=org_id,
+        region=region,
+        conversation_id=conversation_id,
+        task_id=task_id,
+        message_id=message_id,
+        kind=kind,
+        title=title,
+        minio_path=minio_path,
+        mime_type=mime_type,
+        size_bytes=size,
+        version=version,
+        parent_artifact_id=parent_artifact_id,
+        parse_status=parse_status,
+        created_by=created_by,
+    )
+    # artifact_key is a stable logical dedupe key (NOT NULL); self-keyed by default.
+    if "artifact_key" in artifacts.c:
+        artifact_values["artifact_key"] = artifact_id
+    # is_current marks this as the latest version of its artifact_key series.
+    if "is_current" in artifacts.c:
+        artifact_values["is_current"] = True
     async with engine.begin() as conn:
-        await conn.execute(
-            insert(artifacts).values(
-                id=artifact_id,
-                organization_id=org_id,
-                region=region,
-                conversation_id=conversation_id,
-                task_id=task_id,
-                message_id=message_id,
-                kind=kind,
-                title=title,
-                minio_path=minio_path,
-                mime_type=mime_type,
-                size_bytes=size,
-                version=version,
-                parent_artifact_id=parent_artifact_id,
-                parse_status=parse_status,
-                created_by=created_by,
-            )
-        )
+        await conn.execute(insert(artifacts).values(**artifact_values))
         await conn.execute(
             insert(artifact_versions).values(
                 organization_id=org_id,
