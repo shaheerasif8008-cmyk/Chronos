@@ -61,7 +61,10 @@ async def _create_conversation(member: Member, title: str) -> str:
         return str(result.scalar_one())
 
 
-async def _save_message(conversation_id: str, role: str, content: str) -> None:
+async def _save_message(
+    conversation_id: str, role: str, content: str, *,
+    structured_response: dict | None = None,
+) -> None:
     messages = await reflect_table("messages")
     conversations = await reflect_table("conversations")
     async with engine.begin() as conn:
@@ -72,6 +75,7 @@ async def _save_message(conversation_id: str, role: str, content: str) -> None:
                 conversation_id=conversation_id,
                 role=role,
                 content=content,
+                structured_response=structured_response,
                 token_count=len(content.split()),
             )
         )
@@ -331,6 +335,9 @@ async def _agent_loop_stream(
                 yield f"data: {json.dumps({'type': 'artifact', 'artifact': event})}\n\n"
             elif event_type == "task_complete":
                 final_answer = format_task_answer(event.get("result") or {})
+                _sr = event.get("structured_response")
+                if _sr is not None:
+                    yield f"data: {json.dumps({'type': 'structured_response', 'structured_response': _sr})}\n\n"
                 break
             elif event_type == "task_failed":
                 final_answer = f"The task stopped: {event.get('error') or 'unknown error'}"
@@ -427,11 +434,28 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
             yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
             await asyncio.sleep(0)
         assistant_response = full.strip()
-        await _save_message(conversation_id, "assistant", assistant_response)
+        from core.structured_response import build_runtime_facts, compose, resolve_verbosity
+        try:
+            facts = build_runtime_facts(
+                result={"answer": assistant_response}, task_status="complete",
+                tool_summaries=[], approval_exists=False,
+            )
+            verbosity = await resolve_verbosity(requester_context)
+            envelope = await compose(
+                response_type="direct_answer", answer_text=assistant_response,
+                facts=facts, verbosity=verbosity,
+            )
+            envelope_dict = envelope.model_dump()
+        except Exception:
+            envelope_dict = None
+        await _save_message(conversation_id, "assistant", assistant_response,
+                            structured_response=envelope_dict)
         await audit.log("chat_response", member.id, "chat.message", resource_id=conversation_id)
         asyncio.create_task(
             extract_and_save(conversation_id, req.message, assistant_response, requester_context)
         )
+        if envelope_dict is not None:
+            yield f"data: {json.dumps({'type': 'structured_response', 'structured_response': envelope_dict})}\n\n"
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
     return StreamingResponse(stream(), media_type="text/event-stream", headers=_SSE_HEADERS)

@@ -199,6 +199,39 @@ async def test_resolve_verbosity_reads_saved_setting(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_save_message_persists_envelope_and_api_returns_it():
+    from sqlalchemy import insert, select
+    from core.config import settings
+    from core.db import engine, reflect_table
+    from routers import chat as chat_router
+
+    conversations = await reflect_table("conversations")
+    async with engine.begin() as conn:
+        conv_id = (
+            await conn.execute(
+                insert(conversations).values(
+                    organization_id=settings.org_id, region=settings.region,
+                    member_id="member-1", title="t",
+                ).returning(conversations.c.id)
+            )
+        ).scalar_one()
+
+    envelope = {"response_type": "direct_answer", "status": "complete", "summary": "Paris."}
+    await chat_router._save_message(str(conv_id), "assistant", "Paris.",
+                                    structured_response=envelope)
+
+    messages = await reflect_table("messages")
+    async with engine.begin() as conn:
+        row = (
+            await conn.execute(
+                select(messages).where(messages.c.conversation_id == conv_id,
+                                       messages.c.role == "assistant")
+            )
+        ).mappings().first()
+    assert dict(row)["structured_response"] == envelope  # list_messages returns dict(row)
+
+
+@pytest.mark.asyncio
 async def test_collect_tool_summaries_from_history():
     from runtime.agent_loop import collect_tool_summaries
 
