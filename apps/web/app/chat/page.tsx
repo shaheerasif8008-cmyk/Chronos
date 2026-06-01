@@ -40,10 +40,25 @@ type Message = {
   thinking?: boolean;
   pinned?: boolean;
   parent_message_id?: string | null;
+  structured_response?: StructuredResponse | null;
 };
 type ToolTrace = { id: string; tool: string; summary: string; status: MessageStatus };
 type ReasoningSummary = { id: string; iteration?: number; summary: string; status: MessageStatus };
 type ArtifactRef = { id: string; title: string; kind: string; mime_type?: string; size_bytes?: number };
+type ResponseActionRecord = { verb: string; description: string; target?: string | null };
+type StructuredResponse = {
+  response_type: string;
+  status: string;
+  summary: string;
+  key_findings?: string[];
+  assumptions?: string[];
+  risks?: string[];
+  next_action?: string | null;
+  confidence?: string | null;
+  artifacts?: ArtifactRef[];
+  actions?: ResponseActionRecord[];
+  approval_status?: string | null;
+};
 type ProjectSource = { id: string; title?: string | null; source_type?: string | null; parse_status?: string | null; index_status?: string | null; uri?: string | null; created_at?: string };
 type SourceChunkPreview = { chunk_index: number; content: string; token_count?: number | null };
 type SourceDetail = { id: string; title?: string | null; source_type?: string | null; uri?: string | null; artifact_id?: string | null; parse_status?: string | null; index_status?: string | null; warning?: string | null; chunk_count: number; chunks: SourceChunkPreview[] };
@@ -1130,6 +1145,7 @@ function ChatScreen({
         tool_traces: Array.isArray(m.tool_traces)
           ? (m.tool_traces as ToolTrace[])
           : undefined,
+        structured_response: (m.structured_response as StructuredResponse | undefined) ?? null,
         pinned: m.pinned === true,
         parent_message_id: m.parent_message_id != null ? String(m.parent_message_id) : null,
       };
@@ -1255,6 +1271,7 @@ function ChatScreen({
       type: string; content?: string; conversation_id?: string; task_id?: string;
       event?: { type: string; tool?: string | null; summary?: string; error?: string; confidence?: number; iteration?: number; args_preview?: Record<string, unknown>; step?: { description?: string }; approval_ids?: string[]; goal?: string };
       artifact?: { artifact_id: string; title?: string; kind?: string; mime_type?: string; size_bytes?: number };
+      structured_response?: StructuredResponse;
     };
 
     let partial = "";
@@ -1369,6 +1386,14 @@ function ChatScreen({
           const existing = last.artifacts ?? [];
           if (existing.some(x => x.id === ref.id)) return updated;
           return [...updated.slice(0, -1), { ...last, artifacts: [...existing, ref] }];
+        });
+      } else if (ev.type === "structured_response" && ev.structured_response) {
+        const sr = ev.structured_response;
+        setMessages(prev => {
+          const updated = [...prev];
+          const last = updated[updated.length - 1];
+          if (last?.role !== "assistant") return updated;
+          return [...updated.slice(0, -1), { ...last, structured_response: sr }];
         });
       } else if (ev.type === "task_created" && ev.task_id) {
         const taskId = ev.task_id;
@@ -1569,7 +1594,7 @@ function ChatScreen({
               {messages.map((m, i) => (
                 m.role === "user"
                   ? <UserMessage key={m.id ?? `user-${i}`} message={m} conversationId={activeConvoId ?? ""} onRefresh={() => { if (activeConvoId) void loadMessagesFromServer(activeConvoId); }} onBranch={(newConvoId) => { onConvoCreated(newConvoId); }}/>
-                  : <AssistantMessage key={m.id ?? `assistant-${i}`} message={m} content={m.content} conversationId={activeConvoId ?? ""} status={m.status ?? "complete"} persona={activePersona} toolTraces={m.tool_traces} reasoningSummaries={m.reasoning_summaries} artifacts={m.artifacts} thinking={m.thinking} mode={m.mode} onRefresh={() => { if (activeConvoId) void loadMessagesFromServer(activeConvoId); }} onBranch={(newConvoId) => { onConvoCreated(newConvoId); }}/>
+                  : <AssistantMessage key={m.id ?? `assistant-${i}`} message={m} content={m.content} conversationId={activeConvoId ?? ""} status={m.status ?? "complete"} persona={activePersona} toolTraces={m.tool_traces} reasoningSummaries={m.reasoning_summaries} artifacts={m.artifacts} thinking={m.thinking} mode={m.mode} structuredResponse={m.structured_response} onRefresh={() => { if (activeConvoId) void loadMessagesFromServer(activeConvoId); }} onBranch={(newConvoId) => { onConvoCreated(newConvoId); }}/>
               ))}
               {streaming && messages[messages.length - 1]?.role !== "assistant" && (
                 <div className="flex gap-4">
@@ -2138,7 +2163,7 @@ function ArtifactCard({ artifact }: { artifact: ArtifactRef }) {
   );
 }
 
-function AssistantMessage({ message, content, status, persona, toolTraces, reasoningSummaries, artifacts, thinking, mode, conversationId, onRefresh, onBranch }: { message: Message; content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[]; reasoningSummaries?: ReasoningSummary[]; artifacts?: ArtifactRef[]; thinking?: boolean; mode?: string; conversationId: string; onRefresh: () => void; onBranch: (id: string) => void }) {
+function AssistantMessage({ message, content, status, persona, toolTraces, reasoningSummaries, artifacts, thinking, mode, structuredResponse: _structuredResponse, conversationId, onRefresh, onBranch }: { message: Message; content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[]; reasoningSummaries?: ReasoningSummary[]; artifacts?: ArtifactRef[]; thinking?: boolean; mode?: string; structuredResponse?: StructuredResponse | null; conversationId: string; onRefresh: () => void; onBranch: (id: string) => void }) {
   const hasTraces = !!(toolTraces && toolTraces.length > 0);
   const hasReasoning = !!(reasoningSummaries && reasoningSummaries.length > 0);
   const isStreaming = status === "streaming";
