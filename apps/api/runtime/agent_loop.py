@@ -345,7 +345,22 @@ async def publish_activity(task_id: str, event: dict[str, Any]) -> None:
 
 async def _agent_system_message(tools: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     current_date = datetime.now(timezone.utc).date().isoformat()
-    manifest = await generate_tool_manifest(sub_agent=tools == SUBAGENT_TOOLS)
+    is_sub_agent = tools == SUBAGENT_TOOLS
+    manifest = await generate_tool_manifest(sub_agent=is_sub_agent)
+    orchestration_guidance = (
+        "For large jobs with independent workstreams, spawn all useful sub-agents in the same "
+        "assistant step so the tool calls run in parallel. Do not spawn one sub-agent, wait for it, "
+        "then spawn the next if the roles are already known. Give each sub-agent a specific role "
+        "inside its goal, and once their results return, synthesize the final answer directly.\n\n"
+    )
+    sub_agent_guidance = (
+        "You are a bounded sub-agent. Optimize for speed and useful output. Use at most 2-4 model "
+        "iterations unless blocked. Prefer browser__search result snippets for breadth, fetch only "
+        "the 1-3 most valuable pages, and do not keep retrying after rate limits or sparse pages. "
+        "If a connector rate-limits or a fetch returns little content, synthesize from the evidence "
+        "already gathered and say what was limited. Return a concise, structured report for the "
+        "parent to use.\n\n"
+    )
     return {
         "role": "system",
         "content": (
@@ -360,6 +375,7 @@ async def _agent_system_message(tools: list[dict[str, Any]] | None = None) -> di
             "outreach, anything spanning many steps or sub-agents), call start_task to run it "
             "as a durable background task instead of doing it all inline. "
             "All external actions are governed by the broker; some require human approval.\n\n"
+            f"{sub_agent_guidance if is_sub_agent else orchestration_guidance}"
             "CRITICAL RULE — Honesty about search results:\n"
             "- If a search returns 0 results, say so. Do not fabricate statistics, sources, or data.\n"
             "- If a tool result contains `is_fallback: true` or a `warning` field, the live search failed. "
@@ -709,13 +725,25 @@ async def _maybe_create_artifact(task: dict[str, Any], args: dict[str, Any]) -> 
 
     path = str(args.get("path") or "")
     file_content = args.get("content")
-    if not path or not isinstance(file_content, str):
+    if not path:
         return None
     ext = os.path.splitext(path)[1].lower()
     mapping = _RENDERABLE_EXT.get(ext)
     if not mapping:
         return None
     kind, mime = mapping
+    if not isinstance(file_content, str):
+        try:
+            from connectors.filesystem import WORKSPACE_ROOT, _jailed_path
+
+            root = (WORKSPACE_ROOT / str(task.get("organization_id") or "default") / str(task["id"])).resolve()
+            candidate = _jailed_path(root, path)
+            if not candidate.is_file():
+                return None
+            file_content = candidate.read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:
+            logger.warning("Artifact recovery failed for %s: %r", path, exc)
+            return None
 
     from core.artifacts import save_artifact
 
@@ -731,7 +759,7 @@ async def _maybe_create_artifact(task: dict[str, Any], args: dict[str, Any]) -> 
             mime_type=mime,
         )
     except Exception as exc:
-        logger.warning("Artifact creation failed for %s: %s", path, exc)
+        logger.warning("Artifact creation failed for %s: %r", path, exc)
         return None
 
     return {
@@ -1010,6 +1038,33 @@ async def create_task_from_history(
         return str(result.scalar_one())
 
 
+def should_emit_fast_ack(message: str) -> bool:
+    """Return true for turns likely to need tools, retrieval, or durable execution."""
+    text = message.lower()
+    long_or_complex = len(text.split()) >= 18
+    triggers = (
+        "research", "analyze", "analyse", "compare", "extract", "contract",
+        "liability", "draft", "presentation", "slide", "deck", "artifact",
+        "file", "document", "sub-agent", "subagent", "agent", "latest",
+        "current", "today", "find", "search", "generate", "build", "create",
+    )
+    return long_or_complex or any(trigger in text for trigger in triggers)
+
+
+def fast_ack_text(message: str) -> str:
+    """Lightweight visible response sent before planning, retrieval, or tools."""
+    text = message.lower()
+    if "contract" in text or "liability" in text:
+        return "I'll start by checking the contract, extracting the key terms, and comparing the relevant changes."
+    if "presentation" in text or "slide" in text or "deck" in text:
+        return "I'll start by scoping the deck, gathering the research threads, and tracking the presentation artifact as it is built."
+    if "research" in text or "latest" in text or "current" in text or "today" in text:
+        return "I'll start by gathering the relevant sources, checking what needs live lookup, and keeping progress visible as I work."
+    if "file" in text or "document" in text or "extract" in text:
+        return "I'll start by reading the material, extracting the important parts, and then turning that into the result you asked for."
+    return "I'll start by checking the request, gathering the needed context, and keeping the work visible as it runs."
+
+
 async def stream_chat_turn(
     *,
     conversation_id: str,
@@ -1018,6 +1073,7 @@ async def stream_chat_turn(
     requester_context: Any,
     model: str | None,
     mode: str | None = None,
+    emit_conversation: bool = True,
 ):
     """Stream one chat turn inline.
 
@@ -1026,10 +1082,15 @@ async def stream_chat_turn(
     first tool call (with full history). Promotes to a durable background task
     when the model calls start_task.
     """
-    yield {"type": "conversation", "conversation_id": conversation_id}
+    if emit_conversation:
+        yield {"type": "conversation", "conversation_id": conversation_id}
 
     history: list[dict[str, Any]] = list(context_messages) + [{"role": "user", "content": message}]
     effective_model = resolve_agent_model(model)
+    ack_prefix = ""
+    if should_emit_fast_ack(message):
+        ack_prefix = f"{fast_ack_text(message)}\n\n"
+        yield {"type": "token", "content": ack_prefix}
     task_id: str | None = None
     task: dict[str, Any] | None = None
     iteration = 0
@@ -1055,7 +1116,7 @@ async def stream_chat_turn(
             return
 
         if not calls:
-            answer = final_text or ""
+            answer = f"{ack_prefix}{final_text or ''}"
             await persist_assistant_message(conversation_id, answer, requester_context, mode=mode)
             _spawn_background(extract_and_save(conversation_id, message, answer, requester_context))
             yield {"type": "done"}

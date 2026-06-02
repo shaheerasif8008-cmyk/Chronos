@@ -122,9 +122,29 @@ async def cancel_task(task_id: str, member: Member = Depends(get_current_member)
     return {"task_id": task_id, "status": "cancelled", "cancelled": True}
 
 
+@router.post("/{task_id}/retry")
+async def retry_task(task_id: str, member: Member = Depends(get_current_member)) -> dict:
+    """Revive a failed / dead-lettered task: clear terminal state and re-enqueue."""
+    await permissions.check(member, "retry_task", task_id)
+    tasks = await reflect_table("tasks")
+    async with engine.begin() as conn:
+        row = (
+            await conn.execute(
+                select(tasks).where(tasks.c.id == task_id, tasks.c.organization_id == member.organization_id)
+            )
+        ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if row["status"] not in {"failed", "cancelled"}:
+        raise HTTPException(status_code=409, detail=f"Task is {row['status']}, not retryable")
+    await task_runner.requeue_task(task_id)
+    return {"task_id": task_id, "status": "queued", "retried": True}
+
+
 @router.get("/")
 async def list_tasks(
     status: str | None = Query(default=None),
+    dead_letter: bool | None = Query(default=None),
     include_children: bool = Query(default=False),
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
@@ -137,6 +157,8 @@ async def list_tasks(
         stmt = stmt.where(tasks.c.parent_task_id.is_(None))
     if status:
         stmt = stmt.where(tasks.c.status == status)
+    if dead_letter is not None:
+        stmt = stmt.where(tasks.c.dead_letter == dead_letter)
     stmt = stmt.order_by(tasks.c.created_at.desc()).limit(limit).offset(offset)
     async with engine.begin() as conn:
         rows = (await conn.execute(stmt)).mappings().all()
@@ -181,11 +203,19 @@ async def stream_task(task_id: str, member: Member = Depends(get_current_member)
 
     async def events():
         async with engine.begin() as conn:
-            row = (await conn.execute(select(tasks).where(tasks.c.id == task_id))).mappings().first()
+            row = (
+                await conn.execute(
+                    select(tasks).where(
+                        tasks.c.id == task_id,
+                        tasks.c.organization_id == member.organization_id,
+                    )
+                )
+            ).mappings().first()
         if not row:
             yield f"data: {json.dumps({'type': 'task_failed', 'error': 'Task not found'})}\n\n"
             return
-        yield f"data: {json.dumps({'type': 'catch_up', 'task': dict(row)}, default=str)}\n\n"
+        replay_events = await list_task_events(task_id, member.organization_id, limit=200, offset=0)
+        yield f"data: {json.dumps({'type': 'catch_up', 'task': dict(row), 'events': replay_events}, default=str)}\n\n"
 
         pubsub = redis_client.pubsub()
         await pubsub.subscribe(activity_channel(task_id))

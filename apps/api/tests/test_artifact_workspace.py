@@ -213,3 +213,102 @@ async def test_duplicate_creates_independent_copy():
     assert copy["title"] == "Doc (copy)"
     assert copy["version"] == 1
     assert await read_artifact_content(copy["id"]) == b"original"
+
+
+async def _persist_member(org_id: str):
+    """Insert a real members row (project_members FKs to it) and return the Member."""
+    from sqlalchemy import insert
+
+    from core.db import engine, reflect_table
+    from core.models import Member
+
+    mid = str(uuid.uuid4())
+    members = await reflect_table("members")
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(members).values(
+                id=mid, organization_id=org_id, email=f"{mid[:8]}@t.io", role="owner"
+            )
+        )
+    return Member(id=mid, organization_id=org_id, email=f"{mid[:8]}@t.io", role="owner")
+
+
+async def _make_project(org_id: str, name: str = "Proj", member_id: str | None = None) -> str:
+    from sqlalchemy import insert
+
+    from core.db import engine, reflect_table
+
+    projects = await reflect_table("projects")
+    project_members = await reflect_table("project_members")
+    async with engine.begin() as conn:
+        pid = (
+            await conn.execute(
+                insert(projects).values(organization_id=org_id, name=name).returning(projects.c.id)
+            )
+        ).scalar_one()
+        if member_id:
+            await conn.execute(
+                insert(project_members).values(
+                    organization_id=org_id, project_id=pid, member_id=member_id, role="owner"
+                )
+            )
+    return str(pid)
+
+
+@_requires_db
+@pytest.mark.asyncio
+async def test_move_artifact_into_project_and_unlink():
+    """Phase 5 `move`: an artifact can be moved into a project, appears in that
+    project's artifacts, and can be unlinked back out."""
+    from core.artifacts import get_artifact, save_artifact
+    from routers.artifacts import MoveBody, move_artifact
+    from routers.projects import get_project_artifacts
+
+    org = f"test-{uuid.uuid4().hex[:8]}"
+    member = await _persist_member(org)
+    pid = await _make_project(org, member_id=member.id)
+    aid = await save_artifact("movable", kind="markdown", title="M", org_id=org)
+
+    # Not in the project before the move.
+    before = await get_project_artifacts(pid, member=member)
+    assert all(str(r["id"]) != aid for r in before)
+
+    # Move -> project_id set, and it now shows up in the project.
+    moved = await move_artifact(aid, MoveBody(project_id=pid), member=member)
+    assert str(moved["project_id"]) == pid
+    after = await get_project_artifacts(pid, member=member)
+    assert any(str(r["id"]) == aid for r in after)
+
+    # Unlink -> project_id cleared and it leaves the project.
+    cleared = await move_artifact(aid, MoveBody(project_id=None), member=member)
+    assert cleared["project_id"] is None
+    final = await get_project_artifacts(pid, member=member)
+    assert all(str(r["id"]) != aid for r in final)
+
+
+@_requires_db
+@pytest.mark.asyncio
+async def test_move_rejects_cross_org_project_and_artifact():
+    """Move is tenant-scoped: cannot target another org's project, and cannot move
+    another org's artifact (both 404, never leaking the row)."""
+    import pytest as _pytest
+    from fastapi import HTTPException
+
+    from core.artifacts import save_artifact
+    from routers.artifacts import MoveBody, move_artifact
+
+    org_a = f"a-{uuid.uuid4().hex[:8]}"
+    org_b = f"b-{uuid.uuid4().hex[:8]}"
+    aid_a = await save_artifact("a-only", kind="markdown", title="A", org_id=org_a)
+    pid_b = await _make_project(org_b)
+
+    # Org A artifact cannot be moved into Org B's project.
+    with _pytest.raises(HTTPException) as ei:
+        await move_artifact(aid_a, MoveBody(project_id=pid_b), member=_member(org_a))
+    assert ei.value.status_code == 404
+
+    # Org B member cannot move Org A's artifact at all.
+    pid_a = await _make_project(org_a)
+    with _pytest.raises(HTTPException) as ei2:
+        await move_artifact(aid_a, MoveBody(project_id=pid_a), member=_member(org_b))
+    assert ei2.value.status_code == 404

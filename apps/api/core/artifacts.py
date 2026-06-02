@@ -174,6 +174,9 @@ async def read_artifact_content(artifact_id: str) -> bytes | None:
         return None
     path: str = meta["minio_path"]
 
+    if path.startswith("local://"):
+        return _read_local_artifact(path, artifact_id, meta.get("version", 1))
+
     # Try MinIO first.
     client = None
     try:
@@ -185,10 +188,13 @@ async def read_artifact_content(artifact_id: str) -> bytes | None:
     finally:
         await _close_minio(client)
 
+    return _read_local_artifact(path, artifact_id, meta.get("version", 1))
+
+
+def _read_local_artifact(path: str, artifact_id: str, version: int = 1) -> bytes | None:
     # Local fallback.
     import pathlib
-
-    fname = path.split("local://")[-1] if path.startswith("local://") else f"{artifact_id}_v{meta.get('version', 1)}"
+    fname = path.split("local://")[-1] if path.startswith("local://") else f"{artifact_id}_v{version}"
     local = pathlib.Path("/tmp/chronos_artifacts") / fname
     if local.exists():
         return local.read_bytes()
@@ -244,3 +250,47 @@ async def update_artifact_meta(artifact_id: str, org_id: str, **fields: Any) -> 
 async def soft_delete_artifact(artifact_id: str, org_id: str) -> bool:
     res = await update_artifact_meta(artifact_id, org_id, is_deleted=True)
     return res is not None
+
+
+async def project_in_org(project_id: str, org_id: str) -> bool:
+    """True if the project exists and belongs to org_id."""
+    projects = await reflect_table("projects")
+    async with engine.begin() as conn:
+        row = (
+            await conn.execute(
+                select(projects.c.id).where(
+                    projects.c.id == project_id,
+                    projects.c.organization_id == org_id,
+                )
+            )
+        ).first()
+    return row is not None
+
+
+async def set_artifact_project(
+    artifact_id: str, *, project_id: str | None, org_id: str
+) -> dict[str, Any] | None:
+    """Move an artifact into a project (Phase 5 `move`), or unlink with project_id=None.
+
+    Tenant-scoped: only updates an artifact owned by org_id that is not soft-deleted.
+    Returns the updated artifact metadata, or None when the artifact does not exist
+    in this org. Project validity is checked by the caller via ``project_in_org``.
+    """
+    from datetime import datetime, timezone
+    from sqlalchemy import update as _update
+
+    artifacts = await reflect_table("artifacts")
+    async with engine.begin() as conn:
+        result = await conn.execute(
+            _update(artifacts)
+            .where(
+                artifacts.c.id == artifact_id,
+                artifacts.c.organization_id == org_id,
+                artifacts.c.is_deleted == False,  # noqa: E712
+            )
+            .values(project_id=project_id, updated_at=datetime.now(timezone.utc))
+            .returning(artifacts.c.id)
+        )
+        if result.scalar_one_or_none() is None:
+            return None
+    return await get_artifact(artifact_id)

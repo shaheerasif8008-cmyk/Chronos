@@ -182,7 +182,9 @@ SPAWN_SUBAGENT = _fn(
     "Spawn an autonomous sub-agent with its own context window to accomplish a specific goal. "
     "Use for parallel workstreams, deep research on a single topic, or tasks that benefit from "
     "a fresh context. The sub-agent has access to browser and filesystem tools. "
-    "Returns the sub-agent's final answer. Max depth: 3 levels.",
+    "Returns the sub-agent's final answer. For multiple independent workstreams, call this tool "
+    "multiple times in the same assistant step so the sub-agents run in parallel; do not spawn "
+    "them sequentially when the roles are already known. Max depth: 3 levels.",
     {
         "goal": {
             "type": "string",

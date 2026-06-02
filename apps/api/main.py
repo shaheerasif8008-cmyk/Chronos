@@ -1,4 +1,15 @@
 import importlib.util
+import os
+import ssl
+
+import certifi
+
+# macOS: ensure the default SSL context uses certifi's CA bundle, otherwise
+# HTTPS requests (Cognito, OpenRouter, etc.) fail with
+# CERTIFICATE_VERIFY_FAILED.
+os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+_default_ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+ssl._create_default_https_context = lambda: _default_ssl_ctx
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware

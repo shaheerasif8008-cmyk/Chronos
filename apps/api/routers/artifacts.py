@@ -9,8 +9,10 @@ from sqlalchemy import select
 from core import audit, permissions
 from core.artifacts import (
     get_artifact,
+    project_in_org,
     read_artifact_content,
     save_artifact,
+    set_artifact_project,
     soft_delete_artifact,
     update_artifact_meta,
 )
@@ -51,6 +53,10 @@ class AIEditBody(BaseModel):
 
 class RenameBody(BaseModel):
     title: str
+
+
+class MoveBody(BaseModel):
+    project_id: str | None = None
 
 
 class CreateBody(BaseModel):
@@ -207,6 +213,24 @@ async def delete_artifact(artifact_id: str, member: Member = Depends(get_current
     await soft_delete_artifact(artifact_id, member.organization_id)
     await audit.log("artifact", member.id, "artifact.delete", organization_id=member.organization_id, resource_type="artifact", resource_id=artifact_id)
     return {"ok": True}
+
+
+@router.post("/{artifact_id}/move")
+async def move_artifact(artifact_id: str, body: MoveBody, member: Member = Depends(get_current_member)):
+    """Move an artifact into a project (Phase 5 `move`), or unlink with project_id=null."""
+    await _require(member, "artifact.edit", artifact_id)
+    if body.project_id is not None and not await project_in_org(body.project_id, member.organization_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    updated = await set_artifact_project(
+        artifact_id, project_id=body.project_id, org_id=member.organization_id
+    )
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    await audit.log(
+        "artifact", member.id, "artifact.move", organization_id=member.organization_id,
+        resource_type="artifact", resource_id=artifact_id, payload={"project_id": body.project_id},
+    )
+    return updated
 
 
 @router.post("/{artifact_id}/duplicate")

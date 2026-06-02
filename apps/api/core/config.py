@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     memory_retrieve_timeout_seconds: float = 1.5
     task_runner_max_concurrency: int = 4
     task_runner_max_attempts: int = 2
-    task_runner_timeout_seconds: float = 300.0
+    task_runner_timeout_seconds: float = 1800.0
     jwt_secret: str = "change-me-in-dev"
     access_token_expire_minutes: int = 60
 

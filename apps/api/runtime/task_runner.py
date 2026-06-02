@@ -19,28 +19,39 @@ async def _default_run_task(task_id: str) -> Any:
     return await TaskExecutor().run(task_id)
 
 
-async def _default_mark_cancelled(task_id: str, reason: str) -> None:
-    from runtime.agent_loop import emit_activity, save_task
+def classify_failure(error: str) -> str:
+    """Map a runner error string to the final failure taxonomy.
 
-    await save_task(
-        task_id,
-        status="cancelled",
-        error=reason,
-        completed_at=datetime.now(timezone.utc),
-    )
+    Returns one of: ``timeout`` (task-level timeout), ``cancelled`` (user/system
+    cancellation), or ``error`` (an exception exhausted retries).
+    """
+    normalized = (error or "").strip().lower()
+    if normalized == "task_timeout":
+        return "timeout"
+    if normalized in {"user_cancelled", "cancelled", "system_cancelled"}:
+        return "cancelled"
+    return "error"
+
+
+async def _persist_terminal(task_id: str, **values: Any) -> None:
+    from runtime.agent_loop import save_task
+
+    await save_task(task_id, completed_at=datetime.now(timezone.utc), **values)
+
+
+async def _default_mark_cancelled(task_id: str, reason: str) -> None:
+    from runtime.agent_loop import emit_activity
+
+    await _persist_terminal(task_id, status="cancelled", error=reason, failure_reason="cancelled")
     await emit_activity(task_id, {"type": "task_cancelled", "reason": reason})
 
 
 async def _default_mark_failed(task_id: str, error: str) -> None:
-    from runtime.agent_loop import emit_activity, save_task
+    from runtime.agent_loop import emit_activity
 
-    await save_task(
-        task_id,
-        status="failed",
-        error=error,
-        completed_at=datetime.now(timezone.utc),
-    )
-    await emit_activity(task_id, {"type": "task_failed", "error": error})
+    reason = classify_failure(error)
+    await _persist_terminal(task_id, status="failed", error=error, failure_reason=reason, dead_letter=True)
+    await emit_activity(task_id, {"type": "task_failed", "error": error, "failure_reason": reason, "dead_letter": True})
 
 
 class TaskRunner:
@@ -61,8 +72,9 @@ class TaskRunner:
         task_timeout_seconds: float | None = None,
     ) -> None:
         self._run_task = run_task or _default_run_task
-        self._mark_cancelled = mark_cancelled or _default_mark_cancelled
-        self._mark_failed = mark_failed or _default_mark_failed
+        self._mark_cancelled = mark_cancelled or self._builtin_mark_cancelled
+        self._mark_failed = mark_failed or self._builtin_mark_failed
+        self._last_attempts: dict[str, int] = {}
         self._max_concurrency = max(1, int(max_concurrency))
         self._max_attempts = max(1, int(max_attempts))
         self._task_timeout_seconds = task_timeout_seconds
@@ -74,6 +86,45 @@ class TaskRunner:
         self._worker_task: asyncio.Task[Any] | None = None
         self._wake = asyncio.Event()
         self._closed = False
+
+    async def _builtin_mark_cancelled(self, task_id: str, reason: str) -> None:
+        from runtime.agent_loop import emit_activity
+
+        attempts = self._last_attempts.pop(task_id, 0)
+        await _persist_terminal(
+            task_id, status="cancelled", error=reason, failure_reason="cancelled", attempts=attempts
+        )
+        await emit_activity(task_id, {"type": "task_cancelled", "reason": reason})
+
+    async def _builtin_mark_failed(self, task_id: str, error: str) -> None:
+        from runtime.agent_loop import emit_activity
+
+        reason = classify_failure(error)
+        attempts = self._last_attempts.pop(task_id, 1)
+        await _persist_terminal(
+            task_id,
+            status="failed",
+            error=error,
+            failure_reason=reason,
+            dead_letter=True,
+            attempts=attempts,
+        )
+        await emit_activity(
+            task_id,
+            {"type": "task_failed", "error": error, "failure_reason": reason,
+             "dead_letter": True, "attempts": attempts},
+        )
+
+    async def requeue(self, task_id: str, *, priority: int = 10) -> bool:
+        """Revive a dead-lettered/failed task: clear terminal state and re-enqueue."""
+        from runtime.agent_loop import save_task
+
+        await save_task(
+            task_id, status="queued", dead_letter=False, failure_reason=None, error=None
+        )
+        self._last_attempts.pop(task_id, None)
+        await self.enqueue(task_id, priority=priority)
+        return True
 
     async def enqueue(self, task_id: str, *, priority: int = 10) -> None:
         if task_id in self._queued or task_id in self._running:
@@ -152,6 +203,7 @@ class TaskRunner:
     async def _run_with_policy(self, task_id: str) -> None:
         last_error = "task_failed"
         for attempt in range(1, self._max_attempts + 1):
+            self._last_attempts[task_id] = attempt
             try:
                 if self._task_timeout_seconds is None:
                     await self._run_task(task_id)
@@ -189,6 +241,10 @@ async def enqueue_task(task_id: str, priority: int = 10) -> None:
 
 def cancel_task(task_id: str, reason: str = "user_cancelled") -> bool:
     return runner.cancel(task_id, reason=reason)
+
+
+async def requeue_task(task_id: str, priority: int = 10) -> bool:
+    return await runner.requeue(task_id, priority=priority)
 
 
 def start_runner() -> None:

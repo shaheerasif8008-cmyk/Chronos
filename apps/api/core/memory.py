@@ -31,6 +31,8 @@ async def _retrieve_recent_memories(
                     FROM memory_entries
                     WHERE organization_id = :org_id
                       AND is_deleted = FALSE
+                      AND is_archived = FALSE
+                      AND superseded_by IS NULL
                       AND ({scope_filter})
                     ORDER BY created_at DESC
                     LIMIT 10
@@ -155,12 +157,10 @@ def _rank_memory_rows(rows: list[dict[str, Any]], *, now: datetime | None = None
         importance = max(0.0, min(float(row.get("importance_score") or 0.0), 1.0))
         recency = _recency_score(row.get("created_at"), now=now)
         authority = _source_authority(row.get("source"))
-        ranked.append(
-            {
-                **row,
-                "_rank_score": (0.45 * cosine) + (0.20 * recency) + (0.20 * importance) + (0.15 * authority),
-            }
-        )
+        base = (0.45 * cosine) + (0.20 * recency) + (0.20 * importance) + (0.15 * authority)
+        # Pinned memories are deliberately curated; float them above peers.
+        pinned_boost = 0.25 if row.get("is_pinned") else 0.0
+        ranked.append({**row, "_rank_score": base + pinned_boost})
     return sorted(ranked, key=lambda row: row["_rank_score"], reverse=True)
 
 
@@ -279,6 +279,24 @@ async def add_task_scratchpad_memory(
 
 
 async def retrieve(query: str, requester_context: RequesterContext) -> list[MemoryEntry]:
+    # Privacy gate: if memory is disabled for this org/project/member, retrieve nothing.
+    from core.memory_control import is_memory_enabled
+
+    if not await is_memory_enabled(
+        org_id=requester_context.org_id,
+        project_id=requester_context.project_id,
+        member_id=requester_context.member_id,
+    ):
+        await audit.log(
+            "memory_retrieve",
+            requester_context.member_id,
+            "memory.retrieve",
+            organization_id=requester_context.org_id,
+            resource_type="memory_entries",
+            payload={"project_id": requester_context.project_id},
+            decision="memory_disabled",
+        )
+        return []
     expanded_queries = await expand_query(query, requester_context)
     scratchpad = await _retrieve_task_scratchpad(requester_context)
     embeddings: list[tuple[str, list[float]]] = []
@@ -324,11 +342,13 @@ async def retrieve(query: str, requester_context: RequesterContext) -> list[Memo
                     text(
                         f"""
                         SELECT id, organization_id, region, scope, scope_id, content, source,
-                               importance_score, is_deleted, created_by, created_at,
+                               importance_score, is_deleted, created_by, created_at, is_pinned,
                                embedding <=> (:embedding)::vector AS distance
                         FROM memory_entries
                         WHERE organization_id = :org_id
                           AND is_deleted = FALSE
+                          AND is_archived = FALSE
+                          AND superseded_by IS NULL
                           AND embedding IS NOT NULL
                           AND ({scope_filter})
                         ORDER BY embedding <=> (:embedding)::vector
@@ -359,4 +379,16 @@ async def retrieve(query: str, requester_context: RequesterContext) -> list[Memo
         },
         decision="expanded_scoped_memory_search",
     )
-    return (scratchpad + [MemoryEntry(**_memory_entry_payload(row)) for row in ranked])[:10]
+    final = (scratchpad + [MemoryEntry(**_memory_entry_payload(row)) for row in ranked])[:10]
+    # Record which durable (non-scratchpad) memories were surfaced, for usage logs.
+    try:
+        from core.memory_control import record_memory_usage
+
+        await record_memory_usage(
+            [m.id for m in final if not str(m.id).startswith("scratch-")],
+            requester_context=requester_context,
+            context=query[:200],
+        )
+    except Exception:
+        pass
+    return final
