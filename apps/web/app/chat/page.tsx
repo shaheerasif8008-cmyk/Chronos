@@ -47,7 +47,8 @@ type ArtifactRef = { id: string; title: string; kind: string; mime_type?: string
 type ProjectSource = { id: string; title?: string | null; source_type?: string | null; parse_status?: string | null; index_status?: string | null; uri?: string | null; created_at?: string };
 type SourceChunkPreview = { chunk_index: number; content: string; token_count?: number | null };
 type SourceDetail = { id: string; title?: string | null; source_type?: string | null; uri?: string | null; artifact_id?: string | null; parse_status?: string | null; index_status?: string | null; warning?: string | null; chunk_count: number; chunks: SourceChunkPreview[] };
-type MemoryEntry = { id: string; scope: string; scope_id: string; content: string; source: string; importance_score?: number; created_by?: string | null; created_at?: string };
+type MemoryEntry = { id: string; scope: string; scope_id: string; content: string; source: string; importance_score?: number; created_by?: string | null; created_at?: string; is_pinned?: boolean; is_archived?: boolean; is_sensitive?: boolean; superseded_by?: string | null };
+type MemoryConflict = { stale_id: string; survivor_id: string; similarity: number; scope: string; stale_content: string; survivor_content: string };
 type Connector = {
   id: string;
   name?: string;
@@ -3311,15 +3312,93 @@ function MemoryScreen() {
     } catch { /* silently */ }
   }
 
+  const [conflicts, setConflicts] = useState<MemoryConflict[]>([]);
+  const [showConflicts, setShowConflicts] = useState(false);
+
+  async function flagMemory(id: string, kind: "archive" | "pin" | "sensitive", value: boolean) {
+    try {
+      await apiFetch(`/memory/${id}/${kind}`, { method: "POST", body: JSON.stringify({ value }) });
+      if (kind === "archive" && value) {
+        setMemories(prev => prev.filter(m => m.id !== id));
+      } else {
+        const field = kind === "pin" ? "is_pinned" : "is_sensitive";
+        setMemories(prev => prev.map(m => m.id === id ? { ...m, [field]: value } : m));
+      }
+    } catch {
+      setToast({ kind: "danger", text: `Could not ${kind} memory.` });
+    }
+  }
+
+  async function reviewConflicts() {
+    try {
+      const data = await apiFetch("/memory/conflicts").then(r => r.json()) as MemoryConflict[];
+      setConflicts(data);
+      setShowConflicts(true);
+      if (data.length === 0) setToast({ kind: "ok", text: "No conflicting memories found." });
+    } catch {
+      setToast({ kind: "danger", text: "Could not load conflicts." });
+    }
+  }
+
+  async function resolveConflict(c: MemoryConflict) {
+    try {
+      await apiFetch("/memory/resolve-conflict", {
+        method: "POST",
+        body: JSON.stringify({ stale_id: c.stale_id, survivor_id: c.survivor_id }),
+      });
+      setConflicts(prev => prev.filter(x => x.stale_id !== c.stale_id));
+      setMemories(prev => prev.filter(m => m.id !== c.stale_id));
+      setToast({ kind: "ok", text: "Older memory superseded." });
+    } catch {
+      setToast({ kind: "danger", text: "Could not resolve conflict." });
+    }
+  }
+
+  async function exportMemories() {
+    try {
+      const data = await apiFetch("/memory/export").then(r => r.json());
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = "chronos-memory-export.json"; a.click();
+      URL.revokeObjectURL(url);
+      setToast({ kind: "ok", text: `Exported ${data.length} memories.` });
+    } catch {
+      setToast({ kind: "danger", text: "Export failed." });
+    }
+  }
+
+  async function importMemories(file: File) {
+    try {
+      const items = JSON.parse(await file.text());
+      const res = await apiFetch("/memory/import", { method: "POST", body: JSON.stringify({ items }) }).then(r => r.json());
+      await loadMemories();
+      setToast({ kind: "ok", text: `Imported ${res.imported} memories.` });
+    } catch {
+      setToast({ kind: "danger", text: "Import failed — expected a JSON array." });
+    }
+  }
+
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-y-auto">
       <PageHeader
         title="Memory"
         subtitle="What Chronos remembers about you and your workspace. Save anything important."
         right={
-          <button onClick={() => setAdding(true)} className="btn btn-secondary btn-sm">
-            <IC.Plus size={14}/> Add a memory
-          </button>
+          <div className="flex items-center gap-2">
+            <button onClick={() => void reviewConflicts()} className="btn btn-ghost btn-sm" title="Find stale or conflicting memories">
+              <IC.Info size={14}/> Review conflicts
+            </button>
+            <button onClick={() => void exportMemories()} className="btn btn-ghost btn-sm" title="Export memories as JSON">Export</button>
+            <label className="btn btn-ghost btn-sm cursor-pointer" title="Import memories from JSON">
+              Import
+              <input type="file" accept="application/json" className="hidden"
+                     onChange={e => { const f = e.target.files?.[0]; if (f) void importMemories(f); e.target.value = ""; }}/>
+            </label>
+            <button onClick={() => setAdding(true)} className="btn btn-secondary btn-sm">
+              <IC.Plus size={14}/> Add a memory
+            </button>
+          </div>
         }
       />
 
@@ -3414,13 +3493,36 @@ function MemoryScreen() {
                       sub={memories.length === 0 ? "Chronos saves memories automatically during conversations. You can also add them manually." : "No memories match your current filter."}/>
         )}
 
-        {filtered.map(m => <MemoryCard key={m.id} m={m} onDelete={deleteMemory} onUpdate={updateMemory}/>)}
+        {showConflicts && conflicts.length > 0 && (
+          <div className="mem-card p-4 fadeup" style={{ borderColor: "var(--accent)" }}>
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-[13.5px] font-semibold" style={{ color: "var(--text)" }}>
+                {conflicts.length} potential conflict{conflicts.length === 1 ? "" : "s"}
+              </span>
+              <button onClick={() => setShowConflicts(false)} className="btn btn-ghost btn-sm">Dismiss</button>
+            </div>
+            <div className="space-y-2">
+              {conflicts.map(c => (
+                <div key={c.stale_id} className="flex items-start gap-3 p-2.5 rounded-lg" style={{ background: "var(--surface-2)" }}>
+                  <div className="flex-1 min-w-0 text-[13px]" style={{ color: "var(--text)" }}>
+                    <div style={{ color: "var(--text-dim)" }}>Keep: {c.survivor_content}</div>
+                    <div className="line-through" style={{ color: "var(--text-dim)" }}>Stale: {c.stale_content}</div>
+                    <span className="text-[11.5px]" style={{ color: "var(--text-dim)" }}>{Math.round(c.similarity * 100)}% similar · {c.scope}</span>
+                  </div>
+                  <button onClick={() => void resolveConflict(c)} className="btn btn-accent btn-sm flex-shrink-0">Supersede</button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {filtered.map(m => <MemoryCard key={m.id} m={m} onDelete={deleteMemory} onUpdate={updateMemory} onFlag={flagMemory}/>)}
       </div>
     </div>
   );
 }
 
-function MemoryCard({ m, onDelete, onUpdate }: { m: MemoryEntry; onDelete: (id: string) => void; onUpdate: (id: string, content: string, importance_score?: number) => Promise<void> }) {
+function MemoryCard({ m, onDelete, onUpdate, onFlag }: { m: MemoryEntry; onDelete: (id: string) => void; onUpdate: (id: string, content: string, importance_score?: number) => Promise<void>; onFlag: (id: string, kind: "archive" | "pin" | "sensitive", value: boolean) => Promise<void> }) {
   const [hover, setHover] = useState(false);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(m.content);
@@ -3468,11 +3570,22 @@ function MemoryCard({ m, onDelete, onUpdate }: { m: MemoryEntry; onDelete: (id: 
             {m.scope && <><span>·</span><span>{m.scope}</span></>}
             {typeof m.importance_score === "number" && <><span>·</span><span>{Math.round(m.importance_score * 100)}% importance</span></>}
             {m.created_by && <><span>·</span><span>by {m.created_by}</span></>}
+            {m.is_pinned && <><span>·</span><span style={{ color: "var(--accent)" }}>Pinned</span></>}
+            {m.is_sensitive && <><span>·</span><span style={{ color: "var(--danger)" }}>Sensitive</span></>}
           </div>
         </div>
         <div className="flex items-center gap-1 flex-shrink-0" style={{ opacity: hover ? 1 : 0, transition: "opacity 0.15s" }}>
+          <button onClick={() => void onFlag(m.id, "pin", !m.is_pinned)} className="btn btn-ghost btn-sm btn-icon" title={m.is_pinned ? "Unpin" : "Pin"}>
+            <IC.ArrowUp size={13}/>
+          </button>
+          <button onClick={() => void onFlag(m.id, "sensitive", !m.is_sensitive)} className="btn btn-ghost btn-sm btn-icon" title={m.is_sensitive ? "Unmark sensitive" : "Mark sensitive"}>
+            <IC.Lock size={13}/>
+          </button>
           <button onClick={() => setEditing(true)} className="btn btn-ghost btn-sm btn-icon" title="Edit">
             <IC.Pencil size={13}/>
+          </button>
+          <button onClick={() => void onFlag(m.id, "archive", true)} className="btn btn-ghost btn-sm btn-icon" title="Archive">
+            <IC.Folder size={13}/>
           </button>
           <button onClick={() => onDelete(m.id)} className="btn btn-ghost btn-sm btn-icon" title="Delete">
             <IC.Trash size={13}/>

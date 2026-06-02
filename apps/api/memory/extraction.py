@@ -24,6 +24,25 @@ async def extract_and_save(
     assistant_response: str,
     requester_context: RequesterContext,
 ) -> None:
+    # Privacy gate: if memory is disabled for this org/project/member/conversation,
+    # extract nothing and write nothing (returns before any model call or write).
+    from core.memory_control import is_memory_enabled
+
+    if not await is_memory_enabled(
+        org_id=requester_context.org_id,
+        project_id=requester_context.project_id,
+        member_id=requester_context.member_id,
+        conversation_id=conversation_id,
+    ):
+        await audit.log(
+            "memory_extraction_skipped",
+            requester_context.member_id,
+            "memory.extract",
+            resource_type="memory",
+            resource_id=conversation_id,
+            decision="memory_disabled",
+        )
+        return
     prompt = f"""
 Identify facts worth remembering from this exchange.
 Return JSON only: {{"memories": [{{"content": "...", "scope": "personal|workspace|persona|org", "importance": 0.0-1.0}}]}}

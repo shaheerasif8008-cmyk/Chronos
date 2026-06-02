@@ -423,3 +423,170 @@ async def test_run_loop_gates_write_after_untrusted_prompt_injection(monkeypatch
     assert result == {"status": "awaiting_approval"}
     assert task["status"] == "awaiting_approval"
     assert [call["name"] for call in approvals] == ["gmail__draft"]
+
+
+# ─── Dead-letter state + failure taxonomy (Phase 1 completion) ────────────────
+import os  # noqa: E402
+import socket  # noqa: E402
+import uuid  # noqa: E402
+
+
+def _db_reachable() -> bool:
+    host, _, port_str = os.environ.get(
+        "DATABASE_URL", "postgresql+asyncpg://chronos:chronos@localhost:5432/chronos"
+    ).rpartition("@")[-1].partition("/")[0].rpartition(":")
+    port = int(port_str) if port_str.isdigit() else 5432
+    try:
+        with socket.create_connection((host or "localhost", port), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+_requires_db = pytest.mark.skipif(not _db_reachable(), reason="Postgres not reachable")
+
+
+def test_classify_failure_taxonomy():
+    from runtime.task_runner import classify_failure
+
+    assert classify_failure("task_timeout") == "timeout"
+    assert classify_failure("user_cancelled") == "cancelled"
+    assert classify_failure("RuntimeError: boom") == "error"
+    assert classify_failure("") == "error"
+
+
+async def _insert_task(org: str) -> str:
+    from sqlalchemy import insert
+
+    from core.db import engine, reflect_table
+
+    tid = str(uuid.uuid4())
+    tasks = await reflect_table("tasks")
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(tasks).values(
+                id=tid, organization_id=org, goal="reliability probe", triggered_by="test", status="queued"
+            )
+        )
+    return tid
+
+
+async def _task_row(task_id: str) -> dict:
+    from sqlalchemy import select
+
+    from core.db import engine, reflect_table
+
+    tasks = await reflect_table("tasks")
+    async with engine.begin() as conn:
+        return dict((await conn.execute(select(tasks).where(tasks.c.id == task_id))).mappings().first())
+
+
+def _silence_activity(monkeypatch) -> None:
+    """No-op the redis-backed activity publish so builtin terminal handlers exercise
+    only the DB write (avoids cross-loop redis teardown noise in the full-file run)."""
+    from runtime import agent_loop
+
+    async def _noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(agent_loop, "emit_activity", _noop)
+
+
+@_requires_db
+@pytest.mark.asyncio
+async def test_exhausted_retries_dead_letters_with_error_taxonomy(monkeypatch):
+    from runtime.task_runner import TaskRunner
+
+    _silence_activity(monkeypatch)
+    org = f"test-{uuid.uuid4().hex[:8]}"
+    tid = await _insert_task(org)
+
+    async def run_task(task_id: str):
+        raise RuntimeError("always broken")
+
+    runner = TaskRunner(run_task=run_task, max_attempts=3)  # builtin mark_failed -> DB
+    await runner.enqueue(tid)
+    await runner.drain_once()
+
+    row = await _task_row(tid)
+    assert row["status"] == "failed"
+    assert row["dead_letter"] is True
+    assert row["failure_reason"] == "error"
+    assert row["attempts"] == 3
+
+
+@_requires_db
+@pytest.mark.asyncio
+async def test_timeout_dead_letters_with_timeout_taxonomy(monkeypatch):
+    from runtime.task_runner import TaskRunner
+
+    _silence_activity(monkeypatch)
+    org = f"test-{uuid.uuid4().hex[:8]}"
+    tid = await _insert_task(org)
+
+    async def run_task(task_id: str):
+        await asyncio.sleep(0.05)
+
+    runner = TaskRunner(run_task=run_task, task_timeout_seconds=0.001)
+    await runner.enqueue(tid)
+    await runner.drain_once()
+
+    row = await _task_row(tid)
+    assert row["status"] == "failed"
+    assert row["dead_letter"] is True
+    assert row["failure_reason"] == "timeout"
+
+
+@_requires_db
+@pytest.mark.asyncio
+async def test_requeue_clears_dead_letter_and_reruns(monkeypatch):
+    from runtime.task_runner import TaskRunner
+
+    _silence_activity(monkeypatch)
+    org = f"test-{uuid.uuid4().hex[:8]}"
+    tid = await _insert_task(org)
+    runs: list[str] = []
+
+    async def run_task(task_id: str):
+        runs.append(task_id)
+        if len(runs) == 1:
+            raise RuntimeError("first run fails")
+
+    runner = TaskRunner(run_task=run_task, max_attempts=1)
+    await runner.enqueue(tid)
+    await runner.drain_once()
+    failed = await _task_row(tid)
+    assert failed["dead_letter"] is True and failed["status"] == "failed"
+
+    # Revive: dead-letter cleared, task re-enqueued and runs to success.
+    assert await runner.requeue(tid) is True
+    cleared = await _task_row(tid)
+    assert cleared["dead_letter"] is False and cleared["status"] == "queued"
+    await runner.drain_once()
+    assert runs == [tid, tid]
+
+
+@_requires_db
+@pytest.mark.asyncio
+async def test_retry_endpoint_requeues_failed_task(monkeypatch):
+    from core.models import Member
+    from routers import tasks as tasks_router
+
+    org = f"test-{uuid.uuid4().hex[:8]}"
+    tid = await _insert_task(org)
+    # Put it in a failed/dead-letter terminal state.
+    from runtime.agent_loop import save_task
+
+    await save_task(tid, status="failed", dead_letter=True, failure_reason="error")
+
+    requeued: list[str] = []
+
+    async def fake_requeue(task_id, priority=10):
+        requeued.append(task_id)
+        return True
+
+    monkeypatch.setattr(tasks_router.task_runner, "requeue_task", fake_requeue)
+    member = Member(id=str(uuid.uuid4()), organization_id=org, email="m@t.io", role="owner")
+    result = await tasks_router.retry_task(tid, member=member)
+    assert result == {"task_id": tid, "status": "queued", "retried": True}
+    assert requeued == [tid]

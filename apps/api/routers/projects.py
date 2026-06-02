@@ -730,11 +730,9 @@ async def get_project_artifacts(
         ).mappings().all()
         task_ids = [str(r["id"]) for r in task_rows]
 
-        if not conv_ids and not task_ids:
-            return []
-
-        # Build OR filter across conversation and task links
-        filters = []
+        # Build OR filter across direct project link + conversation/task links.
+        # Direct link (artifacts.project_id) is set by the artifact `move` action.
+        filters = [artifacts.c.project_id == project_id]
         if conv_ids:
             filters.append(artifacts.c.conversation_id.in_(conv_ids))
         if task_ids:
