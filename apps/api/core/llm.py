@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import base64
 import json
 import logging
@@ -35,7 +34,7 @@ async def _with_retry(coro_factory, *, max_retries: int = _MAX_RETRIES) -> Any:
             delay = _BASE_BACKOFF_SECONDS * (2 ** attempt) + random.uniform(0, 0.5)
             logger.warning("LLM rate limit (attempt %d/%d), retrying in %.1fs", attempt + 1, max_retries, delay)
             await asyncio.sleep(delay)
-        except Exception:
+        except Exception as exc:
             # Non-retryable error — raise immediately.
             raise
     raise last_exc  # type: ignore[misc]
@@ -183,77 +182,6 @@ def _tool_calls(message: Any) -> list[Any]:
     return getattr(message, "tool_calls", None) or []
 
 
-def _delta(chunk: Any) -> Any:
-    if isinstance(chunk, dict):
-        return chunk.get("choices", [{}])[0].get("delta", {})
-    return chunk.choices[0].delta
-
-
-def _delta_content(delta: Any) -> str:
-    if isinstance(delta, dict):
-        return delta.get("content") or ""
-    return getattr(delta, "content", None) or ""
-
-
-def _delta_tool_calls(delta: Any) -> list[Any]:
-    if isinstance(delta, dict):
-        return delta.get("tool_calls") or []
-    return getattr(delta, "tool_calls", None) or []
-
-
-def _frag_fields(frag: Any) -> tuple[int, str | None, str | None, str]:
-    """Return (index, id, name, args_fragment) from a streamed tool_call delta."""
-    if isinstance(frag, dict):
-        fn = frag.get("function") or {}
-        return int(frag.get("index") or 0), frag.get("id"), fn.get("name"), fn.get("arguments") or ""
-    fn = getattr(frag, "function", None)
-    return (
-        int(getattr(frag, "index", 0) or 0),
-        getattr(frag, "id", None),
-        getattr(fn, "name", None),
-        getattr(fn, "arguments", "") or "",
-    )
-
-
-async def stream_step(messages: list[dict[str, Any]], tools: list[dict[str, Any]], model: str):
-    """Stream one model step.
-
-    Yields ``{"type": "token", "content": str}`` for answer turns, then a terminal
-    ``{"type": "text_done", "text": str}``. For action turns yields no tokens and a
-    terminal ``{"type": "tool_calls", "calls": [{"id","name","args_str"}, ...]}``.
-    """
-    kwargs = model_kwargs(model, messages=messages, stream=True)
-    kwargs["tools"] = tools
-    kwargs["tool_choice"] = "auto"
-    stream = await _with_retry(lambda: litellm.acompletion(**kwargs))
-
-    text_parts: list[str] = []
-    acc: dict[int, dict[str, Any]] = {}
-    async for chunk in stream:
-        delta = _delta(chunk)
-        content = _delta_content(delta)
-        if content:
-            text_parts.append(content)
-            yield {"type": "token", "content": content}
-        for frag in _delta_tool_calls(delta):
-            idx, fid, name, args = _frag_fields(frag)
-            slot = acc.setdefault(idx, {"id": None, "name": None, "args": ""})
-            if fid:
-                slot["id"] = fid
-            if name:
-                slot["name"] = name
-            slot["args"] += args
-
-    if acc:
-        calls = [
-            {"id": s["id"] or f"call_{i}", "name": s["name"] or "", "args_str": s["args"] or "{}"}
-            for i, s in sorted(acc.items())
-        ]
-        yield {"type": "tool_calls", "calls": calls}
-    else:
-        yield {"type": "text_done", "text": "".join(text_parts)}
-
-
 async def stream_completion(messages: list[dict[str, str]], *, model_id: str | None = None):
     selected = normalize_chat_model(model_id)
     if selected != "auto":
@@ -293,6 +221,69 @@ async def stream_completion(messages: list[dict[str, str]], *, model_id: str | N
         token = _choice_delta_content(chunk)
         if token:
             yield token
+
+
+async def stream_step(
+    history: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    model: str,
+):
+    """Stream a single agent-loop LLM step, yielding typed events.
+
+    Yields:
+        {"type": "token", "content": str}      — each streamed text chunk
+        {"type": "text_done", "text": str}     — full text when no tool calls
+        {"type": "tool_calls", "calls": list}  — normalised tool call dicts
+    """
+    kwargs = model_kwargs(model, messages=history, stream=True)
+    kwargs["tools"] = tools
+    kwargs["tool_choice"] = "auto"
+
+    stream = await _with_retry(lambda: litellm.acompletion(**kwargs))
+
+    full_text = ""
+    raw_tool_calls: dict[int, dict[str, Any]] = {}
+
+    async for chunk in stream:
+        choice = chunk.choices[0] if chunk.choices else None
+        if choice is None:
+            continue
+        delta = choice.delta if hasattr(choice, "delta") else {}
+
+        # Accumulate text tokens
+        token = (delta.content if hasattr(delta, "content") else None) or ""
+        if token:
+            full_text += token
+            yield {"type": "token", "content": token}
+
+        # Accumulate streaming tool call fragments
+        tc_deltas = (delta.tool_calls if hasattr(delta, "tool_calls") else None) or []
+        for tc in tc_deltas:
+            idx = tc.index if hasattr(tc, "index") else 0
+            if idx not in raw_tool_calls:
+                raw_tool_calls[idx] = {"id": "", "name": "", "args_str": ""}
+            entry = raw_tool_calls[idx]
+            if hasattr(tc, "id") and tc.id:
+                entry["id"] = tc.id
+            fn = getattr(tc, "function", None)
+            if fn:
+                if getattr(fn, "name", None):
+                    entry["name"] += fn.name
+                if getattr(fn, "arguments", None):
+                    entry["args_str"] += fn.arguments
+
+    if raw_tool_calls:
+        calls = [
+            {
+                "id": v["id"] or f"call_{i}",
+                "name": v["name"],
+                "args_str": v["args_str"] or "{}",
+            }
+            for i, v in sorted(raw_tool_calls.items())
+        ]
+        yield {"type": "tool_calls", "calls": calls}
+    else:
+        yield {"type": "text_done", "text": full_text}
 
 
 async def complete_json(prompt: str, *, model: str | None = None) -> str:
@@ -347,6 +338,38 @@ async def complete_text(prompt: str, *, model: str | None = None) -> str:
     raise RuntimeError("All models failed for complete_text — check OPENROUTER_API_KEY and model config")
 
 
+async def vision_ocr(image_bytes: bytes, mime: str) -> str:
+    """Extract text from an image via a litellm vision model.
+
+    Returns "" when no vision model is configured or the call fails — OCR is
+    best-effort and must never raise into a chat turn or task step.
+    """
+    if not settings.vision_model:
+        return ""
+    data_url = f"data:{mime};base64,{base64.b64encode(image_bytes).decode()}"
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "Extract all text from this image verbatim. Preserve reading "
+                        "order and layout. Return only the extracted text, no commentary."
+                    ),
+                },
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        }
+    ]
+    try:
+        kwargs = model_kwargs(settings.vision_model, messages=messages, stream=False)
+        response = await _with_retry(lambda: litellm.acompletion(**kwargs), max_retries=0)
+        return _message_content(response)
+    except Exception:
+        return ""
+
+
 async def tool_call(messages: list[dict[str, Any]], tools: list[dict[str, Any]], *, model: str | None = None) -> dict[str, Any]:
     """Ask the agent model for the next tool call or final response.
 
@@ -383,23 +406,3 @@ async def tool_call(messages: list[dict[str, Any]], tools: list[dict[str, Any]],
     except Exception:
         pass
     return {"type": "final", "result": {"answer": content}}
-
-
-async def vision_ocr(image_bytes: bytes, mime: str) -> str:
-    """Extract text from an image using the configured vision model.
-
-    Returns empty string if vision_model is not configured or if the call fails.
-    """
-    if not settings.vision_model:
-        return ""
-    data_url = f"data:{mime};base64,{base64.b64encode(image_bytes).decode()}"
-    messages = [{"role": "user", "content": [
-        {"type": "text", "text": "Extract all text from this image verbatim. Preserve reading order and layout. Return only the extracted text, no commentary."},
-        {"type": "image_url", "image_url": {"url": data_url}},
-    ]}]
-    try:
-        kwargs = model_kwargs(settings.vision_model, messages=messages, stream=False)
-        response = await _with_retry(lambda: litellm.acompletion(**kwargs), max_retries=0)
-        return _message_content(response)
-    except Exception:
-        return ""

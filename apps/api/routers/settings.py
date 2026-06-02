@@ -176,6 +176,7 @@ async def overview(member: Member = Depends(get_current_member)) -> dict[str, An
             "approval",
             "notifications",
             "developer",
+            "response_format",
         ]
     }
     sections["profile"]["email"] = member.email

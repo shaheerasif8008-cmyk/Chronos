@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 """
 Tool Broker — the single gateway for ALL connector calls.
 

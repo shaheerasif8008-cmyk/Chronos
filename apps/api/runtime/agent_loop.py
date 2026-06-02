@@ -192,7 +192,32 @@ def format_task_answer(result: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-async def _persist_to_conversation(task: dict[str, Any], content: str) -> str | None:
+def collect_tool_summaries(history: list[dict[str, Any]]) -> list[str]:
+    """Extract one summary string per tool result in the loop history.
+
+    Used to derive runtime action verbs (drafted/sent/updated) for the
+    structured response. Reads the 'summary' field the broker writes into
+    tool messages; falls back to the tool name.
+    """
+    out: list[str] = []
+    for msg in history:
+        if msg.get("role") != "tool":
+            continue
+        name = str(msg.get("name") or "tool")
+        summary = ""
+        content = msg.get("content")
+        if isinstance(content, str):
+            try:
+                summary = str(json.loads(content).get("summary") or "")
+            except Exception:
+                summary = ""
+        out.append(f"{name}: {summary}".strip())
+    return out
+
+
+async def _persist_to_conversation(
+    task: dict[str, Any], content: str, *, structured_response: dict | None = None
+) -> str | None:
     """Persist a final message to the task's conversation if applicable. Never raises.
 
     Returns the inserted message id on success, or None if the task has no
@@ -202,13 +227,13 @@ async def _persist_to_conversation(task: dict[str, Any], content: str) -> str | 
     if not conv_id:
         return None
     try:
-        return await _save_assistant_message(conv_id, content, task)
+        return await _save_assistant_message(conv_id, content, task, structured_response=structured_response)
     except Exception as exc:  # persistence must never break the loop
         logger.warning("Failed to persist message to conversation: %s", exc)
         return None
 
 
-async def _save_assistant_message(conversation_id: str, content: str, task: dict[str, Any], *, mode: str | None = None) -> str | None:
+async def _save_assistant_message(conversation_id: str, content: str, task: dict[str, Any], *, mode: str | None = None, structured_response: dict | None = None) -> str | None:
     """Insert the task's final answer as an assistant message in the conversation.
 
     This is the source of truth — it runs in the agent loop's background task,
@@ -239,6 +264,7 @@ async def _save_assistant_message(conversation_id: str, content: str, task: dict
                 content=content,
                 token_count=len(content.split()),
                 mode=mode,
+                structured_response=structured_response,
             )
             .returning(messages.c.id)
         )
@@ -1157,10 +1183,47 @@ async def run_loop(
             await _checkpoint(task_id, history, iteration + 1, model=effective_model,
                               status="complete", result=result,
                               completed_at=datetime.now(timezone.utc))
+            # Build the structured response envelope from runtime facts + prose composer.
+            # Failures are silently suppressed so the loop never breaks on this path.
+            from core.structured_response import (
+                build_runtime_facts, compose, resolve_verbosity, derive_response_type,
+            )
+            from core.models import RequesterContext
+
+            answer_text = format_task_answer(result)
+            try:
+                approvals = await reflect_table("approvals")
+                async with engine.begin() as conn:
+                    approval_exists = (
+                        await conn.execute(
+                            select(approvals.c.id).where(approvals.c.task_id == task_id).limit(1)
+                        )
+                    ).first() is not None
+                facts = build_runtime_facts(
+                    result=result,
+                    task_status="complete",
+                    tool_summaries=collect_tool_summaries(history),
+                    approval_exists=approval_exists,
+                )
+                triggered_member = task.get("triggered_by_member_id") or "system"
+                verbosity = await resolve_verbosity(
+                    RequesterContext(org_id=task.get("organization_id", "default"),
+                                     member_id=str(triggered_member), role="user")
+                )
+                envelope = await compose(
+                    response_type=derive_response_type(facts), answer_text=answer_text,
+                    facts=facts, verbosity=verbosity,
+                )
+                envelope_dict = envelope.model_dump()
+            except Exception:
+                envelope_dict = None
+
             # Persist the answer to the conversation (source of truth, survives
             # SSE disconnects). Only top-level conversation-triggered tasks.
-            message_id = await _persist_to_conversation(task, format_task_answer(result))
+            message_id = await _persist_to_conversation(task, answer_text, structured_response=envelope_dict)
             event: dict[str, Any] = {"type": "task_complete", "result": result}
+            if envelope_dict is not None:
+                event["structured_response"] = envelope_dict
             if message_id:
                 event["message_id"] = message_id
             await emit_activity(task_id, event)

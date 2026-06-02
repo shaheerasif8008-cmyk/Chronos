@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 """ConnectorRegistry — looks up which connector record to use for a given tool call."""
 from pydantic import BaseModel
 from sqlalchemy import select
