@@ -9,7 +9,7 @@ from typing import Any
 from sqlalchemy import insert, select, update
 from sqlalchemy.exc import IntegrityError
 
-from core.artifacts import _ensure_bucket, _minio_client, get_artifact
+from core.artifacts import _close_minio, _ensure_bucket, _minio_client, get_artifact
 from core.config import settings
 from core.db import engine, reflect_table
 
@@ -53,6 +53,7 @@ async def create_version(
         minio_path = f"artifacts/{org_id}/{artifact_id}/v{next_version}"
 
         # Write bytes outside the DB transaction (never hold a row lock across upload).
+        client = None
         try:
             client = await _minio_client()
             await _ensure_bucket(client)
@@ -65,6 +66,8 @@ async def create_version(
             _d.mkdir(parents=True, exist_ok=True)
             (_d / f"v{next_version}").write_bytes(raw)
             minio_path = f"local://{artifact_id}/v{next_version}"
+        finally:
+            await _close_minio(client)
 
         try:
             async with engine.begin() as conn:
@@ -124,6 +127,7 @@ async def read_version_content(artifact_id: str, version: int, org_id: str) -> b
     if not row:
         return None
     path = row["minio_path"]
+    client = None
     try:
         client = await _minio_client()
         response = await client.get_object(settings.minio_bucket, path)
@@ -133,6 +137,8 @@ async def read_version_content(artifact_id: str, version: int, org_id: str) -> b
         fname = path.split("local://")[-1] if path.startswith("local://") else f"{artifact_id}/v{version}"
         local = pathlib.Path("/tmp/chronos_artifacts") / fname
         return local.read_bytes() if local.exists() else None
+    finally:
+        await _close_minio(client)
 
 
 async def restore_version(

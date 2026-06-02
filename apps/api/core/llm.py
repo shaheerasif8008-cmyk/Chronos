@@ -223,6 +223,69 @@ async def stream_completion(messages: list[dict[str, str]], *, model_id: str | N
             yield token
 
 
+async def stream_step(
+    history: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    model: str,
+):
+    """Stream a single agent-loop LLM step, yielding typed events.
+
+    Yields:
+        {"type": "token", "content": str}      — each streamed text chunk
+        {"type": "text_done", "text": str}     — full text when no tool calls
+        {"type": "tool_calls", "calls": list}  — normalised tool call dicts
+    """
+    kwargs = model_kwargs(model, messages=history, stream=True)
+    kwargs["tools"] = tools
+    kwargs["tool_choice"] = "auto"
+
+    stream = await _with_retry(lambda: litellm.acompletion(**kwargs))
+
+    full_text = ""
+    raw_tool_calls: dict[int, dict[str, Any]] = {}
+
+    async for chunk in stream:
+        choice = chunk.choices[0] if chunk.choices else None
+        if choice is None:
+            continue
+        delta = choice.delta if hasattr(choice, "delta") else {}
+
+        # Accumulate text tokens
+        token = (delta.content if hasattr(delta, "content") else None) or ""
+        if token:
+            full_text += token
+            yield {"type": "token", "content": token}
+
+        # Accumulate streaming tool call fragments
+        tc_deltas = (delta.tool_calls if hasattr(delta, "tool_calls") else None) or []
+        for tc in tc_deltas:
+            idx = tc.index if hasattr(tc, "index") else 0
+            if idx not in raw_tool_calls:
+                raw_tool_calls[idx] = {"id": "", "name": "", "args_str": ""}
+            entry = raw_tool_calls[idx]
+            if hasattr(tc, "id") and tc.id:
+                entry["id"] = tc.id
+            fn = getattr(tc, "function", None)
+            if fn:
+                if getattr(fn, "name", None):
+                    entry["name"] += fn.name
+                if getattr(fn, "arguments", None):
+                    entry["args_str"] += fn.arguments
+
+    if raw_tool_calls:
+        calls = [
+            {
+                "id": v["id"] or f"call_{i}",
+                "name": v["name"],
+                "args_str": v["args_str"] or "{}",
+            }
+            for i, v in sorted(raw_tool_calls.items())
+        ]
+        yield {"type": "tool_calls", "calls": calls}
+    else:
+        yield {"type": "text_done", "text": full_text}
+
+
 async def complete_json(prompt: str, *, model: str | None = None) -> str:
     """Complete with JSON response format, falling back through selected → agent → error.
 
