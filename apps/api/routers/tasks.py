@@ -181,11 +181,19 @@ async def stream_task(task_id: str, member: Member = Depends(get_current_member)
 
     async def events():
         async with engine.begin() as conn:
-            row = (await conn.execute(select(tasks).where(tasks.c.id == task_id))).mappings().first()
+            row = (
+                await conn.execute(
+                    select(tasks).where(
+                        tasks.c.id == task_id,
+                        tasks.c.organization_id == member.organization_id,
+                    )
+                )
+            ).mappings().first()
         if not row:
             yield f"data: {json.dumps({'type': 'task_failed', 'error': 'Task not found'})}\n\n"
             return
-        yield f"data: {json.dumps({'type': 'catch_up', 'task': dict(row)}, default=str)}\n\n"
+        replay_events = await list_task_events(task_id, member.organization_id, limit=200, offset=0)
+        yield f"data: {json.dumps({'type': 'catch_up', 'task': dict(row), 'events': replay_events}, default=str)}\n\n"
 
         pubsub = redis_client.pubsub()
         await pubsub.subscribe(activity_channel(task_id))

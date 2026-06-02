@@ -18,6 +18,7 @@ class RequesterContext(BaseModel):
     workspace_id: str | None = None
     persona_id: str | None = None
     task_id: str | None = None
+    project_id: str | None = None
     role: str = "user"
     memory_context: str = "chat"
 

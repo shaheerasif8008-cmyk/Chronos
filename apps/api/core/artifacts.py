@@ -100,26 +100,27 @@ async def save_artifact(
     # --- Insert artifact head row + initial version row ---
     artifacts = await reflect_table("artifacts")
     artifact_versions = await reflect_table("artifact_versions")
+    artifact_values = dict(
+        id=artifact_id,
+        organization_id=org_id,
+        region=region,
+        conversation_id=conversation_id,
+        task_id=task_id,
+        message_id=message_id,
+        kind=kind,
+        title=title,
+        minio_path=minio_path,
+        mime_type=mime_type,
+        size_bytes=size,
+        version=version,
+        parent_artifact_id=parent_artifact_id,
+        parse_status=parse_status,
+        created_by=created_by,
+    )
+    if "artifact_key" in artifacts.c:
+        artifact_values["artifact_key"] = f"{org_id}/{artifact_id}/v{version}"
     async with engine.begin() as conn:
-        await conn.execute(
-            insert(artifacts).values(
-                id=artifact_id,
-                organization_id=org_id,
-                region=region,
-                conversation_id=conversation_id,
-                task_id=task_id,
-                message_id=message_id,
-                kind=kind,
-                title=title,
-                minio_path=minio_path,
-                mime_type=mime_type,
-                size_bytes=size,
-                version=version,
-                parent_artifact_id=parent_artifact_id,
-                parse_status=parse_status,
-                created_by=created_by,
-            )
-        )
+        await conn.execute(insert(artifacts).values(**artifact_values))
         await conn.execute(
             insert(artifact_versions).values(
                 organization_id=org_id,
@@ -152,6 +153,9 @@ async def read_artifact_content(artifact_id: str) -> bytes | None:
         return None
     path: str = meta["minio_path"]
 
+    if path.startswith("local://"):
+        return _read_local_artifact(path, artifact_id, meta.get("version", 1))
+
     # Try MinIO first.
     try:
         client = await _minio_client()
@@ -160,10 +164,13 @@ async def read_artifact_content(artifact_id: str) -> bytes | None:
     except Exception:
         pass
 
+    return _read_local_artifact(path, artifact_id, meta.get("version", 1))
+
+
+def _read_local_artifact(path: str, artifact_id: str, version: int = 1) -> bytes | None:
     # Local fallback.
     import pathlib
-
-    fname = path.split("local://")[-1] if path.startswith("local://") else f"{artifact_id}_v{meta.get('version', 1)}"
+    fname = path.split("local://")[-1] if path.startswith("local://") else f"{artifact_id}_v{version}"
     local = pathlib.Path("/tmp/chronos_artifacts") / fname
     if local.exists():
         return local.read_bytes()

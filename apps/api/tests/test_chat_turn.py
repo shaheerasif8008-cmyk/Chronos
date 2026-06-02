@@ -1,5 +1,6 @@
 import json
 import pytest
+from sqlalchemy import Column, MetaData, String, Table
 
 
 def _ctx():
@@ -137,8 +138,105 @@ async def test_start_task_promotes_to_background(monkeypatch):
     ))
 
     assert enqueued == ["task-bg"]
+    assert "gathering the relevant sources" in "".join(e.get("content", "") for e in events if e["type"] == "token")
     assert any(e["type"] == "task_created" and e.get("background") for e in events)
     assert events[-1]["type"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_complex_inline_turn_sends_fast_ack_before_model_tokens(monkeypatch):
+    from runtime import agent_loop
+
+    async def fake_stream_step(messages, tools, model):
+        yield {"type": "token", "content": "The"}
+        yield {"type": "token", "content": " answer"}
+        yield {"type": "text_done", "text": "The answer"}
+
+    saved_msgs = []
+
+    async def fake_save_assistant(conv_id, content, ctx, mode=None):
+        saved_msgs.append(content)
+
+    async def noop(*a, **k):
+        return None
+
+    monkeypatch.setattr(agent_loop, "stream_step", fake_stream_step)
+    monkeypatch.setattr(agent_loop, "persist_assistant_message", fake_save_assistant)
+    monkeypatch.setattr(agent_loop, "extract_and_save", noop)
+
+    events = await _run(agent_loop.stream_chat_turn(
+        conversation_id="conv-1",
+        message="Analyze this contract and extract the liability terms compared to the prior draft.",
+        context_messages=[{"role": "system", "content": "sys"}],
+        requester_context=_ctx(),
+        model="agent",
+    ))
+
+    token_events = [e["content"] for e in events if e["type"] == "token"]
+    assert token_events[0].startswith("I'll start by checking the contract")
+    assert "".join(token_events).endswith("The answer")
+    assert saved_msgs == ["".join(token_events)]
+
+
+@pytest.mark.asyncio
+async def test_task_stream_catch_up_includes_replay_events(monkeypatch):
+    from core.models import Member
+    from routers import tasks
+
+    task_table = Table(
+        "tasks",
+        MetaData(),
+        Column("id", String),
+        Column("organization_id", String),
+    )
+
+    class FakeResult:
+        def mappings(self):
+            return self
+
+        def first(self):
+            return {"id": "task-1", "organization_id": "default", "goal": "research", "status": "running"}
+
+    class FakeConn:
+        async def execute(self, _stmt):
+            return FakeResult()
+
+    class FakeBegin:
+        async def __aenter__(self):
+            return FakeConn()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class FakeEngine:
+        def begin(self):
+            return FakeBegin()
+
+    async def fake_reflect_table(name):
+        assert name == "tasks"
+        return task_table
+
+    async def fake_check(*_args, **_kwargs):
+        return True
+
+    async def fake_events(task_id, org_id, limit=200, offset=0):
+        return [{"type": "tool_call", "task_id": task_id, "summary": "Calling browser.search", "created_at": "2026-06-01T12:00:00Z"}]
+
+    monkeypatch.setattr(tasks, "engine", FakeEngine())
+    monkeypatch.setattr(tasks, "reflect_table", fake_reflect_table)
+    monkeypatch.setattr(tasks.permissions, "check", fake_check)
+    monkeypatch.setattr(tasks, "list_task_events", fake_events)
+
+    response = await tasks.stream_task(
+        "task-1",
+        member=Member(id="member-1", email="m@example.com", organization_id="default"),
+    )
+    first = await response.body_iterator.__anext__()
+    payload = json.loads(first.removeprefix("data: ").strip())
+
+    assert payload["type"] == "catch_up"
+    assert payload["task"]["id"] == "task-1"
+    assert payload["events"][0]["summary"] == "Calling browser.search"
 
 
 @pytest.mark.asyncio

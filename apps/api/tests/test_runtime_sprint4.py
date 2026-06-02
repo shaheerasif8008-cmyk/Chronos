@@ -3,7 +3,7 @@ import os
 import json
 
 
-os.environ["DATABASE_URL"] = "postgresql+asyncpg://chronos:chronos@localhost:5432/chronos"
+os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://chronos:chronos@localhost:5432/chronos")
 
 
 @pytest.mark.asyncio
@@ -276,6 +276,28 @@ async def test_agent_system_prompt_includes_current_date_for_live_search():
     assert "latest" in prompt
 
 
+@pytest.mark.asyncio
+async def test_top_level_prompt_prefers_parallel_subagent_spawns():
+    from runtime import agent_loop
+
+    prompt = (await agent_loop._agent_system_message())["content"]
+
+    assert "spawn all useful sub-agents in the same assistant step" in prompt
+    assert "Do not spawn one sub-agent, wait for it, then spawn the next" in prompt
+
+
+@pytest.mark.asyncio
+async def test_subagent_prompt_bounds_research_iterations():
+    from runtime import agent_loop
+    from runtime.tool_registry import SUBAGENT_TOOLS
+
+    prompt = (await agent_loop._agent_system_message(SUBAGENT_TOOLS))["content"]
+
+    assert "Use at most 2-4 model iterations" in prompt
+    assert "fetch only the 1-3 most valuable pages" in prompt
+    assert "do not keep retrying after rate limits" in prompt
+
+
 def test_observability_skips_langfuse_callback_when_package_missing(monkeypatch):
     import importlib.util
 
@@ -390,5 +412,3 @@ async def test_browser_search_falls_back_to_fixture_results_on_live_timeout(monk
     assert result.data["is_fallback"] is True
     assert "placeholder data" in result.data["warning"]
     assert len(result.data["results"]) == 2
-
-

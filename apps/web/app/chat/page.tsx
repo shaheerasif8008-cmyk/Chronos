@@ -114,7 +114,9 @@ type TaskStreamEvent = {
   type: string;
   task_id?: string;
   ts?: string;
+  created_at?: string | null;
   task?: Task;
+  events?: TaskStreamEvent[];
   step?: TaskStep;
   step_index?: number;
   approval_ids?: string[];
@@ -122,6 +124,14 @@ type TaskStreamEvent = {
   error?: string;
   result?: unknown;
   attempt?: number;
+  tool?: string | null;
+  summary?: string | null;
+  artifact_id?: string | null;
+  artifact_title?: string | null;
+  artifact_kind?: string | null;
+  mime_type?: string;
+  size_bytes?: number;
+  payload?: Record<string, unknown>;
 };
 type Approval = { id: string; task_id: string; step_id: string; action_type: string; action_payload: Record<string, unknown>; requested_at?: string; status: string };
 type ActivityAction = {
@@ -258,6 +268,127 @@ function taskLiveMessage(task: Task): Message | null {
     tool_traces: taskToolTraces(task),
     thinking: ["queued", "pending", "planning", "running"].includes(task.status),
   };
+}
+
+function taskAnswer(task: Task | null, event?: TaskStreamEvent): string {
+  const eventResult = event?.result;
+  if (eventResult && typeof eventResult === "object" && "answer" in eventResult) {
+    const answer = String((eventResult as Record<string, unknown>).answer ?? "").trim();
+    if (answer) return answer;
+  }
+  const answer = task?.result?.answer;
+  return typeof answer === "string" && answer.trim() ? answer.trim() : "";
+}
+
+function taskEventArtifact(event: TaskStreamEvent): ArtifactRef | null {
+  const payload = event.payload ?? {};
+  const artifactId = event.artifact_id ?? (typeof payload.artifact_id === "string" ? payload.artifact_id : undefined);
+  if (!artifactId) return null;
+  return {
+    id: artifactId,
+    title: event.artifact_title ?? (typeof payload.title === "string" ? payload.title : "artifact"),
+    kind: event.artifact_kind ?? (typeof payload.kind === "string" ? payload.kind : "file"),
+    mime_type: event.mime_type ?? (typeof payload.mime_type === "string" ? payload.mime_type : undefined),
+    size_bytes: event.size_bytes ?? (typeof payload.size_bytes === "number" ? payload.size_bytes : undefined),
+  };
+}
+
+function taskEventTrace(event: TaskStreamEvent): ToolTrace | null {
+  if (event.type === "catch_up") return null;
+  if (event.type === "artifact") {
+    const artifact = taskEventArtifact(event);
+    return {
+      id: `artifact-${artifact?.id ?? event.created_at ?? event.ts ?? Date.now()}`,
+      tool: "artifact",
+      summary: artifact ? `Created artifact ${artifact.title}` : event.summary || "Created artifact",
+      status: "complete",
+    };
+  }
+  const traceEvent = {
+    tool: event.tool,
+    summary: event.summary ?? undefined,
+    error: event.error,
+    iteration: typeof event.payload?.iteration === "number" ? event.payload.iteration : undefined,
+    args_preview: event.payload?.args_preview as Record<string, unknown> | undefined,
+    step: event.step,
+    approval_ids: event.approval_ids,
+    goal: typeof event.payload?.goal === "string" ? event.payload.goal : undefined,
+  };
+  const tool = traceToolLabel(event.type, traceEvent);
+  let status: MessageStatus = "complete";
+  if (event.type === "tool_call" || event.type === "sub_agent_spawned" || event.type === "model_step" || event.type === "thinking") status = "streaming";
+  if (event.type === "tool_error" || event.type === "task_failed") status = "error";
+  if (event.type === "awaiting_approval") status = "approval_pending";
+  return {
+    id: `${event.type}-${tool}-${event.created_at ?? event.ts ?? Date.now()}`,
+    tool,
+    summary: event.summary || traceSummary(event.type, traceEvent),
+    status,
+  };
+}
+
+function applyTaskEventToMessage(message: Message, task: Task | null, event: TaskStreamEvent): Message {
+  const artifact = taskEventArtifact(event);
+  const nextArtifacts = artifact && !(message.artifacts ?? []).some(a => a.id === artifact.id)
+    ? [...(message.artifacts ?? []), artifact]
+    : message.artifacts;
+  const trace = taskEventTrace(event);
+  let traces = message.tool_traces ?? [];
+
+  if (trace) {
+    if (event.type === "tool_result" || event.type === "tool_error" || event.type === "sub_agent_complete" || event.type === "model_result") {
+      const idx = [...traces].reverse().findIndex(t => t.tool === trace.tool && t.status === "streaming");
+      if (idx >= 0) {
+        const actualIdx = traces.length - 1 - idx;
+        traces = [...traces];
+        traces[actualIdx] = { ...traces[actualIdx], summary: trace.summary, status: trace.status };
+      } else {
+        traces = [...traces, trace];
+      }
+    } else if (!traces.some(t => t.id === trace.id)) {
+      traces = [...traces, trace];
+    }
+  }
+
+  if (event.type === "task_complete") {
+    return {
+      ...message,
+      status: "complete",
+      content: taskAnswer(task, event) || message.content || "Task completed.",
+      thinking: false,
+      artifacts: nextArtifacts,
+      tool_traces: traces.map(t => t.status === "streaming" ? { ...t, status: "complete" as MessageStatus } : t),
+    };
+  }
+  if (event.type === "task_failed") {
+    return {
+      ...message,
+      status: "error",
+      content: message.content || `The task stopped: ${formatTaskError(event.error)}`,
+      thinking: false,
+      artifacts: nextArtifacts,
+      tool_traces: traces,
+    };
+  }
+  return {
+    ...message,
+    status: message.status === "complete" ? "streaming" : message.status,
+    thinking: event.type === "model_step" || event.type === "thinking" || event.type === "tool_call" || event.type === "sub_agent_spawned",
+    artifacts: nextArtifacts,
+    tool_traces: traces,
+  };
+}
+
+function taskMessageFromStream(task: Task, events: TaskStreamEvent[]): Message {
+  const base = taskLiveMessage(task) ?? {
+    id: `task-${task.id}`,
+    role: "assistant" as MessageRole,
+    content: "",
+    status: "streaming" as MessageStatus,
+    tool_traces: [],
+    thinking: true,
+  };
+  return events.reduce((message, event) => applyTaskEventToMessage(message, task, event), base);
 }
 type SettingsOverview = {
   member: { id: string; email: string; name?: string | null; role: string; can_admin: boolean };
@@ -704,7 +835,6 @@ function Sidebar({
     { id: "projects"   as Route, icon: <IC.Folder size={15}/>,     label: "Projects" },
     { id: "research"   as Route, icon: <IC.Search size={15}/>,     label: "Research" },
     { id: "tasks"      as Route, icon: <IC.Check size={15}/>,      label: "Tasks" },
-    { id: "artifacts"  as Route, icon: <IC.Briefcase size={15}/>,  label: "Artifacts" },
     { id: "agents"     as Route, icon: <IC.Sparkles size={15}/>,   label: "Agents" },
     { id: "workflows"  as Route, icon: <IC.Refresh size={15}/>,    label: "Workflows" },
     { id: "audit"      as Route, icon: <IC.Audit size={15}/>,      label: "Audit",      settingsTab: "audit" as SettingsTab },
@@ -968,6 +1098,9 @@ function ChatScreen({
   const [streaming, setStreaming] = useState(false);
   const [activityOpen, setActivityOpen] = useState(false);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
+  const [activeTask, setActiveTask] = useState<Task | null>(null);
+  const [activeTaskEvents, setActiveTaskEvents] = useState<TaskStreamEvent[]>([]);
+  const [activeTaskStreamError, setActiveTaskStreamError] = useState("");
   const [attachments, setAttachments] = useState<{ id: string; name: string; size: number }[]>([]);
   const [personaMenuOpen, setPersonaMenuOpen] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
@@ -1165,6 +1298,7 @@ function ChatScreen({
     });
     if (latestTask?.id) {
       setActiveTaskId(latestTask.id);
+      setActiveTask(latestTask);
     }
   }, []);
 
@@ -1194,14 +1328,106 @@ function ChatScreen({
   useEffect(() => {
     if (!activeConvoId) {
       if (!streamingRef.current) setMessages([]);
+      setActiveTaskId(null);
+      setActiveTask(null);
+      setActiveTaskEvents([]);
+      setActiveTaskStreamError("");
       return;
     }
     // Don't clobber in-flight SSE updates when a new conversation id arrives mid-stream.
     if (streamingRef.current) return;
     setActivityOpen(false);
     setActiveTaskId(null);
+    setActiveTask(null);
+    setActiveTaskEvents([]);
+    setActiveTaskStreamError("");
     void loadMessagesFromServer(activeConvoId).catch(() => {});
   }, [activeConvoId, loadMessagesFromServer]);
+
+  useEffect(() => {
+    if (!activeTaskId) {
+      setActiveTask(null);
+      setActiveTaskEvents([]);
+      setActiveTaskStreamError("");
+      return;
+    }
+    const controller = new AbortController();
+
+    async function connectTaskStream() {
+      setActiveTaskEvents([]);
+      setActiveTaskStreamError("");
+      try {
+        const res = await apiFetch(`/tasks/${activeTaskId}/stream`, { signal: controller.signal });
+        const reader = res.body?.getReader();
+        if (!reader) throw new Error("Task stream did not return a readable body");
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        function consumeFrame(frame: string) {
+          const line = frame.split("\n").find(part => part.startsWith("data: "));
+          if (!line) return;
+          const event = JSON.parse(line.slice(6)) as TaskStreamEvent;
+          if (event.type === "catch_up") {
+            if (event.task) {
+              const replay = event.events ?? [];
+              setActiveTask(replay.reduce<Task | null>((task, item) => mergeTaskEvent(task, item), event.task));
+            }
+            setActiveTaskEvents(event.events ?? []);
+            return;
+          }
+          setActiveTaskEvents(prev => [...prev, event]);
+          setActiveTask(prev => mergeTaskEvent(prev, event));
+        }
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const frames = buffer.split("\n\n");
+          buffer = frames.pop() ?? "";
+          for (const frame of frames) consumeFrame(frame);
+        }
+        if (buffer.trim()) consumeFrame(buffer.trim());
+      } catch (exc) {
+        if ((exc as Error).name !== "AbortError") {
+          setActiveTaskStreamError(exc instanceof Error ? exc.message : "Task stream disconnected");
+        }
+      }
+    }
+
+    void connectTaskStream();
+    return () => controller.abort();
+  }, [activeTaskId]);
+
+  useEffect(() => {
+    if (!activeTaskId || !activeTask) return;
+    const liveMessage = taskMessageFromStream(activeTask, activeTaskEvents);
+    setMessages(prev => {
+      if (prev.length === 0) return [liveMessage];
+      const idx = prev.findIndex(message =>
+        message.id === `task-${activeTaskId}` ||
+        (message.role === "assistant" && (message.tool_traces ?? []).some(trace => trace.id === `task-created-${activeTaskId}` || trace.summary.includes(activeTaskId.slice(0, 8))))
+      );
+      if (idx >= 0) {
+        const updated = [...prev];
+        const current = updated[idx];
+        updated[idx] = {
+          ...current,
+          ...liveMessage,
+          id: current.id ?? liveMessage.id,
+          content: liveMessage.content || current.content,
+          tool_traces: liveMessage.tool_traces?.length ? liveMessage.tool_traces : current.tool_traces,
+          artifacts: liveMessage.artifacts?.length ? liveMessage.artifacts : current.artifacts,
+        };
+        return updated;
+      }
+      const last = prev[prev.length - 1];
+      if (last?.role === "assistant" && last.status === "streaming" && !last.content.trim()) {
+        return [...prev.slice(0, -1), { ...last, ...liveMessage, id: last.id }];
+      }
+      return [...prev, liveMessage];
+    });
+  }, [activeTaskId, activeTask, activeTaskEvents]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -1258,6 +1484,7 @@ function ChatScreen({
     };
 
     let partial = "";
+    let createdTaskId: string | null = null;
 
     function handleStreamEvent(ev: StreamEvent) {
       if (ev.type === "conversation" && ev.conversation_id) {
@@ -1372,6 +1599,7 @@ function ChatScreen({
         });
       } else if (ev.type === "task_created" && ev.task_id) {
         const taskId = ev.task_id;
+        createdTaskId = taskId;
         setActiveTaskId(taskId);
         setActivityOpen(true);
         setMessages(prev => {
@@ -1381,6 +1609,8 @@ function ChatScreen({
           const existing = last.tool_traces ?? [];
           return [...updated.slice(0, -1), {
             ...last,
+            status: "streaming",
+            thinking: true,
             tool_traces: [
               ...existing,
               {
@@ -1398,23 +1628,23 @@ function ChatScreen({
           const last = updated[updated.length - 1];
           if (last?.role === "assistant") {
             const traces = (last.tool_traces ?? []).map(trace =>
-              trace.tool === "task.runtime" && trace.status === "streaming"
+              !createdTaskId && trace.tool === "task.runtime" && trace.status === "streaming"
                 ? { ...trace, summary: "Task stream finished", status: "complete" as MessageStatus }
                 : trace
             );
             const reasoning = (last.reasoning_summaries ?? []).map(item => ({ ...item, status: "complete" as MessageStatus }));
             updated[updated.length - 1] = {
               ...last,
-              status: "complete",
+              status: createdTaskId ? "streaming" : "complete",
               content: partial || last.content,
-              thinking: false,
+              thinking: Boolean(createdTaskId),
               tool_traces: traces,
               reasoning_summaries: reasoning,
             };
           }
           return updated;
         });
-        if (convoId) {
+        if (convoId && !createdTaskId) {
           const syncId = convoId;
           const streamed = partial;
           void (async () => {
@@ -1674,7 +1904,13 @@ function ChatScreen({
       </div>
 
       {activityOpen && (
-        <ActivityDrawer taskId={activeTaskId} onClose={() => setActivityOpen(false)} />
+        <ActivityDrawer
+          taskId={activeTaskId}
+          task={activeTask}
+          events={activeTaskEvents}
+          streamError={activeTaskStreamError}
+          onClose={() => setActivityOpen(false)}
+        />
       )}
 
       {/* ⌘K Command palette */}
@@ -2271,54 +2507,19 @@ function EmptyChatState({ persona, onSubmit }: { persona: typeof PERSONAS[0]; on
   );
 }
 
-function ActivityDrawer({ taskId, onClose }: { taskId: string | null; onClose: () => void }) {
-  const [task, setTask] = useState<Task | null>(null);
-  const [events, setEvents] = useState<TaskStreamEvent[]>([]);
-  const [streamError, setStreamError] = useState("");
-
-  useEffect(() => {
-    if (!taskId) return;
-    const controller = new AbortController();
-
-    async function connect() {
-      setEvents([]);
-      setStreamError("");
-      try {
-        const res = await apiFetch(`/tasks/${taskId}/stream`, { signal: controller.signal });
-        const reader = res.body?.getReader();
-        if (!reader) throw new Error("Task stream did not return a readable body");
-        const decoder = new TextDecoder();
-        let buffer = "";
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          const frames = buffer.split("\n\n");
-          buffer = frames.pop() ?? "";
-
-          for (const frame of frames) {
-            const line = frame.split("\n").find(part => part.startsWith("data: "));
-            if (!line) continue;
-            const event = JSON.parse(line.slice(6)) as TaskStreamEvent;
-            if (event.type === "catch_up" && event.task) setTask(event.task);
-            else {
-              setEvents(prev => [...prev, event]);
-              setTask(prev => mergeTaskEvent(prev, event));
-            }
-          }
-        }
-      } catch (exc) {
-        if ((exc as Error).name !== "AbortError") {
-          setStreamError(exc instanceof Error ? exc.message : "Task stream disconnected");
-        }
-      }
-    }
-
-    void connect();
-    return () => controller.abort();
-  }, [taskId]);
-
+function ActivityDrawer({
+  taskId,
+  task,
+  events,
+  streamError,
+  onClose,
+}: {
+  taskId: string | null;
+  task: Task | null;
+  events: TaskStreamEvent[];
+  streamError: string;
+  onClose: () => void;
+}) {
   const steps = Array.isArray(task?.plan) ? task.plan : task?.plan?.steps ?? [];
   const currentStep = task?.current_step ?? 0;
   const status = taskStatus(task, events, streamError);
@@ -2374,7 +2575,7 @@ function ActivityDrawer({ taskId, onClose }: { taskId: string | null; onClose: (
                 <div className="flex items-center gap-2 text-[13px] font-semibold" style={{ color: "var(--danger)" }}>
                   <IC.Info size={14}/> Task failed
                 </div>
-                <p className="mt-1 text-[12.5px] leading-relaxed" style={{ color: "var(--danger)" }}>{failureEvent.error}</p>
+                <p className="mt-1 text-[12.5px] leading-relaxed" style={{ color: "var(--danger)" }}>{formatTaskError(failureEvent.error)}</p>
               </div>
             ) : null}
 
@@ -2427,7 +2628,7 @@ function ActivityDrawer({ taskId, onClose }: { taskId: string | null; onClose: (
               ) : events.slice(-8).reverse().map((event, index) => (
                 <div key={`${event.type}-${event.ts ?? index}`} className="text-[12.5px] leading-relaxed border-l pl-3" style={{ borderColor: eventColor(event), color: "var(--text-muted)" }}>
                   <span className="font-medium" style={{ color: "var(--text)" }}>{eventLabel(event)}</span>
-                  {event.ts ? <span style={{ color: "var(--text-dim)" }}> · {new Date(event.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span> : null}
+                  {event.ts || event.created_at ? <span style={{ color: "var(--text-dim)" }}> · {new Date(event.ts ?? event.created_at ?? "").toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span> : null}
                 </div>
               ))}
             </div>
@@ -2487,6 +2688,7 @@ function stepStateLabel(state: string) {
 }
 
 function eventLabel(event: TaskStreamEvent) {
+  if (event.summary) return event.summary;
   if (event.type === "step_start") return `Started: ${event.step?.description ?? event.step?.id ?? "step"}`;
   if (event.type === "step_done") return `Finished: ${event.step?.description ?? event.step?.id ?? "step"}`;
   if (event.type === "step_retry") return `Retry ${event.attempt ?? ""}: ${event.step?.description ?? event.step?.id ?? "step"}`;
@@ -2771,6 +2973,14 @@ function nextStepGuidance(event: ActivityAction): Array<{ icon: ReactNode; label
     hints.push({ icon: <IC.Lock size={11}/>, label: "Authentication issue — reconnect in Settings → Connectors" });
   }
   return hints;
+}
+
+function formatTaskError(error?: string): string {
+  if (!error) return "The task stopped before it finished.";
+  if (error === "task_timeout") {
+    return "The task exceeded the runtime limit before it finished. Try again, or narrow the task if it still takes too long.";
+  }
+  return error;
 }
 
 function ActivityActionRow({ action, onTask }: { action: ActivityAction; onTask: () => void }) {

@@ -95,6 +95,7 @@ export function ArtifactDetail({ artifactId, onChanged, onDeleted }: { artifactI
   const [share, setShare] = useState<{ published: boolean; share_path?: string }>({ published: false });
   const [aiInstruction, setAiInstruction] = useState("");
   const [busy, setBusy] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const isText = useMemo(() => {
     const m = (meta?.mime_type ?? "").toLowerCase();
@@ -102,16 +103,28 @@ export function ArtifactDetail({ artifactId, onChanged, onDeleted }: { artifactI
   }, [meta]);
 
   const load = useCallback(async () => {
-    const m = await getArtifact(artifactId);
-    setMeta(m);
-    setShare(await getShareStatus(artifactId));
-    const mime = (m.mime_type ?? "").toLowerCase();
-    if (mime.startsWith("image/")) {
-      const blob = await getContentBlob(artifactId);
-      setBlobUrl(URL.createObjectURL(blob));
-      setText(null);
-    } else {
-      try { const t = await getContentText(artifactId); setText(t); setDraft(t); } catch { setText(null); }
+    setLoadError(null);
+    try {
+      const m = await getArtifact(artifactId);
+      setMeta(m);
+      void getShareStatus(artifactId).then(setShare).catch(() => setShare({ published: false }));
+      const mime = (m.mime_type ?? "").toLowerCase();
+      if (mime.startsWith("image/")) {
+        const blob = await getContentBlob(artifactId);
+        setBlobUrl(URL.createObjectURL(blob));
+        setText(null);
+      } else {
+        try {
+          const t = await getContentText(artifactId);
+          setText(t);
+          setDraft(t);
+        } catch (err) {
+          setText(null);
+          setLoadError(err instanceof Error ? err.message : "Artifact content could not be loaded.");
+        }
+      }
+    } catch (err) {
+      setLoadError(err instanceof Error ? err.message : "Artifact could not be loaded.");
     }
   }, [artifactId]);
 
@@ -142,7 +155,11 @@ export function ArtifactDetail({ artifactId, onChanged, onDeleted }: { artifactI
     } finally { setBusy(false); }
   }
 
-  if (!meta) return <div className="p-6 text-[14px]" style={{ color: "var(--text-dim)" }}>Loading…</div>;
+  if (!meta) return (
+    <div className="p-6 text-[14px]" style={{ color: loadError ? "var(--danger)" : "var(--text-dim)" }}>
+      {loadError ?? "Loading..."}
+    </div>
+  );
   const shareUrl = share.share_path ? `${apiBase()}${share.share_path}` : "";
 
   return (
@@ -177,6 +194,11 @@ export function ArtifactDetail({ artifactId, onChanged, onDeleted }: { artifactI
       </nav>
 
       <div className="flex-1 overflow-auto p-5">
+        {loadError && (
+          <div className="mb-3 rounded-lg border px-3 py-2 text-[13px]" style={{ borderColor: "var(--danger)", color: "var(--danger)" }}>
+            {loadError}
+          </div>
+        )}
         {tab === "preview" && <ArtifactRenderer kind={meta.kind} mimeType={meta.mime_type} content={text} blobUrl={blobUrl} title={meta.title} />}
 
         {tab === "edit" && isText && (
