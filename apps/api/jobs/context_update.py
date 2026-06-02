@@ -64,6 +64,7 @@ async def propose_context_update(org_id: str = "default") -> str | None:
         "context_update_suggested",
         "chronos",
         "context.propose_update",
+        organization_id=org_id,
         resource_type="context_suggestions",
         resource_id=suggestion_id,
     )

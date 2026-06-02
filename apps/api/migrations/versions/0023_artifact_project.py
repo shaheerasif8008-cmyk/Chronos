@@ -8,7 +8,7 @@ from alembic import op
 import sqlalchemy as sa
 
 revision = "0023_artifact_project"
-down_revision = "0022_artifact_workspace"
+down_revision = "0024_message_structured_response"
 branch_labels = None
 depends_on = None
 

@@ -16,8 +16,20 @@ async def _reset_db_engine():
     Async autouse fixture (function-scoped loop via pytest.ini's
     asyncio_default_fixture_loop_scope=function) so teardown awaits dispose on
     the same loop the test used — no reliance on the removed ``event_loop`` fixture.
+
+    The same cross-loop hazard applies to the global async Redis client (e.g. a
+    test that exercises the ToolBroker's rate-limit/loop-detection paths), so we
+    also disconnect its connection pool here. The pool is recreated lazily on the
+    next test's loop.
     """
     yield
     from core.db import engine
 
     await engine.dispose()
+
+    try:
+        from core.redis import redis_client
+
+        await redis_client.connection_pool.disconnect()
+    except Exception:
+        pass

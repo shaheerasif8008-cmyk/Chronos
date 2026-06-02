@@ -17,7 +17,9 @@ def vector_literal(vector: list[float]) -> str:
     return "[" + ",".join(str(value) for value in vector) + "]"
 
 
-async def embedding_literal_for_memory(content: str, *, actor_id: str, action: str) -> str | None:
+async def embedding_literal_for_memory(
+    content: str, *, actor_id: str, action: str, organization_id: str
+) -> str | None:
     try:
         vector = await embed(content)
     except Exception as exc:
@@ -25,6 +27,7 @@ async def embedding_literal_for_memory(content: str, *, actor_id: str, action: s
             "memory_embedding_skipped",
             actor_id,
             action,
+            organization_id=organization_id,
             resource_type="memory_entries",
             payload={"error": str(exc)[:240]},
             decision="embedding_failed",
@@ -35,6 +38,7 @@ async def embedding_literal_for_memory(content: str, *, actor_id: str, action: s
             "memory_embedding_skipped",
             actor_id,
             action,
+            organization_id=organization_id,
             resource_type="memory_entries",
             payload={
                 "expected_dimensions": EXPECTED_EMBEDDING_DIMENSIONS,
@@ -61,6 +65,7 @@ async def create_memory_entry(
         content,
         actor_id=requester_context.member_id,
         action=f"memory.{source}",
+        organization_id=requester_context.org_id,
     )
     memory_entries = await reflect_table("memory_entries")
     async with engine.begin() as conn:
@@ -85,6 +90,7 @@ async def create_memory_entry(
         "memory_write",
         requester_context.member_id,
         f"memory.{source}",
+        organization_id=requester_context.org_id,
         resource_type="memory",
         resource_id=entry_id,
         payload={"source": source, "scope": scope},
@@ -125,6 +131,7 @@ async def update_memory_entry(memory_id: str, content: str, member: Member, *, i
         content,
         actor_id=member.id,
         action="memory.update",
+        organization_id=member.organization_id,
     )
     memory_entries = await reflect_table("memory_entries")
     values = {"content": content, "embedding": embedding, "updated_at": func.now()}
@@ -249,6 +256,7 @@ async def undo_autonomous_memory(memory_id: str, member: Member) -> bool:
         "memory_undo",
         member.id,
         "memory.undo_autonomous",
+        organization_id=member.organization_id,
         resource_type="memory",
         resource_id=memory_id,
     )

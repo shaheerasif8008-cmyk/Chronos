@@ -85,6 +85,7 @@ async def create_schedule(req: ScheduleRequest, member: Member = Depends(get_cur
         "schedule_created",
         member.id,
         "schedules.create",
+        organization_id=member.organization_id,
         resource_type="scheduled_tasks",
         resource_id=schedule_id,
         payload={"goal": req.goal, "kind": req.schedule_kind},
@@ -127,6 +128,7 @@ async def update_schedule(
         "schedule_updated",
         member.id,
         "schedules.update",
+        organization_id=member.organization_id,
         resource_type="scheduled_tasks",
         resource_id=schedule_id,
         payload={"fields": sorted(values.keys())},
@@ -145,6 +147,7 @@ async def delete_schedule(schedule_id: str, member: Member = Depends(get_current
         "schedule_deleted",
         member.id,
         "schedules.delete",
+        organization_id=member.organization_id,
         resource_type="scheduled_tasks",
         resource_id=schedule_id,
     )

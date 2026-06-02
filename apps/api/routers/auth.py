@@ -74,7 +74,10 @@ async def request_otp(req: OtpRequest) -> dict[str, str]:
         raise HTTPException(status_code=404, detail="Dev OTP auth is disabled")
     code = f"{random.randint(0, 999999):06d}"
     _otp_store[req.email.lower()] = code
-    await audit.log("otp_requested", req.email.lower(), "auth.request_otp")
+    # Pre-login: no member (and thus no tenant) is resolved yet — the email may
+    # not even belong to a seeded member. The process default org is the only
+    # org available here, so log it explicitly rather than implying a real tenant.
+    await audit.log("otp_requested", req.email.lower(), "auth.request_otp", organization_id=settings.org_id)
     print(f"Chronos dev OTP for {req.email}: {code}", flush=True)
     return {"status": "otp_sent_dev_console"}
 
@@ -97,7 +100,7 @@ async def verify_otp(req: OtpVerify, response: Response) -> dict[str, str]:
         await conn.execute(
             update(members).where(members.c.id == member.id).values(region=settings.region)
         )
-    await audit.log("otp_verified", member.id, "auth.verify_otp")
+    await audit.log("otp_verified", member.id, "auth.verify_otp", organization_id=member.organization_id)
     response.set_cookie("chronos_session", token, httponly=True, samesite="lax")
     return {"access_token": token, "token_type": "bearer", "member_id": member.id}
 
@@ -118,7 +121,7 @@ async def cognito_callback(req: CognitoCallbackRequest, response: Response) -> d
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
     token = create_access_token(member.id)
-    await audit.log("cognito_login", member.id, "auth.cognito_callback")
+    await audit.log("cognito_login", member.id, "auth.cognito_callback", organization_id=member.organization_id)
     response.set_cookie("chronos_session", token, httponly=True, samesite="lax")
     return {"access_token": token, "token_type": "bearer", "member_id": member.id}
 
@@ -138,6 +141,6 @@ async def cognito_verify_id_token(req: CognitoIdTokenRequest, response: Response
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
     token = create_access_token(member.id)
-    await audit.log("cognito_login", member.id, "auth.cognito_verify")
+    await audit.log("cognito_login", member.id, "auth.cognito_verify", organization_id=member.organization_id)
     response.set_cookie("chronos_session", token, httponly=True, samesite="lax")
     return {"access_token": token, "token_type": "bearer", "member_id": member.id}

@@ -203,6 +203,7 @@ async def gmail_oauth_start(member: Member = Depends(get_current_member)) -> dic
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     await audit.log(
         "connector_oauth_start", str(member.id), "gmail.oauth_start",
+        organization_id=member.organization_id,
         resource_type="connector", resource_id="gmail",
     )
     return {"url": url}
@@ -282,6 +283,7 @@ async def gmail_oauth_callback(
 
     await audit.log(
         "connector_oauth_complete", member_id, "gmail.oauth_callback",
+        organization_id=org_id,
         resource_type="connector", resource_id="gmail",
     )
     return RedirectResponse(url="/connectors", status_code=302)
@@ -341,6 +343,7 @@ async def generic_oauth_start(
     url = f"{app.auth_url}?{urlencode(params)}"
     await audit.log(
         "connector_oauth_start", str(member.id), f"{provider}.oauth_start",
+        organization_id=member.organization_id,
         resource_type="connector", resource_id=provider,
     )
     return {"url": url}
@@ -507,6 +510,7 @@ async def generic_oauth_callback(
 
     await audit.log(
         "connector_oauth_complete", member_id, f"{provider}.oauth_callback",
+        organization_id=org_id,
         resource_type="connector", resource_id=provider,
     )
     return RedirectResponse(url="/connectors", status_code=302)
@@ -536,6 +540,7 @@ async def disconnect_connector(
 
     await audit.log(
         "connector_disconnected", str(member.id), f"{provider}.disconnect",
+        organization_id=member.organization_id,
         resource_type="connector", resource_id=provider,
     )
     return {"status": "disconnected"}

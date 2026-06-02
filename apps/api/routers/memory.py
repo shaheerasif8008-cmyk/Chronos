@@ -129,6 +129,7 @@ async def update_memory(memory_id: str, req: MemoryUpdate, member: Member = Depe
         "memory_write",
         member.id,
         "memory.update",
+        organization_id=member.organization_id,
         resource_type="memory",
         resource_id=memory_id,
     )
@@ -144,6 +145,7 @@ async def delete_memory(memory_id: str, member: Member = Depends(get_current_mem
         "memory_write",
         member.id,
         "memory.delete",
+        organization_id=member.organization_id,
         resource_type="memory",
         resource_id=memory_id,
     )

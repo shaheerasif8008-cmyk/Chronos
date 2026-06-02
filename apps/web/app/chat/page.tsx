@@ -2,6 +2,7 @@
 
 import { Component, ReactNode, useEffect, useRef, useState, useMemo, useCallback } from "react";
 import { usePathname, useRouter } from "next/navigation";
+import Link from "next/link";
 import ArtifactsScreen from "../../components/artifacts/ArtifactsScreen";
 import InChatArtifactPanel from "../../components/artifacts/InChatArtifactPanel";
 
@@ -40,10 +41,25 @@ type Message = {
   thinking?: boolean;
   pinned?: boolean;
   parent_message_id?: string | null;
+  structured_response?: StructuredResponse | null;
 };
 type ToolTrace = { id: string; tool: string; summary: string; status: MessageStatus };
 type ReasoningSummary = { id: string; iteration?: number; summary: string; status: MessageStatus };
 type ArtifactRef = { id: string; title: string; kind: string; mime_type?: string; size_bytes?: number };
+type ResponseActionRecord = { verb: string; description: string; target?: string | null };
+type StructuredResponse = {
+  response_type: string;
+  status: string;
+  summary: string;
+  key_findings?: string[];
+  assumptions?: string[];
+  risks?: string[];
+  next_action?: string | null;
+  confidence?: string | null;
+  artifacts?: ArtifactRef[];
+  actions?: ResponseActionRecord[];
+  approval_status?: string | null;
+};
 type ProjectSource = { id: string; title?: string | null; source_type?: string | null; parse_status?: string | null; index_status?: string | null; uri?: string | null; created_at?: string };
 type SourceChunkPreview = { chunk_index: number; content: string; token_count?: number | null };
 type SourceDetail = { id: string; title?: string | null; source_type?: string | null; uri?: string | null; artifact_id?: string | null; parse_status?: string | null; index_status?: string | null; warning?: string | null; chunk_count: number; chunks: SourceChunkPreview[] };
@@ -1104,11 +1120,21 @@ function ChatScreen({
   const [activeTaskStreamError, setActiveTaskStreamError] = useState("");
   const [attachments, setAttachments] = useState<{ id: string; name: string; size: number }[]>([]);
   const [personaMenuOpen, setPersonaMenuOpen] = useState(false);
+  const [responseVerbosity, setResponseVerbosity] = useState<"concise" | "detailed">("detailed");
   const abortRef = useRef<AbortController | null>(null);
   const streamingRef = useRef(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const isEmpty = !activeConvoId && messages.length === 0;
+
+  useEffect(() => {
+    apiFetch("/settings/")
+      .then(r => r.json())
+      .then((d: { sections?: { response_format?: { verbosity?: string } } }) => {
+        if (d.sections?.response_format?.verbosity === "concise") setResponseVerbosity("concise");
+      })
+      .catch(() => { /* default detailed */ });
+  }, []);
 
   // ── Command palette (⌘K) ──────────────────────────────────────────────────
   const router = useRouter();
@@ -1264,6 +1290,7 @@ function ChatScreen({
         tool_traces: Array.isArray(m.tool_traces)
           ? (m.tool_traces as ToolTrace[])
           : undefined,
+        structured_response: (m.structured_response as StructuredResponse | undefined) ?? null,
         pinned: m.pinned === true,
         parent_message_id: m.parent_message_id != null ? String(m.parent_message_id) : null,
       };
@@ -1295,7 +1322,16 @@ function ChatScreen({
 
     setMessages(prev => {
       if (opts?.preserveLocal && normalized.length < prev.length) return prev;
-      return normalized;
+      // Preserve a just-streamed structured_response if the refreshed DB row
+      // doesn't have one yet (avoids cards vanishing on a resync that wins a race).
+      const prevById = new Map(prev.filter(m => m.id).map(m => [m.id!, m]));
+      return normalized.map(message => {
+        if (!message.id) return message;
+        const existing = prevById.get(message.id);
+        return !message.structured_response && existing?.structured_response
+          ? { ...message, structured_response: existing.structured_response }
+          : message;
+      });
     });
     if (latestTask?.id) {
       setActiveTaskId(latestTask.id);
@@ -1482,6 +1518,7 @@ function ChatScreen({
       type: string; content?: string; conversation_id?: string; task_id?: string;
       event?: { type: string; tool?: string | null; summary?: string; error?: string; confidence?: number; iteration?: number; args_preview?: Record<string, unknown>; step?: { description?: string }; approval_ids?: string[]; goal?: string };
       artifact?: { artifact_id: string; title?: string; kind?: string; mime_type?: string; size_bytes?: number };
+      structured_response?: StructuredResponse;
     };
 
     let partial = "";
@@ -1597,6 +1634,14 @@ function ChatScreen({
           const existing = last.artifacts ?? [];
           if (existing.some(x => x.id === ref.id)) return updated;
           return [...updated.slice(0, -1), { ...last, artifacts: [...existing, ref] }];
+        });
+      } else if (ev.type === "structured_response" && ev.structured_response) {
+        const sr = ev.structured_response;
+        setMessages(prev => {
+          const updated = [...prev];
+          const last = updated[updated.length - 1];
+          if (last?.role !== "assistant") return updated;
+          return [...updated.slice(0, -1), { ...last, structured_response: sr }];
         });
       } else if (ev.type === "task_created" && ev.task_id) {
         const taskId = ev.task_id;
@@ -1800,7 +1845,7 @@ function ChatScreen({
               {messages.map((m, i) => (
                 m.role === "user"
                   ? <UserMessage key={m.id ?? `user-${i}`} message={m} conversationId={activeConvoId ?? ""} onRefresh={() => { if (activeConvoId) void loadMessagesFromServer(activeConvoId); }} onBranch={(newConvoId) => { onConvoCreated(newConvoId); }}/>
-                  : <AssistantMessage key={m.id ?? `assistant-${i}`} message={m} content={m.content} conversationId={activeConvoId ?? ""} status={m.status ?? "complete"} persona={activePersona} toolTraces={m.tool_traces} reasoningSummaries={m.reasoning_summaries} artifacts={m.artifacts} thinking={m.thinking} mode={m.mode} onRefresh={() => { if (activeConvoId) void loadMessagesFromServer(activeConvoId); }} onBranch={(newConvoId) => { onConvoCreated(newConvoId); }}/>
+                  : <AssistantMessage key={m.id ?? `assistant-${i}`} message={m} content={m.content} conversationId={activeConvoId ?? ""} status={m.status ?? "complete"} persona={activePersona} toolTraces={m.tool_traces} reasoningSummaries={m.reasoning_summaries} artifacts={m.artifacts} thinking={m.thinking} mode={m.mode} structuredResponse={m.structured_response} verbosity={responseVerbosity} onRefresh={() => { if (activeConvoId) void loadMessagesFromServer(activeConvoId); }} onBranch={(newConvoId) => { onConvoCreated(newConvoId); }}/>
               ))}
               {streaming && messages[messages.length - 1]?.role !== "assistant" && (
                 <div className="flex gap-4">
@@ -2375,10 +2420,94 @@ function ArtifactCard({ artifact }: { artifact: ArtifactRef }) {
   );
 }
 
-function AssistantMessage({ message, content, status, persona, toolTraces, reasoningSummaries, artifacts, thinking, mode, conversationId, onRefresh, onBranch }: { message: Message; content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[]; reasoningSummaries?: ReasoningSummary[]; artifacts?: ArtifactRef[]; thinking?: boolean; mode?: string; conversationId: string; onRefresh: () => void; onBranch: (id: string) => void }) {
+const STATUS_VARIANT: Record<string, "default" | "ok" | "warn" | "danger" | "info" | "accent"> = {
+  complete: "ok", in_progress: "accent", needs_input: "warn", needs_approval: "warn",
+  partial: "warn", blocked: "danger", failed: "danger", cancelled: "default",
+};
+const STATUS_LABEL: Record<string, string> = {
+  complete: "Complete", in_progress: "In progress", needs_input: "Needs input",
+  needs_approval: "Needs approval", partial: "Partially complete", blocked: "Blocked",
+  failed: "Failed", cancelled: "Cancelled",
+};
+
+function StatusBanner({ sr }: { sr: StructuredResponse }) {
+  const variant = STATUS_VARIANT[sr.status] ?? "info";
+  return (
+    <div className="flex items-center gap-2 mb-2">
+      <Tag variant={variant}>{STATUS_LABEL[sr.status] ?? sr.status}</Tag>
+      {sr.approval_status === "drafted_not_sent" && <Tag variant="warn">Not sent</Tag>}
+      {sr.confidence && <Tag variant="info">{sr.confidence} confidence</Tag>}
+    </div>
+  );
+}
+
+function FindingsRisksCard({ sr }: { sr: StructuredResponse }) {
+  const findings = sr.key_findings ?? [];
+  const assumptions = sr.assumptions ?? [];
+  const risks = sr.risks ?? [];
+  if (!findings.length && !assumptions.length && !risks.length) return null;
+  return (
+    <div className="mt-3 surface border border-soft rounded-lg p-3 space-y-2 text-[13px]">
+      {findings.length > 0 && (
+        <div>
+          <div className="text-[11px] font-medium mb-1" style={{ color: "var(--text-dim)" }}>Key findings</div>
+          <ul className="list-disc pl-4 space-y-0.5">{findings.map((f, i) => <li key={i}>{f}</li>)}</ul>
+        </div>
+      )}
+      {assumptions.length > 0 && (
+        <div>
+          <div className="text-[11px] font-medium mb-1" style={{ color: "var(--text-dim)" }}>Assumptions</div>
+          <ul className="list-disc pl-4 space-y-0.5">{assumptions.map((a, i) => <li key={i}>{a}</li>)}</ul>
+        </div>
+      )}
+      {risks.length > 0 && (
+        <div>
+          <div className="text-[11px] font-medium mb-1" style={{ color: "var(--warn)" }}>Risks &amp; caveats</div>
+          <ul className="list-disc pl-4 space-y-0.5" style={{ color: "var(--text-muted)" }}>
+            {risks.map((r, i) => <li key={i}>{r}</li>)}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function InlineApprovalCard({ sr }: { sr: StructuredResponse }) {
+  if (sr.approval_status !== "drafted_not_sent") return null;
+  return (
+    <div className="mt-3 surface border rounded-lg p-3 text-[13px]" style={{ borderColor: "var(--warn)" }}>
+      <div className="flex items-center gap-2 mb-1">
+        <IC.Lock size={13} style={{ color: "var(--warn)" }} />
+        <span className="font-medium">Approval required</span>
+      </div>
+      <div style={{ color: "var(--text-muted)" }}>
+        A draft is prepared but not sent. Review and approve it in the Approvals inbox.
+      </div>
+      <Link href="/approvals" className="inline-flex items-center gap-1 mt-2 text-[12.5px]" style={{ color: "var(--accent)" }}>
+        Open Approvals <IC.ArrowRight size={13} />
+      </Link>
+    </div>
+  );
+}
+
+function NextActionRow({ sr }: { sr: StructuredResponse }) {
+  if (!sr.next_action) return null;
+  return (
+    <div className="mt-3 flex items-start gap-2 text-[13px]">
+      <IC.ArrowRight size={14} style={{ color: "var(--accent)", marginTop: 2 }} />
+      <span><span className="font-medium">Next: </span>{sr.next_action}</span>
+    </div>
+  );
+}
+
+function AssistantMessage({ message, content, status, persona, toolTraces, reasoningSummaries, artifacts, thinking, mode, structuredResponse, verbosity, conversationId, onRefresh, onBranch }: { message: Message; content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[]; reasoningSummaries?: ReasoningSummary[]; artifacts?: ArtifactRef[]; thinking?: boolean; mode?: string; structuredResponse?: StructuredResponse | null; verbosity?: "concise" | "detailed"; conversationId: string; onRefresh: () => void; onBranch: (id: string) => void }) {
   const hasTraces = !!(toolTraces && toolTraces.length > 0);
   const hasReasoning = !!(reasoningSummaries && reasoningSummaries.length > 0);
   const isStreaming = status === "streaming";
+  const sr = structuredResponse ?? null;
+  // Plain answers stay plain. Cards only for real work or unfinished/abnormal state.
+  const showCards = !!sr && !isStreaming &&
+    (sr.response_type === "task_complete" || sr.status !== "complete");
   return (
     <div className="flex gap-4 fadein group">
       <PersonaAvatar name={persona.name} color={persona.color} size={28}/>
@@ -2395,6 +2524,8 @@ function AssistantMessage({ message, content, status, persona, toolTraces, reaso
             </div>
           )}
         </div>
+
+        {showCards && <StatusBanner sr={sr!} />}
 
         {hasReasoning && (
           <ReasoningPanel summaries={reasoningSummaries!} streaming={isStreaming} />
@@ -2432,6 +2563,10 @@ function AssistantMessage({ message, content, status, persona, toolTraces, reaso
             {artifacts.map(a => <ArtifactCard key={a.id} artifact={a} />)}
           </div>
         )}
+
+        {showCards && verbosity !== "concise" && <FindingsRisksCard sr={sr!} />}
+        {showCards && <InlineApprovalCard sr={sr!} />}
+        {showCards && <NextActionRow sr={sr!} />}
 
         {/* Sources — project knowledge citations grounding this answer */}
         {message.citations && message.citations.length > 0 && (

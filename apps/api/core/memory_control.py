@@ -87,6 +87,7 @@ async def set_memory_policy(member: Member, *, scope: str, scope_id: str, enable
         "memory_policy",
         member.id,
         "memory.policy.set",
+        organization_id=member.organization_id,
         resource_type="memory_policy",
         resource_id=f"{scope}:{scope_id}",
         payload={"enabled": enabled},
@@ -165,6 +166,7 @@ async def archive_memory(memory_id: str, member: Member, *, archived: bool = Tru
     if ok:
         await audit.log(
             "memory_write", member.id, "memory.archive" if archived else "memory.unarchive",
+            organization_id=member.organization_id,
             resource_type="memory", resource_id=memory_id,
         )
     return ok
@@ -175,6 +177,7 @@ async def set_pinned(memory_id: str, member: Member, *, pinned: bool) -> bool:
     if ok:
         await audit.log(
             "memory_write", member.id, "memory.pin" if pinned else "memory.unpin",
+            organization_id=member.organization_id,
             resource_type="memory", resource_id=memory_id,
         )
     return ok
@@ -185,6 +188,7 @@ async def set_sensitive(memory_id: str, member: Member, *, sensitive: bool) -> b
     if ok:
         await audit.log(
             "memory_write", member.id, "memory.classify_sensitive",
+            organization_id=member.organization_id,
             resource_type="memory", resource_id=memory_id,
             payload={"sensitive": sensitive},
         )
@@ -196,6 +200,7 @@ async def change_scope(memory_id: str, member: Member, *, scope: str, scope_id: 
     if ok:
         await audit.log(
             "memory_write", member.id, "memory.change_scope",
+            organization_id=member.organization_id,
             resource_type="memory", resource_id=memory_id,
             payload={"scope": scope, "scope_id": scope_id},
         )
@@ -252,6 +257,7 @@ async def merge_memories(member: Member, *, primary_id: str, duplicate_ids: list
         superseded = result.scalars().all()
     await audit.log(
         "memory_write", member.id, "memory.merge",
+            organization_id=member.organization_id,
         resource_type="memory", resource_id=primary_id,
         payload={"superseded": [str(s) for s in superseded]},
     )
@@ -321,6 +327,7 @@ async def resolve_conflict(member: Member, *, stale_id: str, survivor_id: str) -
     if ok:
         await audit.log(
             "memory_write", member.id, "memory.resolve_conflict",
+            organization_id=member.organization_id,
             resource_type="memory", resource_id=stale_id,
             payload={"survivor": survivor_id},
         )
@@ -380,6 +387,7 @@ async def export_memories(member: Member) -> list[dict[str, Any]]:
     export = [{k: r.get(k) for k in fields} for r in rows]
     await audit.log(
         "memory_export", member.id, "memory.export",
+            organization_id=member.organization_id,
         resource_type="memory", payload={"count": len(export)},
     )
     return export
@@ -413,6 +421,7 @@ async def import_memories(member: Member, items: list[dict[str, Any]]) -> list[s
         ids.append(entry_id)
     await audit.log(
         "memory_import", member.id, "memory.import",
+            organization_id=member.organization_id,
         resource_type="memory", payload={"count": len(ids)},
     )
     return ids

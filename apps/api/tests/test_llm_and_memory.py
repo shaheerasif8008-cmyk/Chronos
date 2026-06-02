@@ -713,6 +713,7 @@ async def test_memory_embedding_literal_returns_none_for_wrong_dimension(monkeyp
         "i have a dog",
         actor_id="member-1",
         action="memory.explicit",
+        organization_id="default",
     )
 
     assert literal is None

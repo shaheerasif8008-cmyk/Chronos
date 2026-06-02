@@ -109,6 +109,9 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "debug_logging": False,
         "experimental_features": False,
     },
+    "response_format": {
+        "verbosity": "detailed",
+    },
 }
 
 
@@ -199,6 +202,7 @@ async def save_settings_doc(
         "settings_change",
         member.id,
         f"settings.{section}.update",
+        organization_id=member.organization_id,
         resource_type="settings",
         resource_id=resource_id,
         payload={"section": section, "scope": target_scope, "before": before, "after": next_values},

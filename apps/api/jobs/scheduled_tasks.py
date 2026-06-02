@@ -102,6 +102,7 @@ async def run_due_scheduled_tasks(now: datetime | None = None) -> list[str]:
             "scheduled_task_triggered",
             "scheduler",
             "scheduled_tasks.run",
+            organization_id=row["organization_id"],
             resource_type="scheduled_tasks",
             resource_id=str(row["id"]),
             payload={"task_id": task_id, "next_run_at": next_run.isoformat() if next_run else None},
