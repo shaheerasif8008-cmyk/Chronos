@@ -121,7 +121,13 @@ async def update(vault_ref: str, credentials: dict[str, Any], actor_id: str = "s
                 .values(encrypted_data=encrypted)
                 .returning(vault_entries.c.organization_id)
             )
-        ).scalar_one_or_none() or settings.org_id
+        ).scalar_one_or_none()
+
+    # Fail closed: no matching row means an unknown vault_ref. Don't repopulate
+    # the Redis cache or emit an audit entry under the process-default org —
+    # that would create a cache-only credential and mis-attribute the tenant.
+    if org_id is None:
+        raise VaultError(f"vault_ref not found: {vault_ref}")
 
     # Overwrite Redis cache
     await redis_client.set(f"vault:data:{vault_ref}", encrypted, ex=_REDIS_TTL)

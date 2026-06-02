@@ -60,27 +60,34 @@ async def test_member_triggered_audit_entry_is_visible_to_that_member_and_isolat
     await _insert_org(org_y)
     try:
         admin = await _insert_member(f"admin-{uuid.uuid4().hex[:8]}", org_x, "owner")
-        target = await _insert_member(f"target-{uuid.uuid4().hex[:8]}", org_x, "user")
+        target_x = await _insert_member(f"tgtx-{uuid.uuid4().hex[:8]}", org_x, "user")
         outsider = await _insert_member(f"out-{uuid.uuid4().hex[:8]}", org_y, "owner")
+        target_y = await _insert_member(f"tgty-{uuid.uuid4().hex[:8]}", org_y, "user")
 
-        # Real call site writes an audit entry on behalf of the org-X admin.
+        # Real call sites write an audit entry in each org (resource_id = the
+        # target member, so the two entries are distinguishable).
         await settings.update_member_role(
-            target.id, settings.MemberRolePatch(role="admin"), member=admin
+            target_x.id, settings.MemberRolePatch(role="admin"), member=admin
+        )
+        await settings.update_member_role(
+            target_y.id, settings.MemberRolePatch(role="admin"), member=outsider
         )
 
-        # The triggering member (org X) can read their own audit entry.
+        # The org-X admin sees their own entry and nothing from org Y.
         as_admin = await settings.list_audit(limit=500, offset=0, member=admin)
-        actions = {row["action"] for row in as_admin}
-        assert "settings.members.role_update" in actions, (
-            "member-triggered audit entry not visible to that member — "
-            "written under the wrong org"
+        admin_resources = {row["resource_id"] for row in as_admin if row["action"] == "settings.members.role_update"}
+        assert target_x.id in admin_resources, (
+            "member-triggered audit entry not visible to that member — written under the wrong org"
         )
-        org_ids = {row["organization_id"] for row in as_admin}
-        assert org_ids == {org_x}, f"audit rows leaked from other orgs: {org_ids}"
+        assert {row["organization_id"] for row in as_admin} == {org_x}, "org-X feed leaked other orgs"
+        assert target_y.id not in admin_resources, "org-Y entry leaked into org-X feed"
 
-        # A member in a different org must not see org X's audit entry.
+        # Positive control + isolation: the org-Y member sees their own entry and
+        # not org X's.
         as_outsider = await settings.list_audit(limit=500, offset=0, member=outsider)
-        assert all(row["organization_id"] == org_y for row in as_outsider)
-        assert "settings.members.role_update" not in {row["action"] for row in as_outsider}
+        outsider_resources = {row["resource_id"] for row in as_outsider if row["action"] == "settings.members.role_update"}
+        assert target_y.id in outsider_resources, "org-Y member cannot read their own audit feed"
+        assert {row["organization_id"] for row in as_outsider} == {org_y}, "org-Y feed leaked other orgs"
+        assert target_x.id not in outsider_resources, "org-X entry leaked into org-Y feed"
     finally:
         await _cleanup([org_x, org_y])
