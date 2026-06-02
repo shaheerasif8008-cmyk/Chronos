@@ -98,7 +98,7 @@ async def create_artifact(body: CreateBody, member: Member = Depends(get_current
         org_id=member.organization_id,
         created_by=f"member:{member.id}",
     )
-    await audit.log("artifact", member.id, "artifact.create", resource_type="artifact", resource_id=aid)
+    await audit.log("artifact", member.id, "artifact.create", organization_id=member.organization_id, resource_type="artifact", resource_id=aid)
     return await get_artifact(aid)
 
 
@@ -148,7 +148,7 @@ async def edit_artifact(artifact_id: str, body: EditBody, member: Member = Depen
         mime_type=body.mime_type, edit_summary=body.edit_summary or "manual edit",
         created_by=f"member:{member.id}",
     )
-    await audit.log("artifact", member.id, "artifact.edit", resource_type="artifact",
+    await audit.log("artifact", member.id, "artifact.edit", organization_id=member.organization_id, resource_type="artifact",
                     resource_id=artifact_id, payload={"version": updated["version"]})
     return updated
 
@@ -174,7 +174,7 @@ async def ai_edit_artifact(artifact_id: str, body: AIEditBody, member: Member = 
         mime_type=meta.get("mime_type"), edit_summary=f"AI edit: {body.instruction[:80]}",
         created_by=f"member:{member.id}",
     )
-    await audit.log("artifact", member.id, "artifact.ai_edit", resource_type="artifact",
+    await audit.log("artifact", member.id, "artifact.ai_edit", organization_id=member.organization_id, resource_type="artifact",
                     resource_id=artifact_id, payload={"version": updated["version"]})
     return updated
 
@@ -187,7 +187,7 @@ async def restore(artifact_id: str, version: int, member: Member = Depends(get_c
                                         created_by=f"member:{member.id}")
     except ValueError:
         raise HTTPException(status_code=404, detail="Version not found")
-    await audit.log("artifact", member.id, "artifact.restore", resource_type="artifact",
+    await audit.log("artifact", member.id, "artifact.restore", organization_id=member.organization_id, resource_type="artifact",
                     resource_id=artifact_id, payload={"restored_from": version, "version": updated["version"]})
     return updated
 
@@ -196,7 +196,7 @@ async def restore(artifact_id: str, version: int, member: Member = Depends(get_c
 async def rename_artifact(artifact_id: str, body: RenameBody, member: Member = Depends(get_current_member)):
     await _require(member, "artifact.edit", artifact_id)
     updated = await update_artifact_meta(artifact_id, member.organization_id, title=body.title)
-    await audit.log("artifact", member.id, "artifact.rename", resource_type="artifact",
+    await audit.log("artifact", member.id, "artifact.rename", organization_id=member.organization_id, resource_type="artifact",
                     resource_id=artifact_id, payload={"title": body.title})
     return updated
 
@@ -205,7 +205,7 @@ async def rename_artifact(artifact_id: str, body: RenameBody, member: Member = D
 async def delete_artifact(artifact_id: str, member: Member = Depends(get_current_member)):
     await _require(member, "artifact.delete", artifact_id)
     await soft_delete_artifact(artifact_id, member.organization_id)
-    await audit.log("artifact", member.id, "artifact.delete", resource_type="artifact", resource_id=artifact_id)
+    await audit.log("artifact", member.id, "artifact.delete", organization_id=member.organization_id, resource_type="artifact", resource_id=artifact_id)
     return {"ok": True}
 
 
@@ -229,7 +229,7 @@ async def duplicate_artifact(artifact_id: str, member: Member = Depends(get_curr
         org_id=member.organization_id,
         created_by=f"member:{member.id}",
     )
-    await audit.log("artifact", member.id, "artifact.duplicate", resource_type="artifact",
+    await audit.log("artifact", member.id, "artifact.duplicate", organization_id=member.organization_id, resource_type="artifact",
                     resource_id=new_id, payload={"source": artifact_id})
     return await get_artifact(new_id)
 
@@ -238,7 +238,7 @@ async def duplicate_artifact(artifact_id: str, member: Member = Depends(get_curr
 async def publish_artifact(artifact_id: str, member: Member = Depends(get_current_member)):
     await _require(member, "artifact.publish", artifact_id)
     share = await create_share(artifact_id, org_id=member.organization_id, created_by=f"member:{member.id}")
-    await audit.log("artifact", member.id, "artifact.publish", resource_type="artifact",
+    await audit.log("artifact", member.id, "artifact.publish", organization_id=member.organization_id, resource_type="artifact",
                     resource_id=artifact_id, decision="published")
     return {"token": share["token"], "status": share["status"], "share_path": f"/shared/{share['token']}"}
 
@@ -247,7 +247,7 @@ async def publish_artifact(artifact_id: str, member: Member = Depends(get_curren
 async def unpublish_artifact(artifact_id: str, member: Member = Depends(get_current_member)):
     await _require(member, "artifact.publish", artifact_id)
     revoked = await revoke_share(artifact_id, member.organization_id)
-    await audit.log("artifact", member.id, "artifact.unpublish", resource_type="artifact",
+    await audit.log("artifact", member.id, "artifact.unpublish", organization_id=member.organization_id, resource_type="artifact",
                     resource_id=artifact_id, decision="revoked")
     return {"revoked": revoked}
 

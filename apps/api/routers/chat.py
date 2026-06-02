@@ -161,6 +161,7 @@ async def delete_conversation(conversation_id: str, member: Member = Depends(get
         "conversation_deleted",
         member.id,
         "chat.delete_conversation",
+        organization_id=member.organization_id,
         resource_type="conversations",
         resource_id=conversation_id,
     )
@@ -233,6 +234,7 @@ async def _parse_attachments(attachment_ids: list[str], conversation_id: str, or
                 })
                 await audit.log(
                     "attachment_parse_cache_hit", "system", "attachments.parse",
+                    organization_id=org_id,
                     resource_type="artifacts", resource_id=att_id,
                 )
                 continue
@@ -255,6 +257,7 @@ async def _parse_attachments(attachment_ids: list[str], conversation_id: str, or
         await _set_parse_status(att_id, status)
         await audit.log(
             "attachment_parsed", "system", "attachments.parse",
+            organization_id=org_id,
             resource_type="artifacts", resource_id=att_id,
             payload={"parse_status": status, "parser_used": doc.parser_used},
         )
@@ -379,7 +382,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
             )
             assistant_response = f"Got it, I'll remember that: {explicit_memory}"
             await _save_message(conversation_id, "assistant", assistant_response)
-            await audit.log("chat_response", member.id, "chat.message", resource_id=conversation_id)
+            await audit.log("chat_response", member.id, "chat.message", organization_id=member.organization_id, resource_id=conversation_id)
             yield f"data: {json.dumps({'type': 'conversation', 'conversation_id': conversation_id})}\n\n"
             yield f"data: {json.dumps({'type': 'memory_saved', 'entry_id': entry_id, 'content': explicit_memory, 'scope': 'org', 'source': 'explicit'})}\n\n"
             yield f"data: {json.dumps({'type': 'token', 'content': assistant_response})}\n\n"
@@ -428,7 +431,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
             await asyncio.sleep(0)
         assistant_response = full.strip()
         await _save_message(conversation_id, "assistant", assistant_response)
-        await audit.log("chat_response", member.id, "chat.message", resource_id=conversation_id)
+        await audit.log("chat_response", member.id, "chat.message", organization_id=member.organization_id, resource_id=conversation_id)
         asyncio.create_task(
             extract_and_save(conversation_id, req.message, assistant_response, requester_context)
         )

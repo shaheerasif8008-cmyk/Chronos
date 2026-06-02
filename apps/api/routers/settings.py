@@ -249,7 +249,7 @@ async def update_member_role(member_id: str, req: MemberRolePatch, member: Membe
         if target["role"] in ADMIN_ROLES and req.role not in ADMIN_ROLES and owner_count <= 1:
             raise HTTPException(status_code=400, detail="Cannot demote the last owner/admin")
         await conn.execute(update(members).where(members.c.id == member_id).values(role=req.role))
-    await audit.log("settings_change", member.id, "settings.members.role_update", resource_type="members", resource_id=member_id, payload={"role": req.role})
+    await audit.log("settings_change", member.id, "settings.members.role_update", organization_id=member.organization_id, resource_type="members", resource_id=member_id, payload={"role": req.role})
     return {"id": member_id, "role": req.role}
 
 
@@ -278,7 +278,7 @@ async def deactivate_member(member_id: str, member: Member = Depends(get_current
         if target["role"] in ADMIN_ROLES and owner_count <= 1:
             raise HTTPException(status_code=400, detail="Cannot remove the last owner/admin")
         await conn.execute(delete(members).where(members.c.id == member_id))
-    await audit.log("settings_change", member.id, "settings.members.remove", resource_type="members", resource_id=member_id)
+    await audit.log("settings_change", member.id, "settings.members.remove", organization_id=member.organization_id, resource_type="members", resource_id=member_id)
     return {"id": member_id, "removed": True}
 
 
@@ -294,7 +294,7 @@ async def purge_memory(req: MemoryPurgeRequest, member: Member = Depends(get_cur
             .where(memory_entries.c.organization_id == member.organization_id, memory_entries.c.is_deleted.is_(False))
             .values(is_deleted=True, updated_at=func.now())
         )
-    await audit.log("settings_change", member.id, "settings.memory.purge", resource_type="memory", payload={"deleted": result.rowcount}, decision="confirmed")
+    await audit.log("settings_change", member.id, "settings.memory.purge", organization_id=member.organization_id, resource_type="memory", payload={"deleted": result.rowcount}, decision="confirmed")
     return {"deleted": result.rowcount}
 
 

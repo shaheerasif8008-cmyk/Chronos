@@ -243,6 +243,7 @@ async def run_search(
         "search",
         member.id,
         "search.global",
+        organization_id=member.organization_id,
         resource_type="global",
         payload={"q_preview": q[:120], "types": types_csv or "all"},
     )

@@ -42,6 +42,7 @@ Assistant: {assistant_response}
             "memory_extraction_error",
             requester_context.member_id,
             "memory.extract",
+            organization_id=requester_context.org_id,
             resource_type="memory",
             resource_id=conversation_id,
             payload={"error": str(exc)[:240]},

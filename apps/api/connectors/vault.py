@@ -71,7 +71,7 @@ async def store(connector_id: str, credentials: dict[str, Any], org_id: str = "d
     await redis_client.set(f"vault:data:{vault_ref}", encrypted, ex=_REDIS_TTL)
 
     # Only vault_ref in audit — never the credential content
-    await audit.log("vault_write", connector_id, "vault.store", resource_type="vault_entries", resource_id=vault_ref)
+    await audit.log("vault_write", connector_id, "vault.store", organization_id=org_id, resource_type="vault_entries", resource_id=vault_ref)
     return vault_ref
 
 
@@ -112,18 +112,23 @@ async def update(vault_ref: str, credentials: dict[str, Any], actor_id: str = "s
 
     vault_entries = await reflect_table("vault_entries")
     async with engine.begin() as conn:
-        await conn.execute(
-            sa_update(vault_entries)
-            .where(vault_entries.c.vault_ref == vault_ref)
-            .values(encrypted_data=encrypted)
-        )
+        # Capture the entry's tenant from the row itself — callers (deep in token
+        # refresh) don't carry org context, but the vault row owns it.
+        org_id = (
+            await conn.execute(
+                sa_update(vault_entries)
+                .where(vault_entries.c.vault_ref == vault_ref)
+                .values(encrypted_data=encrypted)
+                .returning(vault_entries.c.organization_id)
+            )
+        ).scalar_one_or_none() or settings.org_id
 
     # Overwrite Redis cache
     await redis_client.set(f"vault:data:{vault_ref}", encrypted, ex=_REDIS_TTL)
-    await audit.log("vault_update", actor_id, "vault.update", resource_type="vault_entries", resource_id=vault_ref)
+    await audit.log("vault_update", actor_id, "vault.update", organization_id=org_id, resource_type="vault_entries", resource_id=vault_ref)
 
 
 async def delete(vault_ref: str, actor_id: str, org_id: str = "default") -> None:
     """Soft-delete by removing from Redis; Postgres record is retained for audit."""
     await redis_client.delete(f"vault:data:{vault_ref}")
-    await audit.log("vault_delete", actor_id, "vault.delete", resource_type="vault_entries", resource_id=vault_ref)
+    await audit.log("vault_delete", actor_id, "vault.delete", organization_id=org_id, resource_type="vault_entries", resource_id=vault_ref)

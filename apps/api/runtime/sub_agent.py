@@ -60,6 +60,7 @@ class SubAgentManager:
                     "sub_agent_depth_blocked",
                     parent_task.get("triggered_by_member_id") or "chronos",
                     "sub_agent.spawn",
+                    organization_id=parent_task["organization_id"],
                     resource_type="tasks",
                     resource_id=parent_task["id"],
                     decision="denied",

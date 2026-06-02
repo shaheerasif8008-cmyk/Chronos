@@ -263,6 +263,13 @@ def activity_channel(task_id: str) -> str:
     return f"activity:{task_id}"
 
 
+async def _task_org(task_id: str) -> str:
+    """Resolve a task's tenant for audit. The task row owns the org; fall back to
+    the process default only if the task can't be loaded."""
+    task = await get_task(task_id)
+    return (task or {}).get("organization_id") or settings.org_id
+
+
 async def emit_activity(
     task_id: str,
     event: dict[str, Any],
@@ -273,6 +280,7 @@ async def emit_activity(
         "activity",
         actor_id,
         payload.get("type", "activity"),
+        organization_id=await _task_org(task_id),
         resource_type="tasks",
         resource_id=task_id,
         payload=payload,
@@ -293,6 +301,7 @@ async def publish_activity(task_id: str, event: dict[str, Any]) -> None:
             "activity",
             "chronos",
             payload.get("type", "activity"),
+            organization_id=await _task_org(task_id),
             resource_type="tasks",
             resource_id=task_id,
             payload=payload,
