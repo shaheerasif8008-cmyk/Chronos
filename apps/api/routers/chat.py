@@ -297,6 +297,7 @@ async def delete_conversation(conversation_id: str, member: Member = Depends(get
         "conversation_deleted",
         member.id,
         "chat.delete_conversation",
+        organization_id=member.organization_id,
         resource_type="conversations",
         resource_id=conversation_id,
     )
@@ -369,6 +370,7 @@ async def _parse_attachments(attachment_ids: list[str], conversation_id: str, or
                 })
                 await audit.log(
                     "attachment_parse_cache_hit", "system", "attachments.parse",
+                    organization_id=org_id,
                     resource_type="artifacts", resource_id=att_id,
                 )
                 continue
@@ -391,6 +393,7 @@ async def _parse_attachments(attachment_ids: list[str], conversation_id: str, or
         await _set_parse_status(att_id, status)
         await audit.log(
             "attachment_parsed", "system", "attachments.parse",
+            organization_id=org_id,
             resource_type="artifacts", resource_id=att_id,
             payload={"parse_status": status, "parser_used": doc.parser_used},
         )
@@ -544,7 +547,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
             )
             assistant_response = f"Got it, I'll remember that: {explicit_memory}"
             await _save_message(conversation_id, "assistant", assistant_response)
-            await audit.log("chat_response", member.id, "chat.message", resource_id=conversation_id)
+            await audit.log("chat_response", member.id, "chat.message", organization_id=member.organization_id, resource_id=conversation_id)
             yield f"data: {json.dumps({'type': 'conversation', 'conversation_id': conversation_id})}\n\n"
             yield f"data: {json.dumps({'type': 'memory_saved', 'entry_id': entry_id, 'content': explicit_memory, 'scope': 'org', 'source': 'explicit'})}\n\n"
             yield f"data: {json.dumps({'type': 'token', 'content': assistant_response})}\n\n"
@@ -662,6 +665,7 @@ async def pin_message(
         "message_pinned",
         member.id,
         "chat.pin_message",
+        organization_id=member.organization_id,
         resource_type="messages",
         resource_id=message_id,
     )
@@ -688,6 +692,7 @@ async def unpin_message(
         "message_unpinned",
         member.id,
         "chat.unpin_message",
+        organization_id=member.organization_id,
         resource_type="messages",
         resource_id=message_id,
     )
@@ -729,6 +734,7 @@ async def edit_message(
         "message_edited",
         member.id,
         "chat.edit_message",
+        organization_id=member.organization_id,
         resource_type="messages",
         resource_id=message_id,
         payload={"prev_length": len(prev_content), "new_length": len(req.content)},
@@ -798,6 +804,7 @@ async def branch_conversation(
         "conversation_branched",
         member.id,
         "chat.branch_conversation",
+        organization_id=member.organization_id,
         resource_type="conversations",
         resource_id=new_conv_id,
         payload={"source_conversation_id": conversation_id, "branch_message_id": message_id},
@@ -845,6 +852,7 @@ async def save_message_to_memory(
         "message_saved_to_memory",
         member.id,
         "chat.save_message_to_memory",
+        organization_id=member.organization_id,
         resource_type="messages",
         resource_id=message_id,
         payload={"scope": req.scope, "memory_entry_id": str(entry_id)},
@@ -887,6 +895,7 @@ async def convert_message_to_task(
         "message_converted_to_task",
         member.id,
         "chat.convert_message_to_task",
+        organization_id=member.organization_id,
         resource_type="messages",
         resource_id=message_id,
         payload={"task_id": str(task_id), "conversation_id": conversation_id},

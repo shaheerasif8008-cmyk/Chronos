@@ -67,6 +67,7 @@ async def retrieve_source_chunks(
             "source_retrieve_denied",
             requester_context.member_id,
             "source.retrieve",
+            organization_id=requester_context.org_id,
             resource_type="project_source_chunks",
             resource_id=project_id,
             payload={"project_id": project_id, "query_preview": query[:120]},
@@ -82,6 +83,7 @@ async def retrieve_source_chunks(
             "source_retrieve_error",
             requester_context.member_id,
             "source.retrieve",
+            organization_id=requester_context.org_id,
             resource_type="project_source_chunks",
             resource_id=project_id,
             payload={"project_id": project_id, "query_preview": query[:120]},
@@ -93,6 +95,7 @@ async def retrieve_source_chunks(
             "source_retrieve_error",
             requester_context.member_id,
             "source.retrieve",
+            organization_id=requester_context.org_id,
             resource_type="project_source_chunks",
             resource_id=project_id,
             payload={
@@ -146,6 +149,7 @@ async def retrieve_source_chunks(
         "source_retrieve",
         requester_context.member_id,
         "source.retrieve",
+        organization_id=requester_context.org_id,
         resource_type="project_source_chunks",
         resource_id=project_id,
         payload={

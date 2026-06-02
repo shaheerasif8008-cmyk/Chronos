@@ -45,6 +45,7 @@ async def upload_attachment(
     )
     await audit.log(
         "attachment_uploaded", member.id, "attachments.upload",
+        organization_id=member.organization_id,
         resource_type="artifacts", resource_id=attachment_id,
     )
 
@@ -70,6 +71,7 @@ async def upload_attachment(
             source_id = str(src_result.scalar_one())
         await audit.log(
             "source_added", member.id, "attachments.add_source",
+            organization_id=member.organization_id,
             resource_type="project_sources", resource_id=source_id,
             payload={"project_id": project_id},
         )

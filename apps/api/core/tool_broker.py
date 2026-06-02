@@ -288,6 +288,7 @@ class ToolBroker:
                     "tool_result",
                     agent.id,
                     tool,
+                    organization_id=agent.org_id,
                     payload={"summary": cached.summary, "idempotency": "replayed"},
                 )
                 return cached
@@ -297,6 +298,7 @@ class ToolBroker:
             "tool_call",
             agent.id,
             tool,
+            organization_id=agent.org_id,
             payload={
                 "args_hash": args_hash,
                 "idempotency_key": hashlib.sha256(str(idempotency_key).encode()).hexdigest()
@@ -326,6 +328,7 @@ class ToolBroker:
             "tool_result",
             agent.id,
             tool,
+            organization_id=agent.org_id,
             payload={"summary": result.summary},
         )
         if _is_external_write_tool(tool):

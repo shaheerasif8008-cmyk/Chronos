@@ -289,6 +289,19 @@ def activity_channel(task_id: str) -> str:
     return f"activity:{task_id}"
 
 
+async def _task_org(task_id: str) -> str:
+    """Resolve a task's tenant for audit. The task row owns the org.
+
+    If the task can't be loaded we must not attribute the activity to a real
+    tenant. Defaulting to the process org would hide the entry from the true
+    tenant and pollute the default org's audit log; raising would crash the
+    durable-trace path (telemetry must stay resilient). Instead return a
+    synthetic, non-colliding marker so the anomaly is visible and monitorable."""
+    task = await get_task(task_id)
+    org_id = (task or {}).get("organization_id")
+    return str(org_id) if org_id else f"unresolved_task:{task_id}"
+
+
 async def emit_activity(
     task_id: str,
     event: dict[str, Any],
@@ -299,6 +312,7 @@ async def emit_activity(
         "activity",
         actor_id,
         payload.get("type", "activity"),
+        organization_id=await _task_org(task_id),
         resource_type="tasks",
         resource_id=task_id,
         payload=payload,
@@ -319,6 +333,7 @@ async def publish_activity(task_id: str, event: dict[str, Any]) -> None:
             "activity",
             "chronos",
             payload.get("type", "activity"),
+            organization_id=await _task_org(task_id),
             resource_type="tasks",
             resource_id=task_id,
             payload=payload,

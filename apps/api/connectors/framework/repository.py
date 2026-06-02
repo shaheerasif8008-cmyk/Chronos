@@ -849,6 +849,7 @@ class DatabaseConnectorRepository:
             "connector_execution",
             values.get("user_id") or values.get("employee_id"),
             f"connector.{values['connector_id']}.{values['action_name']}",
+            organization_id=values["tenant_id"],
             resource_type="connectors",
             resource_id=values["connector_id"],
             payload={

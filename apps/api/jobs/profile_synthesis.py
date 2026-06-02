@@ -48,12 +48,14 @@ async def synthesize_org_profile(org_id: str = "default") -> str | None:
         profile,
         actor_id="chronos",
         action="memory.synthesize_profile",
+        organization_id=org_id,
     )
     entry_id = await replace_synthesized_memory_entry(org_id=org_id, content=profile, embedding=embedding)
     await audit.log(
         "memory_write",
         "chronos",
         "memory.synthesize_profile",
+        organization_id=org_id,
         resource_type="memory",
         resource_id=entry_id,
         payload={"source": "synthesized"},
