@@ -276,7 +276,6 @@ async def gmail_oauth_callback(
                     select(connectors_table).where(
                         (connectors_table.c.organization_id == org_id)
                         & (connectors_table.c.provider == "gmail")
-                        & (connectors_table.c.vault_ref == vault_ref)
                     )
                 )
             ).mappings().first()
