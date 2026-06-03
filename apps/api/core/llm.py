@@ -17,6 +17,49 @@ _MAX_RETRIES = 3
 _BASE_BACKOFF_SECONDS = 1.0
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
+CHAT_MODEL_OPTIONS: tuple[dict[str, Any], ...] = (
+    {
+        "id": "gpt-5.4-mini",
+        "label": "GPT-5.4 Mini",
+        "model": "openrouter/openai/gpt-5.4-mini",
+        "description": "OpenAI GPT-5.4 Mini through OpenRouter.",
+        "capabilities": ["chat", "tool_use", "agent_loop", "structured_json"],
+        "tool_use": True,
+        "fallback_for": [],
+        "policy": "Selected explicitly by the user in chat.",
+    },
+    {
+        "id": "gpt-5.4-nano",
+        "label": "GPT-5.4 Nano",
+        "model": "openrouter/openai/gpt-5.4-nano",
+        "description": "OpenAI GPT-5.4 Nano through OpenRouter.",
+        "capabilities": ["chat", "tool_use", "agent_loop", "structured_json"],
+        "tool_use": True,
+        "fallback_for": [],
+        "policy": "Selected explicitly by the user in chat.",
+    },
+    {
+        "id": "deepseek-v4-pro",
+        "label": "DeepSeek V4 Pro",
+        "model": "openrouter/deepseek/deepseek-v4-pro",
+        "description": "DeepSeek V4 Pro through OpenRouter.",
+        "capabilities": ["chat", "tool_use", "agent_loop", "structured_json"],
+        "tool_use": True,
+        "fallback_for": [],
+        "policy": "Selected explicitly by the user in chat.",
+    },
+    {
+        "id": "deepseek-v4-flash",
+        "label": "DeepSeek V4 Flash",
+        "model": "openrouter/deepseek/deepseek-v4-flash",
+        "description": "DeepSeek V4 Flash through OpenRouter.",
+        "capabilities": ["chat", "tool_use", "agent_loop", "structured_json"],
+        "tool_use": True,
+        "fallback_for": [],
+        "policy": "Selected explicitly by the user in chat.",
+    },
+)
+
 
 async def _with_retry(coro_factory, *, max_retries: int = _MAX_RETRIES) -> Any:
     """Execute an async callable with exponential backoff on retryable errors.
@@ -49,104 +92,38 @@ def _model_status(*, configured: bool, preferred_live: bool = False) -> str:
 
 
 def available_chat_models() -> list[dict[str, Any]]:
-    models = [
+    return [
         {
-            "id": "agent",
-            "label": "Primary",
-            "model": settings.agent_model,
-            "description": "Use the configured primary agent model.",
-            "capabilities": ["chat", "tool_use", "agent_loop", "structured_json"],
-            "status": _model_status(configured=bool(settings.agent_model), preferred_live=bool(settings.openrouter_api_key)),
-            "tool_use": True,
-            "fallback_for": ["auto", "fast", "local"],
-            "policy": "Allowed for chat, task routing, and governed tool use.",
-        },
-        {
-            "id": "auto",
-            "label": "Auto",
-            "model": settings.agent_model,
-            "description": "Use the configured primary agent model automatically.",
-            "capabilities": ["chat", "fallback", "provider_failover"],
-            "status": _model_status(configured=bool(settings.agent_model), preferred_live=bool(settings.openrouter_api_key or settings.backup_api_key)),
-            "tool_use": True,
-            "fallback_for": [],
-            "policy": "Selects the best configured model and reports provider failures honestly.",
-        },
-        {
-            "id": "local",
-            "label": "Local",
-            "model": settings.local_llm_model,
-            "description": "Use the configured local model.",
-            "capabilities": ["chat", "private_runtime"],
-            "status": _model_status(configured=bool(settings.local_llm_model), preferred_live=False),
-            "tool_use": False,
-            "fallback_for": [],
-            "policy": "Local endpoint only; provider availability depends on the configured local server.",
-        },
-    ]
-    if settings.openrouter_api_key:
-        models.append(
-            {
-                "id": "openrouter",
-                "label": "OpenRouter",
-                "model": settings.openrouter_model,
-                "description": "Use the configured OpenRouter chat model.",
-                "capabilities": ["chat", "fallback", "structured_json"],
-                "status": _model_status(configured=bool(settings.openrouter_model), preferred_live=True),
-                "tool_use": False,
-                "fallback_for": ["auto", "agent", "fast"],
-                "policy": "External provider; governed by configured OpenRouter API key.",
-            }
-        )
-    elif settings.backup_api_key:
-        models.append(
-            {
-                "id": "backup",
-                "label": "Backup",
-                "model": settings.backup_model,
-                "description": "Use the configured backup model.",
-                "capabilities": ["chat", "fallback"],
-                "status": _model_status(configured=bool(settings.backup_model), preferred_live=True),
-                "tool_use": False,
-                "fallback_for": ["auto", "agent", "fast"],
-                "policy": "External backup provider used when primary provider is unavailable.",
-            }
-        )
-    models.append(
-        {
-            "id": "fast",
-            "label": "Fast",
-            "model": settings.fast_model,
-            "description": "Use the configured fast model.",
-            "capabilities": ["chat", "classification", "summarization"],
-            "status": _model_status(configured=bool(settings.fast_model), preferred_live=bool(settings.openrouter_api_key or settings.backup_api_key)),
-            "tool_use": False,
-            "fallback_for": ["agent", "auto"],
-            "policy": "Optimized for low-latency chat and classification; not used for risky writes directly.",
+            **model,
+            "status": _model_status(configured=bool(model["model"]), preferred_live=bool(settings.openrouter_api_key)),
         }
-    )
-    return models
+        for model in CHAT_MODEL_OPTIONS
+    ]
 
 
 def normalize_chat_model(model_id: str | None) -> str:
-    requested = model_id or "agent"
+    if not model_id:
+        raise ValueError("model is required")
+    requested = model_id
     allowed = {model["id"] for model in available_chat_models()}
-    return requested if requested in allowed else "agent"
+    if requested not in allowed:
+        raise ValueError(f"unknown chat model: {requested}")
+    return requested
+
+
+def default_chat_model_id() -> str:
+    return CHAT_MODEL_OPTIONS[0]["id"]
+
+
+def chat_model_string(model_id: str) -> str:
+    selected = normalize_chat_model(model_id)
+    by_id = {model["id"]: model["model"] for model in CHAT_MODEL_OPTIONS}
+    return by_id[selected]
 
 
 def resolve_agent_model(model_id: str | None) -> str:
-    """Map a chat-model id (agent/fast/local/openrouter/backup/auto) to the
-    concrete litellm model string the agent loop should use for tool calling.
-    """
-    mid = normalize_chat_model(model_id)
-    if mid == "fast":
-        return settings.fast_model
-    if mid == "local":
-        return settings.local_llm_model
-    if mid in {"openrouter", "backup"}:
-        return settings.openrouter_model if settings.openrouter_api_key else settings.backup_model
-    # "agent" and "auto" both resolve to the primary agent model (tool-capable).
-    return settings.agent_model
+    """Map the chat selector id to the concrete litellm model string."""
+    return chat_model_string(normalize_chat_model(model_id))
 
 
 def backup_completion_kwargs(messages: list[dict[str, str]], *, stream: bool = False) -> dict[str, Any]:
@@ -179,21 +156,7 @@ def model_kwargs(model: str, *, messages: list[dict[str, str]], stream: bool = F
 
 
 def selected_completion_kwargs(model_id: str, messages: list[dict[str, str]], *, stream: bool = False) -> dict[str, Any]:
-    selected = normalize_chat_model(model_id)
-    if selected == "agent":
-        return agent_completion_kwargs(messages, stream=stream)
-    if selected == "local":
-        return {
-            "model": settings.local_llm_model,
-            "api_base": settings.local_llm_base_url,
-            "messages": messages,
-            "stream": stream,
-        }
-    if selected in {"openrouter", "backup"}:
-        return backup_completion_kwargs(messages, stream=stream)
-    if selected == "fast":
-        return model_kwargs(settings.fast_model, messages=messages, stream=stream)
-    raise ValueError("auto does not map to one completion request")
+    return model_kwargs(chat_model_string(model_id), messages=messages, stream=stream)
 
 
 def _choice_delta_content(chunk: Any) -> str:
@@ -286,38 +249,11 @@ async def stream_step(messages: list[dict[str, Any]], tools: list[dict[str, Any]
 
 async def stream_completion(messages: list[dict[str, str]], *, model_id: str | None = None):
     selected = normalize_chat_model(model_id)
-    if selected != "auto":
-        try:
-            request = litellm.acompletion(**selected_completion_kwargs(selected, messages, stream=True))
-            if selected == "local":
-                stream = await asyncio.wait_for(request, timeout=settings.local_llm_timeout_seconds)
-            else:
-                stream = await request
-        except Exception:
-            yield "Chronos is connected, but the selected AI provider is unavailable right now. Try Auto or another model."
-            return
-        async for chunk in stream:
-            token = _choice_delta_content(chunk)
-            if token:
-                yield token
-        return
-
     try:
-        stream = await asyncio.wait_for(
-            litellm.acompletion(
-                model=settings.local_llm_model,
-                api_base=settings.local_llm_base_url,
-                messages=messages,
-                stream=True,
-            ),
-            timeout=settings.local_llm_timeout_seconds,
-        )
-    except (Exception, asyncio.TimeoutError):
-        try:
-            stream = await litellm.acompletion(**backup_completion_kwargs(messages, stream=True))
-        except Exception:
-            yield "Chronos is connected, but the AI provider is unavailable right now. The local runtime, memory, task, approval, and connector tools are still available."
-            return
+        stream = await litellm.acompletion(**selected_completion_kwargs(selected, messages, stream=True))
+    except Exception:
+        yield "Chronos is connected, but the selected AI provider is unavailable right now. Choose another model in the selector."
+        return
 
     async for chunk in stream:
         token = _choice_delta_content(chunk)

@@ -43,7 +43,7 @@ async def test_no_tool_turn_streams_and_creates_no_task(monkeypatch):
         message="capital of France?",
         context_messages=[{"role": "system", "content": "sys"}],
         requester_context=_ctx(),
-        model="agent",
+        model="gpt-5.4-mini",
     ))
 
     tokens = "".join(e["content"] for e in events if e["type"] == "token")
@@ -98,7 +98,7 @@ async def test_first_tool_call_creates_task_with_full_history(monkeypatch):
         message="news today",
         context_messages=[{"role": "system", "content": "sys"}],
         requester_context=_ctx(),
-        model="agent",
+        model="gpt-5.4-mini",
     ))
 
     roles = [m["role"] for m in created["history"]]
@@ -134,7 +134,7 @@ async def test_start_task_promotes_to_background(monkeypatch):
         message="research 50 AI law firms and draft outreach",
         context_messages=[{"role": "system", "content": "sys"}],
         requester_context=_ctx(),
-        model="agent",
+        model="gpt-5.4-mini",
     ))
 
     assert enqueued == ["task-bg"]
@@ -169,7 +169,7 @@ async def test_complex_inline_turn_sends_fast_ack_before_model_tokens(monkeypatc
         message="Analyze this contract and extract the liability terms compared to the prior draft.",
         context_messages=[{"role": "system", "content": "sys"}],
         requester_context=_ctx(),
-        model="agent",
+        model="gpt-5.4-mini",
     ))
 
     token_events = [e["content"] for e in events if e["type"] == "token"]
@@ -222,7 +222,7 @@ async def test_mailbox_turn_injects_gmail_grounding_before_user(monkeypatch):
         message="summarise my emails in the last 3 days",
         context_messages=[{"role": "system", "content": "sys"}, {"role": "user", "content": "prior prompt"}],
         requester_context=_ctx(),
-        model="agent",
+        model="gpt-5.4-mini",
     ))
 
     messages = captured["messages"]
@@ -409,7 +409,7 @@ async def test_inline_turn_gates_external_write_after_prompt_injection(monkeypat
         message="fetch the page then email a summary",
         context_messages=[{"role": "system", "content": "sys"}],
         requester_context=_ctx(),
-        model="agent",
+        model="gpt-5.4-mini",
     ))
 
     assert gated == ["gmail__draft"]

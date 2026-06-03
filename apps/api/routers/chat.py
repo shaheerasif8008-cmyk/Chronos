@@ -515,7 +515,10 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
     from fastapi import HTTPException
 
     await permissions.check(member, "chat", req.conversation_id or "new_conversation")
-    selected_model = normalize_chat_model(req.model)
+    try:
+        selected_model = normalize_chat_model(req.model)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     # ── Conversation creation / project_id hydration ────────────────────────
     if req.conversation_id:
@@ -589,7 +592,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
                 member=member,
                 persona_id=req.persona_id,
                 workspace_id=req.workspace_id,
-                model=req.model,
+                model=selected_model,
                 original_message=req.message,
                 router_decision={
                     "mode": "agent",

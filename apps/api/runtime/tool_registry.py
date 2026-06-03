@@ -195,9 +195,9 @@ SPAWN_SUBAGENT = _fn(
         },
         "model": {
             "type": "string",
-            "description": "Model tier for the sub-agent: 'agent' for complex tasks, 'fast' for simple ones.",
-            "enum": ["agent", "fast"],
-            "default": "agent",
+            "description": "Explicit chat model selector id for the sub-agent.",
+            "enum": ["gpt-5.4-mini", "gpt-5.4-nano", "deepseek-v4-pro", "deepseek-v4-flash"],
+            "default": "gpt-5.4-mini",
         },
     },
     ["goal"],

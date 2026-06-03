@@ -55,10 +55,10 @@ async def create_task_record(
     `model` is the chat-model id chosen in the UI; it is resolved to a concrete
     litellm model string and stored in agent_state so the loop honours the picker.
     """
-    from core.llm import resolve_agent_model
+    from core.llm import default_chat_model_id, resolve_agent_model
 
     await permissions.check(member, "create_task", workspace_id or "default")
-    resolved_model = resolve_agent_model(model)
+    resolved_model = resolve_agent_model(model or default_chat_model_id())
     normalized_mode = normalize_mode(mode)
     tasks = await reflect_table("tasks")
     raw_user_message = original_message if original_message is not None else goal
