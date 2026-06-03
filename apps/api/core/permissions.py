@@ -12,6 +12,8 @@ Actions that don't map to the model (generic checks, ``use_tool:*``) are allowed
 Internal/system actors (the agent runtime, schedulers, sync jobs) bypass FGA;
 the broker's own safety limits still apply to their tool calls.
 """
+from __future__ import annotations
+
 from core import audit, authz
 from core.authz import AuthzUnavailable
 from core.exceptions import PermissionDenied

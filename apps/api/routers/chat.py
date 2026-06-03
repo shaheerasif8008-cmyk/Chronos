@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Coroutine
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, insert, or_, select, update
@@ -18,6 +18,7 @@ from core.context import assemble_context
 from core.db import engine, reflect_table
 from core.intent import classify_intent
 from core.llm import available_chat_models, normalize_chat_model
+from core.modes import available_modes
 from core.memory_writes import create_memory_entry, extract_explicit_memory_content
 from core.models import Member, RequesterContext
 from core.redis import redis_client
@@ -30,6 +31,8 @@ from runtime.agent_loop import format_task_answer, stream_chat_turn
 from runtime import task_runner
 from runtime.executor import activity_channel
 from routers.tasks import create_task_record
+from routers.workflows import repository as workflow_repository
+from routers.workflows import runtime as workflow_runtime
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -219,9 +222,15 @@ def _normalize_traces(raw: list[dict]) -> list[dict]:
 
 
 @router.get("/models")
-async def list_chat_models(member: Member = Depends(get_current_member)) -> list[dict[str, str]]:
+async def list_chat_models(member: Member = Depends(get_current_member)) -> list[dict[str, Any]]:
     await permissions.check(member, "list_chat_models", settings.org_id)
     return available_chat_models()
+
+
+@router.get("/modes")
+async def list_chat_modes(member: Member = Depends(get_current_member)) -> list[dict[str, Any]]:
+    await permissions.check(member, "list_chat_modes", settings.org_id)
+    return available_modes()
 
 
 @router.get("/conversations")
@@ -633,6 +642,52 @@ class ConvertToTaskRequest(BaseModel):
     mode: str | None = None
 
 
+class ConvertToWorkflowRequest(BaseModel):
+    name: str | None = None
+    workspace_id: str = "default"
+    employee_id: str | None = None
+
+
+class RetryMessageRequest(BaseModel):
+    model: str | None = None
+    mode: str | None = None
+
+
+def _retry_payload_for_message(rows: list[dict], message_id: str) -> dict[str, Any]:
+    """Build the replay payload for regenerate/retry actions.
+
+    User-message retry replays that user turn with only earlier messages as
+    context. Assistant-message regenerate finds the nearest previous user turn
+    and replays it with context before that turn.
+    """
+    target_idx = next((idx for idx, row in enumerate(rows) if str(row.get("id")) == message_id), None)
+    if target_idx is None:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    target = rows[target_idx]
+    if target.get("role") == "assistant":
+        user_idx = next(
+            (idx for idx in range(target_idx - 1, -1, -1) if rows[idx].get("role") == "user"),
+            None,
+        )
+        if user_idx is None:
+            raise HTTPException(status_code=400, detail="No prior user message to regenerate")
+        target_idx = user_idx
+        target = rows[user_idx]
+    elif target.get("role") != "user":
+        raise HTTPException(status_code=400, detail="Only user or assistant messages can be retried")
+
+    return {
+        "message": str(target.get("content") or ""),
+        "context_messages": [
+            {"role": str(row.get("role")), "content": str(row.get("content") or "")}
+            for row in rows[:target_idx]
+            if row.get("role") in {"user", "assistant"} and row.get("content") is not None
+        ],
+        "source_message_id": str(target.get("id")),
+    }
+
+
 async def _check_conversation_ownership(
     conn: Any,
     conversations: Any,
@@ -911,3 +966,137 @@ async def convert_message_to_task(
         payload={"task_id": str(task_id), "conversation_id": conversation_id},
     )
     return {"task_id": task_id}
+
+
+@router.post("/conversations/{conversation_id}/messages/{message_id}/convert-to-workflow")
+async def convert_message_to_workflow(
+    conversation_id: str,
+    message_id: str,
+    req: ConvertToWorkflowRequest,
+    member: Member = Depends(get_current_member),
+) -> dict:
+    await permissions.check(member, "convert_to_workflow", conversation_id)
+    conversations = await reflect_table("conversations")
+    messages = await reflect_table("messages")
+    async with engine.begin() as conn:
+        await _check_conversation_ownership(conn, conversations, conversation_id, member)
+        msg_row = (
+            await conn.execute(
+                select(messages).where(
+                    messages.c.id == message_id,
+                    messages.c.conversation_id == conversation_id,
+                )
+            )
+        ).mappings().first()
+        if msg_row is None:
+            raise HTTPException(status_code=404, detail="Message not found")
+        msg_row = dict(msg_row)
+    repo = await workflow_repository()
+    workflow = await workflow_runtime(repo).create_workflow(
+        tenant_id=member.organization_id,
+        workspace_id=req.workspace_id,
+        employee_id=req.employee_id or member.id,
+        user_id=member.id,
+        name=req.name or f"Workflow from message {message_id[:8]}",
+        description=f"Created from chat message {message_id} in conversation {conversation_id}.",
+        steps=[
+            {
+                "id": "message_input",
+                "tool_name": "internal_echo__echo",
+                "arguments": {"message": msg_row["content"]},
+                "max_attempts": 1,
+                "parallel_safe": False,
+            }
+        ],
+    )
+    await audit.log(
+        "message_converted_to_workflow",
+        member.id,
+        "chat.convert_message_to_workflow",
+        organization_id=member.organization_id,
+        resource_type="messages",
+        resource_id=message_id,
+        payload={"workflow_id": str(workflow["id"]), "conversation_id": conversation_id},
+    )
+    return {"workflow_id": workflow["id"]}
+
+
+async def _replay_message_turn(
+    *,
+    conversation_id: str,
+    message_id: str,
+    req: RetryMessageRequest,
+    member: Member,
+    action: str,
+) -> dict:
+    await permissions.check(member, action, conversation_id)
+    conversations = await reflect_table("conversations")
+    messages = await reflect_table("messages")
+    async with engine.begin() as conn:
+        await _check_conversation_ownership(conn, conversations, conversation_id, member)
+        rows = (
+            await conn.execute(
+                select(messages)
+                .where(messages.c.conversation_id == conversation_id)
+                .order_by(messages.c.created_at.asc(), messages.c.id.asc())
+            )
+        ).mappings().all()
+    payload = _retry_payload_for_message([dict(row) for row in rows], message_id)
+    requester_context = RequesterContext.from_member(member)
+    output = ""
+    task_id: str | None = None
+    async for event in stream_chat_turn(
+        conversation_id=conversation_id,
+        message=payload["message"],
+        context_messages=payload["context_messages"],
+        requester_context=requester_context,
+        model=req.model,
+        mode=req.mode,
+        emit_conversation=False,
+    ):
+        if event.get("type") == "token":
+            output += str(event.get("content") or "")
+        elif event.get("type") == "task_created":
+            task_id = str(event.get("task_id"))
+    await audit.log(
+        "message_regenerated" if action == "regenerate_message" else "message_retried",
+        member.id,
+        f"chat.{action}",
+        organization_id=member.organization_id,
+        resource_type="messages",
+        resource_id=message_id,
+        payload={"source_message_id": payload["source_message_id"], "task_id": task_id},
+    )
+    return {"conversation_id": conversation_id, "source_message_id": payload["source_message_id"], "content": output, "task_id": task_id}
+
+
+@router.post("/conversations/{conversation_id}/messages/{message_id}/regenerate")
+async def regenerate_message(
+    conversation_id: str,
+    message_id: str,
+    req: RetryMessageRequest,
+    member: Member = Depends(get_current_member),
+) -> dict:
+    return await _replay_message_turn(
+        conversation_id=conversation_id,
+        message_id=message_id,
+        req=req,
+        member=member,
+        action="regenerate_message",
+    )
+
+
+@router.post("/conversations/{conversation_id}/messages/{message_id}/retry-from-here")
+async def retry_message_from_here(
+    conversation_id: str,
+    message_id: str,
+    req: RetryMessageRequest,
+    member: Member = Depends(get_current_member),
+) -> dict:
+    return await _replay_message_turn(
+        conversation_id=conversation_id,
+        message_id=message_id,
+        req=req,
+        member=member,
+        action="retry_message",
+    )

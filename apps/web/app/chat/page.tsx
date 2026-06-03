@@ -19,6 +19,13 @@ function apiBase() {
   return "http://localhost:8000";
 }
 
+function formatFileSize(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 type Route = "chat" | "activity" | "approvals" | "memory" | "connectors" | "assistants" | "settings" | "projects" | "research" | "tasks" | "artifacts" | "agents" | "workflows" | "audit";
 type SettingsTab = "general" | "profile" | "organization" | "members" | "permissions" | "employees" | "runtime" | "memory-settings" | "tools-settings" | "approval-settings" | "notifications" | "security" | "billing" | "audit" | "developer" | "danger";
@@ -45,6 +52,13 @@ type Message = {
 type ToolTrace = { id: string; tool: string; summary: string; status: MessageStatus };
 type ReasoningSummary = { id: string; iteration?: number; summary: string; status: MessageStatus };
 type ArtifactRef = { id: string; title: string; kind: string; mime_type?: string; size_bytes?: number };
+type PendingAttachment = {
+  id: string;
+  name: string;
+  size: number;
+  type: string;
+  previewUrl?: string;
+};
 type ResponseActionRecord = { verb: string; description: string; target?: string | null };
 type StructuredResponse = {
   response_type: string;
@@ -125,7 +139,8 @@ type ConnectorApproval = {
 };
 type Task = { id: string; status: string; goal: string; current_step: number; plan?: TaskStep[] | { steps?: TaskStep[] }; agent_state?: Record<string, unknown>; result?: Record<string, unknown>; error?: string | null; created_at?: string; parent_task_id?: string | null; depth?: number; iteration_count?: number };
 type TaskStep = { id: string; action: string; description: string; tool?: string | null };
-type ChatModel = { id: string; label: string; model: string; description?: string };
+type ChatModel = { id: string; label: string; model: string; description?: string; capabilities?: string[]; status?: string; tool_use?: boolean; fallback_for?: string[]; policy?: string };
+type ChatMode = { id: string; label: string; description?: string; capabilities?: string[]; status?: string; creates_task?: boolean };
 type TaskStreamEvent = {
   type: string;
   task_id?: string;
@@ -172,11 +187,25 @@ type ActivityAction = {
 };
 
 const MODEL_STORAGE_KEY = "chronos.chat.selectedModel";
+const MODE_STORAGE_KEY = "chronos.chat.selectedMode";
 
 function modelOptionText(model: ChatModel) {
   if (model.id === "unavailable") return model.label;
   if (model.model === model.id || model.model === model.label) return model.model;
-  return `${model.label}: ${model.model}`;
+  const status = model.status && model.status !== "available" ? ` (${model.status})` : "";
+  return `${model.label}: ${model.model}${status}`;
+}
+
+function modelOptionTitle(model: ChatModel) {
+  const capabilities = model.capabilities?.length ? ` Capabilities: ${model.capabilities.join(", ")}.` : "";
+  const policy = model.policy ? ` ${model.policy}` : "";
+  return `${model.description || model.model}.${capabilities}${policy}`.trim();
+}
+
+function modeOptionTitle(mode: ChatMode) {
+  const capabilities = mode.capabilities?.length ? ` Capabilities: ${mode.capabilities.join(", ")}.` : "";
+  const task = mode.creates_task ? " Creates a durable task when selected." : " Runs in the chat turn unless routing escalates it.";
+  return `${mode.description || mode.label}.${capabilities}${task}`.trim();
 }
 
 function taskSteps(task: Task | null | undefined): TaskStep[] {
@@ -462,7 +491,7 @@ const PALETTE_TYPE_LABELS: Record<string, string> = {
   sources: "Sources",
 };
 
-const CHAT_MODES = [
+const DEFAULT_CHAT_MODES: ChatMode[] = [
   { id: "default",  label: "Default" },
   { id: "research", label: "Research" },
   { id: "agent",    label: "Agent" },
@@ -472,7 +501,7 @@ const CHAT_MODES = [
   { id: "image",    label: "Image" },
   { id: "voice",    label: "Voice" },
   { id: "coding",   label: "Coding" },
-] as const;
+];
 
 // ─── Auth helpers ─────────────────────────────────────────────────────────────
 function getToken() {
@@ -689,7 +718,7 @@ function ChronosAppInner() {
   const [conversationsLoading, setConversationsLoading] = useState(false);
   const [pendingApprovals, setPendingApprovals] = useState(0);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const [theme, setTheme] = useState<"light" | "dark">("light");
+  const [theme, setTheme] = useState<"light" | "dark">("dark");
   const [accent, setAccent] = useState("coral");
   const [searchPaletteOpen, setSearchPaletteOpen] = useState(false);
 
@@ -1112,21 +1141,24 @@ function ChatScreen({
   const [draft, setDraft] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
   const [chatModels, setChatModels] = useState<ChatModel[]>([]);
+  const [chatModes, setChatModes] = useState<ChatMode[]>(DEFAULT_CHAT_MODES);
   const [selectedModel, setSelectedModel] = useState("auto");
   const [modelsLoadError, setModelsLoadError] = useState("");
   const [selectedMode, setSelectedMode] = useState<string>("default");
+  const [modesLoadError, setModesLoadError] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [activityOpen, setActivityOpen] = useState(false);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
   const [activeTask, setActiveTask] = useState<Task | null>(null);
   const [activeTaskEvents, setActiveTaskEvents] = useState<TaskStreamEvent[]>([]);
   const [activeTaskStreamError, setActiveTaskStreamError] = useState("");
-  const [attachments, setAttachments] = useState<{ id: string; name: string; size: number }[]>([]);
+  const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [personaMenuOpen, setPersonaMenuOpen] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const streamingRef = useRef(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const attachmentPreviewUrlsRef = useRef<Set<string>>(new Set());
   const isEmpty = !activeConvoId && messages.length === 0;
   const inlineApprovalIds = useMemo(() => {
     const ids = new Set<string>();
@@ -1142,6 +1174,13 @@ function ChatScreen({
     for (const id of decided) ids.delete(id);
     return [...ids];
   }, [activeTaskEvents]);
+
+  useEffect(() => {
+    return () => {
+      attachmentPreviewUrlsRef.current.forEach(url => URL.revokeObjectURL(url));
+      attachmentPreviewUrlsRef.current.clear();
+    };
+  }, []);
 
   // ── Command palette (⌘K) ──────────────────────────────────────────────────
   const router = useRouter();
@@ -1370,6 +1409,27 @@ function ChatScreen({
   }, []);
 
   useEffect(() => {
+    apiFetch("/chat/modes")
+      .then(r => r.json())
+      .then((data: ChatMode[]) => {
+        const modes = Array.isArray(data) && data.length ? data : DEFAULT_CHAT_MODES;
+        setModesLoadError("");
+        setChatModes(modes);
+        const stored = window.localStorage.getItem(MODE_STORAGE_KEY) || selectedMode;
+        const nextMode = modes.some(mode => mode.id === stored) ? stored : "default";
+        if (nextMode !== selectedMode) {
+          setSelectedMode(nextMode);
+        }
+        window.localStorage.setItem(MODE_STORAGE_KEY, nextMode);
+      })
+      .catch((err) => {
+        setModesLoadError(err instanceof Error ? err.message : "Unable to load modes");
+        setChatModes(DEFAULT_CHAT_MODES);
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
     if (!activeConvoId) {
       if (!streamingRef.current) setMessages([]);
       setActiveTaskId(null);
@@ -1484,6 +1544,8 @@ function ChatScreen({
     const token = getToken();
     const base = apiBase();
     for (const file of Array.from(files)) {
+      const previewUrl = file.type.startsWith("image/") ? URL.createObjectURL(file) : undefined;
+      if (previewUrl) attachmentPreviewUrlsRef.current.add(previewUrl);
       const form = new FormData();
       form.append("file", file);
       if (activeConvoId) form.append("conversation_id", activeConvoId);
@@ -1495,12 +1557,42 @@ function ChatScreen({
         });
         if (res.ok) {
           const data = await res.json() as { attachment_id: string; filename: string; size_bytes: number };
-          setAttachments(prev => [...prev, { id: data.attachment_id, name: data.filename, size: data.size_bytes }]);
+          setAttachments(prev => [...prev, { id: data.attachment_id, name: data.filename, size: data.size_bytes, type: file.type, previewUrl }]);
+        } else if (previewUrl) {
+          URL.revokeObjectURL(previewUrl);
+          attachmentPreviewUrlsRef.current.delete(previewUrl);
         }
       } catch {
+        if (previewUrl) {
+          URL.revokeObjectURL(previewUrl);
+          attachmentPreviewUrlsRef.current.delete(previewUrl);
+        }
         // Upload failed silently — user can retry
       }
     }
+  }
+
+  function removeAttachment(id: string) {
+    setAttachments(prev => {
+      const removed = prev.find(attachment => attachment.id === id);
+      if (removed?.previewUrl) {
+        URL.revokeObjectURL(removed.previewUrl);
+        attachmentPreviewUrlsRef.current.delete(removed.previewUrl);
+      }
+      return prev.filter(attachment => attachment.id !== id);
+    });
+  }
+
+  function clearAttachments() {
+    setAttachments(prev => {
+      prev.forEach(attachment => {
+        if (attachment.previewUrl) {
+          URL.revokeObjectURL(attachment.previewUrl);
+          attachmentPreviewUrlsRef.current.delete(attachment.previewUrl);
+        }
+      });
+      return [];
+    });
   }
 
   async function sendMessage() {
@@ -1508,7 +1600,7 @@ function ChatScreen({
     const text = draft.trim();
     setDraft("");
     const pendingAttachmentIds = attachments.map(a => a.id);
-    setAttachments([]);
+    clearAttachments();
     setMessages(prev => [
       ...prev,
       { role: "user", content: text, status: "complete" },
@@ -1730,7 +1822,7 @@ function ChatScreen({
 
     try {
       const pendingAttachmentIds = attachments.map(a => a.id);
-      setAttachments([]);
+      clearAttachments();
       const resp = await apiFetch("/chat/message", {
         method: "POST",
         headers: { Accept: "text/event-stream" },
@@ -1848,7 +1940,7 @@ function ChatScreen({
           <EmptyChatState persona={activePersona} onSubmit={q => { setDraft(q); setTimeout(() => void sendMessage(), 0); }} />
         ) : (
           <div className="flex-1 overflow-y-auto px-6 py-10">
-            <div className="max-w-[780px] mx-auto space-y-10">
+            <div className="max-w-[1120px] mx-auto space-y-8">
               {messages.map((m, i) => (
                 m.role === "user"
                   ? <UserMessage key={m.id ?? `user-${i}`} message={m} conversationId={activeConvoId ?? ""} onRefresh={() => { if (activeConvoId) void loadMessagesFromServer(activeConvoId); }} onBranch={(newConvoId) => { onConvoCreated(newConvoId); }}/>
@@ -1875,7 +1967,7 @@ function ChatScreen({
 
         {/* Composer */}
         <div className="px-6 pb-6 pt-2" style={{ background: "var(--bg)" }}>
-          <div className="max-w-[780px] mx-auto">
+          <div className="max-w-[1120px] mx-auto">
             <input
               ref={fileInputRef}
               type="file"
@@ -1885,12 +1977,32 @@ function ChatScreen({
             />
             <div className="composer-shell">
               {attachments.length > 0 && (
-                <div className="flex flex-wrap gap-2 px-4 pt-3 pb-1">
+                <div className="flex gap-2 overflow-x-auto px-4 pt-3 pb-2">
                   {attachments.map(a => (
-                    <span key={a.id} className="surface border border-soft rounded-md px-2 py-1 text-[12px] flex items-center gap-1">
-                      {a.name}
-                      <button aria-label={`Remove ${a.name}`} onClick={() => setAttachments(prev => prev.filter(x => x.id !== a.id))}>×</button>
-                    </span>
+                    <div
+                      key={a.id}
+                      className="relative flex h-[72px] min-w-[168px] max-w-[220px] items-center gap-2 rounded-md border border-soft surface px-2 py-2"
+                    >
+                      <div className="flex h-12 w-12 flex-shrink-0 items-center justify-center overflow-hidden rounded-md border border-soft" style={{ background: "var(--surface-2)" }}>
+                        {a.previewUrl ? (
+                          <img src={a.previewUrl} alt="" className="h-full w-full object-cover" />
+                        ) : (
+                          <IC.Audit size={20} style={{ color: "var(--text-dim)" }} />
+                        )}
+                      </div>
+                      <div className="min-w-0 flex-1 pr-5">
+                        <div className="truncate text-[12.5px] font-medium" style={{ color: "var(--text)" }}>{a.name}</div>
+                        <div className="mt-0.5 text-[11px]" style={{ color: "var(--text-dim)" }}>{formatFileSize(a.size)}</div>
+                      </div>
+                      <button
+                        type="button"
+                        aria-label={`Remove ${a.name}`}
+                        onClick={() => removeAttachment(a.id)}
+                        className="absolute right-1.5 top-1.5 flex h-5 w-5 items-center justify-center rounded-full smooth hover:bg-[var(--surface-3)]"
+                      >
+                        <IC.X size={12} />
+                      </button>
+                    </div>
                   ))}
                 </div>
               )}
@@ -1921,8 +2033,9 @@ function ChatScreen({
                     disabled={streaming || !!modelsLoadError || chatModels.length === 0}
                     className="surface border border-soft rounded-md px-2 py-1.5 text-[12.5px] outline-none disabled:opacity-60 w-[300px] max-w-[42vw]"
                     data-selected-model={chatModels.find(model => model.id === selectedModel)?.model ?? selectedModel}
+                    data-selected-model-status={chatModels.find(model => model.id === selectedModel)?.status ?? "unknown"}
                     style={{ color: "var(--text)" }}
-                    title={modelsLoadError || chatModels.find(model => model.id === selectedModel)?.model || selectedModel}
+                    title={modelsLoadError || modelOptionTitle(chatModels.find(model => model.id === selectedModel) ?? { id: selectedModel, label: selectedModel, model: selectedModel })}
                   >
                     {(modelsLoadError
                       ? [{ id: "unavailable", label: "Models unavailable", model: "" }]
@@ -1938,13 +2051,18 @@ function ChatScreen({
                     id="chat-mode-select"
                     aria-label="Mode"
                     value={selectedMode}
-                    onChange={event => setSelectedMode(event.target.value)}
-                    disabled={streaming}
+                    onChange={event => {
+                      setSelectedMode(event.target.value);
+                      window.localStorage.setItem(MODE_STORAGE_KEY, event.target.value);
+                    }}
+                    disabled={streaming || !!modesLoadError || chatModes.length === 0}
                     className="surface border border-soft rounded-md px-2 py-1.5 text-[12.5px] outline-none disabled:opacity-60"
+                    data-selected-mode-status={chatModes.find(mode => mode.id === selectedMode)?.status ?? "unknown"}
+                    title={modesLoadError || modeOptionTitle(chatModes.find(mode => mode.id === selectedMode) ?? { id: selectedMode, label: selectedMode })}
                     style={{ color: "var(--text)" }}
                   >
-                    {CHAT_MODES.map(m => (
-                      <option key={m.id} value={m.id}>{m.label}</option>
+                    {(modesLoadError ? [{ id: "default", label: "Modes unavailable", status: "unavailable" }] : chatModes).map(m => (
+                      <option key={m.id} value={m.id}>{m.status && m.status !== "available" ? `${m.label} (${m.status})` : m.label}</option>
                     ))}
                   </select>
                 </div>
@@ -2181,7 +2299,7 @@ function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: Mes
     if (!mid || isBusy("convert-task")) return;
     startAction("convert-task");
     try {
-      const res = await apiFetch(`/chat/conversations/${conversationId}/messages/${mid}/convert-task`, {
+      const res = await apiFetch(`/chat/conversations/${conversationId}/messages/${mid}/convert-to-task`, {
         method: "POST",
         body: JSON.stringify({}),
       });
@@ -2189,6 +2307,51 @@ function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: Mes
       showToast(`Task created: ${data.task_id.slice(0, 8)}…`);
     } catch { showToast("Failed"); }
     finally { endAction("convert-task"); }
+    setOpen(false);
+  }
+
+  async function handleConvertWorkflow() {
+    if (!mid || isBusy("convert-workflow")) return;
+    startAction("convert-workflow");
+    try {
+      const res = await apiFetch(`/chat/conversations/${conversationId}/messages/${mid}/convert-to-workflow`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      const data = await res.json() as { workflow_id: string };
+      showToast(`Workflow created: ${data.workflow_id.slice(0, 8)}…`);
+    } catch { showToast("Failed"); }
+    finally { endAction("convert-workflow"); }
+    setOpen(false);
+  }
+
+  async function handleRegenerate() {
+    if (!mid || isBusy("regenerate")) return;
+    startAction("regenerate");
+    try {
+      await apiFetch(`/chat/conversations/${conversationId}/messages/${mid}/regenerate`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      onRefresh();
+      showToast("Regenerated");
+    } catch { showToast("Regenerate failed"); }
+    finally { endAction("regenerate"); }
+    setOpen(false);
+  }
+
+  async function handleRetryFromHere() {
+    if (!mid || isBusy("retry-from-here")) return;
+    startAction("retry-from-here");
+    try {
+      await apiFetch(`/chat/conversations/${conversationId}/messages/${mid}/retry-from-here`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      onRefresh();
+      showToast("Retried from here");
+    } catch { showToast("Retry failed"); }
+    finally { endAction("retry-from-here"); }
     setOpen(false);
   }
 
@@ -2273,6 +2436,14 @@ function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: Mes
               <IC.Pencil size={13}/>Edit
             </button>
           )}
+          {message.role === "assistant" && (
+            <button role="menuitem" onClick={handleRegenerate} disabled={isBusy("regenerate")} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5 disabled:opacity-50" style={{ color: "var(--text)" }}>
+              <IC.Refresh size={13}/>Regenerate
+            </button>
+          )}
+          <button role="menuitem" onClick={handleRetryFromHere} disabled={isBusy("retry-from-here")} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5 disabled:opacity-50" style={{ color: "var(--text)" }}>
+            <IC.Refresh size={13}/>Retry from here
+          </button>
           <button role="menuitem" onClick={handleBranch} disabled={isBusy("branch")} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5 disabled:opacity-50" style={{ color: "var(--text)" }}>
             <IC.ArrowRight size={13}/>Branch here
           </button>
@@ -2281,6 +2452,9 @@ function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: Mes
           </button>
           <button role="menuitem" onClick={handleConvertTask} disabled={isBusy("convert-task")} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5 disabled:opacity-50" style={{ color: "var(--text)" }}>
             <IC.Briefcase size={13}/>Convert to task
+          </button>
+          <button role="menuitem" onClick={handleConvertWorkflow} disabled={isBusy("convert-workflow")} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5 disabled:opacity-50" style={{ color: "var(--text)" }}>
+            <IC.Refresh size={13}/>Convert to workflow
           </button>
           <div className="mx-2 my-1 border-t" style={{ borderColor: "var(--border-soft)" }}/>
           <button role="menuitem" onClick={handleExport} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5" style={{ color: "var(--text-dim)" }}>
@@ -2298,18 +2472,15 @@ type MsgProps = { message: Message; conversationId: string; onRefresh: () => voi
 
 function UserMessage({ message, conversationId, onRefresh, onBranch }: MsgProps) {
   return (
-    <div className="flex gap-4 fadein group">
-      <div className="avatar-u">A</div>
-      <div className="flex-1 min-w-0 pt-0.5">
-        <div className="flex items-baseline gap-2 mb-1.5">
-          <span className="text-[14px] font-semibold">You</span>
-          {message.pinned && <IC.Lock size={12} style={{ color: "var(--accent)" }}/>}
-          {/* Fix 7: rely on Tailwind group-hover + focus-within instead of JS state */}
-          <div className="ml-auto transition-opacity opacity-0 group-hover:opacity-100 focus-within:opacity-100">
-            <MessageActionMenu message={message} conversationId={conversationId} onRefresh={onRefresh} onBranch={onBranch}/>
-          </div>
+    <div className="flex justify-end fadein group">
+      <div className="max-w-[72%] min-w-0">
+        <div className="rounded-xl px-4 py-3 text-[15px] leading-relaxed" style={{ background: "var(--surface-2)", color: "var(--text)" }}>
+          {message.content}
         </div>
-        <div className="prose-body" style={{ color: "var(--text)" }}>{message.content}</div>
+        <div className="mt-1.5 flex justify-end transition-opacity opacity-0 group-hover:opacity-100 focus-within:opacity-100">
+          {message.pinned && <IC.Lock size={12} style={{ color: "var(--accent)" }}/>}
+          <MessageActionMenu message={message} conversationId={conversationId} onRefresh={onRefresh} onBranch={onBranch}/>
+        </div>
       </div>
     </div>
   );
@@ -2647,6 +2818,78 @@ function InlineTaskApprovals({
   );
 }
 
+function ToolActivityLine({
+  traces,
+  reasoning,
+  streaming,
+}: {
+  traces?: ToolTrace[];
+  reasoning?: ReasoningSummary[];
+  streaming: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const visibleTraces = traces ?? [];
+  const visibleReasoning = reasoning ?? [];
+  if (!visibleTraces.length && !visibleReasoning.length) return null;
+
+  const running = visibleTraces.some(trace => trace.status === "streaming") ||
+    visibleReasoning.some(item => item.status === "streaming");
+  const errors = visibleTraces.filter(trace => trace.status === "error").length;
+  const latestTrace = [...visibleTraces].reverse().find(trace => trace.status === "streaming") ?? visibleTraces[visibleTraces.length - 1];
+  const latestReasoning = visibleReasoning[visibleReasoning.length - 1];
+  const latestText = latestTrace?.summary || latestReasoning?.summary || "";
+  const label = running || streaming ? "Ran a command, used a tool" : errors ? `${errors} tool issue${errors === 1 ? "" : "s"}` : "Used tools";
+  const countParts = [
+    visibleTraces.length ? `${visibleTraces.length} tool${visibleTraces.length === 1 ? "" : "s"}` : "",
+    visibleReasoning.length ? `${visibleReasoning.length} reasoning update${visibleReasoning.length === 1 ? "" : "s"}` : "",
+  ].filter(Boolean).join(" · ");
+
+  return (
+    <div className="mt-3 text-[13px]" style={{ color: "var(--text-dim)" }}>
+      <button
+        type="button"
+        onClick={() => setOpen(value => !value)}
+        className="flex min-w-0 max-w-full items-center gap-2 rounded-md px-0 py-0.5 text-left smooth hover:text-[var(--text-muted)]"
+        style={{ color: "var(--text-dim)" }}
+      >
+        <Dot color={errors ? "var(--danger)" : running ? "var(--accent)" : "var(--text-faint)"} size={5} pulse={running} ring={running} />
+        <span className="font-medium">{label}</span>
+        {countParts && <span>{countParts}</span>}
+        {latestText && (
+          <>
+            <span aria-hidden="true">·</span>
+            <span className="truncate">{latestText.replace(/\s+/g, " ")}</span>
+          </>
+        )}
+        <IC.ChevronDown size={12} style={{ transform: open ? "rotate(180deg)" : undefined, transition: "transform .15s", flexShrink: 0 }} />
+      </button>
+      {open && (
+        <div className="mt-2 rounded-lg px-3 py-2.5 space-y-2" style={{ background: "var(--surface-2)" }}>
+          {visibleReasoning.map(item => (
+            <div key={item.id} className="min-w-0">
+              <div className="text-[13px]" style={{ color: "var(--text-muted)" }}>
+                {item.iteration ? `Reasoning ${item.iteration}` : "Reasoning"}
+              </div>
+              <div className="mt-0.5 whitespace-pre-wrap text-[12.5px] leading-relaxed" style={{ color: "var(--text-dim)" }}>{item.summary}</div>
+            </div>
+          ))}
+          {visibleTraces.map(trace => (
+            <div key={trace.id} className="flex min-w-0 items-baseline gap-2">
+              <span className="shrink-0 font-mono text-[12px]" style={{ color: "var(--text-muted)" }}>
+                {trace.status === "streaming" ? "Running" : trace.status === "error" ? "Failed" : "Ran"}
+              </span>
+              <span className="shrink-0 font-mono text-[12px]" style={{ color: "var(--text-dim)" }}>
+                {trace.tool.replace(/[_]/g, ".").replace(/\./g, " › ")}
+              </span>
+              <span className="min-w-0 truncate text-[12.5px]" style={{ color: "var(--text-dim)" }}>{trace.summary}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function AssistantMessage({ message, content, status, persona, toolTraces, reasoningSummaries, artifacts, thinking, mode, structuredResponse, conversationId, onRefresh, onBranch }: { message: Message; content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[]; reasoningSummaries?: ReasoningSummary[]; artifacts?: ArtifactRef[]; thinking?: boolean; mode?: string; structuredResponse?: StructuredResponse | null; conversationId: string; onRefresh: () => void; onBranch: (id: string) => void }) {
   const hasTraces = !!(toolTraces && toolTraces.length > 0);
   const hasReasoning = !!(reasoningSummaries && reasoningSummaries.length > 0);
@@ -2656,11 +2899,12 @@ function AssistantMessage({ message, content, status, persona, toolTraces, reaso
   const showCards = !!sr && !isStreaming &&
     (sr.response_type === "task_complete" || sr.status !== "complete");
   return (
-    <div className="flex gap-4 fadein group">
-      <PersonaAvatar name={persona.name} color={persona.color} size={28}/>
-      <div className="flex-1 min-w-0 pt-0.5">
-        <div className="flex items-baseline gap-2 mb-1.5">
-          <span className="text-[14px] font-semibold">{persona.name}</span>
+    <div className="fadein group">
+      <div className="max-w-[920px] min-w-0">
+        <div className="mb-1.5 flex items-baseline gap-2">
+          {(mode && mode !== "default") || status === "error" || message.pinned ? (
+            <span className="sr-only">{persona.name}</span>
+          ) : null}
           {mode && mode !== "default" && <Tag variant="info">{mode}</Tag>}
           {status === "error" && <Tag variant="danger">Error</Tag>}
           {message.pinned && <IC.Lock size={12} style={{ color: "var(--accent)" }}/>}
@@ -2673,17 +2917,6 @@ function AssistantMessage({ message, content, status, persona, toolTraces, reaso
         </div>
 
         {showCards && <StatusBanner sr={sr!} />}
-
-        {hasReasoning && (
-          <ReasoningPanel summaries={reasoningSummaries!} streaming={isStreaming} />
-        )}
-
-        {/* Inline tool traces — like Claude's tool use steps */}
-        {hasTraces && (
-          <div className="mb-3 space-y-1.5">
-            {toolTraces!.map(trace => <TraceRow key={trace.id} trace={trace} />)}
-          </div>
-        )}
 
         {/* Thinking indicator — shown during the (non-streaming) model call */}
         {isStreaming && thinking && !content && (
@@ -2703,6 +2936,8 @@ function AssistantMessage({ message, content, status, persona, toolTraces, reaso
               : isStreaming && <span className="caret ml-0.5" style={{ borderLeft: "2px solid var(--text)" }}>&nbsp;</span>}
           </div>
         )}
+
+        {(hasTraces || hasReasoning) && <ToolActivityLine traces={toolTraces} reasoning={reasoningSummaries} streaming={isStreaming} />}
 
         {/* Artifacts — openable / downloadable files Chronos produced */}
         {artifacts && artifacts.length > 0 && (

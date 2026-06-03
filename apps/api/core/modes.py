@@ -5,6 +5,8 @@ All entry points that accept a user-supplied ``mode`` value should call
 the logic in one place means every code path (chat messages, task records,
 …) applies identical validation rules.
 """
+from __future__ import annotations
+
 import logging
 
 logger = logging.getLogger(__name__)
@@ -13,6 +15,86 @@ ALLOWED_MODES: frozenset[str] = frozenset({
     "default", "research", "agent", "browser", "computer",
     "data", "image", "voice", "coding",
 })
+
+_MODE_METADATA: tuple[dict, ...] = (
+    {
+        "id": "default",
+        "label": "Default",
+        "description": "General assistant chat with automatic task routing when needed.",
+        "capabilities": ["chat", "memory", "artifacts"],
+        "status": "available",
+        "creates_task": False,
+    },
+    {
+        "id": "research",
+        "label": "Research",
+        "description": "Plans a source-gathering task and returns grounded findings.",
+        "capabilities": ["web_search", "source_review", "citations"],
+        "status": "foundation",
+        "creates_task": True,
+    },
+    {
+        "id": "agent",
+        "label": "Agent",
+        "description": "Runs the governed native tool loop for multi-step work.",
+        "capabilities": ["tool_use", "approvals", "activity_trace"],
+        "status": "available",
+        "creates_task": True,
+    },
+    {
+        "id": "browser",
+        "label": "Browser",
+        "description": "Uses browser search and fetch tools; full browser operation is not yet available.",
+        "capabilities": ["web_search", "fetch", "screenshots"],
+        "status": "foundation",
+        "creates_task": True,
+    },
+    {
+        "id": "computer",
+        "label": "Computer",
+        "description": "Reserved for sandboxed computer sessions when that runtime ships.",
+        "capabilities": [],
+        "status": "unavailable",
+        "creates_task": True,
+    },
+    {
+        "id": "data",
+        "label": "Data",
+        "description": "Uses code tools for data questions; a full data workspace is still pending.",
+        "capabilities": ["code_python", "artifacts"],
+        "status": "foundation",
+        "creates_task": True,
+    },
+    {
+        "id": "image",
+        "label": "Image",
+        "description": "Reserved for image understanding and generation workflows.",
+        "capabilities": [],
+        "status": "unavailable",
+        "creates_task": False,
+    },
+    {
+        "id": "voice",
+        "label": "Voice",
+        "description": "Reserved for speech-to-text and text-to-speech workflows.",
+        "capabilities": [],
+        "status": "unavailable",
+        "creates_task": False,
+    },
+    {
+        "id": "coding",
+        "label": "Coding",
+        "description": "Uses code-oriented context and tools; repo workspaces are still pending.",
+        "capabilities": ["code_python", "artifacts"],
+        "status": "foundation",
+        "creates_task": True,
+    },
+)
+
+
+def available_modes() -> list[dict]:
+    """Return product-facing metadata for all composer modes."""
+    return [dict(mode) for mode in _MODE_METADATA]
 
 
 def normalize_mode(value: str | None) -> str:

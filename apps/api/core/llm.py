@@ -40,25 +40,48 @@ async def _with_retry(coro_factory, *, max_retries: int = _MAX_RETRIES) -> Any:
     raise last_exc  # type: ignore[misc]
 
 
-def available_chat_models() -> list[dict[str, str]]:
+def _model_status(*, configured: bool, preferred_live: bool = False) -> str:
+    if configured and preferred_live:
+        return "available"
+    if configured:
+        return "degraded"
+    return "unconfigured"
+
+
+def available_chat_models() -> list[dict[str, Any]]:
     models = [
         {
             "id": "agent",
             "label": "Primary",
             "model": settings.agent_model,
             "description": "Use the configured primary agent model.",
+            "capabilities": ["chat", "tool_use", "agent_loop", "structured_json"],
+            "status": _model_status(configured=bool(settings.agent_model), preferred_live=bool(settings.openrouter_api_key)),
+            "tool_use": True,
+            "fallback_for": ["auto", "fast", "local"],
+            "policy": "Allowed for chat, task routing, and governed tool use.",
         },
         {
             "id": "auto",
             "label": "Auto",
             "model": settings.agent_model,
             "description": "Use the configured primary agent model automatically.",
+            "capabilities": ["chat", "fallback", "provider_failover"],
+            "status": _model_status(configured=bool(settings.agent_model), preferred_live=bool(settings.openrouter_api_key or settings.backup_api_key)),
+            "tool_use": True,
+            "fallback_for": [],
+            "policy": "Selects the best configured model and reports provider failures honestly.",
         },
         {
             "id": "local",
             "label": "Local",
             "model": settings.local_llm_model,
             "description": "Use the configured local model.",
+            "capabilities": ["chat", "private_runtime"],
+            "status": _model_status(configured=bool(settings.local_llm_model), preferred_live=False),
+            "tool_use": False,
+            "fallback_for": [],
+            "policy": "Local endpoint only; provider availability depends on the configured local server.",
         },
     ]
     if settings.openrouter_api_key:
@@ -68,6 +91,11 @@ def available_chat_models() -> list[dict[str, str]]:
                 "label": "OpenRouter",
                 "model": settings.openrouter_model,
                 "description": "Use the configured OpenRouter chat model.",
+                "capabilities": ["chat", "fallback", "structured_json"],
+                "status": _model_status(configured=bool(settings.openrouter_model), preferred_live=True),
+                "tool_use": False,
+                "fallback_for": ["auto", "agent", "fast"],
+                "policy": "External provider; governed by configured OpenRouter API key.",
             }
         )
     elif settings.backup_api_key:
@@ -77,6 +105,11 @@ def available_chat_models() -> list[dict[str, str]]:
                 "label": "Backup",
                 "model": settings.backup_model,
                 "description": "Use the configured backup model.",
+                "capabilities": ["chat", "fallback"],
+                "status": _model_status(configured=bool(settings.backup_model), preferred_live=True),
+                "tool_use": False,
+                "fallback_for": ["auto", "agent", "fast"],
+                "policy": "External backup provider used when primary provider is unavailable.",
             }
         )
     models.append(
@@ -85,6 +118,11 @@ def available_chat_models() -> list[dict[str, str]]:
             "label": "Fast",
             "model": settings.fast_model,
             "description": "Use the configured fast model.",
+            "capabilities": ["chat", "classification", "summarization"],
+            "status": _model_status(configured=bool(settings.fast_model), preferred_live=bool(settings.openrouter_api_key or settings.backup_api_key)),
+            "tool_use": False,
+            "fallback_for": ["agent", "auto"],
+            "policy": "Optimized for low-latency chat and classification; not used for risky writes directly.",
         }
     )
     return models

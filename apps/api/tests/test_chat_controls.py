@@ -14,6 +14,44 @@ def _make_member(member_id="member-1", org_id="default"):
     return Member(id=member_id, organization_id=org_id, email="test@example.com", role="user")
 
 
+def test_retry_payload_for_user_message_uses_prior_context_only():
+    from routers.chat import _retry_payload_for_message
+
+    rows = [
+        {"id": "u1", "role": "user", "content": "first"},
+        {"id": "a1", "role": "assistant", "content": "first answer"},
+        {"id": "u2", "role": "user", "content": "try again"},
+        {"id": "a2", "role": "assistant", "content": "second answer"},
+    ]
+
+    payload = _retry_payload_for_message(rows, "u2")
+
+    assert payload["message"] == "try again"
+    assert payload["context_messages"] == [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "first answer"},
+    ]
+
+
+def test_retry_payload_for_assistant_message_regenerates_previous_user_turn():
+    from routers.chat import _retry_payload_for_message
+
+    rows = [
+        {"id": "u1", "role": "user", "content": "first"},
+        {"id": "a1", "role": "assistant", "content": "first answer"},
+        {"id": "u2", "role": "user", "content": "regenerate this"},
+        {"id": "a2", "role": "assistant", "content": "stale answer"},
+    ]
+
+    payload = _retry_payload_for_message(rows, "a2")
+
+    assert payload["message"] == "regenerate this"
+    assert payload["context_messages"] == [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "first answer"},
+    ]
+
+
 def _fake_engine_factory(rows_by_call=None, returning_scalar=None):
     """Build a fake async SQLAlchemy engine.
 

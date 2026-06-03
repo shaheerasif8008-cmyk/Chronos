@@ -86,6 +86,32 @@ def test_available_chat_models_include_configured_options(monkeypatch):
     assert llm.normalize_chat_model("does-not-exist") == "agent"
 
 
+def test_available_chat_models_expose_capabilities_status_and_policy(monkeypatch):
+    from core import llm
+
+    monkeypatch.setattr(llm.settings, "local_llm_model", "llama3")
+    monkeypatch.setattr(llm.settings, "local_llm_base_url", "http://localhost:11434/v1")
+    monkeypatch.setattr(llm.settings, "openrouter_api_key", "")
+    monkeypatch.setattr(llm.settings, "backup_api_key", "")
+    monkeypatch.setattr(llm.settings, "agent_model", "openrouter/example/agent")
+    monkeypatch.setattr(llm.settings, "fast_model", "openrouter/example/fast")
+
+    models = llm.available_chat_models()
+
+    assert models
+    for model in models:
+        assert isinstance(model["capabilities"], list)
+        assert model["status"] in {"available", "degraded", "unconfigured"}
+        assert "tool_use" in model
+        assert "fallback_for" in model
+        assert "policy" in model
+
+    by_id = {model["id"]: model for model in models}
+    assert by_id["agent"]["tool_use"] is True
+    assert "agent" in by_id["fast"]["fallback_for"]
+    assert by_id["local"]["status"] == "degraded"
+
+
 @pytest.mark.asyncio
 async def test_stream_chat_completion_reports_provider_unavailable(monkeypatch):
     from core import llm

@@ -8,6 +8,7 @@
   --bg-deep: oklch(0.975 0.007 75);
   --surface: oklch(1 0 0);
   --surface-2: oklch(0.965 0.006 75);
+  --surface-3: oklch(0.94 0.008 75);
   --surface-hi: oklch(0.945 0.008 75);
   --border: oklch(0.88 0.008 75);
   --border-soft: oklch(0.93 0.006 75);
@@ -36,6 +37,7 @@ html.dark {
   --bg-deep: oklch(0.17 0.008 60);
   --surface: oklch(0.23 0.008 60);
   --surface-2: oklch(0.27 0.008 60);
+  --surface-3: oklch(0.31 0.009 60);
   --surface-hi: oklch(0.31 0.009 60);
   --border: oklch(0.36 0.010 60);
   --border-soft: oklch(0.31 0.009 60);
@@ -423,7 +425,7 @@ textarea {
 
 /* ── Prose (message body) ── */
 .prose-body {
-  font-size: 15px;
+  font-size: 16px;
   letter-spacing: -0.005em;
   line-height: 1.65;
 }

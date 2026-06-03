@@ -26,6 +26,12 @@ type AuthConfig = {
   };
 };
 
+const FALLBACK_DEV_AUTH_CONFIG: AuthConfig = {
+  provider: "dev_otp",
+  devOtp: true,
+  cognito: { enabled: false },
+};
+
 export default function LoginPage() {
   const router = useRouter();
   const [email, setEmail] = useState("admin@example.com");
@@ -41,7 +47,7 @@ export default function LoginPage() {
       .catch((err) => {
         console.error("Auth config fetch failed:", err);
         setError("Connection failed: Ensure the API is running on the correct port.");
-        setAuthConfig({ provider: "error", devOtp: false, cognito: { enabled: false } });
+        setAuthConfig(FALLBACK_DEV_AUTH_CONFIG);
       });
   }, []);
 

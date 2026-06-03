@@ -48,6 +48,27 @@ def test_normalize_mode_trims_whitespace():
     assert normalize_mode(" agent ") == "agent"
 
 
+def test_available_modes_expose_productized_metadata():
+    from core.modes import available_modes
+
+    modes = available_modes()
+
+    assert [mode["id"] for mode in modes] == [
+        "default", "research", "agent", "browser", "computer",
+        "data", "image", "voice", "coding",
+    ]
+    for mode in modes:
+        assert mode["status"] in {"available", "foundation", "unavailable"}
+        assert isinstance(mode["capabilities"], list)
+        assert mode["label"]
+        assert mode["description"]
+        assert "creates_task" in mode
+
+    by_id = {mode["id"]: mode for mode in modes}
+    assert by_id["research"]["creates_task"] is True
+    assert by_id["voice"]["status"] == "unavailable"
+
+
 # ── 2. create_task_record writes mode to tasks insert ─────────────────────────
 
 @pytest.mark.asyncio
