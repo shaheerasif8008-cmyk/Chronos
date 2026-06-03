@@ -77,6 +77,9 @@ def test_available_chat_models_include_configured_options(monkeypatch):
     models = llm.available_chat_models()
 
     assert [model["id"] for model in models] == ["agent", "auto", "local", "openrouter", "fast"]
+    by_id = {model["id"]: model for model in models}
+    assert by_id["auto"]["model"] == "openrouter/example/agent"
+    assert by_id["local"]["model"] == "llama3"
     assert llm.normalize_chat_model(None) == "agent"
     assert llm.normalize_chat_model("agent") == "agent"
     assert llm.normalize_chat_model("openrouter") == "openrouter"
@@ -855,6 +858,42 @@ async def test_assemble_context_loads_persona_skills_memories_and_task_state(mon
     assert "# Skill: sdr-outreach\nUse outbound research workflow." in system
     assert "# What I Remember\n- ACME uses HubSpot." in system
     assert "# Current Task\nGoal: draft outreach" in system
+
+
+@pytest.mark.asyncio
+async def test_assemble_context_deduplicates_current_saved_user_message(monkeypatch):
+    from core import context
+    from core.models import RequesterContext
+
+    async def fake_org_context(org_id):
+        return ""
+
+    async def fake_find_skills(message):
+        return []
+
+    async def fake_retrieve(message, requester_context):
+        return []
+
+    async def fake_compact_history(conversation_id, *, budget_tokens, verbatim_turns=6):
+        return [
+            {"role": "user", "content": "previous prompt"},
+            {"role": "assistant", "content": "previous answer"},
+            {"role": "user", "content": "what email did you search"},
+        ]
+
+    monkeypatch.setattr(context, "load_org_context", fake_org_context)
+    monkeypatch.setattr(context, "find_relevant_skills", fake_find_skills)
+    monkeypatch.setattr(context.memory, "retrieve", fake_retrieve)
+    monkeypatch.setattr(context, "_compact_history", fake_compact_history)
+
+    assembled = await context.assemble_context(
+        "conversation-1",
+        "what email did you search",
+        RequesterContext(member_id="member-1"),
+    )
+
+    user_messages = [msg["content"] for msg in assembled if msg["role"] == "user"]
+    assert user_messages == ["previous prompt", "what email did you search"]
 
 
 @pytest.mark.asyncio

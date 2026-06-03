@@ -33,7 +33,10 @@ sending, multi-step actions, or anything the assistant should execute.
 directly without doing work.
 
 Return ONLY JSON with exactly these keys:
-{{"mode": "task" | "chat", "goal": "<a concise goal statement if mode is task, else null>"}}
+{{"mode": "task" | "chat", "goal": "<a concise display title if mode is task, else null>"}}
+
+The "goal" field is UI metadata only. It must not be treated as the user's
+executable instruction and may not replace the original message.
 
 Message:
 {message}
@@ -57,7 +60,7 @@ async def classify_intent(message: str) -> dict:
 
     Returns a dict with:
     - ``mode``: "task" or "chat"
-    - ``goal``: extracted goal string if mode=="task", else None
+    - ``goal``: concise display title if mode=="task", else None
 
     Tries an LLM classification first; on any error or malformed output, falls
     back to a deterministic heuristic so routing always succeeds.

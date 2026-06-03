@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import insert, select, update
+from sqlalchemy import insert, select
 
 from core import permissions
 from core.activity_events import list_task_events
@@ -16,6 +17,7 @@ from core.config import settings
 from core.db import engine, reflect_table
 from core.models import Member
 from core.redis import redis_client
+from core.task_envelope import build_task_envelope
 from runtime import task_runner
 from runtime.executor import activity_channel
 
@@ -44,6 +46,9 @@ async def create_task_record(
     project_id: str | None = None,
     attachments_context: list[dict] | None = None,
     project_knowledge: str | None = None,
+    original_message: str | None = None,
+    router_decision: dict | None = None,
+    conversation_context: list[dict] | None = None,
 ) -> str:
     """Insert a task row. The native model action loop orchestrates by default.
 
@@ -56,8 +61,29 @@ async def create_task_record(
     resolved_model = resolve_agent_model(model)
     normalized_mode = normalize_mode(mode)
     tasks = await reflect_table("tasks")
+    raw_user_message = original_message if original_message is not None else goal
+    task_id = str(uuid.uuid4())
+    envelope = build_task_envelope(
+        task_id=task_id,
+        raw_user_message=raw_user_message,
+        ui_title=goal,
+        router_decision=router_decision,
+        conversation_context=conversation_context,
+        attachments=attachments_context,
+    )
+    agent_state: dict = {
+        "agent_history": [],
+        "iteration_count": 0,
+        "model": resolved_model,
+        "attachments": attachments_context or [],
+        "project_knowledge": project_knowledge or "",
+        "original_user_message": raw_user_message,
+        "task_envelope": envelope.model_dump(),
+    }
+
     async with engine.begin() as conn:
         insert_values: dict = dict(
+            id=task_id,
             organization_id=settings.org_id,
             region=settings.region,
             persona_id=persona_id,
@@ -67,7 +93,7 @@ async def create_task_record(
             status="queued",
             goal=goal,
             plan={},
-            agent_state={"agent_history": [], "iteration_count": 0, "model": resolved_model, "attachments": attachments_context or [], "project_knowledge": project_knowledge or ""},
+            agent_state=agent_state,
             current_step=0,
             result={},
             depth=0,
@@ -94,6 +120,8 @@ async def create_task(req: CreateTaskRequest, member: Member = Depends(get_curre
         model=req.model,
         mode=req.mode,
         project_id=req.project_id,
+        original_message=req.goal,
+        router_decision={"mode": "agent", "ui_title": req.goal},
     )
     await task_runner.enqueue_task(task_id)
     return {"task_id": task_id, "status": "queued"}

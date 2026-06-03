@@ -9,6 +9,7 @@ Tests:
 3. Fast-path send_message persists chosen mode on the assistant message.
 """
 import pytest
+from unittest.mock import AsyncMock
 
 
 # ── 1. normalize_mode unit ───────────────────────────────────────────────────
@@ -123,6 +124,9 @@ async def test_create_task_record_writes_mode(monkeypatch):
     assert insert_values.get("mode") == "research", (
         f"mode missing from task insert; got: {insert_values}"
     )
+    envelope = insert_values["agent_state"]["task_envelope"]
+    assert envelope["raw_user_message"] == "Test goal"
+    assert envelope["ui"]["title"] == "Test goal"
 
 
 @pytest.mark.asyncio
@@ -253,3 +257,119 @@ async def test_send_message_threads_mode_into_inline_turn(monkeypatch):
     assert captured.get("mode") == "coding", (
         f"Expected mode='coding' threaded into the inline turn, got: {captured}"
     )
+
+
+@pytest.mark.asyncio
+async def test_nontrivial_chat_uses_history_aware_inline_turn(monkeypatch):
+    """Non-trivial chat should not create a bare background task with empty history."""
+    from routers import chat
+    from core.models import Member
+
+    member = Member(
+        id="member-1",
+        organization_id="default",
+        email="admin@example.com",
+        role="admin",
+    )
+
+    captured: dict = {}
+
+    async def fake_stream_chat_turn(**kwargs):
+        captured["context_messages"] = kwargs.get("context_messages")
+        captured["message"] = kwargs.get("message")
+        yield {"type": "done"}
+
+    async def fake_agent_loop_stream(**kwargs):
+        raise AssertionError("ordinary chat should not use the bare task stream")
+        yield ""  # pragma: no cover
+
+    async def fake_permissions_check(*args, **kwargs):
+        return True
+
+    async def fake_create_conversation(member, title, **kwargs):
+        return "conv-new"
+
+    async def fake_save_message(*args, **kwargs):
+        return None
+
+    async def fake_assemble_context(conv_id, msg, ctx):
+        return [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "summarise my emails in the last 3 days"},
+            {"role": "assistant", "content": "No matching emails found."},
+            {"role": "user", "content": msg},
+        ]
+
+    monkeypatch.setattr(chat.permissions, "check", fake_permissions_check)
+    monkeypatch.setattr(chat, "_create_conversation", fake_create_conversation)
+    monkeypatch.setattr(chat, "_save_message", fake_save_message)
+    monkeypatch.setattr(chat, "assemble_context", fake_assemble_context)
+    monkeypatch.setattr(chat, "extract_explicit_memory_content", lambda msg: None)
+    monkeypatch.setattr(chat, "classify_intent", AsyncMock(return_value={"mode": "chat", "goal": None}))
+    monkeypatch.setattr(chat, "stream_chat_turn", fake_stream_chat_turn)
+    monkeypatch.setattr(chat, "_agent_loop_stream", fake_agent_loop_stream)
+
+    req = chat.ChatRequest(message="what email did you search")
+
+    response = await chat.send_message(req, member)
+    async for _ in response.body_iterator:
+        pass
+
+    assert captured["message"] == "what email did you search"
+    assert any(m["content"] == "summarise my emails in the last 3 days" for m in captured["context_messages"])
+
+
+@pytest.mark.asyncio
+async def test_task_route_preserves_original_message_for_execution(monkeypatch):
+    from routers import chat
+    from core.models import Member
+
+    member = Member(
+        id="member-1",
+        organization_id="default",
+        email="admin@example.com",
+        role="admin",
+    )
+    captured: dict = {}
+
+    async def fake_agent_loop_stream(**kwargs):
+        captured.update(kwargs)
+        yield "data: {\"type\":\"done\"}\n\n"
+
+    async def fake_permissions_check(*args, **kwargs):
+        return True
+
+    async def fake_create_conversation(member, title, **kwargs):
+        return "conv-new"
+
+    async def fake_save_message(*args, **kwargs):
+        return None
+
+    async def fake_assemble_context(conv_id, msg, ctx):
+        return [{"role": "system", "content": "sys"}, {"role": "user", "content": msg}]
+
+    original = (
+        "https://github.com/shaheerasif8008-cmyk/Chronos.git "
+        "this is my repo, run it and tell me about its strengths and weaknesses"
+    )
+
+    monkeypatch.setattr(chat.permissions, "check", fake_permissions_check)
+    monkeypatch.setattr(chat, "_create_conversation", fake_create_conversation)
+    monkeypatch.setattr(chat, "_save_message", fake_save_message)
+    monkeypatch.setattr(chat, "assemble_context", fake_assemble_context)
+    monkeypatch.setattr(chat, "extract_explicit_memory_content", lambda msg: None)
+    monkeypatch.setattr(chat, "classify_intent", AsyncMock(return_value={
+        "mode": "task",
+        "goal": "Run the provided GitHub repository and analyze its strengths and weaknesses",
+    }))
+    monkeypatch.setattr(chat, "_agent_loop_stream", fake_agent_loop_stream)
+
+    response = await chat.send_message(chat.ChatRequest(message=original), member)
+    async for _ in response.body_iterator:
+        pass
+
+    assert captured["goal"] == "Run the provided GitHub repository and analyze its strengths and weaknesses"
+    assert captured["original_message"] == original
+    assert captured["conversation_context"] == [{"role": "system", "content": "sys"}]
+    assert captured["router_decision"]["ui_title"] == "Run the provided GitHub repository and analyze its strengths and weaknesses"
+    assert captured["router_decision"]["metadata"]["classifier"]["goal"] == "Run the provided GitHub repository and analyze its strengths and weaknesses"

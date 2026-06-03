@@ -81,7 +81,10 @@ GMAIL_DRAFT = _fn(
 
 GMAIL_SEARCH = _fn(
     "gmail__search",
-    "Search emails in the connected Gmail account using Gmail query syntax.",
+    "Search emails in the connected Gmail account using Gmail query syntax. "
+    "Use this before answering any question about inbox contents, recent emails, "
+    "email summaries, senders, subjects, or whether an email exists. Ground the answer "
+    "only in returned threads/messages; if result_count is 0, say no matching emails were found.",
     {
         "query": {
             "type": "string",

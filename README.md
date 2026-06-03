@@ -26,6 +26,16 @@ Open `http://localhost:3000/chat`. If you are not signed in, the app redirects t
 
 Foundation proof path: after login, send `operator workflow proof: research leads, draft outreach, and request approval`. Chronos should create a task, use deterministic fixture leads, and stop with pending drafts in `/approvals` without live search or provider keys.
 
+### Gmail OAuth
+
+To connect Gmail locally, create or edit a Google OAuth client and add this exact Authorized redirect URI:
+
+```text
+http://localhost:8000/connectors/gmail/oauth-callback
+```
+
+Then set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `GOOGLE_REDIRECT_URI` in `.env`. The redirect URI in Google Cloud Console must exactly match `GOOGLE_REDIRECT_URI`, including protocol, host, port, and path.
+
 ## Structure
 
 ```text

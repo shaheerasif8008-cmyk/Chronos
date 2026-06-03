@@ -2,7 +2,6 @@
 
 import { Component, ReactNode, useEffect, useRef, useState, useMemo, useCallback } from "react";
 import { usePathname, useRouter } from "next/navigation";
-import Link from "next/link";
 import ArtifactsScreen from "../../components/artifacts/ArtifactsScreen";
 import InChatArtifactPanel from "../../components/artifacts/InChatArtifactPanel";
 
@@ -137,6 +136,7 @@ type TaskStreamEvent = {
   step?: TaskStep;
   step_index?: number;
   approval_ids?: string[];
+  approval_id?: string | null;
   step_id?: string;
   error?: string;
   result?: unknown;
@@ -174,8 +174,9 @@ type ActivityAction = {
 const MODEL_STORAGE_KEY = "chronos.chat.selectedModel";
 
 function modelOptionText(model: ChatModel) {
+  if (model.id === "unavailable") return model.label;
   if (model.model === model.id || model.model === model.label) return model.model;
-  return `${model.model} (${model.label})`;
+  return `${model.label}: ${model.model}`;
 }
 
 function taskSteps(task: Task | null | undefined): TaskStep[] {
@@ -715,7 +716,7 @@ function ChronosAppInner() {
   }, [pathname]);
 
   useEffect(() => {
-    if (route === "chat") void loadConversations();
+    void loadConversations();
   }, [route]);
 
   useEffect(() => {
@@ -796,7 +797,7 @@ function ChronosAppInner() {
       />
 
       <main className="flex-1 min-w-0 flex flex-col" style={{ background: "var(--bg)" }}>
-        {route === "chat"       && <ChatScreen activeConvoId={activeConvoId} activePersonaId={activePersonaId} onPersonaChange={setActivePersonaId} onConvoCreated={(id) => loadConversations(id)} paletteOpen={searchPaletteOpen} onPaletteOpenChange={setSearchPaletteOpen} />}
+        {route === "chat"       && <ChatScreen activeConvoId={activeConvoId} activePersonaId={activePersonaId} onPersonaChange={setActivePersonaId} onConvoCreated={(id) => loadConversations(id)} onApprovalsChanged={loadPendingApprovals} paletteOpen={searchPaletteOpen} onPaletteOpenChange={setSearchPaletteOpen} />}
         {route === "activity"   && <ActivityScreen />}
         {route === "approvals"  && <ApprovalsScreen onDecision={loadPendingApprovals} />}
         {route === "memory"     && <MemoryScreen />}
@@ -845,7 +846,6 @@ function Sidebar({
   const nav = [
     { id: "activity"   as Route, icon: <IC.Activity size={15}/>,   label: "Activity" },
     { id: "approvals"  as Route, icon: <IC.Approvals size={15}/>,  label: "Approvals",  badge: pendingApprovals || null, badgeKind: "warn" },
-    { id: "memory"     as Route, icon: <IC.Memory size={15}/>,     label: "Memory" },
     { id: "artifacts"  as Route, icon: <IC.Folder size={15}/>,     label: "Artifacts" },
     { id: "connectors" as Route, icon: <IC.Connectors size={15}/>, label: "Connectors" },
     { id: "assistants" as Route, icon: <IC.Personas size={15}/>,   label: "Assistants" },
@@ -854,7 +854,6 @@ function Sidebar({
     { id: "tasks"      as Route, icon: <IC.Check size={15}/>,      label: "Tasks" },
     { id: "agents"     as Route, icon: <IC.Sparkles size={15}/>,   label: "Agents" },
     { id: "workflows"  as Route, icon: <IC.Refresh size={15}/>,    label: "Workflows" },
-    { id: "audit"      as Route, icon: <IC.Audit size={15}/>,      label: "Audit",      settingsTab: "audit" as SettingsTab },
   ];
 
   // Group conversations by recency
@@ -888,11 +887,11 @@ function Sidebar({
         <div className="flex flex-col items-center gap-2 overflow-y-auto no-scrollbar w-full px-2">
           {nav.map(it => (
             <button key={it.id}
-                    onClick={() => it.settingsTab ? onOpenSettings(it.settingsTab) : onNavigate(it.id)}
+                    onClick={() => onNavigate(it.id)}
                     title={it.label}
                     className="btn btn-ghost btn-icon relative flex-shrink-0"
-                    style={{ background: (it.settingsTab ? route === "settings" && it.id === "audit" : route === it.id) ? "var(--surface-2)" : "transparent",
-                             color: (it.settingsTab ? route === "settings" && it.id === "audit" : route === it.id) ? "var(--text)" : "var(--text-muted)" }}>
+                    style={{ background: route === it.id ? "var(--surface-2)" : "transparent",
+                             color: route === it.id ? "var(--text)" : "var(--text-muted)" }}>
               {it.icon}
               {it.badge ? (
                 <span className="absolute -top-0.5 -right-0.5 min-w-[14px] h-[14px] px-1 rounded-full text-[9px] font-semibold flex items-center justify-center"
@@ -942,8 +941,8 @@ function Sidebar({
       <div className="px-3 pt-2 pb-1 space-y-0.5 overflow-y-auto no-scrollbar">
         {nav.map(it => (
           <button key={it.id}
-                  onClick={() => it.settingsTab ? onOpenSettings(it.settingsTab) : onNavigate(it.id)}
-                  className={`nav-item w-full ${it.settingsTab ? "" : route === it.id ? "active" : ""}`}>
+                  onClick={() => onNavigate(it.id)}
+                  className={`nav-item w-full ${route === it.id ? "active" : ""}`}>
             <span className="nav-icon flex-shrink-0">{it.icon}</span>
             <span className="flex-1 text-left">{it.label}</span>
             {it.badge ? (
@@ -1059,6 +1058,7 @@ function AccountMenu({ onClose, onSettings, onSignOut }: { onClose: () => void; 
         { label: "Profile",            icon: <IC.Personas size={14}/>, tab: "profile" as SettingsTab },
         { label: "General settings",   icon: <IC.Settings size={14}/>, tab: "general" as SettingsTab },
         { label: "Organization",       icon: <IC.Briefcase size={14}/>, tab: "organization" as SettingsTab },
+        { label: "Memory",             icon: <IC.Memory size={14}/>, tab: "memory-settings" as SettingsTab },
         { label: "Notifications",      icon: <IC.Bell size={14}/>, tab: "notifications" as SettingsTab },
         { label: "Audit log",          icon: <IC.Audit size={14}/>, tab: "audit" as SettingsTab },
       ].map(it => (
@@ -1097,6 +1097,7 @@ function ChatScreen({
   activePersonaId,
   onPersonaChange,
   onConvoCreated,
+  onApprovalsChanged,
   paletteOpen,
   onPaletteOpenChange,
 }: {
@@ -1104,6 +1105,7 @@ function ChatScreen({
   activePersonaId: string;
   onPersonaChange: (personaId: string) => void;
   onConvoCreated: (id: string) => void;
+  onApprovalsChanged: () => void;
   paletteOpen: boolean;
   onPaletteOpenChange: (open: boolean) => void;
 }) {
@@ -1111,6 +1113,7 @@ function ChatScreen({
   const [messages, setMessages] = useState<Message[]>([]);
   const [chatModels, setChatModels] = useState<ChatModel[]>([]);
   const [selectedModel, setSelectedModel] = useState("auto");
+  const [modelsLoadError, setModelsLoadError] = useState("");
   const [selectedMode, setSelectedMode] = useState<string>("default");
   const [streaming, setStreaming] = useState(false);
   const [activityOpen, setActivityOpen] = useState(false);
@@ -1120,21 +1123,25 @@ function ChatScreen({
   const [activeTaskStreamError, setActiveTaskStreamError] = useState("");
   const [attachments, setAttachments] = useState<{ id: string; name: string; size: number }[]>([]);
   const [personaMenuOpen, setPersonaMenuOpen] = useState(false);
-  const [responseVerbosity, setResponseVerbosity] = useState<"concise" | "detailed">("detailed");
   const abortRef = useRef<AbortController | null>(null);
   const streamingRef = useRef(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const isEmpty = !activeConvoId && messages.length === 0;
-
-  useEffect(() => {
-    apiFetch("/settings/")
-      .then(r => r.json())
-      .then((d: { sections?: { response_format?: { verbosity?: string } } }) => {
-        if (d.sections?.response_format?.verbosity === "concise") setResponseVerbosity("concise");
-      })
-      .catch(() => { /* default detailed */ });
-  }, []);
+  const inlineApprovalIds = useMemo(() => {
+    const ids = new Set<string>();
+    const decided = new Set<string>();
+    for (const event of activeTaskEvents) {
+      if (event.type === "awaiting_approval") {
+        for (const id of event.approval_ids ?? []) ids.add(id);
+      }
+      if ((event.type === "approval_decided" || event.type === "approval_rejected") && event.approval_id) {
+        decided.add(event.approval_id);
+      }
+    }
+    for (const id of decided) ids.delete(id);
+    return [...ids];
+  }, [activeTaskEvents]);
 
   // ── Command palette (⌘K) ──────────────────────────────────────────────────
   const router = useRouter();
@@ -1343,6 +1350,7 @@ function ChatScreen({
     apiFetch("/chat/models")
       .then(r => r.json())
       .then((data: ChatModel[]) => {
+        setModelsLoadError("");
         setChatModels(data);
         const preferred = data.find(model => model.id === "agent") ?? data.find(model => model.id === "openrouter") ?? data.find(model => model.id === "backup") ?? data.find(model => model.id === "fast") ?? data[0];
         const stored = window.localStorage.getItem(MODEL_STORAGE_KEY) || selectedModel;
@@ -1354,10 +1362,9 @@ function ChatScreen({
           window.localStorage.setItem(MODEL_STORAGE_KEY, nextModel);
         }
       })
-      .catch(() => {
-        setChatModels([{ id: "auto", label: "Auto", model: "auto", description: "Default model routing" }]);
-        setSelectedModel("auto");
-        window.localStorage.setItem(MODEL_STORAGE_KEY, "auto");
+      .catch((err) => {
+        setModelsLoadError(err instanceof Error ? err.message : "Unable to load models");
+        setChatModels([]);
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -1845,7 +1852,7 @@ function ChatScreen({
               {messages.map((m, i) => (
                 m.role === "user"
                   ? <UserMessage key={m.id ?? `user-${i}`} message={m} conversationId={activeConvoId ?? ""} onRefresh={() => { if (activeConvoId) void loadMessagesFromServer(activeConvoId); }} onBranch={(newConvoId) => { onConvoCreated(newConvoId); }}/>
-                  : <AssistantMessage key={m.id ?? `assistant-${i}`} message={m} content={m.content} conversationId={activeConvoId ?? ""} status={m.status ?? "complete"} persona={activePersona} toolTraces={m.tool_traces} reasoningSummaries={m.reasoning_summaries} artifacts={m.artifacts} thinking={m.thinking} mode={m.mode} structuredResponse={m.structured_response} verbosity={responseVerbosity} onRefresh={() => { if (activeConvoId) void loadMessagesFromServer(activeConvoId); }} onBranch={(newConvoId) => { onConvoCreated(newConvoId); }}/>
+                  : <AssistantMessage key={m.id ?? `assistant-${i}`} message={m} content={m.content} conversationId={activeConvoId ?? ""} status={m.status ?? "complete"} persona={activePersona} toolTraces={m.tool_traces} reasoningSummaries={m.reasoning_summaries} artifacts={m.artifacts} thinking={m.thinking} mode={m.mode} structuredResponse={m.structured_response} onRefresh={() => { if (activeConvoId) void loadMessagesFromServer(activeConvoId); }} onBranch={(newConvoId) => { onConvoCreated(newConvoId); }}/>
               ))}
               {streaming && messages[messages.length - 1]?.role !== "assistant" && (
                 <div className="flex gap-4">
@@ -1853,6 +1860,14 @@ function ChatScreen({
                   <div className="typing-wave mt-2"><span/><span/><span/></div>
                 </div>
               )}
+              <InlineTaskApprovals
+                approvalIds={inlineApprovalIds}
+                taskId={activeTaskId}
+                onChanged={() => {
+                  onApprovalsChanged();
+                  if (activeConvoId) void loadMessagesFromServer(activeConvoId, { preserveLocal: true });
+                }}
+              />
               <div ref={bottomRef}/>
             </div>
           </div>
@@ -1898,18 +1913,23 @@ function ChatScreen({
                   <select
                     id="chat-model-select"
                     aria-label="Model"
-                    value={selectedModel}
+                    value={modelsLoadError ? "unavailable" : selectedModel}
                     onChange={event => {
                       setSelectedModel(event.target.value);
                       window.localStorage.setItem(MODEL_STORAGE_KEY, event.target.value);
                     }}
-                    disabled={streaming}
+                    disabled={streaming || !!modelsLoadError || chatModels.length === 0}
                     className="surface border border-soft rounded-md px-2 py-1.5 text-[12.5px] outline-none disabled:opacity-60 w-[300px] max-w-[42vw]"
                     data-selected-model={chatModels.find(model => model.id === selectedModel)?.model ?? selectedModel}
                     style={{ color: "var(--text)" }}
-                    title={chatModels.find(model => model.id === selectedModel)?.model ?? selectedModel}
+                    title={modelsLoadError || chatModels.find(model => model.id === selectedModel)?.model || selectedModel}
                   >
-                    {(chatModels.length ? chatModels : [{ id: "auto", label: "Auto", model: "auto" }]).map(model => (
+                    {(modelsLoadError
+                      ? [{ id: "unavailable", label: "Models unavailable", model: "" }]
+                      : chatModels.length
+                      ? chatModels
+                      : [{ id: selectedModel, label: "Loading models", model: selectedModel }]
+                    ).map(model => (
                       <option key={model.id} value={model.id}>{modelOptionText(model)}</option>
                     ))}
                   </select>
@@ -2431,43 +2451,13 @@ const STATUS_LABEL: Record<string, string> = {
 };
 
 function StatusBanner({ sr }: { sr: StructuredResponse }) {
+  if (sr.status === "complete") return null;
   const variant = STATUS_VARIANT[sr.status] ?? "info";
   return (
     <div className="flex items-center gap-2 mb-2">
       <Tag variant={variant}>{STATUS_LABEL[sr.status] ?? sr.status}</Tag>
       {sr.approval_status === "drafted_not_sent" && <Tag variant="warn">Not sent</Tag>}
-      {sr.confidence && <Tag variant="info">{sr.confidence} confidence</Tag>}
-    </div>
-  );
-}
-
-function FindingsRisksCard({ sr }: { sr: StructuredResponse }) {
-  const findings = sr.key_findings ?? [];
-  const assumptions = sr.assumptions ?? [];
-  const risks = sr.risks ?? [];
-  if (!findings.length && !assumptions.length && !risks.length) return null;
-  return (
-    <div className="mt-3 surface border border-soft rounded-lg p-3 space-y-2 text-[13px]">
-      {findings.length > 0 && (
-        <div>
-          <div className="text-[11px] font-medium mb-1" style={{ color: "var(--text-dim)" }}>Key findings</div>
-          <ul className="list-disc pl-4 space-y-0.5">{findings.map((f, i) => <li key={i}>{f}</li>)}</ul>
-        </div>
-      )}
-      {assumptions.length > 0 && (
-        <div>
-          <div className="text-[11px] font-medium mb-1" style={{ color: "var(--text-dim)" }}>Assumptions</div>
-          <ul className="list-disc pl-4 space-y-0.5">{assumptions.map((a, i) => <li key={i}>{a}</li>)}</ul>
-        </div>
-      )}
-      {risks.length > 0 && (
-        <div>
-          <div className="text-[11px] font-medium mb-1" style={{ color: "var(--warn)" }}>Risks &amp; caveats</div>
-          <ul className="list-disc pl-4 space-y-0.5" style={{ color: "var(--text-muted)" }}>
-            {risks.map((r, i) => <li key={i}>{r}</li>)}
-          </ul>
-        </div>
-      )}
+      {sr.status !== "complete" && sr.confidence && <Tag variant="info">{sr.confidence} confidence</Tag>}
     </div>
   );
 }
@@ -2481,26 +2471,183 @@ function InlineApprovalCard({ sr }: { sr: StructuredResponse }) {
         <span className="font-medium">Approval required</span>
       </div>
       <div style={{ color: "var(--text-muted)" }}>
-        A draft is prepared but not sent. Review and approve it in the Approvals inbox.
+        A draft is prepared but not sent. Review and approve it in this chat when the approval request appears.
       </div>
-      <Link href="/approvals" className="inline-flex items-center gap-1 mt-2 text-[12.5px]" style={{ color: "var(--accent)" }}>
-        Open Approvals <IC.ArrowRight size={13} />
-      </Link>
     </div>
   );
 }
 
-function NextActionRow({ sr }: { sr: StructuredResponse }) {
-  if (!sr.next_action) return null;
+function InlineTaskApprovals({
+  approvalIds,
+  taskId,
+  onChanged,
+}: {
+  approvalIds: string[];
+  taskId: string | null;
+  onChanged: () => void;
+}) {
+  const [approvals, setApprovals] = useState<Approval[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [error, setError] = useState("");
+  const idsKey = approvalIds.join("|");
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadInlineApprovals() {
+      if (!approvalIds.length) {
+        setApprovals([]);
+        setError("");
+        return;
+      }
+      setLoading(true);
+      setError("");
+      try {
+        const rows = await Promise.all(
+          approvalIds.map(id => apiFetch(`/approvals/${id}`).then(r => r.json()) as Promise<Approval>),
+        );
+        if (!cancelled) setApprovals(rows);
+      } catch (exc) {
+        if (!cancelled) setError(exc instanceof Error ? exc.message : "Unable to load approval details");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+    void loadInlineApprovals();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [idsKey]);
+
+  const pending = approvals.filter(item => item.status === "pending");
+  if (!approvalIds.length && approvals.length === 0) return null;
+  if (!loading && pending.length === 0) return null;
+
+  async function decide(id: string, decision: "approved" | "rejected", batch = false) {
+    const key = batch ? `batch-${decision}` : id;
+    setBusyId(key);
+    setError("");
+    try {
+      await apiFetch(`/approvals/${id}/decide`, {
+        method: "POST",
+        body: JSON.stringify({ decision, batch }),
+      });
+      setApprovals(prev => batch
+        ? prev.map(item => item.status === "pending" ? { ...item, status: decision } : item)
+        : prev.map(item => item.id === id ? { ...item, status: decision } : item));
+      onChanged();
+    } catch (exc) {
+      setError(exc instanceof Error ? exc.message : "Unable to update approval");
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  const firstPending = pending[0];
+
   return (
-    <div className="mt-3 flex items-start gap-2 text-[13px]">
-      <IC.ArrowRight size={14} style={{ color: "var(--accent)", marginTop: 2 }} />
-      <span><span className="font-medium">Next: </span>{sr.next_action}</span>
+    <div className="flex gap-4 fadein">
+      <div className="w-7 h-7 rounded-full flex items-center justify-center flex-shrink-0"
+           style={{ background: "var(--warn-soft)", color: "var(--warn)" }}>
+        <IC.Approvals size={15}/>
+      </div>
+      <div className="flex-1 min-w-0">
+        <div className="surface border rounded-xl p-4" style={{ borderColor: "var(--warn)" }}>
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <div className="flex items-center gap-2 mb-1">
+                <Tag variant="warn">Approval required</Tag>
+                {taskId && <span className="text-[11.5px] font-mono" style={{ color: "var(--text-dim)" }}>task {taskId.slice(0, 8)}</span>}
+              </div>
+              <div className="text-[14px] font-medium">Review this action before Chronos continues</div>
+              <div className="text-[12.5px] mt-1" style={{ color: "var(--text-muted)" }}>
+                Chronos is paused until you approve or reject the pending action below.
+              </div>
+            </div>
+            {pending.length > 1 && firstPending && (
+              <div className="flex items-center gap-2 flex-shrink-0">
+                <button
+                  onClick={() => void decide(firstPending.id, "approved", true)}
+                  disabled={!!busyId}
+                  className="btn btn-ok-soft btn-sm disabled:opacity-50"
+                >
+                  <IC.Check size={13} stroke={2.2}/> {busyId === "batch-approved" ? "Approving..." : "Approve all"}
+                </button>
+                <button
+                  onClick={() => void decide(firstPending.id, "rejected", true)}
+                  disabled={!!busyId}
+                  className="btn btn-danger-soft btn-sm disabled:opacity-50"
+                >
+                  <IC.X size={13}/> {busyId === "batch-rejected" ? "Rejecting..." : "Reject all"}
+                </button>
+              </div>
+            )}
+          </div>
+
+          {loading && (
+            <div className="mt-4 text-[12.5px]" style={{ color: "var(--text-dim)" }}>Loading approval details...</div>
+          )}
+          {error && (
+            <div className="mt-4 rounded-lg border px-3 py-2 text-[12.5px]" style={{ borderColor: "var(--danger)", color: "var(--danger)" }}>
+              {error}
+            </div>
+          )}
+          {!loading && pending.length > 0 && (
+            <div className="mt-4 space-y-3">
+              {pending.map(approval => {
+                const payload = approval.action_payload ?? {};
+                const args = (payload.args || {}) as Record<string, unknown>;
+                const subject = String(args.subject ?? payload.subject ?? approval.action_type);
+                const recipient = String(args.to ?? payload.to ?? "");
+                const body = String(args.body ?? payload.body ?? "");
+                return (
+                  <div key={approval.id} className="rounded-lg border border-soft p-3" style={{ background: "var(--bg)" }}>
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="text-[13.5px] font-medium truncate">{subject}</div>
+                        <div className="mt-1 flex items-center gap-2 flex-wrap text-[12px]" style={{ color: "var(--text-dim)" }}>
+                          <Tag>{approval.action_type}</Tag>
+                          {recipient && <span>To {recipient}</span>}
+                          {approval.requested_at && <span>{labelTime(approval.requested_at)}</span>}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2 flex-shrink-0">
+                        <button
+                          onClick={() => void decide(approval.id, "approved")}
+                          disabled={!!busyId}
+                          className="btn btn-ok-soft btn-sm disabled:opacity-50"
+                        >
+                          <IC.Check size={13} stroke={2.2}/> {busyId === approval.id ? "Saving..." : "Approve"}
+                        </button>
+                        <button
+                          onClick={() => void decide(approval.id, "rejected")}
+                          disabled={!!busyId}
+                          className="btn btn-danger-soft btn-sm disabled:opacity-50"
+                        >
+                          <IC.X size={13}/> Reject
+                        </button>
+                      </div>
+                    </div>
+                    {body ? (
+                      <div className="mt-3 max-h-40 overflow-auto rounded-md px-3 py-2 text-[12.5px] whitespace-pre-wrap" style={{ background: "var(--surface-2)", color: "var(--text-muted)" }}>
+                        {body}
+                      </div>
+                    ) : (
+                      <pre className="mt-3 max-h-40 overflow-auto rounded-md px-3 py-2 text-[11.5px]" style={{ background: "var(--surface-2)", color: "var(--text-muted)" }}>
+                        {JSON.stringify(payload, null, 2)}
+                      </pre>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
 
-function AssistantMessage({ message, content, status, persona, toolTraces, reasoningSummaries, artifacts, thinking, mode, structuredResponse, verbosity, conversationId, onRefresh, onBranch }: { message: Message; content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[]; reasoningSummaries?: ReasoningSummary[]; artifacts?: ArtifactRef[]; thinking?: boolean; mode?: string; structuredResponse?: StructuredResponse | null; verbosity?: "concise" | "detailed"; conversationId: string; onRefresh: () => void; onBranch: (id: string) => void }) {
+function AssistantMessage({ message, content, status, persona, toolTraces, reasoningSummaries, artifacts, thinking, mode, structuredResponse, conversationId, onRefresh, onBranch }: { message: Message; content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[]; reasoningSummaries?: ReasoningSummary[]; artifacts?: ArtifactRef[]; thinking?: boolean; mode?: string; structuredResponse?: StructuredResponse | null; conversationId: string; onRefresh: () => void; onBranch: (id: string) => void }) {
   const hasTraces = !!(toolTraces && toolTraces.length > 0);
   const hasReasoning = !!(reasoningSummaries && reasoningSummaries.length > 0);
   const isStreaming = status === "streaming";
@@ -2564,9 +2711,7 @@ function AssistantMessage({ message, content, status, persona, toolTraces, reaso
           </div>
         )}
 
-        {showCards && verbosity !== "concise" && <FindingsRisksCard sr={sr!} />}
         {showCards && <InlineApprovalCard sr={sr!} />}
-        {showCards && <NextActionRow sr={sr!} />}
 
         {/* Sources — project knowledge citations grounding this answer */}
         {message.citations && message.citations.length > 0 && (
@@ -2701,7 +2846,7 @@ function ActivityDrawer({
                   <IC.Approvals size={14}/> Waiting for approval
                 </div>
                 <p className="mt-1 text-[12.5px] leading-relaxed" style={{ color: "var(--text-muted)" }}>
-                  {approvalEvent.approval_ids?.length ?? 0} drafts are waiting in Approvals.
+                  {approvalEvent.approval_ids?.length ?? 0} approval request(s) are waiting in chat.
                 </p>
               </div>
             ) : null}
@@ -3150,7 +3295,7 @@ function ActivityActionRow({ action, onTask }: { action: ActivityAction; onTask:
         </div>
         <div className="mt-2 flex items-center gap-2 flex-wrap">
           {action.task_id && <button onClick={onTask} className="btn btn-ghost btn-sm"><IC.Briefcase size={13}/> Task</button>}
-          {action.approval_id && <button onClick={() => { window.location.href = "/approvals"; }} className="btn btn-ghost btn-sm"><IC.Approvals size={13}/> Approval</button>}
+          {action.approval_id && <button onClick={action.task_id ? onTask : () => { window.location.href = "/chat"; }} className="btn btn-ghost btn-sm"><IC.Approvals size={13}/> Open in chat</button>}
           {action.artifact_id && <button onClick={() => void openArtifact()} className="btn btn-ghost btn-sm"><IC.Folder size={13}/> {action.artifact_title || "Artifact"}</button>}
         </div>
       </div>
@@ -3762,6 +3907,7 @@ function ConnectorsScreen() {
   const [connecting, setConnecting] = useState<string | null>(null);
   const [disconnecting, setDisconnecting] = useState<string | null>(null);
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
 
   async function load() {
     setLoading(true);
@@ -3777,6 +3923,21 @@ function ConnectorsScreen() {
 
   useEffect(() => { void load(); }, []);
 
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const params = new URLSearchParams(window.location.search);
+    const callbackError = params.get("connector_error") || params.get("error");
+    const callbackSuccess = params.get("connector_success");
+    if (callbackError) {
+      setError(callbackError);
+    } else if (callbackSuccess) {
+      setNotice(`${callbackSuccess.replaceAll("_", " ")} connected.`);
+    }
+    if (callbackError || callbackSuccess) {
+      window.history.replaceState({}, "", window.location.pathname);
+    }
+  }, []);
+
   async function connect(app: CatalogApp) {
     if (!app.configured) {
       setError(`Set ${app.id.toUpperCase()}_CLIENT_ID and ${app.id.toUpperCase()}_CLIENT_SECRET in your .env to enable ${app.name}.`);
@@ -3784,6 +3945,7 @@ function ConnectorsScreen() {
     }
     setConnecting(app.id);
     setError("");
+    setNotice("");
     try {
       const endpoint = app.id === "gmail"
         ? "/connectors/gmail/oauth-start"
@@ -3805,6 +3967,7 @@ function ConnectorsScreen() {
     if (!confirm(`Disconnect ${app.name}? Chronos will no longer be able to access it.`)) return;
     setDisconnecting(app.id);
     setError("");
+    setNotice("");
     try {
       const res = await apiFetch(`/connectors/${app.id}/disconnect`, { method: "DELETE" });
       if (!res.ok) throw new Error(`Error ${res.status}`);
@@ -3824,6 +3987,13 @@ function ConnectorsScreen() {
       />
 
       <div className="px-10 pb-10">
+        {notice && (
+          <div className="mb-5 rounded-xl border border-soft px-4 py-3 text-[13px]" style={{ color: "var(--ok)", background: "var(--surface-2)" }}>
+            {notice}
+            <button className="ml-3 underline" onClick={() => setNotice("")}>Dismiss</button>
+          </div>
+        )}
+
         {error && (
           <div className="mb-5 rounded-xl border border-soft px-4 py-3 text-[13px]" style={{ color: "var(--danger)", background: "var(--surface-2)" }}>
             {error}

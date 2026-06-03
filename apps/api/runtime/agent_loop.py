@@ -37,6 +37,7 @@ from core.exceptions import ApprovalRequired
 from core.llm import _message_content, _message, _tool_calls, _with_retry, model_kwargs, resolve_agent_model, stream_step
 from core.models import AgentContext
 from core.redis import redis_client
+from core.task_envelope import build_task_envelope, envelope_to_agent_prompt
 from core.tool_manifest import generate_tool_manifest
 from runtime.tool_registry import (
     ALL_TOOLS,
@@ -459,7 +460,29 @@ async def _load_history(task: dict[str, Any], tools: list[dict[str, Any]] | None
     project_knowledge = state.get("project_knowledge") if isinstance(state, dict) else None
     if isinstance(project_knowledge, str) and project_knowledge.strip():
         seed.append({"role": "user", "content": project_knowledge})
-    seed.append({"role": "user", "content": str(task["goal"])})
+    envelope_data = state.get("task_envelope") if isinstance(state, dict) else None
+    if isinstance(envelope_data, dict):
+        try:
+            from core.models import TaskEnvelope
+
+            seed.append({"role": "user", "content": envelope_to_agent_prompt(TaskEnvelope(**envelope_data))})
+            return seed
+        except Exception:
+            logger.warning("Invalid task envelope for task %s; falling back to raw message", task.get("id"))
+
+    original_message = state.get("original_user_message") if isinstance(state, dict) else None
+    if isinstance(original_message, str) and original_message.strip():
+        goal = str(task["goal"])
+        envelope = build_task_envelope(
+            task_id=str(task.get("id") or ""),
+            raw_user_message=original_message.strip(),
+            ui_title=goal,
+            router_decision={"mode": "agent", "ui_title": goal},
+            attachments=attachments if isinstance(attachments, list) else [],
+        )
+        seed.append({"role": "user", "content": envelope_to_agent_prompt(envelope)})
+    else:
+        seed.append({"role": "user", "content": str(task["goal"])})
     return seed
 
 
@@ -1065,6 +1088,22 @@ def fast_ack_text(message: str) -> str:
     return "I'll start by checking the request, gathering the needed context, and keeping the work visible as it runs."
 
 
+def requires_mailbox_grounding(message: str) -> bool:
+    text = message.lower()
+    if not any(marker in text for marker in ("email", "emails", "gmail", "inbox", "mailbox")):
+        return False
+    if any(marker in text for marker in ("draft an email", "write an email", "compose an email")):
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "summarize", "summarise", "summary", "search", "find", "look",
+            "what", "which", "who", "last", "recent", "today", "yesterday",
+            "days", "week", "inbox", "received", "came in",
+        )
+    )
+
+
 async def stream_chat_turn(
     *,
     conversation_id: str,
@@ -1085,7 +1124,22 @@ async def stream_chat_turn(
     if emit_conversation:
         yield {"type": "conversation", "conversation_id": conversation_id}
 
-    history: list[dict[str, Any]] = list(context_messages) + [{"role": "user", "content": message}]
+    history: list[dict[str, Any]] = list(context_messages)
+    if requires_mailbox_grounding(message):
+        history.append(
+            {
+                "role": "system",
+                "content": (
+                    "Controller requirement: this user request asks about mailbox contents. "
+                    "Before giving any factual summary, count, sender, subject, or existence claim, "
+                    "call gmail__search and use only the returned Gmail threads/messages as evidence. "
+                    "If the Gmail tool errors, say the search failed. If result_count is 0 or no threads "
+                    "are returned, say no matching emails were found. Do not invent emails, senders, "
+                    "subjects, counts, or dates."
+                ),
+            }
+        )
+    history.append({"role": "user", "content": message})
     effective_model = resolve_agent_model(model)
     ack_prefix = ""
     if should_emit_fast_ack(message):

@@ -179,6 +179,127 @@ async def test_complex_inline_turn_sends_fast_ack_before_model_tokens(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_mailbox_turn_injects_gmail_grounding_before_user(monkeypatch):
+    from runtime import agent_loop
+
+    captured = {}
+    steps = [
+        [{"type": "tool_calls", "calls": [{"id": "c1", "name": "gmail__search", "args_str": json.dumps({"query": "newer_than:3d"})}]}],
+        [{"type": "token", "content": "No matching emails found."}, {"type": "text_done", "text": "No matching emails found."}],
+    ]
+
+    async def fake_stream_step(messages, tools, model):
+        captured.setdefault("messages", list(messages))
+        for ev in steps.pop(0):
+            yield ev
+
+    async def fake_create(*, history, **kwargs):
+        captured["created_history"] = history
+        return "task-1"
+
+    async def fake_get_task(tid):
+        return {"id": tid, "organization_id": "default", "region": "us", "depth": 0,
+                "triggered_by_member_id": "member-1", "workspace_id": None, "persona_id": None}
+
+    async def fake_execute(call, task, agent):
+        return {"role": "tool", "tool_call_id": call["id"], "name": call["name"],
+                "content": json.dumps({"summary": "Gmail search 'newer_than:3d': 0 result(s)", "data": {"result_count": 0, "threads": []}})}
+
+    async def noop(*a, **k):
+        return None
+
+    monkeypatch.setattr(agent_loop, "stream_step", fake_stream_step)
+    monkeypatch.setattr(agent_loop, "create_task_from_history", fake_create)
+    monkeypatch.setattr(agent_loop, "get_task", fake_get_task)
+    monkeypatch.setattr(agent_loop, "_execute_tool", fake_execute)
+    monkeypatch.setattr(agent_loop, "emit_activity", noop)
+    monkeypatch.setattr(agent_loop, "save_task", noop)
+    monkeypatch.setattr(agent_loop, "persist_assistant_message", noop)
+    monkeypatch.setattr(agent_loop, "extract_and_save", noop)
+
+    await _run(agent_loop.stream_chat_turn(
+        conversation_id="conv-1",
+        message="summarise my emails in the last 3 days",
+        context_messages=[{"role": "system", "content": "sys"}, {"role": "user", "content": "prior prompt"}],
+        requester_context=_ctx(),
+        model="agent",
+    ))
+
+    messages = captured["messages"]
+    assert messages[-1] == {"role": "user", "content": "summarise my emails in the last 3 days"}
+    assert messages[-2]["role"] == "system"
+    assert "call gmail__search" in messages[-2]["content"]
+    assert any(m["content"] == "prior prompt" for m in messages)
+    assert captured["created_history"][: len(messages)] == messages
+
+
+@pytest.mark.asyncio
+async def test_task_history_uses_original_message_as_source_of_truth(monkeypatch):
+    from runtime import agent_loop
+
+    async def fake_system_message(tools=None):
+        return {"role": "system", "content": "sys"}
+
+    monkeypatch.setattr(agent_loop, "_agent_system_message", fake_system_message)
+
+    history = await agent_loop._load_history({
+        "id": "task-1",
+        "goal": "Run the provided GitHub repository and analyze it.",
+        "agent_state": {
+            "agent_history": [],
+            "original_user_message": (
+                "https://github.com/shaheerasif8008-cmyk/Chronos.git "
+                "this is my repo, run it and tell me about its strengths and weaknesses"
+            ),
+        },
+    })
+
+    assert history[-1]["role"] == "user"
+    assert "Use the Original user request as the source of truth" in history[-1]["content"]
+    assert "Original user request:" in history[-1]["content"]
+    assert "https://github.com/shaheerasif8008-cmyk/Chronos.git" in history[-1]["content"]
+    assert "Extracted entities:" in history[-1]["content"]
+    assert "Router metadata:" in history[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_task_envelope_beats_lossy_router_summary(monkeypatch):
+    from runtime import agent_loop
+    from core.task_envelope import build_task_envelope
+
+    async def fake_system_message(tools=None):
+        return {"role": "system", "content": "sys"}
+
+    monkeypatch.setattr(agent_loop, "_agent_system_message", fake_system_message)
+
+    raw = (
+        "https://github.com/shaheerasif8008-cmyk/Chronos.git "
+        "this is my repo, run it and tell me about its strengths and weaknesses"
+    )
+    envelope = build_task_envelope(
+        task_id="task-1",
+        raw_user_message=raw,
+        ui_title="Run the provided GitHub repository and analyze its strengths and weaknesses",
+        router_decision={
+            "mode": "agent",
+            "ui_title": "Run the provided GitHub repository and analyze its strengths and weaknesses",
+        },
+    )
+
+    history = await agent_loop._load_history({
+        "id": "task-1",
+        "goal": "Run the provided GitHub repository and analyze its strengths and weaknesses",
+        "agent_state": {"task_envelope": envelope.model_dump()},
+    })
+
+    prompt = history[-1]["content"]
+    assert raw in prompt
+    assert "https://github.com/shaheerasif8008-cmyk/Chronos.git" in prompt
+    assert "Router metadata:" in prompt
+    assert "Use the Original user request as the source of truth" in prompt
+
+
+@pytest.mark.asyncio
 async def test_task_stream_catch_up_includes_replay_events(monkeypatch):
     from core.models import Member
     from routers import tasks

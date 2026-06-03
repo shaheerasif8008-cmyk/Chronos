@@ -51,8 +51,8 @@ def available_chat_models() -> list[dict[str, str]]:
         {
             "id": "auto",
             "label": "Auto",
-            "model": settings.local_llm_model,
-            "description": "Try local first, then fallback provider.",
+            "model": settings.agent_model,
+            "description": "Use the configured primary agent model automatically.",
         },
         {
             "id": "local",

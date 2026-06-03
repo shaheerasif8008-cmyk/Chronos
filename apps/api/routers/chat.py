@@ -416,9 +416,12 @@ async def _agent_loop_stream(
     persona_id: str | None,
     workspace_id: str | None,
     model: str | None,
+    original_message: str | None = None,
     requester_context: RequesterContext | None = None,
     user_message_for_memory: str | None = None,
     attachments_context: list[dict] | None = None,
+    router_decision: dict | None = None,
+    conversation_context: list[dict] | None = None,
 ):
     """Run a goal through the tool-capable agent loop and stream it as a chat reply.
 
@@ -436,6 +439,9 @@ async def _agent_loop_stream(
         workspace_id=workspace_id,
         model=model,
         attachments_context=attachments_context,
+        original_message=original_message,
+        router_decision=router_decision,
+        conversation_context=conversation_context,
     )
 
     # Subscribe BEFORE firing executor, then wait briefly for subscription to
@@ -562,25 +568,29 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
 
     intent = await classify_intent(req.message)
 
-    # Tool-capable path: explicit "task" goals AND ordinary non-trivial chat both
-    # run the agent loop so chat can search and act inline (Option 1). Only clearly
-    # trivial, tool-free messages fall through to the fast token-streamed completion.
-    # Messages with attachments always route through the loop for full context injection.
-    route_through_loop = intent["mode"] == "task" or not _is_trivial_chat(req.message) or bool(attachments_context)
-    if route_through_loop:
-        is_task = intent["mode"] == "task"
+    # Explicit tasks stay durable immediately. Ordinary chat, including non-trivial
+    # tool-using chat, goes through stream_chat_turn below so conversation history
+    # is assembled before any lazy task/tool execution starts.
+    if intent["mode"] == "task":
+        context = await assemble_context(conversation_id, req.message, requester_context)
         return StreamingResponse(
             _agent_loop_stream(
                 conversation_id=conversation_id,
-                goal=(intent.get("goal") or req.message) if is_task else req.message,
+                goal=intent.get("goal") or req.message,
                 member=member,
                 persona_id=req.persona_id,
                 workspace_id=req.workspace_id,
                 model=req.model,
-                # Chat-routed runs keep autonomous memory extraction; explicit tasks do not.
-                requester_context=None if is_task else requester_context,
-                user_message_for_memory=None if is_task else req.message,
+                original_message=req.message,
+                router_decision={
+                    "mode": "agent",
+                    "ui_title": intent.get("goal") or req.message,
+                    "metadata": {"classifier": intent},
+                },
+                requester_context=None,
+                user_message_for_memory=None,
                 attachments_context=attachments_context or None,
+                conversation_context=context[:-1],
             ),
             media_type="text/event-stream",
             headers=_SSE_HEADERS,

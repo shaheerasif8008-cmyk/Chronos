@@ -37,8 +37,9 @@ class Settings(BaseSettings):
     cognito_domain: str = ""
     cognito_callback_url: str = "http://localhost:3000/login/callback"
     cognito_auto_provision_members: bool = False
+    frontend_base_url: str = "http://localhost:3000"
     # Connector / vault
-    vault_encryption_key: str = ""   # 32-byte hex string; required outside dev
+    vault_encryption_key: str = ""   # 32-byte key as 64 hex chars; required outside dev
     composio_api_key: str = ""       # kept for backward compat; not actively used
     composio_callback_base_url: str = "http://localhost:8000"
     tavily_api_key: str = ""

@@ -34,6 +34,7 @@ import json
 import logging
 import time
 import uuid
+import asyncio
 from email.mime.text import MIMEText
 from typing import Any
 from pathlib import Path
@@ -213,6 +214,72 @@ def _build_rfc822(to: str, subject: str, body: str, cc: str = "") -> str:
     return base64.urlsafe_b64encode(raw_bytes).decode().rstrip("=")
 
 
+def _message_headers(message: dict[str, Any]) -> dict[str, str]:
+    headers = ((message.get("payload") or {}).get("headers") or [])
+    out: dict[str, str] = {}
+    for header in headers:
+        name = str(header.get("name") or "").lower()
+        if name in {"from", "to", "cc", "subject", "date"}:
+            out[name] = str(header.get("value") or "")
+    return out
+
+
+def _normalise_thread_detail(detail: dict[str, Any]) -> dict[str, Any]:
+    messages = detail.get("messages") or []
+    normalized_messages: list[dict[str, Any]] = []
+    for message in messages:
+        headers = _message_headers(message)
+        normalized_messages.append(
+            {
+                "id": message.get("id"),
+                "from": headers.get("from", ""),
+                "to": headers.get("to", ""),
+                "cc": headers.get("cc", ""),
+                "subject": headers.get("subject", ""),
+                "date": headers.get("date", ""),
+                "snippet": message.get("snippet", ""),
+            }
+        )
+    first = normalized_messages[0] if normalized_messages else {}
+    return {
+        "id": detail.get("id"),
+        "history_id": detail.get("historyId"),
+        "subject": first.get("subject", ""),
+        "from": first.get("from", ""),
+        "date": first.get("date", ""),
+        "snippet": detail.get("snippet") or first.get("snippet", ""),
+        "message_count": len(normalized_messages),
+        "messages": normalized_messages,
+    }
+
+
+async def _fetch_thread_details(vault_ref: str, thread_refs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    async def fetch_one(thread: dict[str, Any]) -> dict[str, Any] | None:
+        thread_id = str(thread.get("id") or "")
+        if not thread_id:
+            return None
+        detail = await _gmail_call_with_refresh(
+            vault_ref,
+            "GET",
+            f"/threads/{thread_id}",
+            params={
+                "format": "metadata",
+                "metadataHeaders": ["From", "To", "Cc", "Subject", "Date"],
+            },
+        )
+        return _normalise_thread_detail(detail)
+
+    details = await asyncio.gather(*(fetch_one(thread) for thread in thread_refs), return_exceptions=True)
+    out: list[dict[str, Any]] = []
+    for item in details:
+        if isinstance(item, Exception):
+            log.warning("Failed to fetch Gmail thread detail: %s", item)
+            continue
+        if item:
+            out.append(item)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Main connector class
 # ---------------------------------------------------------------------------
@@ -295,9 +362,10 @@ class GmailConnector:
             "/threads",
             params={"labelIds": "INBOX", "maxResults": max_results},
         )
-        threads = data.get("threads") or []
+        thread_refs = data.get("threads") or []
+        threads = await _fetch_thread_details(vault_ref, thread_refs[:max_results])
         return ToolResult(
-            data=data,
+            data={**data, "threads": threads, "result_count": len(threads)},
             summary=f"Read inbox: {len(threads)} thread(s)",
         )
 
@@ -310,9 +378,10 @@ class GmailConnector:
             "/threads",
             params={"q": query, "maxResults": max_results},
         )
-        threads = data.get("threads") or []
+        thread_refs = data.get("threads") or []
+        threads = await _fetch_thread_details(vault_ref, thread_refs[:max_results])
         return ToolResult(
-            data=data,
+            data={**data, "threads": threads, "result_count": len(threads), "query": query},
             summary=f"Gmail search '{query}': {len(threads)} result(s)",
         )
 

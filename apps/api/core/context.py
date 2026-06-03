@@ -196,6 +196,8 @@ async def assemble_context(
 
     # ── Layer 7: conversation history (with compaction) ─────────────────────
     history = await _compact_history(conversation_id, budget_tokens=history_budget)
+    if history and history[-1].get("role") == "user" and history[-1].get("content") == message:
+        history = history[:-1]
 
     return [{"role": "system", "content": base}, *history, {"role": "user", "content": message}]
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 from pydantic import BaseModel, Field
 from datetime import datetime
+from typing import Any
 
 
 class Member(BaseModel):
@@ -73,3 +74,36 @@ class MemoryEntry(BaseModel):
 class ToolResult(BaseModel):
     data: dict
     summary: str
+
+
+class TaskExtractedEntities(BaseModel):
+    urls: list[str] = Field(default_factory=list)
+    repo_urls: list[str] = Field(default_factory=list)
+    emails: list[str] = Field(default_factory=list)
+    file_names: list[str] = Field(default_factory=list)
+    dates: list[str] = Field(default_factory=list)
+    money_amounts: list[str] = Field(default_factory=list)
+
+
+class TaskRouterDecision(BaseModel):
+    mode: str = "chat"
+    task_type: str | None = None
+    required_tools: list[str] = Field(default_factory=list)
+    requires_approval: bool | None = None
+    confidence: float | None = None
+    ui_title: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class TaskEnvelopeUI(BaseModel):
+    title: str
+
+
+class TaskEnvelope(BaseModel):
+    id: str
+    raw_user_message: str
+    conversation_context: list[dict[str, Any]] = Field(default_factory=list)
+    attachments: list[dict[str, Any]] = Field(default_factory=list)
+    extracted_entities: TaskExtractedEntities = Field(default_factory=TaskExtractedEntities)
+    router_decision: TaskRouterDecision = Field(default_factory=TaskRouterDecision)
+    ui: TaskEnvelopeUI

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import RedirectResponse
@@ -19,9 +20,18 @@ from connectors.framework.tool_calling import execute_tool_call, get_available_t
 from core import audit, permissions
 from core.auth import get_current_member
 from core.config import settings
+from core.exceptions import VaultError
 from core.models import AgentContext, Member
 
 router = APIRouter(prefix="/connectors", tags=["connectors"])
+
+
+def _connectors_redirect(**params: str) -> RedirectResponse:
+    url = f"{settings.frontend_base_url.rstrip('/')}/connectors"
+    clean = {key: value for key, value in params.items() if value}
+    if clean:
+        url = f"{url}?{urlencode(clean)}"
+    return RedirectResponse(url=url, status_code=302)
 
 
 def _gmail_module():
@@ -211,8 +221,10 @@ async def gmail_oauth_start(member: Member = Depends(get_current_member)) -> dic
 
 @router.get("/gmail/oauth-callback")
 async def gmail_oauth_callback(
-    code: str = Query(...),
+    code: str | None = Query(None),
     state: str = Query(...),
+    error: str | None = Query(None),
+    error_description: str | None = Query(None),
 ) -> RedirectResponse:
     """Google OAuth2 callback — exchanges the code for tokens and stores them.
 
@@ -224,6 +236,17 @@ async def gmail_oauth_callback(
     from connectors.vault import store as vault_store
     from core.db import engine, reflect_table
     from sqlalchemy import insert, select, update
+
+    if error:
+        return _connectors_redirect(
+            connector_error=error_description or error,
+            connector_provider="gmail",
+        )
+    if not code:
+        return _connectors_redirect(
+            connector_error="Google did not return an authorization code.",
+            connector_provider="gmail",
+        )
 
     # oauth_finish verifies the HMAC state internally and returns (member_id, org_id)
     # as part of the credential dict.
@@ -237,56 +260,62 @@ async def gmail_oauth_callback(
     member_id: str = credential_data["member_id"]
     org_id: str = credential_data["org_id"]
 
-    connector_id = f"gmail:{org_id}:{member_id}"
-    vault_ref = await vault_store(
-        connector_id=connector_id,
-        credentials=credential_data,
-        org_id=org_id,
-    )
+    try:
+        connector_id = f"gmail:{org_id}:{member_id}"
+        vault_ref = await vault_store(
+            connector_id=connector_id,
+            credentials=credential_data,
+            org_id=org_id,
+        )
 
-    # Upsert the connectors table so the framework registry knows this user's Gmail is live.
-    connectors_table = await reflect_table("connectors")
-    async with engine.begin() as conn:
-        existing = (
-            await conn.execute(
-                select(connectors_table).where(
-                    (connectors_table.c.organization_id == org_id)
-                    & (connectors_table.c.provider == "gmail")
-                    & (connectors_table.c.vault_ref == vault_ref)
+        # Upsert the connectors table so the framework registry knows this user's Gmail is live.
+        connectors_table = await reflect_table("connectors")
+        async with engine.begin() as conn:
+            existing = (
+                await conn.execute(
+                    select(connectors_table).where(
+                        (connectors_table.c.organization_id == org_id)
+                        & (connectors_table.c.provider == "gmail")
+                        & (connectors_table.c.vault_ref == vault_ref)
+                    )
                 )
-            )
-        ).mappings().first()
+            ).mappings().first()
 
-        if existing:
-            await conn.execute(
-                update(connectors_table)
-                .where(connectors_table.c.id == existing["id"])
-                .values(
-                    vault_ref=vault_ref,
-                    status="active",
-                    account_handle=credential_data.get("email", ""),
+            if existing:
+                await conn.execute(
+                    update(connectors_table)
+                    .where(connectors_table.c.id == existing["id"])
+                    .values(
+                        vault_ref=vault_ref,
+                        status="active",
+                        account_handle=credential_data.get("email", ""),
+                    )
                 )
-            )
-        else:
-            await conn.execute(
-                insert(connectors_table).values(
-                    id=str(uuid.uuid4()),
-                    organization_id=org_id,
-                    provider="gmail",
-                    account_handle=credential_data.get("email", ""),
-                    vault_ref=vault_ref,
-                    status="active",
-                    scopes=["gmail.read_inbox", "gmail.draft", "gmail.search"],
-                    region=settings.region,
+            else:
+                await conn.execute(
+                    insert(connectors_table).values(
+                        id=str(uuid.uuid4()),
+                        organization_id=org_id,
+                        provider="gmail",
+                        account_handle=credential_data.get("email", ""),
+                        vault_ref=vault_ref,
+                        status="active",
+                        scopes=["gmail.read_inbox", "gmail.draft", "gmail.search"],
+                        region=settings.region,
+                    )
                 )
-            )
+    except VaultError as exc:
+        return _connectors_redirect(
+            connector_error=str(exc),
+            connector_provider="gmail",
+        )
 
     await audit.log(
         "connector_oauth_complete", member_id, "gmail.oauth_callback",
         organization_id=org_id,
         resource_type="connector", resource_id="gmail",
     )
-    return RedirectResponse(url="/connectors", status_code=302)
+    return _connectors_redirect(connector_success="gmail")
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +397,7 @@ async def generic_oauth_callback(
         raise HTTPException(status_code=400, detail="Use /connectors/gmail/oauth-callback for Gmail")
 
     if error:
-        return RedirectResponse(url=f"/connectors?error={error}", status_code=302)
+        return _connectors_redirect(connector_error=error, connector_provider=provider)
 
     app = get_app(provider)
     if not app:
@@ -474,46 +503,52 @@ async def generic_oauth_callback(
 
     credentials["account_handle"] = account_handle
     connector_id = f"{provider}:{org_id}:{member_id}"
-    vault_ref = await vault_store(connector_id=connector_id, credentials=credentials, org_id=org_id)
+    try:
+        vault_ref = await vault_store(connector_id=connector_id, credentials=credentials, org_id=org_id)
 
-    # Upsert connectors table
-    connectors_table = await reflect_table("connectors")
-    async with engine.begin() as conn:
-        existing = (
-            await conn.execute(
-                select(connectors_table).where(
-                    (connectors_table.c.organization_id == org_id)
-                    & (connectors_table.c.provider == provider)
+        # Upsert connectors table
+        connectors_table = await reflect_table("connectors")
+        async with engine.begin() as conn:
+            existing = (
+                await conn.execute(
+                    select(connectors_table).where(
+                        (connectors_table.c.organization_id == org_id)
+                        & (connectors_table.c.provider == provider)
+                    )
                 )
-            )
-        ).mappings().first()
+            ).mappings().first()
 
-        if existing:
-            await conn.execute(
-                update(connectors_table)
-                .where(connectors_table.c.id == existing["id"])
-                .values(vault_ref=vault_ref, status="active", account_handle=account_handle)
-            )
-        else:
-            await conn.execute(
-                insert(connectors_table).values(
-                    id=str(uuid.uuid4()),
-                    organization_id=org_id,
-                    provider=provider,
-                    account_handle=account_handle,
-                    vault_ref=vault_ref,
-                    status="active",
-                    scopes=app.scopes,
-                    region=settings.region,
+            if existing:
+                await conn.execute(
+                    update(connectors_table)
+                    .where(connectors_table.c.id == existing["id"])
+                    .values(vault_ref=vault_ref, status="active", account_handle=account_handle)
                 )
-            )
+            else:
+                await conn.execute(
+                    insert(connectors_table).values(
+                        id=str(uuid.uuid4()),
+                        organization_id=org_id,
+                        provider=provider,
+                        account_handle=account_handle,
+                        vault_ref=vault_ref,
+                        status="active",
+                        scopes=app.scopes,
+                        region=settings.region,
+                    )
+                )
+    except VaultError as exc:
+        return _connectors_redirect(
+            connector_error=str(exc),
+            connector_provider=provider,
+        )
 
     await audit.log(
         "connector_oauth_complete", member_id, f"{provider}.oauth_callback",
         organization_id=org_id,
         resource_type="connector", resource_id=provider,
     )
-    return RedirectResponse(url="/connectors", status_code=302)
+    return _connectors_redirect(connector_success=provider)
 
 
 @router.delete("/{provider}/disconnect")
