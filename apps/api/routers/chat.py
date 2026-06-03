@@ -566,13 +566,23 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
     if attachment_ids:
         attachments_context = await _parse_attachments(attachment_ids, conversation_id, member.organization_id)
 
-    intent = await classify_intent(req.message)
+    # classify_intent and assemble_context are independent, and both the task and
+    # chat branches need the assembled context — so run them concurrently to overlap
+    # their LLM round-trips instead of paying for them in series. Obviously
+    # conversational messages skip the classifier LLM call entirely.
+    if _is_trivial_chat(req.message):
+        intent = {"mode": "chat", "goal": None}
+        context = await assemble_context(conversation_id, req.message, requester_context)
+    else:
+        intent, context = await asyncio.gather(
+            classify_intent(req.message),
+            assemble_context(conversation_id, req.message, requester_context),
+        )
 
     # Explicit tasks stay durable immediately. Ordinary chat, including non-trivial
     # tool-using chat, goes through stream_chat_turn below so conversation history
     # is assembled before any lazy task/tool execution starts.
     if intent["mode"] == "task":
-        context = await assemble_context(conversation_id, req.message, requester_context)
         return StreamingResponse(
             _agent_loop_stream(
                 conversation_id=conversation_id,
@@ -595,8 +605,6 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
             media_type="text/event-stream",
             headers=_SSE_HEADERS,
         )
-
-    context = await assemble_context(conversation_id, req.message, requester_context)
 
     async def _sse_wrap(gen):
         async for event in gen:
