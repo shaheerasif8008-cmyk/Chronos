@@ -236,7 +236,9 @@ async def assemble_context(
 
     # ── Layer 6: task state ─────────────────────────────────────────────────
     if requester_context.task_id:
-        task_context = await _load_task_context(requester_context.task_id)
+        task_context = await _load_task_context(
+            requester_context.task_id, requester_context.org_id
+        )
         if task_context:
             base += f"\n\n# Current Task\n{task_context}"
 
@@ -275,13 +277,20 @@ async def _load_project_instructions(project_id: str, org_id: str) -> str | None
     return instructions
 
 
-async def _load_task_context(task_id: str) -> str:
+async def _load_task_context(task_id: str, org_id: str) -> str:
     try:
         tasks = await reflect_table("tasks")
     except Exception:
         return ""
     async with engine.begin() as conn:
-        row = (await conn.execute(select(tasks).where(tasks.c.id == task_id))).mappings().first()
+        row = (
+            await conn.execute(
+                select(tasks).where(
+                    tasks.c.id == task_id,
+                    tasks.c.organization_id == org_id,
+                )
+            )
+        ).mappings().first()
     if not row:
         return ""
     task = dict(row)

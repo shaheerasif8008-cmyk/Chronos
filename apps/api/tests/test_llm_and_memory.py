@@ -786,7 +786,7 @@ async def test_assemble_context_loads_persona_skills_memories_and_task_state(mon
             )
         ]
 
-    async def fake_task_context(task_id):
+    async def fake_task_context(task_id, org_id):
         return "Goal: draft outreach\nStatus: running\nStep: 1/3"
 
     class FakeResult:
