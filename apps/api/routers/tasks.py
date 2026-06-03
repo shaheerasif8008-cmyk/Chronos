@@ -84,7 +84,7 @@ async def create_task_record(
     async with engine.begin() as conn:
         insert_values: dict = dict(
             id=task_id,
-            organization_id=settings.org_id,
+            organization_id=member.organization_id,
             region=settings.region,
             persona_id=persona_id,
             workspace_id=workspace_id,
