@@ -269,7 +269,7 @@ async def test_send_message_threads_mode_into_inline_turn(monkeypatch):
     monkeypatch.setattr(chat, "extract_explicit_memory_content", lambda msg: None)
     monkeypatch.setattr(chat, "stream_chat_turn", fake_stream_chat_turn)
 
-    req = chat.ChatRequest(message="hi", mode="coding")
+    req = chat.ChatRequest(message="hi", model="gpt-5.4-mini", mode="coding")
 
     response = await chat.send_message(req, member)
     async for _ in response.body_iterator:
@@ -330,7 +330,7 @@ async def test_nontrivial_chat_uses_history_aware_inline_turn(monkeypatch):
     monkeypatch.setattr(chat, "stream_chat_turn", fake_stream_chat_turn)
     monkeypatch.setattr(chat, "_agent_loop_stream", fake_agent_loop_stream)
 
-    req = chat.ChatRequest(message="what email did you search")
+    req = chat.ChatRequest(message="what email did you search", model="gpt-5.4-mini")
 
     response = await chat.send_message(req, member)
     async for _ in response.body_iterator:
@@ -385,7 +385,7 @@ async def test_task_route_preserves_original_message_for_execution(monkeypatch):
     }))
     monkeypatch.setattr(chat, "_agent_loop_stream", fake_agent_loop_stream)
 
-    response = await chat.send_message(chat.ChatRequest(message=original), member)
+    response = await chat.send_message(chat.ChatRequest(message=original, model="gpt-5.4-mini"), member)
     async for _ in response.body_iterator:
         pass
 

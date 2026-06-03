@@ -8,11 +8,11 @@ test("model selection persists across reload", async ({ page }) => {
   await expect(model).toBeVisible();
 
   // Pick a non-default model.
-  await model.selectOption("agent");
-  await expect(model).toHaveValue("agent");
+  await model.selectOption("deepseek-v4-flash");
+  await expect(model).toHaveValue("deepseek-v4-flash");
 
   // Survives a full page refresh.
   await page.reload();
   const modelAfter = page.getByLabel("Model", { exact: true });
-  await expect(modelAfter).toHaveValue("agent");
+  await expect(modelAfter).toHaveValue("deepseek-v4-flash");
 });

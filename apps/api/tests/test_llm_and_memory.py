@@ -8,7 +8,16 @@ from core.models import RequesterContext
 
 
 @pytest.mark.asyncio
-async def test_stream_chat_completion_defaults_to_agent_model(monkeypatch):
+async def test_stream_chat_completion_requires_selected_model():
+    from core import llm
+
+    with pytest.raises(ValueError, match="model is required"):
+        async for _token in llm.stream_completion([{"role": "user", "content": "hi"}]):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_stream_chat_completion_uses_selected_gpt_mini_model(monkeypatch):
     from core import llm
 
     calls = []
@@ -24,21 +33,20 @@ async def test_stream_chat_completion_defaults_to_agent_model(monkeypatch):
 
     monkeypatch.setattr(llm.litellm, "acompletion", fake_completion)
     monkeypatch.setattr(llm.settings, "openrouter_api_key", "or-test-key")
-    monkeypatch.setattr(llm.settings, "agent_model", "openrouter/deepseek/deepseek-v4-flash:free")
 
     tokens = []
-    async for token in llm.stream_completion([{"role": "user", "content": "hi"}]):
+    async for token in llm.stream_completion([{"role": "user", "content": "hi"}], model_id="gpt-5.4-mini"):
         tokens.append(token)
 
     assert tokens == ["agent ", "works"]
     assert len(calls) == 1
     assert calls[0]["api_key"] == "or-test-key"
     assert calls[0]["api_base"] == "https://openrouter.ai/api/v1"
-    assert calls[0]["model"] == "openrouter/deepseek/deepseek-v4-flash:free"
+    assert calls[0]["model"] == "openrouter/openai/gpt-5.4-mini"
 
 
 @pytest.mark.asyncio
-async def test_stream_chat_completion_uses_selected_fast_model(monkeypatch):
+async def test_stream_chat_completion_uses_each_selected_model(monkeypatch):
     from core import llm
 
     calls = []
@@ -52,49 +60,53 @@ async def test_stream_chat_completion_uses_selected_fast_model(monkeypatch):
         return chunks()
 
     monkeypatch.setattr(llm.litellm, "acompletion", fake_completion)
-    monkeypatch.setattr(llm.settings, "fast_model", "openrouter/minimax/minimax-m2.5:free")
     monkeypatch.setattr(llm.settings, "openrouter_api_key", "or-test-key")
 
-    tokens = []
-    async for token in llm.stream_completion([{"role": "user", "content": "hi"}], model_id="fast"):
-        tokens.append(token)
+    expected = {
+        "gpt-5.4-mini": "openrouter/openai/gpt-5.4-mini",
+        "gpt-5.4-nano": "openrouter/openai/gpt-5.4-nano",
+        "deepseek-v4-pro": "openrouter/deepseek/deepseek-v4-pro",
+        "deepseek-v4-flash": "openrouter/deepseek/deepseek-v4-flash",
+    }
+    for selector_id, model_string in expected.items():
+        tokens = []
+        async for token in llm.stream_completion([{"role": "user", "content": "hi"}], model_id=selector_id):
+            tokens.append(token)
 
-    assert tokens == ["fast"]
-    assert len(calls) == 1
-    assert calls[0]["model"] == "openrouter/minimax/minimax-m2.5:free"
-    assert calls[0]["api_key"] == "or-test-key"
+        assert tokens == ["fast"]
+        assert calls[-1]["model"] == model_string
+        assert calls[-1]["api_key"] == "or-test-key"
 
 
 def test_available_chat_models_include_configured_options(monkeypatch):
     from core import llm
 
-    monkeypatch.setattr(llm.settings, "local_llm_model", "llama3")
     monkeypatch.setattr(llm.settings, "openrouter_api_key", "or-test-key")
-    monkeypatch.setattr(llm.settings, "openrouter_model", "openrouter/example/model")
-    monkeypatch.setattr(llm.settings, "agent_model", "openrouter/example/agent")
-    monkeypatch.setattr(llm.settings, "fast_model", "openrouter/example/fast")
 
     models = llm.available_chat_models()
 
-    assert [model["id"] for model in models] == ["agent", "auto", "local", "openrouter", "fast"]
+    assert [model["id"] for model in models] == [
+        "gpt-5.4-mini",
+        "gpt-5.4-nano",
+        "deepseek-v4-pro",
+        "deepseek-v4-flash",
+    ]
     by_id = {model["id"]: model for model in models}
-    assert by_id["auto"]["model"] == "openrouter/example/agent"
-    assert by_id["local"]["model"] == "llama3"
-    assert llm.normalize_chat_model(None) == "agent"
-    assert llm.normalize_chat_model("agent") == "agent"
-    assert llm.normalize_chat_model("openrouter") == "openrouter"
-    assert llm.normalize_chat_model("does-not-exist") == "agent"
+    assert by_id["gpt-5.4-mini"]["model"] == "openrouter/openai/gpt-5.4-mini"
+    assert by_id["gpt-5.4-nano"]["model"] == "openrouter/openai/gpt-5.4-nano"
+    assert by_id["deepseek-v4-pro"]["model"] == "openrouter/deepseek/deepseek-v4-pro"
+    assert by_id["deepseek-v4-flash"]["model"] == "openrouter/deepseek/deepseek-v4-flash"
+    assert llm.normalize_chat_model("gpt-5.4-mini") == "gpt-5.4-mini"
+    with pytest.raises(ValueError):
+        llm.normalize_chat_model(None)
+    with pytest.raises(ValueError):
+        llm.normalize_chat_model("does-not-exist")
 
 
 def test_available_chat_models_expose_capabilities_status_and_policy(monkeypatch):
     from core import llm
 
-    monkeypatch.setattr(llm.settings, "local_llm_model", "llama3")
-    monkeypatch.setattr(llm.settings, "local_llm_base_url", "http://localhost:11434/v1")
     monkeypatch.setattr(llm.settings, "openrouter_api_key", "")
-    monkeypatch.setattr(llm.settings, "backup_api_key", "")
-    monkeypatch.setattr(llm.settings, "agent_model", "openrouter/example/agent")
-    monkeypatch.setattr(llm.settings, "fast_model", "openrouter/example/fast")
 
     models = llm.available_chat_models()
 
@@ -107,9 +119,9 @@ def test_available_chat_models_expose_capabilities_status_and_policy(monkeypatch
         assert "policy" in model
 
     by_id = {model["id"]: model for model in models}
-    assert by_id["agent"]["tool_use"] is True
-    assert "agent" in by_id["fast"]["fallback_for"]
-    assert by_id["local"]["status"] == "degraded"
+    assert by_id["gpt-5.4-mini"]["tool_use"] is True
+    assert by_id["deepseek-v4-flash"]["fallback_for"] == []
+    assert by_id["gpt-5.4-nano"]["status"] == "degraded"
 
 
 @pytest.mark.asyncio
@@ -122,11 +134,11 @@ async def test_stream_chat_completion_reports_provider_unavailable(monkeypatch):
     monkeypatch.setattr(llm.litellm, "acompletion", fake_completion)
 
     tokens = []
-    async for token in llm.stream_completion([{"role": "user", "content": "hi"}]):
+    async for token in llm.stream_completion([{"role": "user", "content": "hi"}], model_id="gpt-5.4-mini"):
         tokens.append(token)
 
     assert tokens == [
-        "Chronos is connected, but the selected AI provider is unavailable right now. Try Auto or another model."
+        "Chronos is connected, but the selected AI provider is unavailable right now. Choose another model in the selector."
     ]
 
 

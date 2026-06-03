@@ -187,6 +187,7 @@ type ActivityAction = {
 };
 
 const MODEL_STORAGE_KEY = "chronos.chat.selectedModel";
+const DEFAULT_MODEL_ID = "gpt-5.4-mini";
 const MODE_STORAGE_KEY = "chronos.chat.selectedMode";
 
 function modelOptionText(model: ChatModel) {
@@ -1142,7 +1143,7 @@ function ChatScreen({
   const [messages, setMessages] = useState<Message[]>([]);
   const [chatModels, setChatModels] = useState<ChatModel[]>([]);
   const [chatModes, setChatModes] = useState<ChatMode[]>(DEFAULT_CHAT_MODES);
-  const [selectedModel, setSelectedModel] = useState("auto");
+  const [selectedModel, setSelectedModel] = useState(DEFAULT_MODEL_ID);
   const [modelsLoadError, setModelsLoadError] = useState("");
   const [selectedMode, setSelectedMode] = useState<string>("default");
   const [modesLoadError, setModesLoadError] = useState("");
@@ -1391,7 +1392,7 @@ function ChatScreen({
       .then((data: ChatModel[]) => {
         setModelsLoadError("");
         setChatModels(data);
-        const preferred = data.find(model => model.id === "agent") ?? data.find(model => model.id === "openrouter") ?? data.find(model => model.id === "backup") ?? data.find(model => model.id === "fast") ?? data[0];
+        const preferred = data.find(model => model.id === DEFAULT_MODEL_ID) ?? data[0];
         const stored = window.localStorage.getItem(MODEL_STORAGE_KEY) || selectedModel;
         const nextModel = data.some(model => model.id === stored) ? stored : preferred?.id;
         if (nextModel && nextModel !== selectedModel) {

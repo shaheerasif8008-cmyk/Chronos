@@ -34,7 +34,7 @@ from core import audit, tool_broker
 from core.config import settings
 from core.db import engine, reflect_table
 from core.exceptions import ApprovalRequired
-from core.llm import _message_content, _message, _tool_calls, _with_retry, model_kwargs, resolve_agent_model, stream_step
+from core.llm import _message_content, _message, _tool_calls, _with_retry, default_chat_model_id, model_kwargs, resolve_agent_model, stream_step
 from core.models import AgentContext
 from core.redis import redis_client
 from core.task_envelope import build_task_envelope, envelope_to_agent_prompt
@@ -804,8 +804,11 @@ async def _run_subagent(
         raise ValueError(f"Sub-agent depth limit ({MAX_DEPTH}) reached — cannot spawn further.")
 
     goal = str(args.get("goal") or "No goal specified")
-    model_tier = str(args.get("model") or "agent")
-    child_model = settings.agent_model if model_tier == "agent" else settings.fast_model
+    model_id = str(args.get("model") or default_chat_model_id())
+    try:
+        child_model = resolve_agent_model(model_id)
+    except ValueError:
+        child_model = resolve_agent_model(default_chat_model_id())
 
     # Step 4: opt-in state inheritance. The DAG executor resolves `inherit_keys`
     # against its live context and passes `_inherited_context`. A native-loop spawn
