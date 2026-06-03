@@ -114,44 +114,102 @@ async def assemble_context(
     system_budget = budget // 2
     history_budget = budget - system_budget
 
+    # ── Concurrent fetch phase ──────────────────────────────────────────────
+    # Every layer's data source is independent, but the string assembly below has
+    # sequential, budget-gated dependencies (each layer's fit check depends on the
+    # running `base` length). So fetch all the slow I/O concurrently here, then
+    # assemble synchronously with results in hand. This makes time-to-first-token
+    # ≈ max(fetch latencies) instead of their sum — the two LLM round-trips
+    # (skills relevance + memory embed) and the DB/file reads now overlap.
+    # Capture the sub-agent flag before overwriting memory_context: the tool
+    # manifest depends on the *incoming* context (sub-agents get a different
+    # manifest), whereas memory.retrieve wants the resolved task/chat value.
+    is_sub_agent = requester_context.memory_context == "sub_agent"
+    requester_context.memory_context = "task" if requester_context.task_id else "chat"
+
+    async def _fetch_skills() -> list[tuple[str, str | None, str]]:
+        skill_ids = await find_relevant_skills(message)
+        skill_index = {s["id"]: s for s in load_skill_index()}
+        out: list[tuple[str, str | None, str]] = []
+        for skill_id in skill_ids:
+            skill_meta = skill_index.get(skill_id, {})
+            warning = await skill_connector_warning(skill_meta)
+            content = await load_skill_content(skill_id, progressive=True)
+            out.append((skill_id, warning, content))
+        return out
+
+    async def _fetch_memory() -> list:
+        try:
+            return await asyncio.wait_for(
+                memory.retrieve(message, requester_context),
+                timeout=settings.memory_retrieve_timeout_seconds,
+            )
+        except (Exception, asyncio.TimeoutError):
+            return []
+
+    async def _fetch_project_instructions() -> str | None:
+        if requester_context.project_id is None:
+            return None
+        return await _load_project_instructions(
+            requester_context.project_id, requester_context.org_id
+        )
+
+    async def _fetch_citations() -> list | None:
+        # Returns None when not applicable (no project) so the assembler can skip
+        # touching surfaced_citations, vs [] meaning "applicable but nothing found".
+        if requester_context.project_id is None:
+            return None
+        try:
+            return await retrieve_source_chunks(message, requester_context)
+        except Exception:
+            return []
+
+    (
+        org_context,
+        tool_manifest,
+        persona_prompt,
+        project_instructions,
+        skills_data,
+        memories,
+        citations,
+        history,
+    ) = await asyncio.gather(
+        load_org_context(requester_context.org_id),
+        generate_tool_manifest(
+            persona_id=requester_context.persona_id,
+            org_id=requester_context.org_id,
+            sub_agent=is_sub_agent,
+        ),
+        get_persona_prompt(requester_context.persona_id),
+        _fetch_project_instructions(),
+        _fetch_skills(),
+        _fetch_memory(),
+        _fetch_citations(),
+        _compact_history(conversation_id, budget_tokens=history_budget),
+    )
+
+    # ── Assembly phase (sequential, budget-gated — order preserved) ─────────
     # ── Layer 1: base system prompt ─────────────────────────────────────────
     base = load_base_system_prompt()
 
     # ── Layer 2: org context ────────────────────────────────────────────────
-    org_context = await load_org_context(requester_context.org_id)
     if org_context and _estimate_tokens(base + org_context) <= system_budget:
         base += f"\n\n# Organization Context\n{org_context}"
 
     # ── Layer 2b: dynamic tool manifest ────────────────────────────────────
-    tool_manifest = await generate_tool_manifest(
-        persona_id=requester_context.persona_id,
-        org_id=requester_context.org_id,
-        sub_agent=requester_context.memory_context == "sub_agent",
-    )
     if tool_manifest and _estimate_tokens(base + tool_manifest) <= system_budget:
         base += f"\n\n{tool_manifest}"
 
     # ── Layer 3: persona ────────────────────────────────────────────────────
-    persona_prompt = await get_persona_prompt(requester_context.persona_id)
     if persona_prompt and _estimate_tokens(base + persona_prompt) <= system_budget:
         base += f"\n\n# Your Identity\n{persona_prompt}"
 
     # ── Layer 3b: project instructions ─────────────────────────────────────
-    if requester_context.project_id is not None:
-        project_instructions = await _load_project_instructions(
-            requester_context.project_id, requester_context.org_id
-        )
-        if project_instructions and _estimate_tokens(base + project_instructions) <= system_budget:
-            base += f"\n\n# Project Instructions\n{project_instructions}"
+    if project_instructions and _estimate_tokens(base + project_instructions) <= system_budget:
+        base += f"\n\n# Project Instructions\n{project_instructions}"
 
     # ── Layer 4: skills (Category 6: connector-aware, progressive) ──────────
-    skill_ids = await find_relevant_skills(message)
-    skill_index = {s["id"]: s for s in load_skill_index()}
-    for skill_id in skill_ids:
-        skill_meta = skill_index.get(skill_id, {})
-        # Category 6: warn if required connectors are missing.
-        warning = await skill_connector_warning(skill_meta)
-        content = await load_skill_content(skill_id, progressive=True)
+    for skill_id, warning, content in skills_data:
         if content and _estimate_tokens(base + content) <= system_budget:
             base += f"\n\n# Skill: {skill_id}\n{content}"
             if warning:
@@ -161,14 +219,6 @@ async def assemble_context(
             base += f"\n\n{warning}"
 
     # ── Layer 5: memory ─────────────────────────────────────────────────────
-    requester_context.memory_context = "task" if requester_context.task_id else "chat"
-    try:
-        memories = await asyncio.wait_for(
-            memory.retrieve(message, requester_context),
-            timeout=settings.memory_retrieve_timeout_seconds,
-        )
-    except (Exception, asyncio.TimeoutError):
-        memories = []
     if memories:
         mem_block = "\n".join(f"- {m.content}" for m in memories)
         if _estimate_tokens(base + mem_block) <= system_budget:
@@ -176,10 +226,6 @@ async def assemble_context(
 
     # ── Layer 5b: project knowledge (permission-aware source citations) ─────
     if requester_context.project_id is not None:
-        try:
-            citations = await retrieve_source_chunks(message, requester_context)
-        except Exception:
-            citations = []
         if citations:
             knowledge_block = build_knowledge_block(citations)
             if knowledge_block and _estimate_tokens(base + knowledge_block) <= system_budget:
@@ -192,12 +238,13 @@ async def assemble_context(
 
     # ── Layer 6: task state ─────────────────────────────────────────────────
     if requester_context.task_id:
-        task_context = await _load_task_context(requester_context.task_id)
+        task_context = await _load_task_context(
+            requester_context.task_id, requester_context.org_id
+        )
         if task_context:
             base += f"\n\n# Current Task\n{task_context}"
 
     # ── Layer 7: conversation history (with compaction) ─────────────────────
-    history = await _compact_history(conversation_id, budget_tokens=history_budget)
     if history and history[-1].get("role") == "user" and history[-1].get("content") == message:
         history = history[:-1]
 
@@ -232,13 +279,20 @@ async def _load_project_instructions(project_id: str, org_id: str) -> str | None
     return instructions
 
 
-async def _load_task_context(task_id: str) -> str:
+async def _load_task_context(task_id: str, org_id: str) -> str:
     try:
         tasks = await reflect_table("tasks")
     except Exception:
         return ""
     async with engine.begin() as conn:
-        row = (await conn.execute(select(tasks).where(tasks.c.id == task_id))).mappings().first()
+        row = (
+            await conn.execute(
+                select(tasks).where(
+                    tasks.c.id == task_id,
+                    tasks.c.organization_id == org_id,
+                )
+            )
+        ).mappings().first()
     if not row:
         return ""
     task = dict(row)
