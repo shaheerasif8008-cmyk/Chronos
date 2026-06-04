@@ -421,6 +421,58 @@ async def test_citation_spans_dropped_when_quote_not_in_source(monkeypatch):
     assert full_text[citations[0]["char_start"]:citations[0]["char_end"]] == "cats and dogs"
 
 
+@pytest.mark.asyncio
+async def test_summarize_drops_unverified_claims_from_summary(monkeypatch):
+    """Claims whose quote cannot be found in source must be excluded from summary.
+
+    This is the discriminating test for the 'no claim without a stored source span'
+    requirement. The model returns two sections — one with a findable quote and one
+    with a fabricated quote. Only the verified section must appear in the summary.
+    """
+    from core import tool_broker as tb
+    import core.llm as llm_mod
+
+    org_id = _unique_org()
+    _patch_broker_infra(monkeypatch)
+
+    source_text = "The annual review confirms strong performance metrics."
+    raw = _make_docx_bytes(source_text)
+    _make_artifact_mocks(monkeypatch, raw, "", "review.docx", artifact_id="docx-mixed", org_id=org_id)
+
+    # Model returns two sections: one real quote, one fabricated
+    response = json.dumps({
+        "sections": [
+            {"heading": "Real", "text": "Verified claim.", "quote": "strong performance metrics"},
+            {"heading": "Fake", "text": "Fabricated claim.", "quote": "unicorns and dragons"},
+        ]
+    })
+
+    async def fake_complete_json(prompt, *, model=None):
+        return response
+
+    monkeypatch.setattr(llm_mod, "complete_json", fake_complete_json)
+
+    agent = _make_agent(org_id)
+    result = await tb.execute(agent, "doc.summarize", {"artifact_id": "docx-mixed"})
+
+    # Only the verified section must be in the summary
+    summary = result.data["summary"]
+    headings = [s["heading"] for s in summary]
+    assert "Real" in headings, "Verified section must be in summary"
+    assert "Fake" not in headings, "Fabricated section must NOT be in summary"
+
+    # Exactly one citation — the verified one
+    citations = result.data["citations"]
+    assert len(citations) == 1
+    assert citations[0]["quote"] == "strong performance metrics"
+
+    # Citation span must match source
+    from parsing.engine import parse_document
+    doc = await parse_document(raw, "", "review.docx")
+    cit = citations[0]
+    assert doc.full_text[cit["char_start"]:cit["char_end"]] == cit["quote"]
+
+
 # ---------------------------------------------------------------------------
 # TEST: tool registry entries exist and convert to broker name
 # ---------------------------------------------------------------------------

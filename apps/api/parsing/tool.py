@@ -188,18 +188,18 @@ class DocConnector:
 
         citations = _derive_citations(doc.full_text, artifact_id, sections)
 
-        summary_sections = []
-        # Keep sections that have a verified citation
+        # Only include sections whose quote was verifiably found in the source.
+        # Sections with unverifiable quotes are dropped entirely — no claim is returned
+        # without a corresponding stored source span (acceptance requirement).
         verified_quotes = {c["quote"] for c in citations}
-        for sec in sections:
-            quote = (sec.get("quote") or "").strip()
-            summary_sections.append(
-                {
-                    "heading": sec.get("heading", ""),
-                    "text": sec.get("text", ""),
-                    "verified": quote in verified_quotes,
-                }
-            )
+        summary_sections = [
+            {
+                "heading": sec.get("heading", ""),
+                "text": sec.get("text", ""),
+            }
+            for sec in sections
+            if (sec.get("quote") or "").strip() in verified_quotes
+        ]
 
         return ToolResult(
             data={
