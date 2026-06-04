@@ -178,6 +178,29 @@ DOC_READ = _fn(
     ["artifact_id"],
 )
 
+DOC_SUMMARIZE = _fn(
+    "doc__summarize",
+    "Summarize a document with verifiable citations. Each section of the summary "
+    "is anchored to a verbatim quote from the source (char offsets included). "
+    "Supports the same formats as doc__parse. Returns an honest warning when the "
+    "document cannot be parsed.",
+    {
+        "artifact_id": {"type": "string", "description": "Artifact id of the document to summarize."},
+    },
+    ["artifact_id"],
+)
+
+DOC_COMPARE = _fn(
+    "doc__compare",
+    "Compare two documents and return a structured list of similarities and differences "
+    "with verifiable citations into both sources.",
+    {
+        "artifact_id_a": {"type": "string", "description": "Artifact id of the first document."},
+        "artifact_id_b": {"type": "string", "description": "Artifact id of the second document."},
+    },
+    ["artifact_id_a", "artifact_id_b"],
+)
+
 # ── Sub-agent ─────────────────────────────────────────────────────────────────
 
 SPAWN_SUBAGENT = _fn(
@@ -232,6 +255,8 @@ ALL_TOOLS: list[dict[str, Any]] = [
     CODE_PYTHON,
     DOC_PARSE,
     DOC_READ,
+    DOC_SUMMARIZE,
+    DOC_COMPARE,
     SPAWN_SUBAGENT,
 ]
 
@@ -246,6 +271,8 @@ SUBAGENT_TOOLS: list[dict[str, Any]] = [
     CODE_PYTHON,
     DOC_PARSE,
     DOC_READ,
+    DOC_SUMMARIZE,
+    DOC_COMPARE,
 ]
 
 #: Names that always need explicit human approval before execution.
@@ -269,6 +296,8 @@ INLINE_CHAT_TOOLS: list[dict[str, Any]] = [
     CODE_PYTHON,
     DOC_PARSE,
     DOC_READ,
+    DOC_SUMMARIZE,
+    DOC_COMPARE,
     START_TASK,
 ]
 
