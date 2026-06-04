@@ -1155,6 +1155,7 @@ function ChatScreen({
   const [activeTaskEvents, setActiveTaskEvents] = useState<TaskStreamEvent[]>([]);
   const [activeTaskStreamError, setActiveTaskStreamError] = useState("");
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
+  const [uploadError, setUploadError] = useState<string | null>(null);
   const [personaMenuOpen, setPersonaMenuOpen] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const streamingRef = useRef(false);
@@ -1545,6 +1546,7 @@ function ChatScreen({
     // uploads — the browser needs to set the multipart boundary itself.
     const token = getToken();
     const base = apiBase();
+    setUploadError(null);
     for (const file of Array.from(files)) {
       const previewUrl = file.type.startsWith("image/") ? URL.createObjectURL(file) : undefined;
       if (previewUrl) attachmentPreviewUrlsRef.current.add(previewUrl);
@@ -1560,16 +1562,21 @@ function ChatScreen({
         if (res.ok) {
           const data = await res.json() as { attachment_id: string; filename: string; size_bytes: number };
           setAttachments(prev => [...prev, { id: data.attachment_id, name: data.filename, size: data.size_bytes, type: file.type, previewUrl }]);
-        } else if (previewUrl) {
-          URL.revokeObjectURL(previewUrl);
-          attachmentPreviewUrlsRef.current.delete(previewUrl);
+        } else {
+          if (previewUrl) {
+            URL.revokeObjectURL(previewUrl);
+            attachmentPreviewUrlsRef.current.delete(previewUrl);
+          }
+          let detail = `Upload failed (${res.status})`;
+          try { const body = await res.json() as { detail?: string }; if (body.detail) detail = body.detail; } catch { /* ignore */ }
+          setUploadError(detail);
         }
-      } catch {
+      } catch (err) {
         if (previewUrl) {
           URL.revokeObjectURL(previewUrl);
           attachmentPreviewUrlsRef.current.delete(previewUrl);
         }
-        // Upload failed silently — user can retry
+        setUploadError(err instanceof Error ? err.message : "Upload failed — please try again");
       }
     }
   }
@@ -1978,6 +1985,17 @@ function ChatScreen({
               onChange={e => { if (e.target.files) void uploadFiles(e.target.files); e.target.value = ""; }}
             />
             <div className="composer-shell">
+              {uploadError && (
+                <div
+                  className="mx-4 mt-3 flex items-center gap-2 rounded-md px-3 py-2 text-[12.5px]"
+                  style={{ background: "var(--danger-bg, rgba(239,68,68,.1))", color: "var(--danger, #ef4444)", border: "1px solid var(--danger-border, rgba(239,68,68,.25))" }}
+                  role="alert"
+                >
+                  <IC.X size={13} style={{ flexShrink: 0 }} />
+                  <span className="flex-1">{uploadError}</span>
+                  <button type="button" aria-label="Dismiss" onClick={() => setUploadError(null)} className="smooth hover:opacity-70"><IC.X size={13} /></button>
+                </div>
+              )}
               {attachments.length > 0 && (
                 <div className="flex gap-2 overflow-x-auto px-4 pt-3 pb-2">
                   {attachments.map(a => (
@@ -2476,6 +2494,20 @@ function UserMessage({ message, conversationId, onRefresh, onBranch }: MsgProps)
   return (
     <div className="flex justify-end fadein group">
       <div className="max-w-[72%] min-w-0">
+        {message.artifacts && message.artifacts.length > 0 && (
+          <div className="mb-2 flex flex-wrap justify-end gap-1.5">
+            {message.artifacts.map(a => (
+              <div
+                key={a.id}
+                className="flex items-center gap-1.5 rounded-md border px-2 py-1 text-[12px]"
+                style={{ background: "var(--surface-2)", borderColor: "var(--border-soft)", color: "var(--text-muted)" }}
+              >
+                <IC.Audit size={12} style={{ flexShrink: 0, color: "var(--text-dim)" }} />
+                <span className="max-w-[140px] truncate">{a.title}</span>
+              </div>
+            ))}
+          </div>
+        )}
         <div className="rounded-xl px-4 py-3 text-[15px] leading-relaxed" style={{ background: "var(--surface-2)", color: "var(--text)" }}>
           {message.content}
         </div>

@@ -520,12 +520,29 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    # ── Build artifact_refs for user message (from attachment metadata) ────────
+    # Resolve attachment metadata up-front so it can be persisted on the user
+    # message row. Only attachments belonging to this org are included.
+    _attachment_ids_raw: list[str] = getattr(req, "attachment_ids", []) or []
+    _user_artifact_refs: list[dict] = []
+    for _att_id in _attachment_ids_raw:
+        _meta = await _get_artifact(_att_id)
+        if _meta and str(_meta.get("organization_id")) == str(member.organization_id):
+            _user_artifact_refs.append({
+                "id": _att_id,
+                "title": _meta.get("title") or "attachment",
+                "kind": _meta.get("kind") or "attachment",
+                "mime_type": _meta.get("mime_type"),
+                "size_bytes": _meta.get("size_bytes"),
+            })
+
     # ── Conversation creation / project_id hydration ────────────────────────
     if req.conversation_id:
         # Existing conversation: save user message and fetch conversation row
         # (single round-trip) so we can hydrate project_id without an extra query.
         conv_row = await _save_message(
             req.conversation_id, "user", req.message,
+            artifact_refs=_user_artifact_refs or None,
             _member_id=member.id, _org_id=member.organization_id,
         )
         conversation_id = req.conversation_id
@@ -541,7 +558,10 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
         # New conversation: create it (with project_id if supplied), then save
         # the user message WITHOUT a RETURNING fetch (_member_id omitted).
         conversation_id = await _create_conversation(member, req.message, project_id=req.project_id)
-        await _save_message(conversation_id, "user", req.message)
+        await _save_message(
+            conversation_id, "user", req.message,
+            artifact_refs=_user_artifact_refs or None,
+        )
         effective_project_id = req.project_id
 
     requester_context = RequesterContext.from_member(member)
@@ -550,8 +570,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
     requester_context.project_id = effective_project_id
     explicit_memory = extract_explicit_memory_content(req.message)
 
-    _attachment_ids_for_memory = getattr(req, "attachment_ids", []) or []
-    if explicit_memory and not _attachment_ids_for_memory:
+    if explicit_memory and not _attachment_ids_raw:
         async def explicit_stream():
             entry_id = await create_memory_entry(
                 content=explicit_memory,
@@ -573,10 +592,9 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
 
         return StreamingResponse(explicit_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
-    attachment_ids: list[str] = getattr(req, "attachment_ids", []) or []
     attachments_context: list[dict] = []
-    if attachment_ids:
-        attachments_context = await _parse_attachments(attachment_ids, conversation_id, member.organization_id)
+    if _attachment_ids_raw:
+        attachments_context = await _parse_attachments(_attachment_ids_raw, conversation_id, member.organization_id)
 
     # classify_intent and assemble_context are independent, and both the task and
     # chat branches need the assembled context — so run them concurrently to overlap
