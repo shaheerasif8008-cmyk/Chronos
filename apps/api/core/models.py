@@ -23,6 +23,7 @@ class RequesterContext(BaseModel):
     role: str = "user"
     memory_context: str = "chat"
     surfaced_citations: list = Field(default_factory=list)
+    surfaced_memory_refs: list = Field(default_factory=list)
 
     @classmethod
     def from_member(cls, member: Member) -> "RequesterContext":

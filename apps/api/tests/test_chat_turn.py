@@ -27,7 +27,7 @@ async def test_no_tool_turn_streams_and_creates_no_task(monkeypatch):
         return "task-x"
 
     saved_msgs = []
-    async def fake_save_assistant(conv_id, content, ctx, mode=None):
+    async def fake_save_assistant(conv_id, content, ctx, mode=None, **kwargs):
         saved_msgs.append(content)
 
     async def fake_extract(*a, **k):
@@ -154,7 +154,7 @@ async def test_complex_inline_turn_sends_fast_ack_before_model_tokens(monkeypatc
 
     saved_msgs = []
 
-    async def fake_save_assistant(conv_id, content, ctx, mode=None):
+    async def fake_save_assistant(conv_id, content, ctx, mode=None, **kwargs):
         saved_msgs.append(content)
 
     async def noop(*a, **k):
@@ -414,3 +414,83 @@ async def test_inline_turn_gates_external_write_after_prompt_injection(monkeypat
 
     assert gated == ["gmail__draft"]
     assert any(e["type"] == "awaiting_approval" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_inline_turn_persists_reply_metadata_for_history_refresh(monkeypatch):
+    from runtime import agent_loop
+
+    ctx = _ctx()
+    ctx.surfaced_citations = [{"source_title": "Policy", "snippet": "Use managed devices."}]
+    ctx.surfaced_memory_refs = [{"id": "mem-1", "content": "User prefers concise answers."}]
+
+    steps = [
+        [{"type": "tool_calls", "calls": [{"id": "c1", "name": "browser__search", "args_str": json.dumps({"query": "policy"})}]}],
+        [{"type": "token", "content": "Use managed devices."}, {"type": "text_done", "text": "Use managed devices."}],
+    ]
+
+    async def fake_stream_step(messages, tools, model):
+        for ev in steps.pop(0):
+            yield ev
+
+    async def fake_create(**kwargs):
+        return "task-meta"
+
+    async def fake_get_task(tid):
+        return {
+            "id": tid,
+            "organization_id": "default",
+            "region": "us",
+            "depth": 0,
+            "triggered_by_member_id": "member-1",
+            "workspace_id": None,
+            "persona_id": None,
+        }
+
+    async def fake_execute(call, task, agent):
+        return {
+            "role": "tool",
+            "tool_call_id": call["id"],
+            "name": call["name"],
+            "content": json.dumps({"summary": "Found policy source", "data": {}}),
+        }
+
+    persisted = {}
+
+    async def fake_save_assistant(conv_id, content, requester_context, **kwargs):
+        persisted["conversation_id"] = conv_id
+        persisted["content"] = content
+        persisted.update(kwargs)
+
+    async def noop(*a, **k):
+        return None
+
+    monkeypatch.setattr(agent_loop, "stream_step", fake_stream_step)
+    monkeypatch.setattr(agent_loop, "create_task_from_history", fake_create)
+    monkeypatch.setattr(agent_loop, "get_task", fake_get_task)
+    monkeypatch.setattr(agent_loop, "_execute_tool", fake_execute)
+    monkeypatch.setattr(agent_loop, "persist_assistant_message", fake_save_assistant)
+    monkeypatch.setattr(agent_loop, "save_task", noop)
+    monkeypatch.setattr(agent_loop, "extract_and_save", noop)
+
+    events = await _run(agent_loop.stream_chat_turn(
+        conversation_id="conv-1",
+        message="search policy",
+        context_messages=[{"role": "system", "content": "sys"}],
+        requester_context=ctx,
+        model="gpt-5.4-mini",
+    ))
+
+    assert persisted["conversation_id"] == "conv-1"
+    assert persisted["content"].endswith("Use managed devices.")
+    assert persisted["citations"] == ctx.surfaced_citations
+    assert persisted["memory_refs"] == ctx.surfaced_memory_refs
+    assert persisted["tool_traces"] == [
+        {
+            "id": "tool-1",
+            "tool": "browser__search",
+            "summary": "Found policy source",
+            "status": "complete",
+        }
+    ]
+    assert any(e["type"] == "trace" and e["event"]["type"] == "tool_result" for e in events)

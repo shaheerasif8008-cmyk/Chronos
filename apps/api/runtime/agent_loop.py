@@ -217,7 +217,13 @@ def collect_tool_summaries(history: list[dict[str, Any]]) -> list[str]:
 
 
 async def _persist_to_conversation(
-    task: dict[str, Any], content: str, *, structured_response: dict | None = None
+    task: dict[str, Any],
+    content: str,
+    *,
+    structured_response: dict | None = None,
+    citations: list | None = None,
+    tool_traces: list | None = None,
+    memory_refs: list | None = None,
 ) -> str | None:
     """Persist a final message to the task's conversation if applicable. Never raises.
 
@@ -228,13 +234,31 @@ async def _persist_to_conversation(
     if not conv_id:
         return None
     try:
-        return await _save_assistant_message(conv_id, content, task, structured_response=structured_response)
+        return await _save_assistant_message(
+            conv_id,
+            content,
+            task,
+            structured_response=structured_response,
+            citations=citations,
+            tool_traces=tool_traces,
+            memory_refs=memory_refs,
+        )
     except Exception as exc:  # persistence must never break the loop
         logger.warning("Failed to persist message to conversation: %s", exc)
         return None
 
 
-async def _save_assistant_message(conversation_id: str, content: str, task: dict[str, Any], *, mode: str | None = None, structured_response: dict | None = None) -> str | None:
+async def _save_assistant_message(
+    conversation_id: str,
+    content: str,
+    task: dict[str, Any],
+    *,
+    mode: str | None = None,
+    structured_response: dict | None = None,
+    citations: list | None = None,
+    tool_traces: list | None = None,
+    memory_refs: list | None = None,
+) -> str | None:
     """Insert the task's final answer as an assistant message in the conversation.
 
     This is the source of truth — it runs in the agent loop's background task,
@@ -266,6 +290,9 @@ async def _save_assistant_message(conversation_id: str, content: str, task: dict
                 token_count=len(content.split()),
                 mode=mode,
                 structured_response=structured_response,
+                citations=citations,
+                tool_traces=tool_traces,
+                memory_refs=memory_refs,
             )
             .returning(messages.c.id)
         )
@@ -1008,7 +1035,14 @@ async def _mark_approval(approval_id: str, payload: dict[str, Any], approvals_ta
 # ── Inline chat turn ──────────────────────────────────────────────────────────
 
 async def persist_assistant_message(
-    conversation_id: str, content: str, requester_context: Any, *, mode: str | None = None
+    conversation_id: str,
+    content: str,
+    requester_context: Any,
+    *,
+    mode: str | None = None,
+    citations: list | None = None,
+    tool_traces: list | None = None,
+    memory_refs: list | None = None,
 ) -> None:
     """Save an inline chat turn's final answer as an assistant message. Never raises."""
     try:
@@ -1017,9 +1051,61 @@ async def persist_assistant_message(
             content,
             {"id": None, "organization_id": requester_context.org_id, "region": "us"},
             mode=mode,
+            citations=citations,
+            tool_traces=tool_traces,
+            memory_refs=memory_refs,
         )
     except Exception as exc:  # persistence must never break the turn
         logger.warning("Failed to persist inline assistant message: %s", exc)
+
+
+def _normalize_chat_tool_traces(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    pending: dict[str, dict[str, Any]] = {}
+    out: list[dict[str, Any]] = []
+    seq = 0
+
+    def next_id(prefix: str) -> str:
+        nonlocal seq
+        seq += 1
+        return f"{prefix}-{seq}"
+
+    for event in raw:
+        etype = str(event.get("type") or "")
+        if etype in {"thinking", "reasoning_summary"}:
+            continue
+        if etype == "tool_call":
+            tool = str(event.get("tool") or "tool")
+            pending[tool] = {
+                "id": next_id("tool"),
+                "tool": tool,
+                "summary": str(event.get("summary") or ""),
+                "status": "pending",
+            }
+        elif etype in {"tool_result", "tool_error"}:
+            tool = str(event.get("tool") or "tool")
+            row = pending.pop(tool, None) or {
+                "id": next_id("tool"),
+                "tool": tool,
+                "summary": "",
+                "status": "pending",
+            }
+            if etype == "tool_result":
+                row["summary"] = str(event.get("summary") or row.get("summary") or "")
+                row["status"] = "complete"
+            else:
+                row["summary"] = str(event.get("error") or event.get("summary") or row.get("summary") or "")
+                row["status"] = "error"
+            out.append(row)
+        elif event.get("tool"):
+            out.append({
+                "id": next_id("trace"),
+                "tool": str(event.get("tool")),
+                "summary": str(event.get("summary") or ""),
+                "status": str(event.get("status") or "complete"),
+            })
+
+    out.extend(pending.values())
+    return out
 
 
 async def create_task_from_history(
@@ -1151,6 +1237,20 @@ async def stream_chat_turn(
     task_id: str | None = None
     task: dict[str, Any] | None = None
     iteration = 0
+    raw_tool_trace_events: list[dict[str, Any]] = []
+    surfaced_citations = list(getattr(requester_context, "surfaced_citations", []) or [])
+    surfaced_memory_refs = list(getattr(requester_context, "surfaced_memory_refs", []) or [])
+
+    async def save_inline_answer(content: str) -> None:
+        await persist_assistant_message(
+            conversation_id,
+            content,
+            requester_context,
+            mode=mode,
+            citations=surfaced_citations,
+            tool_traces=_normalize_chat_tool_traces(raw_tool_trace_events),
+            memory_refs=surfaced_memory_refs,
+        )
 
     while iteration < MAX_ITERATIONS:
         iteration += 1
@@ -1167,14 +1267,14 @@ async def stream_chat_turn(
         except Exception as exc:
             logger.error("Inline turn model error: %s", exc)
             msg = "Sorry — I hit a model error and couldn't finish that. Please try again."
-            await persist_assistant_message(conversation_id, msg, requester_context, mode=mode)
+            await save_inline_answer(msg)
             yield {"type": "token", "content": msg}
             yield {"type": "done"}
             return
 
         if not calls:
             answer = f"{ack_prefix}{final_text or ''}"
-            await persist_assistant_message(conversation_id, answer, requester_context, mode=mode)
+            await save_inline_answer(answer)
             _spawn_background(extract_and_save(conversation_id, message, answer, requester_context))
             yield {"type": "done"}
             return
@@ -1216,8 +1316,13 @@ async def stream_chat_turn(
             return
 
         for call in calls:
-            yield {"type": "trace", "event": {"type": "tool_call", "tool": call["name"],
-                                              "args_preview": _args_preview(_parse_args(call["args_str"]))}}
+            tool_call_event = {
+                "type": "tool_call",
+                "tool": call["name"],
+                "args_preview": _args_preview(_parse_args(call["args_str"])),
+            }
+            raw_tool_trace_events.append(tool_call_event)
+            yield {"type": "trace", "event": tool_call_event}
             try:
                 tool_msg = await _execute_tool(call, task, agent)
             except ApprovalRequired:
@@ -1231,12 +1336,14 @@ async def stream_chat_turn(
                 summary = json.loads(tool_msg["content"]).get("summary", "")
             except Exception:
                 pass
-            yield {"type": "trace", "event": {"type": "tool_result", "tool": call["name"], "summary": summary}}
+            tool_result_event = {"type": "tool_result", "tool": call["name"], "summary": summary}
+            raw_tool_trace_events.append(tool_result_event)
+            yield {"type": "trace", "event": tool_result_event}
 
         await _checkpoint(task_id, history, iteration, model=effective_model, current_step=iteration)
 
     msg = "This is taking many steps. Try narrowing the request, or ask me to run it as a background task."
-    await persist_assistant_message(conversation_id, msg, requester_context, mode=mode)
+    await save_inline_answer(msg)
     yield {"type": "token", "content": msg}
     yield {"type": "done"}
 

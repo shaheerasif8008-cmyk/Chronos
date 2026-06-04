@@ -223,6 +223,20 @@ async def assemble_context(
         mem_block = "\n".join(f"- {m.content}" for m in memories)
         if _estimate_tokens(base + mem_block) <= system_budget:
             base += "\n\n# What I Remember\n" + mem_block
+            requester_context.surfaced_memory_refs = [
+                {
+                    "id": getattr(m, "id", None),
+                    "content": getattr(m, "content", ""),
+                    "scope": getattr(m, "scope", None),
+                    "source": getattr(m, "source", None),
+                    "importance_score": getattr(m, "importance_score", None),
+                }
+                for m in memories
+            ]
+        else:
+            requester_context.surfaced_memory_refs = []
+    else:
+        requester_context.surfaced_memory_refs = []
 
     # ── Layer 5b: project knowledge (permission-aware source citations) ─────
     if requester_context.project_id is not None:
