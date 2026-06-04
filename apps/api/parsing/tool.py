@@ -26,6 +26,26 @@ def _workspace_file(args: dict[str, Any], rel: str) -> bytes:
     return path.read_bytes()
 
 
+def _json_list(raw_json: str, key: str) -> list[dict[str, Any]]:
+    """Parse model JSON and return the list of dict items under ``key``.
+
+    Malformed JSON or a wrong-shaped value (non-dict root, non-list value, or list
+    elements that are not dicts) yields an empty list so downstream ``.get(...)`` calls
+    never raise on adversarial or misconfigured model output. This is distinct from an
+    LLM *infrastructure* failure (a raised exception), which callers surface honestly.
+    """
+    try:
+        parsed = json.loads(raw_json)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(parsed, dict):
+        return []
+    value = parsed.get(key)
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
 def _derive_citations(full_text: str, artifact_id: str, claims: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Locate each claim's verbatim quote in full_text and build citation objects.
 
@@ -181,10 +201,22 @@ class DocConnector:
 
         try:
             raw_json = await llm.complete_json(prompt)
-            parsed = json.loads(raw_json)
-            sections = parsed.get("sections") or []
         except Exception:
-            sections = []
+            # LLM infrastructure failure (no key, all models exhausted, network).
+            # Degrade honestly rather than returning a silent empty summary that
+            # looks identical to "nothing worth summarizing".
+            return ToolResult(
+                data={
+                    "warning": "summary unavailable: model error",
+                    "summary": None,
+                    "citations": [],
+                    "parser_used": doc.parser_used,
+                    "truncated": doc.truncated,
+                    "note": doc.note,
+                },
+                summary=f"Could not summarize {title}: model unavailable",
+            )
+        sections = _json_list(raw_json, "sections")
 
         citations = _derive_citations(doc.full_text, artifact_id, sections)
 
@@ -266,10 +298,19 @@ class DocConnector:
 
         try:
             raw_json = await llm.complete_json(prompt)
-            parsed = json.loads(raw_json)
-            items = parsed.get("items") or []
         except Exception:
-            items = []
+            # LLM infrastructure failure — degrade honestly (see _summarize).
+            return ToolResult(
+                data={
+                    "warning": "comparison unavailable: model error",
+                    "comparison": None,
+                    "citations": [],
+                    "parser_used_a": doc_a.parser_used,
+                    "parser_used_b": doc_b.parser_used,
+                },
+                summary=f"Could not compare {title_a} vs {title_b}: model unavailable",
+            )
+        items = _json_list(raw_json, "items")
 
         # Derive citations for each source separately
         claims_a = [{"quote": item.get("quote_a")} for item in items if item.get("quote_a")]

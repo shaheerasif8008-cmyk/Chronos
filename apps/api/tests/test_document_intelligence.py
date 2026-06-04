@@ -467,6 +467,53 @@ async def test_summarize_unparseable_returns_warning_no_fabricated_summary(monke
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
+async def test_summarize_wrong_shape_model_json_does_not_crash(monkeypatch):
+    """Structurally valid JSON with the wrong shape must degrade to no claims, not crash."""
+    from core import tool_broker as tb
+    import core.llm as llm_mod
+
+    org_id = _unique_org()
+    _patch_broker_infra(monkeypatch)
+
+    raw = _make_docx_bytes("Some real document content about widgets.")
+    _make_artifact_mocks(monkeypatch, raw, "", "doc.docx", artifact_id="ws-1", org_id=org_id)
+
+    async def fake_complete_json(prompt, *, model=None):
+        return json.dumps({"sections": "this should be a list, not a string"})
+
+    monkeypatch.setattr(llm_mod, "complete_json", fake_complete_json)
+
+    agent = _make_agent(org_id)
+    result = await tb.execute(agent, "doc.summarize", {"artifact_id": "ws-1"})
+    assert result.data["summary"] == []
+    assert result.data["citations"] == []
+
+
+@pytest.mark.asyncio
+async def test_summarize_llm_failure_degrades_honestly(monkeypatch):
+    """An LLM infrastructure failure must produce an honest warning, not a silent empty summary."""
+    from core import tool_broker as tb
+    import core.llm as llm_mod
+
+    org_id = _unique_org()
+    _patch_broker_infra(monkeypatch)
+
+    raw = _make_docx_bytes("Some real document content about widgets.")
+    _make_artifact_mocks(monkeypatch, raw, "", "doc.docx", artifact_id="fail-1", org_id=org_id)
+
+    async def fake_complete_json(prompt, *, model=None):
+        raise RuntimeError("All models failed for complete_json")
+
+    monkeypatch.setattr(llm_mod, "complete_json", fake_complete_json)
+
+    agent = _make_agent(org_id)
+    result = await tb.execute(agent, "doc.summarize", {"artifact_id": "fail-1"})
+    assert result.data["summary"] is None
+    assert "warning" in result.data and "unavailable" in result.data["warning"]
+    assert result.data["citations"] == []
+
+
+@pytest.mark.asyncio
 async def test_citation_spans_dropped_when_quote_not_in_source(monkeypatch):
     """If model returns a quote that doesn't appear in source, it must be dropped."""
     from parsing.tool import _derive_citations
