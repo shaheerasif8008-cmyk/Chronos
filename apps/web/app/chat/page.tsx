@@ -4,6 +4,7 @@ import { Component, ReactNode, useEffect, useRef, useState, useMemo, useCallback
 import { usePathname, useRouter } from "next/navigation";
 import ArtifactsScreen from "../../components/artifacts/ArtifactsScreen";
 import InChatArtifactPanel from "../../components/artifacts/InChatArtifactPanel";
+import ResearchScreen from "../../components/research/ResearchScreen";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 const CONFIGURED_API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
@@ -843,7 +844,7 @@ function ChronosAppInner() {
         }} />}
         {route === "settings"   && <SettingsScreen tab={settingsTab} setTab={setSettingsTab} theme={theme} setTheme={setTheme} accent={accent} setAccent={setAccent} signOut={signOut} />}
         {route === "projects"   && <ProjectsScreen />}
-        {route === "research"   && <EmptyPanel label="Research" />}
+        {route === "research"   && <ResearchScreen />}
         {route === "tasks"      && <EmptyPanel label="Tasks" />}
         {route === "artifacts"  && <EmptyPanel label="Artifacts" />}
         {route === "agents"     && <EmptyPanel label="Agents" />}
