@@ -267,3 +267,211 @@ async def test_cross_org_upload_to_task_returns_404():
         assert resp.status_code == 404, (
             f"expected 404 for cross-org task link, got {resp.status_code}: {resp.text}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Test 4: send_message wires artifact_refs through to _save_message
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_send_message_persists_attachment_refs_on_user_message(monkeypatch):
+    """send_message must resolve artifact metadata for each attachment_id and
+    write it into the artifact_refs kwarg of the user-message _save_message call.
+
+    This proves the new code in the router (the _user_artifact_refs loop) actually
+    executes — not just that _save_message accepts the kwarg.
+
+    Uses monkeypatching to avoid DB, LLM, and streaming overhead.
+    """
+    from fastapi import Response
+    from routers import chat as chat_router
+    from core.models import Member
+
+    member = Member(id="m1", organization_id="org-test", email="a@b.c", role="user", name="A")
+
+    # Capture the kwargs passed to _save_message.
+    save_calls: list[dict] = []
+
+    async def fake_save_message(conv_id, role, content, *, _member_id=None, _org_id=None, **kwargs):
+        save_calls.append({"conv_id": conv_id, "role": role, "kwargs": kwargs})
+        # Simulate the conv_row return (for existing-conv branch).
+        if _member_id is not None:
+            return {"id": conv_id, "project_id": None}
+        return None
+
+    async def fake_get_artifact(artifact_id):
+        return {
+            "organization_id": "org-test",
+            "title": "report.pdf",
+            "kind": "attachment",
+            "mime_type": "application/pdf",
+            "size_bytes": 1024,
+        }
+
+    async def fake_parse_attachments(ids, conv_id, org_id):
+        return []
+
+    async def fake_permissions_check(*a, **k):
+        return True
+
+    async def fake_assemble_context(*a, **k):
+        return [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
+
+    async def fake_extract_memory(msg):
+        return None
+
+    async def _fake_stream():
+        # Minimal async generator — returns nothing
+        return
+        yield  # make it a generator
+
+    async def fake_stream_chat_turn(**kwargs):
+        yield {"type": "done"}
+
+    monkeypatch.setattr(chat_router, "_save_message", fake_save_message)
+    monkeypatch.setattr(chat_router, "_get_artifact", fake_get_artifact)
+    monkeypatch.setattr(chat_router, "_parse_attachments", fake_parse_attachments)
+    monkeypatch.setattr(chat_router.permissions, "check", fake_permissions_check)
+    monkeypatch.setattr(chat_router, "assemble_context", fake_assemble_context)
+    monkeypatch.setattr(chat_router, "extract_explicit_memory_content", lambda _: None)
+    monkeypatch.setattr(chat_router, "normalize_chat_model", lambda m: "fast")
+    monkeypatch.setattr(chat_router, "classify_intent", lambda _: _wrap_coro({"mode": "chat", "goal": None}))
+    monkeypatch.setattr(chat_router, "stream_chat_turn", fake_stream_chat_turn)
+
+    req = chat_router.ChatRequest(
+        message="summarize this",
+        conversation_id="conv-existing",
+        attachment_ids=["att-1"],
+    )
+    response = await chat_router.send_message(req, member=member)
+    # The response is a StreamingResponse; we only care that _save_message was called.
+    user_saves = [c for c in save_calls if c["role"] == "user"]
+    assert len(user_saves) >= 1, f"_save_message not called for user role: {save_calls}"
+    refs = user_saves[0]["kwargs"].get("artifact_refs")
+    assert refs is not None, f"artifact_refs not passed to _save_message: {user_saves[0]}"
+    assert len(refs) == 1
+    assert refs[0]["id"] == "att-1"
+    assert refs[0]["kind"] == "attachment"
+    assert refs[0]["mime_type"] == "application/pdf"
+
+
+@pytest.mark.asyncio
+async def test_send_message_filters_cross_org_attachment(monkeypatch):
+    """Attachments belonging to a different org must not appear in artifact_refs."""
+    from routers import chat as chat_router
+    from core.models import Member
+
+    member = Member(id="m2", organization_id="org-mine", email="b@b.c", role="user", name="B")
+
+    save_calls: list[dict] = []
+
+    async def fake_save_message(conv_id, role, content, *, _member_id=None, _org_id=None, **kwargs):
+        save_calls.append({"role": role, "kwargs": kwargs})
+        if _member_id is not None:
+            return {"id": conv_id, "project_id": None}
+        return None
+
+    async def fake_get_artifact(artifact_id):
+        # Belongs to a DIFFERENT org — should be filtered out.
+        return {"organization_id": "org-other", "title": "evil.pdf", "kind": "attachment",
+                "mime_type": "application/pdf", "size_bytes": 512}
+
+    async def fake_parse_attachments(ids, conv_id, org_id):
+        return []
+
+    async def fake_permissions_check(*a, **k):
+        return True
+
+    async def fake_assemble_context(*a, **k):
+        return [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
+
+    async def fake_stream_chat_turn(**kwargs):
+        yield {"type": "done"}
+
+    monkeypatch.setattr(chat_router, "_save_message", fake_save_message)
+    monkeypatch.setattr(chat_router, "_get_artifact", fake_get_artifact)
+    monkeypatch.setattr(chat_router, "_parse_attachments", fake_parse_attachments)
+    monkeypatch.setattr(chat_router.permissions, "check", fake_permissions_check)
+    monkeypatch.setattr(chat_router, "assemble_context", fake_assemble_context)
+    monkeypatch.setattr(chat_router, "extract_explicit_memory_content", lambda _: None)
+    monkeypatch.setattr(chat_router, "normalize_chat_model", lambda m: "fast")
+    monkeypatch.setattr(chat_router, "classify_intent", lambda _: _wrap_coro({"mode": "chat", "goal": None}))
+    monkeypatch.setattr(chat_router, "stream_chat_turn", fake_stream_chat_turn)
+
+    req = chat_router.ChatRequest(
+        message="sneaky",
+        conversation_id="conv-existing",
+        attachment_ids=["foreign-att"],
+    )
+    await chat_router.send_message(req, member=member)
+
+    user_saves = [c for c in save_calls if c["role"] == "user"]
+    assert len(user_saves) >= 1
+    refs = user_saves[0]["kwargs"].get("artifact_refs")
+    # Cross-org artifact must be filtered → empty list → we pass None to _save_message.
+    assert not refs, f"cross-org artifact leaked into artifact_refs: {refs}"
+
+
+# ---------------------------------------------------------------------------
+# Test 5: Upload with research_run_id audits the link
+# ---------------------------------------------------------------------------
+
+@_requires_db
+@pytest.mark.asyncio
+async def test_upload_with_research_run_id_audits_link():
+    """Upload a file with research_run_id → audit event attachment_linked_research_run
+    must exist (research_runs has no artifact FK, so audit is the linkage).
+    """
+    org_id, member_id, token = await _make_org_and_member()
+
+    # Insert a minimal research run.
+    research_runs = await reflect_table("research_runs")
+    async with engine.begin() as conn:
+        row = (
+            await conn.execute(
+                insert(research_runs).values(
+                    organization_id=org_id,
+                    region="us",
+                    member_id=member_id,
+                    question="test research question",
+                    status="pending",
+                ).returning(research_runs.c.id)
+            )
+        ).first()
+    run_id = str(row[0])
+
+    async with _client() as client:
+        resp = await client.post(
+            "/attachments",
+            files={"file": ("context.txt", io.BytesIO(b"research context"), "text/plain")},
+            data={"research_run_id": run_id},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body.get("research_run_id") == run_id
+        attachment_id = body["attachment_id"]
+
+    # Verify audit event exists.
+    audit_log = await reflect_table("audit_log")
+    async with engine.begin() as conn:
+        row = (
+            await conn.execute(
+                select(audit_log).where(
+                    audit_log.c.event_type == "attachment_linked_research_run",
+                    audit_log.c.resource_id == attachment_id,
+                    audit_log.c.organization_id == org_id,
+                )
+            )
+        ).mappings().first()
+    assert row is not None, "No attachment_linked_research_run audit event found"
+    assert row["payload"]["research_run_id"] == run_id
+
+
+# ---------------------------------------------------------------------------
+# Helpers for async coroutine wrapping (used by send_message unit tests)
+# ---------------------------------------------------------------------------
+
+async def _wrap_coro(val):
+    """Return val as a coroutine result (for monkeypatching async functions)."""
+    return val
