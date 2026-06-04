@@ -278,9 +278,21 @@ class DocConnector:
         citations_b = _derive_citations(doc_b.full_text, artifact_id_b, claims_b)
         all_citations = citations_a + citations_b
 
+        # Only keep comparison items whose cited quote(s) were verifiably found in the
+        # source(s). An item must have at least one verified quote (quote_a or quote_b)
+        # to be returned — no claim is returned without a corresponding stored source
+        # span (acceptance requirement, applied equally to compare and summarize).
+        verified_quotes = {c["quote"] for c in all_citations}
+        comparison = [
+            item
+            for item in items
+            if (item.get("quote_a") or "").strip() in verified_quotes
+            or (item.get("quote_b") or "").strip() in verified_quotes
+        ]
+
         return ToolResult(
             data={
-                "comparison": items,
+                "comparison": comparison,
                 "citations": all_citations,
                 "parser_used_a": doc_a.parser_used,
                 "parser_used_b": doc_b.parser_used,

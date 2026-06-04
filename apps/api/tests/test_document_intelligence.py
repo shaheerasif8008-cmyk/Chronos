@@ -365,6 +365,67 @@ async def test_compare_two_docs_citations_into_both(monkeypatch):
         )
 
 
+@pytest.mark.asyncio
+async def test_compare_drops_unverified_claims_from_comparison(monkeypatch):
+    """A comparison item whose quotes are not in either source must be excluded from
+    the returned `comparison` output (not just from the citations list)."""
+    from core import tool_broker as tb
+    import parsing.tool as doctool
+    import core.llm as llm_mod
+
+    org_id = _unique_org()
+    _patch_broker_infra(monkeypatch)
+
+    text_a = "Contract A covers liability and indemnification clauses."
+    text_b = "Contract B outlines warranty terms and service levels."
+    raw_a = _make_docx_bytes(text_a)
+    raw_b = _make_docx_bytes(text_b)
+
+    async def fake_get(aid):
+        return {"organization_id": org_id, "mime_type": "", "title": f"{aid}.docx", "kind": "attachment"}
+
+    async def fake_read(aid):
+        return raw_a if aid == "art-a" else raw_b
+
+    monkeypatch.setattr(doctool, "get_artifact", fake_get)
+    monkeypatch.setattr(doctool, "read_artifact_content", fake_read)
+
+    # One real item (verbatim quotes) + one fabricated item (quotes absent from both docs).
+    response = json.dumps({
+        "items": [
+            {
+                "type": "similarity",
+                "description": "Both are contracts.",
+                "quote_a": "liability and indemnification",
+                "quote_b": "warranty terms",
+            },
+            {
+                "type": "difference",
+                "description": "FABRICATED — quotes appear in neither document.",
+                "quote_a": "quantum teleportation protocol",
+                "quote_b": "interstellar shipping rates",
+            },
+        ]
+    })
+
+    async def fake_complete_json(prompt, *, model=None):
+        return response
+
+    monkeypatch.setattr(llm_mod, "complete_json", fake_complete_json)
+
+    agent = _make_agent(org_id)
+    result = await tb.execute(agent, "doc.compare", {"artifact_id_a": "art-a", "artifact_id_b": "art-b"})
+
+    comparison = result.data["comparison"]
+    descriptions = " ".join(item.get("description", "") for item in comparison)
+    assert "FABRICATED" not in descriptions, "Unverified comparison item must be dropped"
+    assert len(comparison) == 1, f"Only the verified item should remain, got {comparison}"
+    # Every returned item must carry at least one quote that exists in a citation span.
+    verified = {c["quote"] for c in result.data["citations"]}
+    for item in comparison:
+        assert (item.get("quote_a") in verified) or (item.get("quote_b") in verified)
+
+
 # ---------------------------------------------------------------------------
 # TEST: unparseable input → honest warning, no fabricated summary
 # ---------------------------------------------------------------------------
