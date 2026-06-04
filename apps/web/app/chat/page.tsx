@@ -2491,6 +2491,54 @@ function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: Mes
 
 type MsgProps = { message: Message; conversationId: string; onRefresh: () => void; onBranch: (id: string) => void };
 
+/** Chip for a single persisted attachment on a user message.
+ *  Image attachments: fetches the blob via apiFetch (Bearer-authed) and renders
+ *  a small thumbnail.  Non-image attachments: filename chip, same as before.
+ */
+function AttachmentChip({ artifact }: { artifact: ArtifactRef }) {
+  const [thumbUrl, setThumbUrl] = useState<string | null>(null);
+  const isImage = (artifact.mime_type ?? "").startsWith("image/");
+
+  useEffect(() => {
+    if (!isImage) return;
+    let objectUrl: string | null = null;
+    apiFetch(`/artifacts/${artifact.id}/content`)
+      .then(r => r.blob())
+      .then(blob => {
+        objectUrl = URL.createObjectURL(blob);
+        setThumbUrl(objectUrl);
+      })
+      .catch(() => { /* silently fall back to chip */ });
+    return () => {
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [artifact.id, isImage]);
+
+  if (isImage && thumbUrl) {
+    return (
+      <div
+        className="rounded-md border overflow-hidden"
+        style={{ borderColor: "var(--border-soft)", width: 56, height: 56, flexShrink: 0 }}
+        title={artifact.title}
+      >
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img src={thumbUrl} alt={artifact.title} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className="flex items-center gap-1.5 rounded-md border px-2 py-1 text-[12px]"
+      style={{ background: "var(--surface-2)", borderColor: "var(--border-soft)", color: "var(--text-muted)" }}
+    >
+      <IC.Attach size={12} style={{ flexShrink: 0, color: "var(--text-dim)" }} />
+      <span className="max-w-[140px] truncate">{artifact.title}</span>
+    </div>
+  );
+}
+
 function UserMessage({ message, conversationId, onRefresh, onBranch }: MsgProps) {
   return (
     <div className="flex justify-end fadein group">
@@ -2498,14 +2546,7 @@ function UserMessage({ message, conversationId, onRefresh, onBranch }: MsgProps)
         {message.artifacts && message.artifacts.length > 0 && (
           <div className="mb-2 flex flex-wrap justify-end gap-1.5">
             {message.artifacts.map(a => (
-              <div
-                key={a.id}
-                className="flex items-center gap-1.5 rounded-md border px-2 py-1 text-[12px]"
-                style={{ background: "var(--surface-2)", borderColor: "var(--border-soft)", color: "var(--text-muted)" }}
-              >
-                <IC.Attach size={12} style={{ flexShrink: 0, color: "var(--text-dim)" }} />
-                <span className="max-w-[140px] truncate">{a.title}</span>
-              </div>
+              <AttachmentChip key={a.id} artifact={a} />
             ))}
           </div>
         )}

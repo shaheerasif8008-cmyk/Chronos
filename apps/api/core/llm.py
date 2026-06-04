@@ -23,7 +23,7 @@ CHAT_MODEL_OPTIONS: tuple[dict[str, Any], ...] = (
         "label": "GPT-5.4 Mini",
         "model": "openrouter/openai/gpt-5.4-mini",
         "description": "OpenAI GPT-5.4 Mini through OpenRouter.",
-        "capabilities": ["chat", "tool_use", "agent_loop", "structured_json"],
+        "capabilities": ["chat", "tool_use", "agent_loop", "structured_json", "vision"],
         "tool_use": True,
         "fallback_for": [],
         "policy": "Selected explicitly by the user in chat.",
@@ -33,7 +33,7 @@ CHAT_MODEL_OPTIONS: tuple[dict[str, Any], ...] = (
         "label": "GPT-5.4 Nano",
         "model": "openrouter/openai/gpt-5.4-nano",
         "description": "OpenAI GPT-5.4 Nano through OpenRouter.",
-        "capabilities": ["chat", "tool_use", "agent_loop", "structured_json"],
+        "capabilities": ["chat", "tool_use", "agent_loop", "structured_json", "vision"],
         "tool_use": True,
         "fallback_for": [],
         "policy": "Selected explicitly by the user in chat.",
@@ -99,6 +99,19 @@ def available_chat_models() -> list[dict[str, Any]]:
         }
         for model in CHAT_MODEL_OPTIONS
     ]
+
+
+def model_supports_vision(model_id: str) -> bool:
+    """Return True when the chat-model registry entry for *model_id* declares "vision".
+
+    Non-fatal: unknown model ids return False rather than raising so callers can
+    unconditionally fall back to the OCR path without an extra guard.
+    """
+    by_id = {m["id"]: m for m in CHAT_MODEL_OPTIONS}
+    entry = by_id.get(model_id)
+    if entry is None:
+        return False
+    return "vision" in entry.get("capabilities", [])
 
 
 def normalize_chat_model(model_id: str | None) -> str:

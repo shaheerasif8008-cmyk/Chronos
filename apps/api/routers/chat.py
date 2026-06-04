@@ -17,7 +17,13 @@ from core.config import settings
 from core.context import assemble_context
 from core.db import engine, reflect_table
 from core.intent import classify_intent
-from core.llm import available_chat_models, normalize_chat_model
+from core.context import (
+    _IMAGE_MIMES,
+    _VISION_UNAVAILABLE_NOTE,
+    build_image_block,
+    build_user_turn_content,
+)
+from core.llm import available_chat_models, model_supports_vision, normalize_chat_model
 from core.modes import available_modes
 from core.memory_writes import create_memory_entry, extract_explicit_memory_content
 from core.models import Member, RequesterContext
@@ -596,6 +602,33 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
     if _attachment_ids_raw:
         attachments_context = await _parse_attachments(_attachment_ids_raw, conversation_id, member.organization_id)
 
+    # ── Vision / multimodal user-turn assembly ──────────────────────────────
+    # Collect image blocks for attachments that belong to this org and have an
+    # image mime type.  Done here (not inside stream_chat_turn) so the org filter
+    # is co-located with the existing artifact resolution logic above.
+    _image_blocks: list[dict] = []
+    _has_images = False
+    for _att_id in _attachment_ids_raw:
+        _meta = await _get_artifact(_att_id)
+        if not _meta or str(_meta.get("organization_id")) != str(member.organization_id):
+            continue  # cross-org or missing — skip (security)
+        mime = str(_meta.get("mime_type") or "")
+        if mime not in _IMAGE_MIMES:
+            continue
+        _has_images = True
+        if model_supports_vision(selected_model):
+            raw_bytes = await _read_artifact_content(_att_id) or b""
+            if raw_bytes:
+                _image_blocks.append(build_image_block(raw_bytes, mime))
+
+    _vision_active = model_supports_vision(selected_model) and bool(_image_blocks)
+    _user_content = build_user_turn_content(
+        req.message,
+        _image_blocks,
+        vision_available=_vision_active,
+        ocr_note=_VISION_UNAVAILABLE_NOTE if (_has_images and not _vision_active) else None,
+    )
+
     # classify_intent and assemble_context are independent, and both the task and
     # chat branches need the assembled context — so run them concurrently to overlap
     # their LLM round-trips instead of paying for them in series. Obviously
@@ -640,6 +673,12 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
         async for event in gen:
             yield f"data: {json.dumps(event)}\n\n"
 
+    # Pass user_content only when it differs from the plain message string so
+    # the non-vision path remains byte-for-byte identical to before.
+    _user_content_kwarg: dict = {}
+    if _user_content is not req.message:
+        _user_content_kwarg = {"user_content": _user_content}
+
     return StreamingResponse(
         _sse_wrap(
             stream_chat_turn(
@@ -649,6 +688,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
                 requester_context=requester_context,
                 model=selected_model,
                 mode=req.mode,
+                **_user_content_kwarg,
             )
         ),
         media_type="text/event-stream",

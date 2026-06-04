@@ -1202,6 +1202,7 @@ async def stream_chat_turn(
     model: str | None,
     mode: str | None = None,
     emit_conversation: bool = True,
+    user_content: Any | None = None,
 ):
     """Stream one chat turn inline.
 
@@ -1228,7 +1229,10 @@ async def stream_chat_turn(
                 ),
             }
         )
-    history.append({"role": "user", "content": message})
+    # user_content may be a list (multimodal vision blocks) or a plain string.
+    # message (always str) is kept for ack/grounding/memory/goal — user_content
+    # only controls what the model receives as the user turn's content field.
+    history.append({"role": "user", "content": user_content if user_content is not None else message})
     effective_model = resolve_agent_model(model)
     ack_prefix = ""
     if should_emit_fast_ack(message):

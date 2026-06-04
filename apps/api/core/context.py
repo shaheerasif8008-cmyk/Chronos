@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from pathlib import Path
 import asyncio
 
@@ -291,6 +292,58 @@ async def _load_project_instructions(project_id: str, org_id: str) -> str | None
     if not instructions or not instructions.strip():
         return None
     return instructions
+
+
+_IMAGE_MIMES = frozenset({"image/png", "image/jpeg", "image/jpg", "image/webp"})
+
+# Vision-unavailable note appended when images are present but the selected model
+# cannot process them natively — truthful, observable in context/response.
+_VISION_UNAVAILABLE_NOTE = (
+    "[Note: image attachment(s) present but the selected model does not support "
+    "vision — OCR text extraction was used instead. Switch to a vision-capable "
+    "model (e.g. GPT-5.4 Mini) to send images directly.]"
+)
+
+
+def build_user_turn_content(
+    message: str,
+    image_blocks: list[dict],
+    *,
+    vision_available: bool,
+    ocr_note: str | None = None,
+) -> str | list:
+    """Return the content value for the final user-turn message dict.
+
+    Two shapes:
+    - vision_available=True and image_blocks non-empty:
+        Returns a list: [text_block, image_url_block, ...].
+        litellm forwards list-content to providers that support it (OpenAI vision API).
+    - Otherwise:
+        Returns a plain string (message + optional OCR note).
+        Keeps the path identical to the pre-vision code for all non-image turns.
+
+    This function is **pure** (no I/O) so it is fast-path safe and trivially testable.
+
+    Design note: the helper lives here (not in chat.py) because it is part of
+    context assembly — it decides the final user-turn payload.  The chat router
+    calls it after resolving org-scoped image attachment bytes and calls
+    stream_chat_turn with the result via the `user_content` param.
+    """
+    if vision_available and image_blocks:
+        blocks: list[dict] = [{"type": "text", "text": message}]
+        blocks.extend(image_blocks)
+        return blocks
+
+    # Non-vision path: plain text, with optional OCR note appended.
+    if ocr_note:
+        return f"{message}\n\n{ocr_note}"
+    return message
+
+
+def build_image_block(image_bytes: bytes, mime: str) -> dict:
+    """Return a single OpenAI-style image_url content block from raw bytes."""
+    data_url = f"data:{mime};base64,{base64.b64encode(image_bytes).decode()}"
+    return {"type": "image_url", "image_url": {"url": data_url}}
 
 
 async def _load_task_context(task_id: str, org_id: str) -> str:
