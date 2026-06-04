@@ -1610,6 +1610,7 @@ function ChatScreen({
     setDraft("");
     const pendingAttachmentIds = attachments.map(a => a.id);
     clearAttachments();
+    setUploadError(null);
     setMessages(prev => [
       ...prev,
       { role: "user", content: text, status: "complete" },
@@ -2502,7 +2503,7 @@ function UserMessage({ message, conversationId, onRefresh, onBranch }: MsgProps)
                 className="flex items-center gap-1.5 rounded-md border px-2 py-1 text-[12px]"
                 style={{ background: "var(--surface-2)", borderColor: "var(--border-soft)", color: "var(--text-muted)" }}
               >
-                <IC.Audit size={12} style={{ flexShrink: 0, color: "var(--text-dim)" }} />
+                <IC.Attach size={12} style={{ flexShrink: 0, color: "var(--text-dim)" }} />
                 <span className="max-w-[140px] truncate">{a.title}</span>
               </div>
             ))}

@@ -320,11 +320,6 @@ async def test_send_message_persists_attachment_refs_on_user_message(monkeypatch
     async def fake_extract_memory(msg):
         return None
 
-    async def _fake_stream():
-        # Minimal async generator — returns nothing
-        return
-        yield  # make it a generator
-
     async def fake_stream_chat_turn(**kwargs):
         yield {"type": "done"}
 
@@ -466,6 +461,40 @@ async def test_upload_with_research_run_id_audits_link():
         ).mappings().first()
     assert row is not None, "No attachment_linked_research_run audit event found"
     assert row["payload"]["research_run_id"] == run_id
+
+
+@_requires_db
+@pytest.mark.asyncio
+async def test_cross_org_upload_to_research_run_returns_404():
+    """Member from org B cannot link an upload to org A's research run → 404."""
+    org_a_id, member_a_id, _ = await _make_org_and_member()
+    _, _b_member, token_b = await _make_org_and_member()
+
+    research_runs = await reflect_table("research_runs")
+    async with engine.begin() as conn:
+        row = (
+            await conn.execute(
+                insert(research_runs).values(
+                    organization_id=org_a_id,
+                    region="us",
+                    member_id=member_a_id,
+                    question="org A private research",
+                    status="pending",
+                ).returning(research_runs.c.id)
+            )
+        ).first()
+    run_id = str(row[0])
+
+    async with _client() as client:
+        resp = await client.post(
+            "/attachments",
+            files={"file": ("steal.txt", io.BytesIO(b"bad actor"), "text/plain")},
+            data={"research_run_id": run_id},
+            headers={"Authorization": f"Bearer {token_b}"},
+        )
+        assert resp.status_code == 404, (
+            f"expected 404 for cross-org research run link, got {resp.status_code}: {resp.text}"
+        )
 
 
 # ---------------------------------------------------------------------------
