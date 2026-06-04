@@ -21,7 +21,8 @@ from core.exceptions import PermissionDenied
 from jobs import context_update, profile_synthesis, scheduled_tasks
 from core.db import engine, reflect_table
 from runtime import task_runner
-from routers import activity, approvals, artifact_share, artifacts, attachments, auth, chat, connectors, context, memory, projects, schedules, search, settings, tasks, workflows
+from runtime.research_executor import start_research
+from routers import activity, approvals, artifact_share, artifacts, attachments, auth, chat, connectors, context, memory, projects, research, schedules, search, settings, tasks, workflows
 
 app = FastAPI(title="Chronos API", version="0.1.0")
 
@@ -56,6 +57,7 @@ app.include_router(attachments.router)
 app.include_router(settings.router)
 app.include_router(workflows.router)
 app.include_router(schedules.router)
+app.include_router(research.router)
 
 
 def _init_observability() -> None:
@@ -115,6 +117,7 @@ async def start_schedulers() -> None:
     task_runner.start_runner()
     await recover_incomplete_tasks()
     await recover_incomplete_workflows()
+    await recover_incomplete_research()
 
 
 async def _bootstrap_authz() -> None:
@@ -144,6 +147,23 @@ async def recover_incomplete_tasks() -> list[str]:
     for task_id in task_ids:
         await task_runner.enqueue_task(task_id)
     return task_ids
+
+
+async def recover_incomplete_research() -> list[str]:
+    research_runs = await reflect_table("research_runs")
+    async with engine.begin() as conn:
+        rows = (
+            await conn.execute(
+                select(research_runs.c.id, research_runs.c.organization_id).where(
+                    research_runs.c.status.in_(["pending", "planning", "running"])
+                )
+            )
+        ).all()
+
+    run_ids = [str(row[0]) for row in rows]
+    for row in rows:
+        await start_research(str(row[0]), str(row[1]))
+    return run_ids
 
 
 async def recover_incomplete_workflows() -> list[str]:

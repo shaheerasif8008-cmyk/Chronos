@@ -4,6 +4,7 @@ import { Component, ReactNode, useEffect, useRef, useState, useMemo, useCallback
 import { usePathname, useRouter } from "next/navigation";
 import ArtifactsScreen from "../../components/artifacts/ArtifactsScreen";
 import InChatArtifactPanel from "../../components/artifacts/InChatArtifactPanel";
+import ResearchScreen from "../../components/research/ResearchScreen";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 const CONFIGURED_API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
@@ -843,7 +844,7 @@ function ChronosAppInner() {
         }} />}
         {route === "settings"   && <SettingsScreen tab={settingsTab} setTab={setSettingsTab} theme={theme} setTheme={setTheme} accent={accent} setAccent={setAccent} signOut={signOut} />}
         {route === "projects"   && <ProjectsScreen />}
-        {route === "research"   && <EmptyPanel label="Research" />}
+        {route === "research"   && <ResearchScreen />}
         {route === "tasks"      && <EmptyPanel label="Tasks" />}
         {route === "artifacts"  && <EmptyPanel label="Artifacts" />}
         {route === "agents"     && <EmptyPanel label="Agents" />}
@@ -4747,10 +4748,109 @@ function ProjectDetailScreen({
               ))}
             </div>
           )
+        ) : tab === "research" ? (
+          <ProjectResearchTab tasks={tasks} artifacts={artifacts} sources={sources} />
         ) : (
           <EmptyState title="Nothing here yet" sub="This feature is coming soon." />
         )}
       </div>
+    </div>
+  );
+}
+
+function ProjectResearchTab({
+  tasks,
+  artifacts,
+  sources,
+}: {
+  tasks: Task[];
+  artifacts: ArtifactRef[];
+  sources: ProjectSource[];
+}) {
+  const rows = [
+    ...tasks.map(task => ({
+      id: `task-${task.id}`,
+      kind: "Task",
+      title: task.goal || "Untitled task",
+      detail: task.status,
+      date: task.created_at,
+      icon: <IC.Activity size={15} />,
+      tag: task.status,
+      tagVariant: task.status === "complete" ? "ok" : task.status === "failed" ? "danger" : task.status === "awaiting_approval" ? "warn" : "info",
+    })),
+    ...artifacts.map(artifact => ({
+      id: `artifact-${artifact.id}`,
+      kind: "Artifact",
+      title: artifact.title || "Untitled artifact",
+      detail: artifact.kind,
+      date: undefined,
+      icon: <IC.Folder size={15} />,
+      tag: artifact.kind,
+      tagVariant: "default",
+    })),
+    ...sources.map(source => {
+      const status = source.index_status ?? source.parse_status ?? "pending";
+      return {
+        id: `source-${source.id}`,
+        kind: "Source",
+        title: source.title || source.uri || "Untitled source",
+        detail: source.source_type ?? "source",
+        date: source.created_at,
+        icon: <IC.Search size={15} />,
+        tag: status,
+        tagVariant: status === "indexed" || status === "synced" ? "ok" : status === "failed" || status === "revoked" ? "danger" : "info",
+      };
+    }),
+  ].sort((a, b) => Date.parse(b.date ?? "") - Date.parse(a.date ?? ""));
+
+  const activeTasks = tasks.filter(task => !["complete", "failed"].includes(task.status)).length;
+  const indexedSources = sources.filter(source => ["indexed", "synced"].includes(source.index_status ?? "")).length;
+
+  if (rows.length === 0) {
+    return <EmptyState icon={<IC.Search size={22} />} title="No research activity" sub="Project tasks, artifacts, and indexed sources appear here as research work accumulates." />;
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))" }}>
+        <ProjectResearchMetric label="Tasks" value={tasks.length} detail={activeTasks ? `${activeTasks} active` : "none active"} />
+        <ProjectResearchMetric label="Artifacts" value={artifacts.length} detail="project outputs" />
+        <ProjectResearchMetric label="Sources" value={sources.length} detail={`${indexedSources} indexed`} />
+      </div>
+      <div className="surface border border-soft rounded-xl overflow-hidden">
+        <div className="px-5 py-3 border-b hairline flex items-center justify-between gap-3">
+          <div className="font-medium text-[14px]">Research activity</div>
+          <div className="text-[12px]" style={{ color: "var(--text-faint)" }}>{rows.length} items</div>
+        </div>
+        {rows.map(row => (
+          <div key={row.id} className="px-5 py-4 border-b hairline last:border-b-0 flex items-start gap-3">
+            <div className="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0" style={{ background: "var(--surface-2)", color: "var(--text-dim)" }}>
+              {row.icon}
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-2 min-w-0">
+                <div className="font-medium text-[14px] truncate">{row.title}</div>
+                <Tag variant={row.tagVariant as "default" | "accent" | "ok" | "warn" | "danger" | "info"}>{row.tag}</Tag>
+              </div>
+              <div className="flex flex-wrap gap-x-3 gap-y-1 mt-1 text-[12px]" style={{ color: "var(--text-faint)" }}>
+                <span>{row.kind}</span>
+                <span>{row.detail}</span>
+                {row.date && <span>{new Date(row.date).toLocaleString()}</span>}
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ProjectResearchMetric({ label, value, detail }: { label: string; value: number; detail: string }) {
+  return (
+    <div className="surface border border-soft rounded-xl px-5 py-4">
+      <div className="text-[12px] font-medium uppercase tracking-[0.08em]" style={{ color: "var(--text-faint)" }}>{label}</div>
+      <div className="mt-1 text-[24px] font-semibold leading-tight">{value}</div>
+      <div className="text-[12px] mt-0.5" style={{ color: "var(--text-dim)" }}>{detail}</div>
     </div>
   );
 }
