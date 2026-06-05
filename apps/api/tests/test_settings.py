@@ -95,3 +95,38 @@ async def test_settings_overview_includes_connector_health(monkeypatch):
     )
 
     assert overview["runtime_health"]["connectors"]["gmail"]["tier"] == "demo"
+
+
+@pytest.mark.asyncio
+async def test_export_memory_returns_org_json_download(monkeypatch):
+    from core.models import Member
+    from routers import settings
+
+    async def fake_export_memories(member):
+        assert member.organization_id == "org-1"
+        return [
+            {
+                "content": "Archived customer preference.",
+                "scope": "org",
+                "scope_id": "org-1",
+                "source": "explicit",
+                "importance_score": 0.8,
+                "is_archived": True,
+                "is_pinned": False,
+                "is_sensitive": False,
+            }
+        ]
+
+    monkeypatch.setattr(settings, "export_memories", fake_export_memories)
+
+    response = await settings.export_memory(
+        Member(id="member-1", organization_id="org-1", email="admin@example.com", role="admin")
+    )
+
+    assert response.media_type == "application/json"
+    assert response.headers["Content-Disposition"] == "attachment; filename=chronos-memory-org-export.json"
+    assert response.body == (
+        b'{"format":"json","scope":"organization","scope_id":"org-1","include":"non-deleted memories, including archived and excluding superseded",'
+        b'"items":[{"content":"Archived customer preference.","scope":"org","scope_id":"org-1","source":"explicit","importance_score":0.8,'
+        b'"is_archived":true,"is_pinned":false,"is_sensitive":false}]}'
+    )

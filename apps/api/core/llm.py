@@ -60,6 +60,8 @@ CHAT_MODEL_OPTIONS: tuple[dict[str, Any], ...] = (
     },
 )
 
+REASONING_EFFORT_OPTIONS = ("low", "medium", "high")
+
 
 async def _with_retry(coro_factory, *, max_retries: int = _MAX_RETRIES) -> Any:
     """Execute an async callable with exponential backoff on retryable errors.
@@ -126,37 +128,77 @@ def resolve_agent_model(model_id: str | None) -> str:
     return chat_model_string(normalize_chat_model(model_id))
 
 
-def backup_completion_kwargs(messages: list[dict[str, str]], *, stream: bool = False) -> dict[str, Any]:
+def normalize_reasoning_effort(reasoning_effort: str | None) -> str | None:
+    if reasoning_effort is None:
+        return None
+    normalized = reasoning_effort.strip().lower()
+    if normalized in {"", "auto", "default"}:
+        return None
+    if normalized not in REASONING_EFFORT_OPTIONS:
+        raise ValueError(f"unknown reasoning effort: {reasoning_effort}")
+    return normalized
+
+
+def apply_reasoning_effort(kwargs: dict[str, Any], reasoning_effort: str | None) -> dict[str, Any]:
+    normalized = normalize_reasoning_effort(reasoning_effort)
+    if normalized:
+        kwargs["reasoning_effort"] = normalized
+    return kwargs
+
+
+def backup_completion_kwargs(
+    messages: list[dict[str, str]],
+    *,
+    stream: bool = False,
+    reasoning_effort: str | None = None,
+) -> dict[str, Any]:
     if settings.openrouter_api_key:
-        return {
+        return apply_reasoning_effort({
             "model": settings.openrouter_model,
             "api_key": settings.openrouter_api_key,
             "api_base": settings.openrouter_api_base,
             "messages": messages,
             "stream": stream,
-        }
-    return {
+        }, reasoning_effort)
+    return apply_reasoning_effort({
         "model": settings.backup_model,
         "api_key": settings.backup_api_key,
         "messages": messages,
         "stream": stream,
-    }
+    }, reasoning_effort)
 
 
-def agent_completion_kwargs(messages: list[dict[str, str]], *, stream: bool = False) -> dict[str, Any]:
-    return model_kwargs(settings.agent_model, messages=messages, stream=stream)
+def agent_completion_kwargs(
+    messages: list[dict[str, str]],
+    *,
+    stream: bool = False,
+    reasoning_effort: str | None = None,
+) -> dict[str, Any]:
+    return model_kwargs(settings.agent_model, messages=messages, stream=stream, reasoning_effort=reasoning_effort)
 
 
-def model_kwargs(model: str, *, messages: list[dict[str, str]], stream: bool = False) -> dict[str, Any]:
+def model_kwargs(
+    model: str,
+    *,
+    messages: list[dict[str, str]],
+    stream: bool = False,
+    reasoning_effort: str | None = None,
+) -> dict[str, Any]:
     kwargs: dict[str, Any] = {"model": model, "messages": messages, "stream": stream}
     if model.startswith("openrouter/") or settings.openrouter_api_key:
         kwargs["api_key"] = settings.openrouter_api_key
         kwargs["api_base"] = settings.openrouter_api_base
-    return kwargs
+    return apply_reasoning_effort(kwargs, reasoning_effort)
 
 
-def selected_completion_kwargs(model_id: str, messages: list[dict[str, str]], *, stream: bool = False) -> dict[str, Any]:
-    return model_kwargs(chat_model_string(model_id), messages=messages, stream=stream)
+def selected_completion_kwargs(
+    model_id: str,
+    messages: list[dict[str, str]],
+    *,
+    stream: bool = False,
+    reasoning_effort: str | None = None,
+) -> dict[str, Any]:
+    return model_kwargs(chat_model_string(model_id), messages=messages, stream=stream, reasoning_effort=reasoning_effort)
 
 
 def _choice_delta_content(chunk: Any) -> str:
@@ -214,8 +256,14 @@ def _frag_fields(frag: Any) -> tuple[int, str | None, str | None, str]:
     )
 
 
-async def stream_step(messages: list[dict[str, Any]], tools: list[dict[str, Any]], model: str):
-    kwargs = model_kwargs(model, messages=messages, stream=True)
+async def stream_step(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    model: str,
+    *,
+    reasoning_effort: str | None = None,
+):
+    kwargs = model_kwargs(model, messages=messages, stream=True, reasoning_effort=reasoning_effort)
     kwargs["tools"] = tools
     kwargs["tool_choice"] = "auto"
     stream = await _with_retry(lambda: litellm.acompletion(**kwargs))
@@ -247,10 +295,17 @@ async def stream_step(messages: list[dict[str, Any]], tools: list[dict[str, Any]
         yield {"type": "text_done", "text": "".join(text_parts)}
 
 
-async def stream_completion(messages: list[dict[str, str]], *, model_id: str | None = None):
+async def stream_completion(
+    messages: list[dict[str, str]],
+    *,
+    model_id: str | None = None,
+    reasoning_effort: str | None = None,
+):
     selected = normalize_chat_model(model_id)
     try:
-        stream = await litellm.acompletion(**selected_completion_kwargs(selected, messages, stream=True))
+        stream = await litellm.acompletion(
+            **selected_completion_kwargs(selected, messages, stream=True, reasoning_effort=reasoning_effort)
+        )
     except Exception:
         yield "Chronos is connected, but the selected AI provider is unavailable right now. Choose another model in the selector."
         return
@@ -265,6 +320,8 @@ async def stream_step(
     history: list[dict[str, Any]],
     tools: list[dict[str, Any]],
     model: str,
+    *,
+    reasoning_effort: str | None = None,
 ):
     """Stream a single agent-loop LLM step, yielding typed events.
 
@@ -273,7 +330,7 @@ async def stream_step(
         {"type": "text_done", "text": str}     — full text when no tool calls
         {"type": "tool_calls", "calls": list}  — normalised tool call dicts
     """
-    kwargs = model_kwargs(model, messages=history, stream=True)
+    kwargs = model_kwargs(model, messages=history, stream=True, reasoning_effort=reasoning_effort)
     kwargs["tools"] = tools
     kwargs["tool_choice"] = "auto"
 

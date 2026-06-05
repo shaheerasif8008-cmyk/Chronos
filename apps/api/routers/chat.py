@@ -17,7 +17,7 @@ from core.config import settings
 from core.context import assemble_context
 from core.db import engine, reflect_table
 from core.intent import classify_intent
-from core.llm import available_chat_models, normalize_chat_model
+from core.llm import available_chat_models, normalize_chat_model, normalize_reasoning_effort
 from core.modes import available_modes
 from core.memory_writes import create_memory_entry, extract_explicit_memory_content
 from core.models import Member, RequesterContext
@@ -68,6 +68,7 @@ class ChatRequest(BaseModel):
     conversation_id: str | None = None
     model: str | None = None
     mode: str | None = None
+    reasoning_effort: str | None = None
     persona_id: str | None = None
     workspace_id: str | None = None
     project_id: str | None = None
@@ -425,6 +426,7 @@ async def _agent_loop_stream(
     persona_id: str | None,
     workspace_id: str | None,
     model: str | None,
+    reasoning_effort: str | None = None,
     original_message: str | None = None,
     requester_context: RequesterContext | None = None,
     user_message_for_memory: str | None = None,
@@ -447,6 +449,7 @@ async def _agent_loop_stream(
         persona_id=persona_id,
         workspace_id=workspace_id,
         model=model,
+        reasoning_effort=reasoning_effort,
         attachments_context=attachments_context,
         original_message=original_message,
         router_decision=router_decision,
@@ -517,6 +520,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
     await permissions.check(member, "chat", req.conversation_id or "new_conversation")
     try:
         selected_model = normalize_chat_model(req.model)
+        selected_reasoning_effort = normalize_reasoning_effort(req.reasoning_effort)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -603,6 +607,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
                 persona_id=req.persona_id,
                 workspace_id=req.workspace_id,
                 model=selected_model,
+                reasoning_effort=selected_reasoning_effort,
                 original_message=req.message,
                 router_decision={
                     "mode": "agent",
@@ -631,6 +636,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
                 requester_context=requester_context,
                 model=selected_model,
                 mode=req.mode,
+                reasoning_effort=selected_reasoning_effort,
             )
         ),
         media_type="text/event-stream",

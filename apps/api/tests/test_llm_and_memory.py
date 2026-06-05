@@ -200,10 +200,54 @@ async def test_embed_uses_redis_cache(monkeypatch):
 
     assert first == [0.1, 0.2, 0.3]
     assert second == first
-    assert kwargs["model"] == "openrouter/nvidia/llama-nemotron-embed-vl-1b-v2:free"
+    assert kwargs["model"] == "google/gemini-embedding-2"
     assert kwargs["api_key"] == "or-test-key"
     assert kwargs["api_base"] == "https://openrouter.ai/api/v1"
     assert 86400 in store.values()
+
+
+@pytest.mark.asyncio
+async def test_openrouter_embedding_requests_configured_dimensions(monkeypatch):
+    from core import embeddings
+
+    captured = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": [{"embedding": [0.1] * 1536}]}
+
+    class FakeClient:
+        def __init__(self, timeout):
+            captured["timeout"] = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def post(self, url, *, headers, json):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["json"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr(embeddings.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(embeddings.settings, "embedding_model", "google/gemini-embedding-2")
+    monkeypatch.setattr(embeddings.settings, "embedding_dimensions", 1536)
+    monkeypatch.setattr(embeddings.settings, "openrouter_api_key", "or-test-key")
+
+    response = await embeddings._openrouter_embedding("remember this")
+
+    assert response["data"][0]["embedding"] == [0.1] * 1536
+    assert captured["json"] == {
+        "model": "google/gemini-embedding-2",
+        "input": "remember this",
+        "dimensions": 1536,
+    }
 
 
 @pytest.mark.asyncio

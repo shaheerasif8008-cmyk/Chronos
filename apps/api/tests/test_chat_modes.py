@@ -69,6 +69,29 @@ def test_available_modes_expose_productized_metadata():
     assert by_id["voice"]["status"] == "unavailable"
 
 
+def test_model_kwargs_threads_reasoning_effort():
+    from core.llm import model_kwargs
+
+    kwargs = model_kwargs(
+        "openrouter/openai/gpt-5.4-mini",
+        messages=[{"role": "user", "content": "hi"}],
+        reasoning_effort="High",
+    )
+
+    assert kwargs["reasoning_effort"] == "high"
+
+
+def test_model_kwargs_rejects_unknown_reasoning_effort():
+    from core.llm import model_kwargs
+
+    with pytest.raises(ValueError, match="unknown reasoning effort"):
+        model_kwargs(
+            "openrouter/openai/gpt-5.4-mini",
+            messages=[{"role": "user", "content": "hi"}],
+            reasoning_effort="maximum",
+        )
+
+
 # ── 2. create_task_record writes mode to tasks insert ─────────────────────────
 
 @pytest.mark.asyncio
@@ -139,12 +162,14 @@ async def test_create_task_record_writes_mode(monkeypatch):
         member=member,
         triggered_by="conv-1",
         mode="research",
+        reasoning_effort="high",
     )
 
     assert task_id == "task-uuid-123"
     assert insert_values.get("mode") == "research", (
         f"mode missing from task insert; got: {insert_values}"
     )
+    assert insert_values["agent_state"]["reasoning_effort"] == "high"
     envelope = insert_values["agent_state"]["task_envelope"]
     assert envelope["raw_user_message"] == "Test goal"
     assert envelope["ui"]["title"] == "Test goal"
@@ -248,6 +273,7 @@ async def test_send_message_threads_mode_into_inline_turn(monkeypatch):
 
     async def fake_stream_chat_turn(**kwargs):
         captured["mode"] = kwargs.get("mode")
+        captured["reasoning_effort"] = kwargs.get("reasoning_effort")
         yield {"type": "done"}
 
     async def fake_permissions_check(*args, **kwargs):
@@ -269,7 +295,7 @@ async def test_send_message_threads_mode_into_inline_turn(monkeypatch):
     monkeypatch.setattr(chat, "extract_explicit_memory_content", lambda msg: None)
     monkeypatch.setattr(chat, "stream_chat_turn", fake_stream_chat_turn)
 
-    req = chat.ChatRequest(message="hi", model="gpt-5.4-mini", mode="coding")
+    req = chat.ChatRequest(message="hi", model="gpt-5.4-mini", mode="coding", reasoning_effort="high")
 
     response = await chat.send_message(req, member)
     async for _ in response.body_iterator:
@@ -278,6 +304,7 @@ async def test_send_message_threads_mode_into_inline_turn(monkeypatch):
     assert captured.get("mode") == "coding", (
         f"Expected mode='coding' threaded into the inline turn, got: {captured}"
     )
+    assert captured.get("reasoning_effort") == "high"
 
 
 @pytest.mark.asyncio

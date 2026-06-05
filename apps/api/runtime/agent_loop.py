@@ -536,6 +536,8 @@ async def _llm_step(
     history: list[dict[str, Any]],
     tools: list[dict[str, Any]],
     model: str,
+    *,
+    reasoning_effort: str | None = None,
 ) -> tuple[str | None, list[dict[str, Any]]]:
     """Call the LLM and return (final_text | None, list_of_tool_calls).
 
@@ -543,7 +545,7 @@ async def _llm_step(
         final_text: The text response if the LLM is done calling tools.
         tool_calls: Normalised list of tool call dicts if the LLM wants to act.
     """
-    kwargs = model_kwargs(model, messages=history, stream=False)
+    kwargs = model_kwargs(model, messages=history, stream=False, reasoning_effort=reasoning_effort)
     kwargs["tools"] = tools
     kwargs["tool_choice"] = "auto"
     response = await _with_retry(lambda: litellm.acompletion(**kwargs))
@@ -1201,6 +1203,7 @@ async def stream_chat_turn(
     requester_context: Any,
     model: str | None,
     mode: str | None = None,
+    reasoning_effort: str | None = None,
     emit_conversation: bool = True,
 ):
     """Stream one chat turn inline.
@@ -1257,7 +1260,10 @@ async def stream_chat_turn(
         final_text: str | None = None
         calls: list[dict[str, Any]] = []
         try:
-            async for ev in stream_step(history, INLINE_CHAT_TOOLS, effective_model):
+            stream_kwargs: dict[str, str] = {}
+            if reasoning_effort:
+                stream_kwargs["reasoning_effort"] = reasoning_effort
+            async for ev in stream_step(history, INLINE_CHAT_TOOLS, effective_model, **stream_kwargs):
                 if ev["type"] == "token":
                     yield {"type": "token", "content": ev["content"]}
                 elif ev["type"] == "text_done":
@@ -1368,6 +1374,7 @@ async def run_loop(
     # Precedence: explicit arg (sub-agents) > model chosen in the UI (stored in
     # agent_state) > default agent model.
     stored_model = (task.get("agent_state") or {}).get("model") if isinstance(task.get("agent_state"), dict) else None
+    stored_reasoning_effort = (task.get("agent_state") or {}).get("reasoning_effort") if isinstance(task.get("agent_state"), dict) else None
     effective_model = model or stored_model or settings.agent_model
     agent = AgentContext.from_task(task)
 
@@ -1400,7 +1407,12 @@ async def run_loop(
         })
         await publish_activity(task_id, {"type": "thinking"})
         try:
-            final_text, calls = await _llm_step(history, effective_tools, effective_model)
+            final_text, calls = await _llm_step(
+                history,
+                effective_tools,
+                effective_model,
+                reasoning_effort=stored_reasoning_effort,
+            )
         except Exception as exc:
             logger.error("LLM error in agent loop for task %s: %s", task_id, exc)
             await save_task(task_id, status="failed", error=str(exc))
