@@ -49,8 +49,12 @@ _FORBIDDEN_DATA_PATTERNS = [
     # Block subprocess/concurrency/ctypes (openblas threads are set via env, not code)
     r"\bimport\s+(subprocess|multiprocessing|ctypes|resource)\b",
     r"\bfrom\s+(subprocess|multiprocessing|ctypes|resource)\b",
-    # Block dynamic import
+    # Block dynamic import (including importlib.import_module / builtins bypasses)
     r"__import__\s*\(",
+    r"\bimportlib\b",
+    r"\bimport_module\s*\(",
+    r"\bimport\s+builtins\b",
+    r"\bfrom\s+builtins\b",
     # Block absolute-path open
     r"\bopen\s*\(\s*['\"]/",
     # Block shell execution

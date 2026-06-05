@@ -528,3 +528,38 @@ async def test_inline_tools_no_regression():
     assert "browser__search" in all_names
     assert "image__generate" in all_names
     assert "voice__transcribe" in all_names
+
+
+@pytest.mark.parametrize("bad", [
+    "import importlib\nimportlib.import_module('socket')",
+    "import importlib as il\nil.import_module('subprocess')",
+    "from importlib import import_module\nimport_module('socket')",
+    "import builtins\nbuiltins.__import__('socket')",
+    "from builtins import __import__",
+    "import httpx",
+    "import urllib.request",
+    "import subprocess",
+    "import multiprocessing",
+    "import ctypes",
+    "__import__('socket')",
+    "open('/etc/passwd').read()",
+    "import os\nos.system('id')",
+])
+def test_validate_data_code_blocks_escape_vectors(bad):
+    """The forbidden-pattern validator rejects dynamic-import bypasses, network,
+    subprocess, ctypes, absolute-path open, and shell execution."""
+    from connectors.data_analysis import _validate_data_code
+    with pytest.raises(ValueError):
+        _validate_data_code(bad)
+
+
+def test_validate_data_code_allows_data_libs():
+    """Legitimate pandas/matplotlib/numpy analysis code is allowed."""
+    from connectors.data_analysis import _validate_data_code
+    good = (
+        "import pandas as pd\nimport numpy as np\nimport matplotlib\n"
+        "matplotlib.use('Agg')\nimport matplotlib.pyplot as plt\n"
+        "df = pd.read_csv('data.csv')\nplt.plot(df.index, df.iloc[:,0])\nplt.savefig('chart_1.png')\n"
+        "print(df.describe())"
+    )
+    _validate_data_code(good)  # must not raise
