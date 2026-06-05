@@ -285,7 +285,7 @@ async def test_doc_connector_parse_by_path(tmp_path, monkeypatch):
     from parsing import tool as doctool
 
     # Point the workspace root at a temp dir and drop a file in it.
-    monkeypatch.setattr("connectors.filesystem.WORKSPACE_ROOT", tmp_path)
+    monkeypatch.setattr("core.workspace.WORKSPACE_ROOT", tmp_path)
     work = tmp_path / "default" / "t1"
     work.mkdir(parents=True)
     (work / "note.txt").write_text("workspace doc body")

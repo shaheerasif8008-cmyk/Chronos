@@ -4,8 +4,8 @@ from pathlib import Path
 from typing import Any
 
 from core.models import ToolResult
+from core.workspace import WORKSPACE_ROOT, jailed_path as _jailed_path
 
-WORKSPACE_ROOT = Path("/tmp/chronos_task_workspaces")
 MAX_WRITE_BYTES = 256_000
 MAX_READ_BYTES = 256_000
 
@@ -16,16 +16,6 @@ def _workspace_root(args: dict[str, Any]) -> Path:
     root = (WORKSPACE_ROOT / org_id / task_id).resolve()
     root.mkdir(parents=True, exist_ok=True)
     return root
-
-
-def _jailed_path(root: Path, requested: str) -> Path:
-    relative = requested.strip().lstrip("/")
-    if not relative or relative in {".", ".."}:
-        return root
-    path = (root / relative).resolve()
-    if root != path and root not in path.parents:
-        raise ValueError("Path escapes the task workspace")
-    return path
 
 
 class FilesystemConnector:
