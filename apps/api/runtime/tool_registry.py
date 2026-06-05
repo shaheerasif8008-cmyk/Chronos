@@ -256,6 +256,18 @@ COMPUTER_TOOLS = [
 
 # ── Repo workspace ────────────────────────────────────────────────────────────
 
+REPO_CLONE = _fn(
+    "repo__clone",
+    "Import a repository into the current task workspace. Supports local workspace paths and public GitHub HTTPS clone URLs.",
+    {
+        "source_path": {"type": "string", "description": "Local path under the configured Chronos workspace root.", "default": ""},
+        "source_url": {"type": "string", "description": "Public https://github.com/<owner>/<repo> URL.", "default": ""},
+        "repo_path": {"type": "string", "description": "Workspace-relative destination path. Default: repos/imported.", "default": "repos/imported"},
+        "timeout_seconds": {"type": "integer", "description": "Clone timeout, capped at 60 seconds.", "default": 30},
+    },
+    [],
+)
+
 REPO_OPEN_FIXTURE = _fn(
     "repo__open_fixture",
     "Open a bundled fixture repository inside the current task workspace. "
@@ -275,6 +287,15 @@ REPO_CREATE_BRANCH = _fn(
         "repo_path": {"type": "string", "description": "Workspace-relative repo path. Default: repos/python_bug.", "default": "repos/python_bug"},
     },
     ["branch"],
+)
+
+REPO_LIST_FILES = _fn(
+    "repo__list_files",
+    "List source files in the current task repo workspace, excluding git and Chronos metadata.",
+    {
+        "repo_path": {"type": "string", "description": "Workspace-relative repo path. Default: repos/python_bug.", "default": "repos/python_bug"},
+    },
+    [],
 )
 
 REPO_READ_FILE = _fn(
@@ -300,9 +321,10 @@ REPO_WRITE_FILE = _fn(
 
 REPO_RUN_TESTS = _fn(
     "repo__run_tests",
-    "Run the constrained repo test loop: pytest -q, without shell access.",
+    "Run the constrained repo test loop. Only pytest commands are accepted; shell operators and absolute paths are rejected.",
     {
         "repo_path": {"type": "string", "description": "Workspace-relative repo path. Default: repos/python_bug.", "default": "repos/python_bug"},
+        "command": {"type": "string", "description": "Optional pytest command, for example 'pytest -q tests/test_app.py'.", "default": "pytest -q"},
         "timeout_seconds": {"type": "integer", "description": "Max runtime, capped at 30 seconds.", "default": 20},
     },
     [],
@@ -317,13 +339,62 @@ REPO_DIFF = _fn(
     [],
 )
 
+REPO_STATUS = _fn(
+    "repo__status",
+    "Return current branch and git status for the repo workspace.",
+    {
+        "repo_path": {"type": "string", "description": "Workspace-relative repo path. Default: repos/python_bug.", "default": "repos/python_bug"},
+    },
+    [],
+)
+
+REPO_COMMIT = _fn(
+    "repo__commit",
+    "Commit all repo workspace changes with Chronos bot identity and return the commit SHA.",
+    {
+        "message": {"type": "string", "description": "Commit message."},
+        "repo_path": {"type": "string", "description": "Workspace-relative repo path. Default: repos/python_bug.", "default": "repos/python_bug"},
+    },
+    ["message"],
+)
+
+REPO_CREATE_PR = _fn(
+    "repo__create_pr",
+    "Create an approved pull-request request artifact for the repo workspace. Without approval_id it returns approval_required.",
+    {
+        "title": {"type": "string", "description": "PR title."},
+        "body": {"type": "string", "description": "PR body.", "default": ""},
+        "base": {"type": "string", "description": "Base branch.", "default": "main"},
+        "head": {"type": "string", "description": "Head branch. Defaults to current branch.", "default": ""},
+        "approval_id": {"type": "string", "description": "Approval record id authorizing PR creation.", "default": ""},
+        "repo_path": {"type": "string", "description": "Workspace-relative repo path. Default: repos/python_bug.", "default": "repos/python_bug"},
+    },
+    ["title"],
+)
+
+REPO_REVIEW = _fn(
+    "repo__review",
+    "Review the current repo diff and write an actionable code-review artifact with inline findings.",
+    {
+        "title": {"type": "string", "description": "Review title.", "default": "Code review"},
+        "repo_path": {"type": "string", "description": "Workspace-relative repo path. Default: repos/python_bug.", "default": "repos/python_bug"},
+    },
+    [],
+)
+
 REPO_WORKSPACE_TOOLS = [
+    REPO_CLONE,
     REPO_OPEN_FIXTURE,
     REPO_CREATE_BRANCH,
+    REPO_LIST_FILES,
     REPO_READ_FILE,
     REPO_WRITE_FILE,
     REPO_RUN_TESTS,
     REPO_DIFF,
+    REPO_STATUS,
+    REPO_COMMIT,
+    REPO_CREATE_PR,
+    REPO_REVIEW,
 ]
 
 # ── Documents ─────────────────────────────────────────────────────────────────
