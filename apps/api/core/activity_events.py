@@ -16,6 +16,13 @@ ACTION_EVENT_TYPES = {
     "sub_agent_spawned",
     "sub_agent_complete",
     "sub_agent_event",
+    "browser_action",
+    "browser_session_created",
+    "browser_takeover_requested",
+    "browser_takeover_released",
+    "browser_sensitive_site_approved",
+    "browser_session_revoked",
+    "browser_session_closed",
     "task_complete",
     "task_failed",
     "task_cancelled",
@@ -281,9 +288,9 @@ def _row_type(row: dict[str, Any]) -> str:
 
 
 def _status_for(event_type: str, task: dict[str, Any], approval: dict[str, Any], payload: dict[str, Any]) -> str:
-    if event_type in {"tool_call", "sub_agent_spawned"}:
+    if event_type in {"tool_call", "sub_agent_spawned", "browser_action"}:
         return "running"
-    if event_type in {"tool_result", "sub_agent_complete", "artifact", "task_complete"}:
+    if event_type in {"tool_result", "sub_agent_complete", "artifact", "task_complete", "browser_session_created", "browser_takeover_released", "browser_sensitive_site_approved", "browser_session_closed"}:
         return "complete"
     if event_type in {"tool_error", "task_failed"}:
         return "error"
@@ -329,6 +336,22 @@ def _summary_for(
         return "Task completed"
     if event_type == "task_failed":
         return str(payload.get("error") or "Task failed")
+    if event_type == "browser_action":
+        action = payload.get("action") or "action"
+        suffix = payload.get("current_url") or payload.get("selector") or payload.get("filename") or ""
+        return f"Browser {action}: {suffix}".strip()
+    if event_type == "browser_session_created":
+        return "Browser session created"
+    if event_type == "browser_takeover_requested":
+        return f"Browser takeover requested: {payload.get('reason') or 'user input required'}"
+    if event_type == "browser_takeover_released":
+        return f"Browser hand-back: {payload.get('summary') or 'released'}"
+    if event_type == "browser_sensitive_site_approved":
+        return f"Browser sensitive site approved: {payload.get('domain') or ''}".strip()
+    if event_type == "browser_session_revoked":
+        return "Browser session revoked"
+    if event_type == "browser_session_closed":
+        return "Browser session closed"
     return str(task.get("goal") or event_type)
 
 
