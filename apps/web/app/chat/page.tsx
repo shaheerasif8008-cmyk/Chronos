@@ -2715,14 +2715,26 @@ function VoicePlayButton({ text, conversationId }: { text: string; conversationI
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const urlRef = useRef<string | null>(null);
 
-  async function handleSpeak() {
-    if (busy) return;
-    // Stop any currently playing audio from this button.
+  // Stop current playback and revoke its blob URL — used on re-click and unmount.
+  function stopAndRevoke() {
     if (audioRef.current) {
       audioRef.current.pause();
       audioRef.current = null;
     }
+    if (urlRef.current) {
+      URL.revokeObjectURL(urlRef.current);
+      urlRef.current = null;
+    }
+  }
+
+  // Revoke any outstanding blob URL when the component unmounts.
+  useEffect(() => stopAndRevoke, []);
+
+  async function handleSpeak() {
+    if (busy) return;
+    stopAndRevoke();  // stop any prior playback and free its URL
     setError(null);
     setBusy(true);
     try {
@@ -2737,10 +2749,11 @@ function VoicePlayButton({ text, conversationId }: { text: string; conversationI
       const audioRes = await apiFetch(`/artifacts/${data.audio_artifact_id}/content`);
       const blob = await audioRes.blob();
       const url = URL.createObjectURL(blob);
+      urlRef.current = url;
       const audio = new Audio(url);
       audioRef.current = audio;
-      audio.play().catch(() => setError("Audio playback failed (browser blocked autoplay)"));
-      audio.addEventListener("ended", () => URL.revokeObjectURL(url));
+      audio.addEventListener("ended", stopAndRevoke);
+      audio.play().catch(() => { setError("Audio playback failed (browser blocked autoplay)"); stopAndRevoke(); });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setError(msg.includes("422") || msg.toLowerCase().includes("not configured")

@@ -486,3 +486,39 @@ async def test_voice_transcribe_endpoint_rejects_cross_org_conversation(monkeypa
     with pytest.raises(HTTPException) as exc:
         await chat_router.voice_transcribe(req, member=member_b)
     assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_voice_transcribe_inline_audio_b64(monkeypatch):
+    """The inline audio_b64 path transcribes without an artifact and persists a transcript."""
+    import base64
+    org = _unique_org()
+    agent = _make_agent(org_id=org)
+    _patch_broker_infra(monkeypatch)
+    _force_voice_models(monkeypatch)
+    _stub_stt(monkeypatch, transcript="inline transcript")
+
+    from core.tool_broker import tool_broker
+    from core.artifacts import get_artifact
+    audio_b64 = base64.b64encode(_FAKE_AUDIO).decode()
+    result = await tool_broker.execute(agent, "voice.transcribe", {"audio_b64": audio_b64})
+    assert result.data["status"] == "success"
+    assert result.data["transcript"] == "inline transcript"
+    tid = result.data["transcript_artifact_id"]
+    meta = await get_artifact(tid)
+    assert meta is not None and meta.get("kind") == "transcript"
+
+
+@pytest.mark.asyncio
+async def test_voice_transcribe_bad_audio_b64_honest_error(monkeypatch):
+    """Malformed audio_b64 returns an honest error, not a crash."""
+    org = _unique_org()
+    agent = _make_agent(org_id=org)
+    _patch_broker_infra(monkeypatch)
+    _force_voice_models(monkeypatch)
+    _stub_stt(monkeypatch)
+
+    from core.tool_broker import tool_broker
+    result = await tool_broker.execute(agent, "voice.transcribe", {"audio_b64": "not_base64_$$$"})
+    assert result.data["status"] == "error"
+    assert "base64" in result.data.get("reason", "").lower()

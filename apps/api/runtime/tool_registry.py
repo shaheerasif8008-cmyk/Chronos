@@ -280,7 +280,7 @@ VOICE_TRANSCRIBE = _fn(
         "mime_type": {
             "type": "string",
             "description": "MIME type of the audio (e.g. 'audio/mpeg', 'audio/webm'). "
-                           "Required only when using audio_b64.",
+                           "Optional; defaults to audio/mpeg.",
         },
         "conversation_id": {
             "type": "string",
