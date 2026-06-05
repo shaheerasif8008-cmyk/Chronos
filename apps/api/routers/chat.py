@@ -622,10 +622,25 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
                 _image_blocks.append(build_image_block(raw_bytes, mime))
 
     _vision_active = model_supports_vision(selected_model) and bool(_image_blocks)
+
+    # Degraded path: gather OCR preview text from already-parsed image attachments
+    # so the model actually receives the extracted content.  This makes the
+    # "vision unavailable — used OCR text extraction" note truthful (not just stated).
+    _ocr_text: str | None = None
+    if _has_images and not _vision_active and attachments_context:
+        _ocr_parts = [
+            f"[Image: {entry.get('filename') or 'attachment'}]\n{entry['preview']}"
+            for entry in attachments_context
+            if entry.get("preview")
+        ]
+        if _ocr_parts:
+            _ocr_text = "\n\n".join(_ocr_parts)
+
     _user_content = build_user_turn_content(
         req.message,
         _image_blocks,
         vision_available=_vision_active,
+        ocr_text=_ocr_text,
         ocr_note=_VISION_UNAVAILABLE_NOTE if (_has_images and not _vision_active) else None,
     )
 

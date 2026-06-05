@@ -310,6 +310,7 @@ def build_user_turn_content(
     image_blocks: list[dict],
     *,
     vision_available: bool,
+    ocr_text: str | None = None,
     ocr_note: str | None = None,
 ) -> str | list:
     """Return the content value for the final user-turn message dict.
@@ -319,8 +320,12 @@ def build_user_turn_content(
         Returns a list: [text_block, image_url_block, ...].
         litellm forwards list-content to providers that support it (OpenAI vision API).
     - Otherwise:
-        Returns a plain string (message + optional OCR note).
-        Keeps the path identical to the pre-vision code for all non-image turns.
+        Returns a plain string (message + optional OCR-extracted text + optional note).
+        When images are attached but vision is unavailable, the OCR-extracted text is
+        embedded directly in the user turn so the model actually receives the image
+        content — this makes the accompanying ``ocr_note`` truthful rather than a bare
+        claim. Keeps the path byte-for-byte identical to the pre-vision code for all
+        non-image turns (no ocr_text/ocr_note).
 
     This function is **pure** (no I/O) so it is fast-path safe and trivially testable.
 
@@ -334,10 +339,14 @@ def build_user_turn_content(
         blocks.extend(image_blocks)
         return blocks
 
-    # Non-vision path: plain text, with optional OCR note appended.
+    # Non-vision path: plain text, with the OCR-extracted image text and an honest
+    # note appended when present. Order: user message → extracted text → note.
+    parts = [message]
+    if ocr_text:
+        parts.append(ocr_text)
     if ocr_note:
-        return f"{message}\n\n{ocr_note}"
-    return message
+        parts.append(ocr_note)
+    return "\n\n".join(parts) if len(parts) > 1 else message
 
 
 def build_image_block(image_bytes: bytes, mime: str) -> dict:
