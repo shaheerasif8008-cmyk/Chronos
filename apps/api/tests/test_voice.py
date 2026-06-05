@@ -447,3 +447,42 @@ def test_voice_broker_name_conversion():
 
     assert to_broker_name("voice__transcribe") == "voice.transcribe"
     assert to_broker_name("voice__speak") == "voice.speak"
+
+
+@pytest.mark.asyncio
+async def test_voice_transcribe_endpoint_rejects_cross_org_conversation(monkeypatch):
+    """The /chat/voice/transcribe endpoint must not link a transcript to a
+    conversation owned by a different org (tenant isolation)."""
+    import uuid
+    from fastapi import HTTPException
+    from sqlalchemy import insert
+    from core.db import engine, reflect_table
+    from core.models import Member
+    import routers.chat as chat_router
+
+    org_a = _unique_org()
+    org_b = _unique_org()
+
+    # A conversation owned by org A.
+    conversations = await reflect_table("conversations")
+    async with engine.begin() as conn:
+        row = (
+            await conn.execute(
+                insert(conversations)
+                .values(
+                    organization_id=org_a,
+                    region="us",
+                    member_id=str(uuid.uuid4()),
+                    title="org A private convo",
+                )
+                .returning(conversations.c.id)
+            )
+        ).first()
+    convo_id = str(row[0])
+
+    member_b = Member(id=str(uuid.uuid4()), organization_id=org_b, email="b@example.com", role="user")
+    req = chat_router.VoiceTranscribeRequest(artifact_id=str(uuid.uuid4()), conversation_id=convo_id)
+
+    with pytest.raises(HTTPException) as exc:
+        await chat_router.voice_transcribe(req, member=member_b)
+    assert exc.value.status_code == 404

@@ -1324,6 +1324,9 @@ async def voice_transcribe(
     agent = _make_voice_agent(member)
     args: dict = {"artifact_id": req.artifact_id}
     if req.conversation_id:
+        # Tenant isolation: never link a transcript to a foreign-org conversation.
+        from routers.attachments import _require_conversation_member
+        await _require_conversation_member(member, req.conversation_id)
         args["conversation_id"] = req.conversation_id
 
     result = await tool_broker.execute(agent, "voice.transcribe", args)
@@ -1374,6 +1377,9 @@ async def voice_speak(
     agent = _make_voice_agent(member)
     args: dict = {"text": req.text, "voice": req.voice}
     if req.conversation_id:
+        # Tenant isolation: never link synthesized audio to a foreign-org conversation.
+        from routers.attachments import _require_conversation_member
+        await _require_conversation_member(member, req.conversation_id)
         args["conversation_id"] = req.conversation_id
 
     result = await tool_broker.execute(agent, "voice.speak", args)
