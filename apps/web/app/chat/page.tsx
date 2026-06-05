@@ -3,6 +3,7 @@
 import { Component, ReactNode, useEffect, useRef, useState, useMemo, useCallback } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import ArtifactsScreen from "../../components/artifacts/ArtifactsScreen";
+import AgentsScreen from "../../components/agents/AgentsScreen";
 import BrowserOperatorScreen from "../../components/browser/BrowserOperatorScreen";
 import ComputerScreen from "../../components/computer/ComputerScreen";
 import InChatArtifactPanel from "../../components/artifacts/InChatArtifactPanel";
@@ -881,7 +882,7 @@ function ChronosAppInner() {
         {route === "browser"    && <BrowserOperatorScreen />}
         {route === "computer"   && <ComputerScreen />}
         {route === "tasks"      && <EmptyPanel label="Tasks" />}
-        {route === "agents"     && <EmptyPanel label="Agents" />}
+        {route === "agents"     && <AgentsScreen />}
         {route === "workflows"  && <EmptyPanel label="Workflows" />}
         {route === "audit"      && <EmptyPanel label="Audit" />}
       </main>
