@@ -25,6 +25,7 @@ _SNIPPET_CHARS = 600
 class Citation(BaseModel):
     source_id: str
     source_title: str | None = None
+    source_type: str = "project"
     chunk_index: int
     snippet: str
     distance: float | None = None
@@ -115,6 +116,7 @@ async def retrieve_source_chunks(
                 text(
                     """
                     SELECT c.source_id, c.chunk_index, c.content, s.title AS source_title,
+                           s.source_type AS source_type,
                            c.embedding <=> (:embedding)::vector AS distance
                     FROM project_source_chunks c
                     JOIN project_sources s ON s.id = c.source_id
@@ -138,6 +140,7 @@ async def retrieve_source_chunks(
         Citation(
             source_id=str(row["source_id"]),
             source_title=row.get("source_title"),
+            source_type=str(row.get("source_type") or "project"),
             chunk_index=int(row["chunk_index"]),
             snippet=str(row["content"])[:_SNIPPET_CHARS],
             distance=float(row["distance"]) if row.get("distance") is not None else None,
@@ -192,6 +195,7 @@ def citations_payload(citations: list[Citation]) -> list[dict]:
             "marker": f"S{i}",
             "source_id": citation.source_id,
             "source_title": citation.source_title,
+            "source_type": citation.source_type,
             "chunk_index": citation.chunk_index,
             "snippet": citation.snippet,
         }

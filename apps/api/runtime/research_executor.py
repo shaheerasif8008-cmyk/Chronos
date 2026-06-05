@@ -192,6 +192,7 @@ async def _run_research_inner(run_id: str, org_id: str) -> None:
     n = 1  # citation marker counter (S1, S2, ...)
     web_fallback_warned = False
     skipped_scopes: set[str] = set()
+    connector_citations_found = False
 
     # Build AgentContext for web tool calls (no project_id field on AgentContext)
     agent = AgentContext(
@@ -280,8 +281,9 @@ async def _run_research_inner(run_id: str, org_id: str) -> None:
             except Exception as exc:
                 logger.warning("Web search failed for query %r: %s", query, exc)
 
-        # --- Project source ---
-        if source_scopes.get("project") and project_id:
+        # --- Indexed project and connector sources ---
+        indexed_scopes_enabled = bool(source_scopes.get("project") or source_scopes.get("connector"))
+        if indexed_scopes_enabled and project_id:
             rc = RequesterContext(
                 org_id=org_id,
                 member_id=member_id or "chronos",
@@ -292,10 +294,17 @@ async def _run_research_inner(run_id: str, org_id: str) -> None:
                 for chunk in chunks:
                     if not chunk.snippet.strip():
                         continue
+                    source_type = getattr(chunk, "source_type", "project") or "project"
+                    if source_type == "connector":
+                        if not source_scopes.get("connector"):
+                            continue
+                        connector_citations_found = True
+                    elif not source_scopes.get("project"):
+                        continue
                     await research.add_citation(
                         run_id, org_id,
                         marker=f"S{n}",
-                        source_type="project",
+                        source_type=source_type,
                         snippet=chunk.snippet,
                         source_id=chunk.source_id,
                         source_title=chunk.source_title,
@@ -303,14 +312,22 @@ async def _run_research_inner(run_id: str, org_id: str) -> None:
                     )
                     await _emit(
                         run_id, org_id, "research_citation",
-                        {"marker": f"S{n}", "source_type": "project", "source_id": chunk.source_id},
+                        {"marker": f"S{n}", "source_type": source_type, "source_id": chunk.source_id},
                     )
                     n += 1
             except Exception as exc:
-                logger.warning("Project source retrieval failed for query %r: %s", query, exc)
+                logger.warning("Indexed source retrieval failed for query %r: %s", query, exc)
 
-        # --- Unsupported scope types: connector, upload, mcp ---
-        for scope in ("connector", "upload", "mcp"):
+        if source_scopes.get("connector") and not connector_citations_found and "connector" not in skipped_scopes:
+            skipped_scopes.add("connector")
+            await _emit(
+                run_id, org_id, "research_source_skipped",
+                {"scope": "connector", "reason": "no indexed connector sources available"},
+            )
+            limitations.append("Connector sources are not yet indexed and were not used.")
+
+        # --- Unsupported scope types: upload, mcp ---
+        for scope in ("upload", "mcp"):
             if source_scopes.get(scope) and scope not in skipped_scopes:
                 skipped_scopes.add(scope)
                 await _emit(

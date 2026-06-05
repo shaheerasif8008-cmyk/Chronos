@@ -284,6 +284,20 @@ def _fake_project_chunk():
     )
 
 
+def _fake_connector_chunk():
+    """Return a Citation-like object simulating an indexed connector source chunk."""
+    from memory.source_retrieval import Citation
+
+    return Citation(
+        source_id=str(uuid.uuid4()),
+        source_title="Slack Thread",
+        source_type="connector",
+        chunk_index=0,
+        snippet="connector synced snippet for testing",
+        distance=0.2,
+    )
+
+
 async def _fake_tool_broker_execute(agent, tool: str, args: dict):
     """Fake tool broker: handles browser.search and browser.fetch."""
     if tool == "browser.search":
@@ -536,6 +550,43 @@ async def test_no_fabricated_connector_citation():
         f"Expected a research_source_skipped event for 'connector', "
         f"events: {[e['event_type'] for e in events]}"
     )
+
+
+@_requires_db
+@pytest.mark.asyncio
+async def test_connector_indexed_sources_are_used_as_research_citations():
+    """Connector scope uses indexed connector chunks and does not emit a skipped-source event."""
+    from core.models import Member
+    from core.research import create_run, list_citations, list_events
+
+    member = Member(id=str(uuid.uuid4()), organization_id="default", email="t@t.com", role="user")
+    run_id = await create_run(
+        member,
+        question="What did our Slack connector sync?",
+        source_scopes={"connector": True, "web": False},
+        project_id=str(uuid.uuid4()),
+    )
+
+    with (
+        patch("runtime.research_executor.complete_json", new=AsyncMock(return_value='{"queries": ["q1"]}')),
+        patch("runtime.research_executor.complete_text", new=AsyncMock(return_value="Connector report citing [S1].")),
+        patch("runtime.research_executor.tool_broker.execute", new=AsyncMock(side_effect=_fake_tool_broker_execute)),
+        patch("runtime.research_executor.retrieve_source_chunks", new=AsyncMock(return_value=[_fake_connector_chunk()])),
+    ):
+        from runtime.research_executor import run_research
+        await run_research(run_id, "default")
+
+    citations = await list_citations(run_id, "default")
+    connector_citations = [c for c in citations if c["source_type"] == "connector"]
+    assert len(connector_citations) == 1
+    assert connector_citations[0]["snippet"] == "connector synced snippet for testing"
+
+    events = await list_events(run_id, "default")
+    assert not [
+        e for e in events
+        if e["event_type"] == "research_source_skipped"
+        and (e.get("payload") or {}).get("scope") == "connector"
+    ]
 
 
 # ===========================================================================
