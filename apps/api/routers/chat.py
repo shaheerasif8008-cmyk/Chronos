@@ -1261,3 +1261,136 @@ async def retry_message_from_here(
         member=member,
         action="retry_message",
     )
+
+
+# ── Voice endpoints ───────────────────────────────────────────────────────────
+
+
+class VoiceTranscribeRequest(BaseModel):
+    """Request body for voice.transcribe via the chat API."""
+
+    artifact_id: str
+    conversation_id: str | None = None
+
+
+class VoiceSpeakRequest(BaseModel):
+    """Request body for voice.speak via the chat API."""
+
+    text: str
+    voice: str = "alloy"
+    conversation_id: str | None = None
+
+
+def _make_voice_agent(member: Member) -> "core.models.AgentContext":  # type: ignore[name-defined]
+    """Build a minimal AgentContext from a member for voice tool calls."""
+    from core.models import AgentContext
+
+    return AgentContext(
+        id=member.id,
+        org_id=member.organization_id,
+        task_id=None,
+        member_id=member.id,
+    )
+
+
+@router.post("/voice/transcribe")
+async def voice_transcribe(
+    req: VoiceTranscribeRequest,
+    member: Member = Depends(get_current_member),
+) -> dict:
+    """Transcribe an uploaded audio artifact to text via the tool broker.
+
+    The caller must first upload the audio file via POST /attachments to get
+    an artifact_id, then pass it here. Routes through tool_broker.execute so
+    audit logging and permission checks are applied.
+
+    Returns the transcript text, transcript artifact id, and model used.
+    When STT is not configured, returns a 422 with a clear message rather than
+    silently failing.
+
+    Args:
+        req: Artifact id to transcribe + optional conversation id.
+        member: Authenticated member (injected by FastAPI).
+
+    Returns:
+        JSON with transcript, transcript_artifact_id, model, status.
+
+    Raises:
+        HTTPException(422): When the STT provider is not configured (degraded).
+        HTTPException(400): When the audio artifact is not found or access denied.
+    """
+    from core.tool_broker import tool_broker
+
+    agent = _make_voice_agent(member)
+    args: dict = {"artifact_id": req.artifact_id}
+    if req.conversation_id:
+        args["conversation_id"] = req.conversation_id
+
+    result = await tool_broker.execute(agent, "voice.transcribe", args)
+
+    if result.data.get("status") == "unavailable":
+        raise HTTPException(
+            status_code=422,
+            detail=result.summary or "STT provider not configured",
+        )
+    if result.data.get("status") == "error":
+        raise HTTPException(
+            status_code=400,
+            detail=result.data.get("reason") or result.summary or "Transcription failed",
+        )
+
+    return {
+        "status": "success",
+        "transcript": result.data.get("transcript", ""),
+        "transcript_artifact_id": result.data.get("transcript_artifact_id"),
+        "model": result.data.get("model"),
+    }
+
+
+@router.post("/voice/speak")
+async def voice_speak(
+    req: VoiceSpeakRequest,
+    member: Member = Depends(get_current_member),
+) -> dict:
+    """Convert text to speech via the tool broker and return an audio artifact.
+
+    Routes through tool_broker.execute so audit logging and permission checks
+    are applied. The returned audio_artifact_id can be fetched via
+    GET /artifacts/{id}/content (audio/mpeg) for playback in the browser.
+
+    Args:
+        req: Text to synthesise, optional voice, optional conversation id.
+        member: Authenticated member (injected by FastAPI).
+
+    Returns:
+        JSON with audio_artifact_id, tts_meta, status.
+
+    Raises:
+        HTTPException(422): When the TTS provider is not configured (degraded).
+        HTTPException(400): When synthesis fails.
+    """
+    from core.tool_broker import tool_broker
+
+    agent = _make_voice_agent(member)
+    args: dict = {"text": req.text, "voice": req.voice}
+    if req.conversation_id:
+        args["conversation_id"] = req.conversation_id
+
+    result = await tool_broker.execute(agent, "voice.speak", args)
+
+    if result.data.get("status") == "unavailable":
+        raise HTTPException(
+            status_code=422,
+            detail=result.summary or "TTS provider not configured",
+        )
+    if result.data.get("status") == "error":
+        raise HTTPException(
+            status_code=400,
+            detail=result.data.get("reason") or result.summary or "Speech synthesis failed",
+        )
+
+    return {
+        "status": "success",
+        "audio_artifact_id": result.data.get("audio_artifact_id"),
+        "tts_meta": result.data.get("tts_meta"),
+    }
