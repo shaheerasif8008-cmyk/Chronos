@@ -587,6 +587,7 @@ const IC = {
   Lightbulb:  (p: IcProps) => <Ic {...p}><path d="M7 13c-.7-1-1.5-2-1.5-4 0-2.5 2-4.5 4.5-4.5s4.5 2 4.5 4.5c0 2-.8 3-1.5 4M8 13h4M8.5 16h3"/></Ic>,
   Eye:        (p: IcProps) => <Ic {...p}><path d="M2 10s2.8-5 8-5 8 5 8 5-2.8 5-8 5-8-5-8-5z"/><circle cx="10" cy="10" r="2.2"/></Ic>,
   Stop:       (p: IcProps) => <Ic {...p}><rect x="5" y="5" width="10" height="10" rx="1"/></Ic>,
+  Volume:     (p: IcProps) => <Ic {...p}><path d="M6 8H4c-.6 0-1 .4-1 1v2c0 .6.4 1 1 1h2l4 3V5L6 8z"/><path d="M13.5 6.5a5 5 0 010 7M16 4a8.5 8.5 0 010 12"/></Ic>,
 };
 
 // ─── Primitives ───────────────────────────────────────────────────────────────
@@ -1163,11 +1164,15 @@ function ChatScreen({
   const [activeTaskEvents, setActiveTaskEvents] = useState<TaskStreamEvent[]>([]);
   const [activeTaskStreamError, setActiveTaskStreamError] = useState("");
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
+  const [uploadError, setUploadError] = useState<string | null>(null);
   const [personaMenuOpen, setPersonaMenuOpen] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const streamingRef = useRef(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const voiceInputRef = useRef<HTMLInputElement>(null);
+  const [voiceError, setVoiceError] = useState<string | null>(null);
+  const [voiceBusy, setVoiceBusy] = useState(false);
   const attachmentPreviewUrlsRef = useRef<Set<string>>(new Set());
   const isEmpty = !activeConvoId && messages.length === 0;
   const inlineApprovalIds = useMemo(() => {
@@ -1562,6 +1567,7 @@ function ChatScreen({
     // uploads — the browser needs to set the multipart boundary itself.
     const token = getToken();
     const base = apiBase();
+    setUploadError(null);
     for (const file of Array.from(files)) {
       const previewUrl = file.type.startsWith("image/") ? URL.createObjectURL(file) : undefined;
       if (previewUrl) attachmentPreviewUrlsRef.current.add(previewUrl);
@@ -1577,17 +1583,71 @@ function ChatScreen({
         if (res.ok) {
           const data = await res.json() as { attachment_id: string; filename: string; size_bytes: number };
           setAttachments(prev => [...prev, { id: data.attachment_id, name: data.filename, size: data.size_bytes, type: file.type, previewUrl }]);
-        } else if (previewUrl) {
-          URL.revokeObjectURL(previewUrl);
-          attachmentPreviewUrlsRef.current.delete(previewUrl);
+        } else {
+          if (previewUrl) {
+            URL.revokeObjectURL(previewUrl);
+            attachmentPreviewUrlsRef.current.delete(previewUrl);
+          }
+          let detail = `Upload failed (${res.status})`;
+          try { const body = await res.json() as { detail?: string }; if (body.detail) detail = body.detail; } catch { /* ignore */ }
+          setUploadError(detail);
         }
-      } catch {
+      } catch (err) {
         if (previewUrl) {
           URL.revokeObjectURL(previewUrl);
           attachmentPreviewUrlsRef.current.delete(previewUrl);
         }
-        // Upload failed silently — user can retry
+        setUploadError(err instanceof Error ? err.message : "Upload failed — please try again");
       }
+    }
+  }
+
+  async function uploadVoice(files: FileList) {
+    // Upload audio file via /attachments then call /chat/voice/transcribe.
+    // On success, populate the composer draft with the transcript text.
+    // On unavailable (no STT provider), show an honest degraded error message.
+    const token = getToken();
+    const base = apiBase();
+    setVoiceError(null);
+    const file = files[0];
+    if (!file) return;
+    setVoiceBusy(true);
+    try {
+      // Step 1: Upload audio as attachment
+      const form = new FormData();
+      form.append("file", file);
+      if (activeConvoId) form.append("conversation_id", activeConvoId);
+      const uploadRes = await fetch(`${base}/attachments`, {
+        method: "POST",
+        body: form,
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!uploadRes.ok) {
+        const body = await uploadRes.json().catch(() => ({})) as { detail?: string };
+        setVoiceError(body.detail || `Upload failed (${uploadRes.status})`);
+        return;
+      }
+      const uploadData = await uploadRes.json() as { attachment_id: string };
+
+      // Step 2: Transcribe via broker-routed endpoint
+      const transcribeRes = await apiFetch("/chat/voice/transcribe", {
+        method: "POST",
+        body: JSON.stringify({
+          artifact_id: uploadData.attachment_id,
+          conversation_id: activeConvoId ?? undefined,
+        }),
+      }).catch(err => { throw err instanceof Error ? err : new Error(String(err)); });
+      const transcribeData = await transcribeRes.json() as { transcript?: string };
+      if (transcribeData.transcript) {
+        setDraft(prev => prev ? `${prev} ${transcribeData.transcript}` : transcribeData.transcript!);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Transcription unavailable";
+      setVoiceError(msg.includes("422") || msg.toLowerCase().includes("not configured")
+        ? "Transcription unavailable: no STT provider is configured."
+        : msg);
+    } finally {
+      setVoiceBusy(false);
     }
   }
 
@@ -1629,6 +1689,7 @@ function ChatScreen({
     setDraft("");
     const pendingAttachmentIds = attachments.map(a => a.id);
     clearAttachments();
+    setUploadError(null);
     setMessages(prev => [
       ...prev,
       { role: "user", content: text, status: "complete" },
@@ -2011,7 +2072,36 @@ function ChatScreen({
               className="hidden"
               onChange={e => { if (e.target.files) void uploadFiles(e.target.files); e.target.value = ""; }}
             />
+            <input
+              ref={voiceInputRef}
+              type="file"
+              accept="audio/*"
+              className="hidden"
+              onChange={e => { if (e.target.files) void uploadVoice(e.target.files); e.target.value = ""; }}
+            />
             <div className="composer-shell">
+              {uploadError && (
+                <div
+                  className="mx-4 mt-3 flex items-center gap-2 rounded-md px-3 py-2 text-[12.5px]"
+                  style={{ background: "var(--danger-bg, rgba(239,68,68,.1))", color: "var(--danger, #ef4444)", border: "1px solid var(--danger-border, rgba(239,68,68,.25))" }}
+                  role="alert"
+                >
+                  <IC.X size={13} style={{ flexShrink: 0 }} />
+                  <span className="flex-1">{uploadError}</span>
+                  <button type="button" aria-label="Dismiss" onClick={() => setUploadError(null)} className="smooth hover:opacity-70"><IC.X size={13} /></button>
+                </div>
+              )}
+              {voiceError && (
+                <div
+                  className="mx-4 mt-3 flex items-center gap-2 rounded-md px-3 py-2 text-[12.5px]"
+                  style={{ background: "var(--danger-bg, rgba(239,68,68,.1))", color: "var(--danger, #ef4444)", border: "1px solid var(--danger-border, rgba(239,68,68,.25))" }}
+                  role="alert"
+                >
+                  <IC.Mic size={13} style={{ flexShrink: 0 }} />
+                  <span className="flex-1">{voiceError}</span>
+                  <button type="button" aria-label="Dismiss" onClick={() => setVoiceError(null)} className="smooth hover:opacity-70"><IC.X size={13} /></button>
+                </div>
+              )}
               {attachments.length > 0 && (
                 <div className="flex gap-2 overflow-x-auto px-4 pt-3 pb-2">
                   {attachments.map(a => (
@@ -2054,6 +2144,16 @@ function ChatScreen({
               <div className="flex items-center justify-between px-3 pb-2.5 pt-1">
                 <div className="flex items-center gap-1">
                   <button type="button" aria-label="Attach files" className="btn btn-ghost btn-sm btn-icon" onClick={() => fileInputRef.current?.click()}><IC.Attach size={15}/></button>
+                  <button
+                    type="button"
+                    aria-label="Transcribe audio (upload audio file)"
+                    title="Upload an audio file to transcribe"
+                    disabled={voiceBusy}
+                    className={`btn btn-ghost btn-sm btn-icon${voiceBusy ? " opacity-50" : ""}`}
+                    onClick={() => voiceInputRef.current?.click()}
+                  >
+                    {voiceBusy ? <IC.Refresh size={15} style={{ animation: "spin 1s linear infinite" }}/> : <IC.Mic size={15}/>}
+                  </button>
                   <button className="btn btn-ghost btn-sm">
                     <IC.Sparkles size={14} style={{ color: "var(--accent)" }}/> Skills · 1
                   </button>
@@ -2519,10 +2619,68 @@ function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: Mes
 
 type MsgProps = { message: Message; conversationId: string; onRefresh: () => void; onBranch: (id: string) => void };
 
+/** Chip for a single persisted attachment on a user message.
+ *  Image attachments: fetches the blob via apiFetch (Bearer-authed) and renders
+ *  a small thumbnail.  Non-image attachments: filename chip, same as before.
+ */
+function AttachmentChip({ artifact }: { artifact: ArtifactRef }) {
+  const [thumbUrl, setThumbUrl] = useState<string | null>(null);
+  const isImage = (artifact.mime_type ?? "").startsWith("image/");
+
+  useEffect(() => {
+    if (!isImage) return;
+    let cancelled = false;
+    let objectUrl: string | null = null;
+    apiFetch(`/artifacts/${artifact.id}/content`)
+      .then(r => r.blob())
+      .then(blob => {
+        if (cancelled) return;  // unmounted/re-ran before fetch resolved
+        objectUrl = URL.createObjectURL(blob);
+        setThumbUrl(objectUrl);
+      })
+      .catch(() => { /* silently fall back to chip */ });
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [artifact.id, isImage]);
+
+  if (isImage && thumbUrl) {
+    return (
+      <div
+        className="rounded-md border overflow-hidden"
+        style={{ borderColor: "var(--border-soft)", width: 56, height: 56, flexShrink: 0 }}
+        title={artifact.title}
+      >
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img src={thumbUrl} alt={artifact.title} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className="flex items-center gap-1.5 rounded-md border px-2 py-1 text-[12px]"
+      style={{ background: "var(--surface-2)", borderColor: "var(--border-soft)", color: "var(--text-muted)" }}
+    >
+      <IC.Attach size={12} style={{ flexShrink: 0, color: "var(--text-dim)" }} />
+      <span className="max-w-[140px] truncate">{artifact.title}</span>
+    </div>
+  );
+}
+
 function UserMessage({ message, conversationId, onRefresh, onBranch }: MsgProps) {
   return (
     <div className="flex justify-end fadein group">
       <div className="max-w-[72%] min-w-0">
+        {message.artifacts && message.artifacts.length > 0 && (
+          <div className="mb-2 flex flex-wrap justify-end gap-1.5">
+            {message.artifacts.map(a => (
+              <AttachmentChip key={a.id} artifact={a} />
+            ))}
+          </div>
+        )}
         <div className="rounded-xl px-4 py-3 text-[15px] leading-relaxed" style={{ background: "var(--surface-2)", color: "var(--text)" }}>
           {message.content}
         </div>
@@ -2591,6 +2749,88 @@ function ReasoningPanel({ summaries, streaming }: { summaries: ReasoningSummary[
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * VoicePlayButton — small speaker button on assistant messages.
+ * Calls POST /chat/voice/speak via the broker, then plays the returned
+ * audio artifact from GET /artifacts/{id}/content.
+ * Shows an honest "TTS unavailable" tooltip when the provider is not configured.
+ */
+function VoicePlayButton({ text, conversationId }: { text: string; conversationId: string }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const urlRef = useRef<string | null>(null);
+
+  // Stop current playback and revoke its blob URL — used on re-click and unmount.
+  function stopAndRevoke() {
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current = null;
+    }
+    if (urlRef.current) {
+      URL.revokeObjectURL(urlRef.current);
+      urlRef.current = null;
+    }
+  }
+
+  // Revoke any outstanding blob URL when the component unmounts.
+  useEffect(() => stopAndRevoke, []);
+
+  async function handleSpeak() {
+    if (busy) return;
+    stopAndRevoke();  // stop any prior playback and free its URL
+    setError(null);
+    setBusy(true);
+    try {
+      const res = await apiFetch("/chat/voice/speak", {
+        method: "POST",
+        body: JSON.stringify({ text: text.slice(0, 4096), conversation_id: conversationId || undefined }),
+      });
+      const data = await res.json() as { audio_artifact_id?: string };
+      if (!data.audio_artifact_id) { setError("No audio returned"); return; }
+
+      // Fetch audio content through the artifact endpoint (auth-gated, tenant-scoped).
+      const audioRes = await apiFetch(`/artifacts/${data.audio_artifact_id}/content`);
+      const blob = await audioRes.blob();
+      const url = URL.createObjectURL(blob);
+      urlRef.current = url;
+      const audio = new Audio(url);
+      audioRef.current = audio;
+      audio.addEventListener("ended", stopAndRevoke);
+      audio.play().catch(() => { setError("Audio playback failed (browser blocked autoplay)"); stopAndRevoke(); });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setError(msg.includes("422") || msg.toLowerCase().includes("not configured")
+        ? "TTS unavailable: no TTS provider configured"
+        : `TTS error: ${msg.slice(0, 80)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <span className="inline-flex items-center gap-1">
+      <button
+        type="button"
+        aria-label="Read aloud"
+        title={error ?? "Read aloud"}
+        disabled={busy}
+        className="btn btn-ghost btn-sm btn-icon opacity-60 hover:opacity-100"
+        onClick={() => void handleSpeak()}
+      >
+        {busy
+          ? <IC.Refresh size={13} style={{ animation: "spin 1s linear infinite" }}/>
+          : <IC.Volume size={13}/>}
+      </button>
+      {error && (
+        <span className="text-[11px]" style={{ color: "var(--danger, #ef4444)" }} title={error}>
+          <IC.Info size={11}/>
+        </span>
+      )}
+    </span>
   );
 }
 
@@ -2959,7 +3199,8 @@ function AssistantMessage({ message, content, status, persona, toolTraces, reaso
           {message.pinned && <IC.Lock size={12} style={{ color: "var(--accent)" }}/>}
           {/* Fix 7: rely on Tailwind group-hover + focus-within instead of JS state */}
           {!isStreaming && (
-            <div className="ml-auto transition-opacity opacity-0 group-hover:opacity-100 focus-within:opacity-100">
+            <div className="ml-auto flex items-center gap-1 transition-opacity opacity-0 group-hover:opacity-100 focus-within:opacity-100">
+              {content && <VoicePlayButton text={content} conversationId={conversationId}/>}
               <MessageActionMenu message={message} conversationId={conversationId} onRefresh={onRefresh} onBranch={onBranch}/>
             </div>
           )}

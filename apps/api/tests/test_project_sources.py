@@ -124,7 +124,8 @@ async def test_upload_with_project_id_creates_source(monkeypatch):
         headers=Headers({"content-type": "application/pdf"}),
     )
     out = await attachments.upload_attachment(
-        file=upload, conversation_id=None, project_id="proj-1", member=member
+        file=upload, conversation_id=None, project_id="proj-1",
+        task_id=None, research_run_id=None, member=member,
     )
 
     assert out["attachment_id"] == "att-123"
@@ -157,6 +158,9 @@ async def test_upload_without_project_id_returns_null_source(monkeypatch):
     monkeypatch.setattr(attachments, "insert", counting_insert)
     monkeypatch.setattr(attachments.audit, "log", AsyncMock())
     monkeypatch.setattr(attachments.permissions, "check", AsyncMock(return_value=True))
+    # Conversation membership is enforced separately (its own test); stub it here so
+    # this test isolates the "no project_id → null source" behavior.
+    monkeypatch.setattr(attachments, "_require_conversation_member", AsyncMock())
 
     upload = StarletteUploadFile(
         filename="report.pdf",
@@ -164,7 +168,8 @@ async def test_upload_without_project_id_returns_null_source(monkeypatch):
         headers=Headers({"content-type": "application/pdf"}),
     )
     out = await attachments.upload_attachment(
-        file=upload, conversation_id="c1", project_id=None, member=member
+        file=upload, conversation_id="c1", project_id=None,
+        task_id=None, research_run_id=None, member=member,
     )
 
     assert out["attachment_id"] == "att-123"
