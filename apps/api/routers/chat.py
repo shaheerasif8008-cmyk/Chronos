@@ -690,6 +690,10 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
         async def _image_mode_stream():
             from core.models import AgentContext
 
+            # Emit conversation_id first (matching the task/chat paths) so the client
+            # binds the conversation before any artifact events arrive.
+            yield f"data: {json.dumps({'type': 'conversation', 'conversation_id': conversation_id})}\n\n"
+
             agent = AgentContext(
                 id=member.id,
                 org_id=member.organization_id,
@@ -725,7 +729,6 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
                 assistant_text = result.summary
                 await _save_message(conversation_id, "assistant", assistant_text, mode="image")
 
-            yield f"data: {json.dumps({'type': 'conversation', 'conversation_id': conversation_id})}\n\n"
             chunk_size = 40
             for i in range(0, len(assistant_text), chunk_size):
                 yield f"data: {json.dumps({'type': 'token', 'content': assistant_text[i:i + chunk_size]})}\n\n"

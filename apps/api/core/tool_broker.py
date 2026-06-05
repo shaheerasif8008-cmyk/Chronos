@@ -172,10 +172,14 @@ def _check_safety_limits(tool: str, args: dict) -> None:
             raise SafetyLimitViolation(f"gmail.send: {len(recipients)} recipients exceeds limit of 10")
 
     if tool == "image.generate":
-        count = int(args.get("count", 1))
-        if count > _SAFETY_LIMITS["image.generate"]["max_count"]:
+        max_count = _SAFETY_LIMITS["image.generate"]["max_count"]
+        try:
+            count = int(args.get("count", 1))
+        except (TypeError, ValueError):
+            raise SafetyLimitViolation("image.generate: count must be an integer")
+        if not (1 <= count <= max_count):
             raise SafetyLimitViolation(
-                f"image.generate: count {count} exceeds limit of {_SAFETY_LIMITS['image.generate']['max_count']}"
+                f"image.generate: count {count} must be between 1 and {max_count}"
             )
 
     # Generic delete guard

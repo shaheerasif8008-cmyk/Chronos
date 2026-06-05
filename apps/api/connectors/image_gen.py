@@ -16,7 +16,6 @@ Generation metadata (prompt, size, count, provider, model) is stored in the
 artifact title and returned in ToolResult.data — no schema migration required.
 """
 
-import json
 from typing import Any
 
 from core.config import settings
@@ -27,7 +26,7 @@ _DEFAULT_COUNT = 1
 _MAX_COUNT = 4  # enforced by _check_safety_limits in broker; also capped here
 
 
-async def _call_provider(prompt: str, size: str, count: int) -> list[bytes]:
+async def _call_provider(prompt: str, size: str, count: int, style: str | None = None) -> list[bytes]:
     """Call the configured image provider and return a list of raw image bytes.
 
     This function is the single stubbable seam for provider I/O.  In tests,
@@ -38,6 +37,7 @@ async def _call_provider(prompt: str, size: str, count: int) -> list[bytes]:
         prompt: Text description of the image(s) to generate.
         size: Image dimensions string (e.g. "1024x1024").
         count: Number of images to generate (1–4).
+        style: Optional provider style hint (forwarded only when set).
 
     Returns:
         A list of raw PNG/JPEG image bytes, one entry per generated image.
@@ -49,11 +49,13 @@ async def _call_provider(prompt: str, size: str, count: int) -> list[bytes]:
 
     # litellm exposes image_generation() which mirrors the OpenAI Images API.
     # n (count), size, and model map directly to the litellm call.
+    extra: dict[str, Any] = {"style": style} if style else {}
     response = await litellm.aimage_generation(
         model=settings.image_model,
         prompt=prompt,
         n=count,
         size=size,
+        **extra,
     )
     # Each item has a b64_json or url field.
     blobs: list[bytes] = []
@@ -120,8 +122,24 @@ class ImageGenConnector:
                 ),
             )
 
-        # Call the provider (stubbed in tests via monkeypatch).
-        image_bytes_list = await _call_provider(prompt, size, count)
+        # Call the provider (stubbed in tests via monkeypatch). A provider/network
+        # error must degrade honestly into an error ToolResult — never propagate and
+        # break the broker call / SSE stream.
+        try:
+            image_bytes_list = await _call_provider(prompt, size, count, style)
+        except Exception as exc:
+            return ToolResult(
+                data={"status": "error", "reason": f"provider call failed: {type(exc).__name__}"},
+                summary=f"Image generation failed: {exc}",
+            )
+
+        # An empty provider response (e.g. content-policy suppression) is NOT a
+        # success — distinguish it honestly so the caller doesn't show "0 images" as ok.
+        if not image_bytes_list:
+            return ToolResult(
+                data={"status": "error", "reason": "provider returned no images", "artifact_ids": []},
+                summary="Image generation produced no images (provider returned an empty result).",
+            )
 
         # Save each generated image as an artifact.
         from core.artifacts import save_artifact

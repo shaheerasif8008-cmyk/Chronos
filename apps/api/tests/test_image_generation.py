@@ -83,7 +83,7 @@ def _stub_provider(monkeypatch, blobs: list[bytes]) -> None:
     """Monkeypatch the connector's _call_provider to return deterministic bytes."""
     import connectors.image_gen as ig
 
-    async def fake_call_provider(prompt: str, size: str, count: int) -> list[bytes]:
+    async def fake_call_provider(prompt: str, size: str, count: int, style: str | None = None) -> list[bytes]:
         return blobs[:count]
 
     monkeypatch.setattr(ig, "_call_provider", fake_call_provider)
@@ -222,23 +222,68 @@ async def test_image_generate_cross_org_isolation(monkeypatch):
 
     artifact_id = result.data["artifact_ids"][0]
 
-    from core.artifacts import get_artifact
+    # Drive the REAL artifacts-router guard (routers.artifacts._require), not a local
+    # copy — so a regression in the actual guard would fail this test.
+    import uuid as _uuid
+    from fastapi import HTTPException
+    from core.models import Member
+    import routers.artifacts as artifacts_router
 
-    async def _require_org(artifact_id: str, requester_org: str) -> dict | None:
-        """Replicate the org-scoped check from routers/artifacts.py _require."""
-        meta = await get_artifact(artifact_id)
-        if not meta or str(meta.get("organization_id")) != str(requester_org):
-            return None  # would be 404 in the router
-        return meta
+    # permissions.check enforces only with OpenFGA (off in this env); the org filter
+    # in _require is what we assert. Patch it True to isolate the tenant boundary.
+    monkeypatch.setattr(artifacts_router.permissions, "check", lambda *a, **k: _async_true())
 
-    # Org A can access it.
-    meta_as_a = await _require_org(artifact_id, org_a)
-    assert meta_as_a is not None
+    member_a = Member(id=str(_uuid.uuid4()), organization_id=org_a, email="a@example.com", role="user")
+    member_b = Member(id=str(_uuid.uuid4()), organization_id=org_b, email="b@example.com", role="user")
+
+    # Org A can read it through the real guard.
+    meta_as_a = await artifacts_router._require(member_a, "read_artifact", artifact_id)
     assert str(meta_as_a["organization_id"]) == org_a
 
-    # Org B cannot see it.
-    meta_as_b = await _require_org(artifact_id, org_b)
-    assert meta_as_b is None, "cross-org artifact should not be readable by org B"
+    # Org B is denied by the real guard (404).
+    with pytest.raises(HTTPException) as exc:
+        await artifacts_router._require(member_b, "read_artifact", artifact_id)
+    assert exc.value.status_code == 404
+
+
+async def _async_true(*a, **k):
+    return True
+
+
+@pytest.mark.asyncio
+async def test_image_generate_provider_error_degrades(monkeypatch):
+    """A provider/network error must return an honest error ToolResult, never propagate."""
+    org = _unique_org()
+    agent = _make_agent(org_id=org)
+    _patch_broker_infra(monkeypatch)
+    _force_image_model(monkeypatch)
+
+    import connectors.image_gen as ig
+
+    async def boom(prompt, size, count, style=None):
+        raise RuntimeError("provider exploded")
+
+    monkeypatch.setattr(ig, "_call_provider", boom)
+
+    from core.tool_broker import tool_broker
+    result = await tool_broker.execute(agent, "image.generate", {"prompt": "x"})
+    assert result.data["status"] == "error"
+    assert "artifact_ids" not in result.data or result.data.get("artifact_ids") in (None, [])
+
+
+@pytest.mark.asyncio
+async def test_image_generate_empty_result_is_not_success(monkeypatch):
+    """An empty provider response is an honest error, not a 'success' with 0 images."""
+    org = _unique_org()
+    agent = _make_agent(org_id=org)
+    _patch_broker_infra(monkeypatch)
+    _force_image_model(monkeypatch)
+    _stub_provider(monkeypatch, [])  # provider returns no images
+
+    from core.tool_broker import tool_broker
+    result = await tool_broker.execute(agent, "image.generate", {"prompt": "x"})
+    assert result.data["status"] == "error"
+    assert result.data.get("artifact_ids") in (None, [])
 
 
 # ---------------------------------------------------------------------------
