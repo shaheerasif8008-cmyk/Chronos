@@ -1,15 +1,15 @@
 """phase 12 scheduled workflows monitors
 
-Revision ID: 0029_phase12_scheduled_workflows_monitors
-Revises: 0028_computer_phase10
+Revision ID: 0030_phase12_scheduled_workflows_monitors
+Revises: 0029_agents_phase13
 Create Date: 2026-06-05
 """
 from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
-revision = "0029_phase12_scheduled_workflows_monitors"
-down_revision = "0028_computer_phase10"
+revision = "0030_phase12_scheduled_workflows_monitors"
+down_revision = "0029_agents_phase13"
 branch_labels = None
 depends_on = None
 

@@ -33,7 +33,7 @@ Add a Playwright static route guard for `/workflows` that expects real schedule,
 
 **Files:**
 - Modify: `apps/api/migrations/versions/0021_scheduled_tasks.py`
-- Create: `apps/api/migrations/versions/0029_phase12_scheduled_workflows_monitors.py`
+- Create: `apps/api/migrations/versions/0030_phase12_scheduled_workflows_monitors.py`
 - Modify: `apps/api/jobs/scheduled_tasks.py`
 - Modify: `apps/api/routers/schedules.py`
 - Modify: `apps/api/routers/workflows.py`
