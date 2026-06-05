@@ -132,10 +132,14 @@ async def test_image_generate_creates_artifact_and_audits(monkeypatch):
     content = await read_artifact_content(artifact_ids[0])
     assert content == _FAKE_PNG
 
+    # --- Persisted title carries the prompt (refetch after DB round-trip) ---
+    assert "a red square" in (meta["title"] or "")
+
     # --- Generation metadata in ToolResult ---
     gen_meta = result.data["generation_meta"]
     assert gen_meta["prompt"] == "a red square"
     assert gen_meta["model"] == "test/dall-e-stub"
+    assert gen_meta["size"] == "1024x1024"
 
     # --- Audit trail ---
     assert "tool_call" in audited
@@ -192,19 +196,19 @@ async def test_image_generate_degraded_no_provider(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Test 4: Cross-org — org B agent cannot see org A's image artifact
+# Test 4: Cross-org — org B agent cannot read org A's image artifact
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_image_generate_cross_org_isolation(monkeypatch):
-    """Artifact saved for org A is not accessible as org B's artifact.
+    """Artifact saved for org A is denied to an org-B requester.
 
-    get_artifact returns the row regardless of org (it's id-only); the caller
-    enforces the tenant boundary by comparing meta['organization_id'] to the
-    requester's org.  This test confirms the artifact is stored with the correct
-    org and that a cross-org check (as performed by chat.py and other callers)
-    returns the right org on the artifact so org B would be denied.
+    The denial path is the same one used by artifacts router and chat.py:
+    ``str(meta['organization_id']) != str(requester_org_id)`` → 404 / skip.
+    We exercise it directly here with a helper that replicates that guard.
     """
+    from fastapi import HTTPException
+
     org_a = _unique_org()
     org_b = _unique_org()
     agent_a = _make_agent(org_id=org_a)
@@ -219,12 +223,22 @@ async def test_image_generate_cross_org_isolation(monkeypatch):
     artifact_id = result.data["artifact_ids"][0]
 
     from core.artifacts import get_artifact
-    meta = await get_artifact(artifact_id)
-    assert meta is not None
-    # The artifact belongs to org A — an org B caller would see this mismatch
-    # and deny access (str comparison, matching chat.py pattern).
-    assert str(meta["organization_id"]) == org_a
-    assert str(meta["organization_id"]) != org_b
+
+    async def _require_org(artifact_id: str, requester_org: str) -> dict | None:
+        """Replicate the org-scoped check from routers/artifacts.py _require."""
+        meta = await get_artifact(artifact_id)
+        if not meta or str(meta.get("organization_id")) != str(requester_org):
+            return None  # would be 404 in the router
+        return meta
+
+    # Org A can access it.
+    meta_as_a = await _require_org(artifact_id, org_a)
+    assert meta_as_a is not None
+    assert str(meta_as_a["organization_id"]) == org_a
+
+    # Org B cannot see it.
+    meta_as_b = await _require_org(artifact_id, org_b)
+    assert meta_as_b is None, "cross-org artifact should not be readable by org B"
 
 
 # ---------------------------------------------------------------------------
