@@ -31,6 +31,7 @@ class CreateTaskRequest(BaseModel):
     workspace_id: str | None = None
     model: str | None = None
     mode: str | None = None
+    reasoning_effort: str | None = None
     project_id: str | None = None
 
 
@@ -43,6 +44,7 @@ async def create_task_record(
     workspace_id: str | None = None,
     model: str | None = None,
     mode: str | None = None,
+    reasoning_effort: str | None = None,
     project_id: str | None = None,
     attachments_context: list[dict] | None = None,
     project_knowledge: str | None = None,
@@ -55,10 +57,11 @@ async def create_task_record(
     `model` is the chat-model id chosen in the UI; it is resolved to a concrete
     litellm model string and stored in agent_state so the loop honours the picker.
     """
-    from core.llm import default_chat_model_id, resolve_agent_model
+    from core.llm import default_chat_model_id, normalize_reasoning_effort, resolve_agent_model
 
     await permissions.check(member, "create_task", workspace_id or "default")
     resolved_model = resolve_agent_model(model or default_chat_model_id())
+    normalized_reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     normalized_mode = normalize_mode(mode)
     tasks = await reflect_table("tasks")
     raw_user_message = original_message if original_message is not None else goal
@@ -75,6 +78,7 @@ async def create_task_record(
         "agent_history": [],
         "iteration_count": 0,
         "model": resolved_model,
+        "reasoning_effort": normalized_reasoning_effort,
         "attachments": attachments_context or [],
         "project_knowledge": project_knowledge or "",
         "original_user_message": raw_user_message,
@@ -119,6 +123,7 @@ async def create_task(req: CreateTaskRequest, member: Member = Depends(get_curre
         workspace_id=req.workspace_id,
         model=req.model,
         mode=req.mode,
+        reasoning_effort=req.reasoning_effort,
         project_id=req.project_id,
         original_message=req.goal,
         router_decision={"mode": "agent", "ui_title": req.goal},

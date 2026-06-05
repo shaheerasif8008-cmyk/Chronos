@@ -190,6 +190,14 @@ type ActivityAction = {
 const MODEL_STORAGE_KEY = "chronos.chat.selectedModel";
 const DEFAULT_MODEL_ID = "gpt-5.4-mini";
 const MODE_STORAGE_KEY = "chronos.chat.selectedMode";
+const REASONING_STORAGE_KEY = "chronos.chat.reasoningEffort";
+const REASONING_OPTIONS = [
+  { id: "low", label: "Low", title: "Use lighter reasoning for faster replies." },
+  { id: "medium", label: "Medium", title: "Use balanced reasoning." },
+  { id: "high", label: "High", title: "Use deeper reasoning for harder requests." },
+] as const;
+type ReasoningEffort = typeof REASONING_OPTIONS[number]["id"];
+const DEFAULT_REASONING_EFFORT: ReasoningEffort = "medium";
 
 function modelOptionText(model: ChatModel) {
   if (model.id === "unavailable") return model.label;
@@ -463,7 +471,6 @@ function routeFromPath(pathname: string | null): Route {
   if (pathname === "/projects") return "projects";
   if (pathname === "/research") return "research";
   if (pathname === "/tasks") return "tasks";
-  if (pathname === "/artifacts") return "artifacts";
   if (pathname === "/agents") return "agents";
   if (pathname === "/workflows") return "workflows";
   if (pathname === "/audit") return "audit";
@@ -1149,6 +1156,7 @@ function ChatScreen({
   const [modelsLoadError, setModelsLoadError] = useState("");
   const [selectedMode, setSelectedMode] = useState<string>("default");
   const [modesLoadError, setModesLoadError] = useState("");
+  const [selectedReasoningEffort, setSelectedReasoningEffort] = useState<ReasoningEffort>(DEFAULT_REASONING_EFFORT);
   const [streaming, setStreaming] = useState(false);
   const [activityOpen, setActivityOpen] = useState(false);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
@@ -1437,6 +1445,15 @@ function ChatScreen({
   }, []);
 
   useEffect(() => {
+    const stored = window.localStorage.getItem(REASONING_STORAGE_KEY);
+    if (REASONING_OPTIONS.some(option => option.id === stored)) {
+      setSelectedReasoningEffort(stored as ReasoningEffort);
+    } else {
+      window.localStorage.setItem(REASONING_STORAGE_KEY, DEFAULT_REASONING_EFFORT);
+    }
+  }, []);
+
+  useEffect(() => {
     if (!activeConvoId) {
       if (!streamingRef.current) setMessages([]);
       setActiveTaskId(null);
@@ -1654,6 +1671,15 @@ function ChatScreen({
         }
       });
       return [];
+    });
+  }
+
+  function cycleReasoningEffort() {
+    setSelectedReasoningEffort(current => {
+      const index = REASONING_OPTIONS.findIndex(option => option.id === current);
+      const next = REASONING_OPTIONS[(index + 1) % REASONING_OPTIONS.length]?.id ?? DEFAULT_REASONING_EFFORT;
+      window.localStorage.setItem(REASONING_STORAGE_KEY, next);
+      return next;
     });
   }
 
@@ -1889,7 +1915,15 @@ function ChatScreen({
       const resp = await apiFetch("/chat/message", {
         method: "POST",
         headers: { Accept: "text/event-stream" },
-        body: JSON.stringify({ message: text, conversation_id: convoId, model: selectedModel, mode: selectedMode, persona_id: activePersonaId, attachment_ids: pendingAttachmentIds }),
+        body: JSON.stringify({
+          message: text,
+          conversation_id: convoId,
+          model: selectedModel,
+          mode: selectedMode,
+          reasoning_effort: selectedReasoningEffort,
+          persona_id: activePersonaId,
+          attachment_ids: pendingAttachmentIds,
+        }),
         signal: ab.signal,
       });
 
@@ -2122,6 +2156,19 @@ function ChatScreen({
                   </button>
                   <button className="btn btn-ghost btn-sm">
                     <IC.Sparkles size={14} style={{ color: "var(--accent)" }}/> Skills · 1
+                  </button>
+                  <button
+                    type="button"
+                    aria-label={`Reasoning effort: ${selectedReasoningEffort}`}
+                    aria-pressed={selectedReasoningEffort !== DEFAULT_REASONING_EFFORT}
+                    onClick={cycleReasoningEffort}
+                    disabled={streaming}
+                    className="btn btn-ghost btn-sm"
+                    title={REASONING_OPTIONS.find(option => option.id === selectedReasoningEffort)?.title}
+                    data-reasoning-effort={selectedReasoningEffort}
+                  >
+                    <IC.Lightbulb size={14}/>
+                    Reasoning · {REASONING_OPTIONS.find(option => option.id === selectedReasoningEffort)?.label ?? selectedReasoningEffort}
                   </button>
                   <label className="sr-only" htmlFor="chat-model-select">Model</label>
                   <select
@@ -4363,6 +4410,18 @@ type CatalogApp = {
   name: string;
   description: string;
   icon_svg: string;
+  category?: string;
+  auth_type?: string;
+  scopes?: string[];
+  actions?: string[];
+  risk_levels?: string[];
+  sync_supported?: boolean;
+  policy?: string;
+  health_status?: string;
+  health_updated_at?: string | null;
+  last_used_at?: string;
+  client_id_env?: string;
+  client_secret_env?: string;
   configured: boolean;
   connected: boolean;
   account_handle: string;
@@ -4417,8 +4476,14 @@ function ConnectorsScreen() {
   }, []);
 
   async function connect(app: CatalogApp) {
+    if (app.auth_type && app.auth_type !== "oauth2") {
+      setError(`${app.name} uses ${app.auth_type} setup. Configure it from connector policy/schema settings before connecting live credentials.`);
+      return;
+    }
     if (!app.configured) {
-      setError(`Set ${app.id.toUpperCase()}_CLIENT_ID and ${app.id.toUpperCase()}_CLIENT_SECRET in your .env to enable ${app.name}.`);
+      const idEnv = app.client_id_env || `${app.id.toUpperCase()}_CLIENT_ID`;
+      const secretEnv = app.client_secret_env || `${app.id.toUpperCase()}_CLIENT_SECRET`;
+      setError(`Set ${idEnv} and ${secretEnv} in your .env to enable ${app.name}.`);
       return;
     }
     setConnecting(app.id);
@@ -4524,15 +4589,46 @@ function ConnectorsScreen() {
                   {app.description}
                 </p>
 
+                <div className="flex flex-wrap gap-1">
+                  {app.auth_type && <Tag>{app.auth_type}</Tag>}
+                  {app.sync_supported && <Tag variant="accent">Sync</Tag>}
+                  {app.health_status && <Tag variant={app.health_status === "healthy" || app.health_status === "connected" ? "ok" : app.health_status === "not_connected" ? "info" : "warn"}>{app.health_status}</Tag>}
+                  {(app.risk_levels || []).slice(0, 3).map(level => (
+                    <Tag key={level} variant={level === "read" ? "info" : level === "financial" || level === "destructive" ? "danger" : "warn"}>{level}</Tag>
+                  ))}
+                </div>
+
+                {(app.actions || []).length > 0 && (
+                  <div className="text-[11.5px] leading-5" style={{ color: "var(--text-dim)" }}>
+                    Actions: {(app.actions || []).join(", ")}
+                  </div>
+                )}
+
+                {(app.scopes || []).length > 0 && (
+                  <div className="text-[11.5px] leading-5 line-clamp-2" style={{ color: "var(--text-dim)" }}>
+                    Scopes: {(app.scopes || []).slice(0, 4).join(", ")}{(app.scopes || []).length > 4 ? "…" : ""}
+                  </div>
+                )}
+
+                <div className="text-[11.5px] leading-5" style={{ color: "var(--text-dim)" }}>
+                  Last used: {app.last_used_at || "never"}
+                </div>
+
+                {app.policy && (
+                  <p className="text-[11.5px] leading-[1.5]" style={{ color: "var(--text-muted)" }}>
+                    {app.policy}
+                  </p>
+                )}
+
                 <div className="mt-auto pt-1 flex gap-2">
                   {!app.connected ? (
                     <button
                       onClick={() => void connect(app)}
                       disabled={connecting === app.id}
                       className="btn btn-accent btn-sm w-full disabled:opacity-50"
-                      title={!app.configured ? `Add ${app.id.toUpperCase()}_CLIENT_ID + CLIENT_SECRET to .env first` : undefined}
+                      title={!app.configured ? `Add ${app.client_id_env || `${app.id.toUpperCase()}_CLIENT_ID`} + ${app.client_secret_env || "CLIENT_SECRET"} to .env first` : undefined}
                     >
-                      {connecting === app.id ? "Redirecting…" : app.configured ? "Connect" : "Configure first"}
+                      {connecting === app.id ? "Redirecting…" : app.auth_type !== "oauth2" ? "Configure" : app.configured ? "Connect" : "Configure first"}
                     </button>
                   ) : (
                     <>
@@ -5581,7 +5677,21 @@ function RuntimeSettings({ data, patch, health }: { data: Record<string, unknown
 
 function MemorySettings({ data, patch, stats, setToast, setConfirm, reload }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void; stats: { active: number; deleted: number }; setToast: (t: { kind: "ok" | "danger"; text: string }) => void; setConfirm: (c: { title: string; text: string; required?: string; action: (typed: string) => Promise<void> } | null) => void; reload: () => Promise<void> }) {
   async function purge() { try { await apiFetch("/settings/memory/purge", { method: "POST", body: JSON.stringify({ confirmation: "PURGE MEMORY" }) }); setToast({ kind: "ok", text: "Memory purged" }); await reload(); } catch (exc) { setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to purge memory" }); } }
-  return <><SettingsSection title="Memory policy" note={`${stats.active} active memories, ${stats.deleted} deleted.`}><SettingsField label="Workspace memory"><Toggle label="Workspace memory" checked={Boolean(data.workspace_memory)} onChange={workspace_memory => patch({ workspace_memory })}/></SettingsField><SettingsField label="Employee memory"><Toggle label="Employee memory" checked={Boolean(data.employee_memory)} onChange={employee_memory => patch({ employee_memory })}/></SettingsField><SettingsField label="User memory"><Toggle label="User memory" checked={Boolean(data.user_memory)} onChange={user_memory => patch({ user_memory })}/></SettingsField><SettingsField label="Retention days"><TextInput ariaLabel="Memory retention" value={val(data, "retention_days")} onChange={retention_days => patch({ retention_days: Number(retention_days) || 0 })}/></SettingsField><SettingsField label="Review required"><Toggle label="Memory review required" checked={Boolean(data.review_required)} onChange={review_required => patch({ review_required })}/></SettingsField><SettingsField label="Auto-save memory"><Toggle label="Auto-save memory" checked={Boolean(data.auto_save)} onChange={auto_save => patch({ auto_save })}/></SettingsField><SettingsField label="Sensitive detection"><Toggle label="Sensitive memory detection" checked={Boolean(data.sensitive_detection)} onChange={sensitive_detection => patch({ sensitive_detection })}/></SettingsField></SettingsSection><SettingsSection title="Memory danger zone"><SettingsField label="Export memory"><button className="btn btn-sm" disabled title="Memory export endpoint is not implemented">Export unavailable</button></SettingsField><SettingsField label="Purge all memory" hint="Requires typed confirmation and writes an audit entry."><button className="btn btn-danger-soft btn-sm" onClick={() => setConfirm({ title: "Purge memory", text: "This soft-deletes all active memory entries in this workspace.", required: "PURGE MEMORY", action: async () => purge() })}>Purge memory</button></SettingsField></SettingsSection></>;
+  async function exportMemoryJson() {
+    try {
+      const blob = await (await apiFetch("/settings/memory/export.json")).blob();
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = "chronos-memory-org-export.json";
+      anchor.click();
+      URL.revokeObjectURL(url);
+      setToast({ kind: "ok", text: "Organization memory JSON exported." });
+    } catch (exc) {
+      setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to export memory" });
+    }
+  }
+  return <><SettingsSection title="Memory policy" note={`${stats.active} active memories, ${stats.deleted} deleted.`}><SettingsField label="Workspace memory"><Toggle label="Workspace memory" checked={Boolean(data.workspace_memory)} onChange={workspace_memory => patch({ workspace_memory })}/></SettingsField><SettingsField label="Employee memory"><Toggle label="Employee memory" checked={Boolean(data.employee_memory)} onChange={employee_memory => patch({ employee_memory })}/></SettingsField><SettingsField label="User memory"><Toggle label="User memory" checked={Boolean(data.user_memory)} onChange={user_memory => patch({ user_memory })}/></SettingsField><SettingsField label="Retention days"><TextInput ariaLabel="Memory retention" value={val(data, "retention_days")} onChange={retention_days => patch({ retention_days: Number(retention_days) || 0 })}/></SettingsField><SettingsField label="Review required"><Toggle label="Memory review required" checked={Boolean(data.review_required)} onChange={review_required => patch({ review_required })}/></SettingsField><SettingsField label="Auto-save memory"><Toggle label="Auto-save memory" checked={Boolean(data.auto_save)} onChange={auto_save => patch({ auto_save })}/></SettingsField><SettingsField label="Sensitive detection"><Toggle label="Sensitive memory detection" checked={Boolean(data.sensitive_detection)} onChange={sensitive_detection => patch({ sensitive_detection })}/></SettingsField></SettingsSection><SettingsSection title="Memory danger zone"><SettingsField label="Export organization memory" hint="Downloads JSON for non-deleted organization memory, including archived entries and excluding superseded entries."><button className="btn btn-sm" onClick={() => void exportMemoryJson()}>Export JSON</button></SettingsField><SettingsField label="Purge all memory" hint="Requires typed confirmation and writes an audit entry."><button className="btn btn-danger-soft btn-sm" onClick={() => setConfirm({ title: "Purge memory", text: "This soft-deletes all active memory entries in this workspace.", required: "PURGE MEMORY", action: async () => purge() })}>Purge memory</button></SettingsField></SettingsSection></>;
 }
 
 function ToolsSettings({ data, patch, connectors, capabilities, health }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void; connectors: SettingsOverview["connectors"]; capabilities: SettingsOverview["capabilities"]; health: NonNullable<SettingsOverview["runtime_health"]["connectors"]> }) {

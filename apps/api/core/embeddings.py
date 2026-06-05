@@ -40,7 +40,7 @@ async def _openrouter_embedding(text: str) -> dict:
                 "HTTP-Referer": "http://127.0.0.1:3000",
                 "X-Title": "Chronos",
             },
-            json={"model": model, "input": text},
+            json={"model": model, "input": text, "dimensions": settings.embedding_dimensions},
         )
         response.raise_for_status()
         return response.json()

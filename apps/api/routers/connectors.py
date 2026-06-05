@@ -168,8 +168,10 @@ async def list_catalog(member: Member = Depends(get_current_member)) -> list[dic
 
     apps = available_apps()
 
-    # Enrich with connection status from the connectors table
+    # Enrich with connection, health, and last-used state from the connector tables.
     connectors_table = await reflect_table("connectors")
+    health_table = await reflect_table("connector_health")
+    logs_table = await reflect_table("connector_execution_logs")
     async with engine.begin() as conn:
         rows = (
             await conn.execute(
@@ -183,11 +185,40 @@ async def list_catalog(member: Member = Depends(get_current_member)) -> list[dic
                 )
             )
         ).mappings().all()
+        health_rows = (
+            await conn.execute(
+                select(
+                    health_table.c.connector_id,
+                    health_table.c.status,
+                    health_table.c.updated_at,
+                ).where(health_table.c.organization_id == str(member.organization_id))
+            )
+        ).mappings().all()
+        log_rows = (
+            await conn.execute(
+                select(
+                    logs_table.c.connector_id,
+                    logs_table.c.created_at,
+                )
+                .where(logs_table.c.organization_id == str(member.organization_id))
+                .order_by(logs_table.c.created_at.desc())
+            )
+        ).mappings().all()
 
     connected: dict[str, str] = {row["provider"]: row["account_handle"] or "" for row in rows}
+    health: dict[str, dict[str, Any]] = {row["connector_id"]: dict(row) for row in health_rows}
+    last_used: dict[str, str] = {}
+    for row in log_rows:
+        cid = str(row["connector_id"])
+        if cid not in last_used:
+            last_used[cid] = str(row["created_at"]) if row.get("created_at") else ""
     for app in apps:
         app["connected"] = app["id"] in connected
         app["account_handle"] = connected.get(app["id"], "")
+        app_health = health.get(app["id"]) or {}
+        app["health_status"] = app_health.get("status") or ("connected" if app["connected"] else "not_connected")
+        app["health_updated_at"] = str(app_health.get("updated_at")) if app_health.get("updated_at") else None
+        app["last_used_at"] = last_used.get(app["id"], "")
     return apps
 
 
@@ -340,6 +371,8 @@ async def generic_oauth_start(
     app = get_app(provider)
     if not app:
         raise HTTPException(status_code=404, detail=f"Unknown provider: {provider}")
+    if app.auth_type != "oauth2":
+        raise HTTPException(status_code=501, detail=f"{app.name} uses {app.auth_type} setup, not OAuth2")
 
     await permissions.check(member, f"connect_{provider}", str(member.organization_id))
 
@@ -401,6 +434,8 @@ async def generic_oauth_callback(
     app = get_app(provider)
     if not app:
         raise HTTPException(status_code=404, detail=f"Unknown provider: {provider}")
+    if app.auth_type != "oauth2":
+        raise HTTPException(status_code=501, detail=f"{app.name} uses {app.auth_type} setup, not OAuth2")
 
     try:
         member_id, org_id = _gmail_module()._verify_state(state)

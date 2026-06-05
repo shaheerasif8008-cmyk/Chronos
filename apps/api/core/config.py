@@ -17,7 +17,8 @@ class Settings(BaseSettings):
     openrouter_model: str = "openrouter/deepseek/deepseek-v4-flash:free"
     agent_model: str = "openrouter/deepseek/deepseek-v4-flash:free"
     openrouter_api_base: str = "https://openrouter.ai/api/v1"
-    embedding_model: str = "openrouter/nvidia/llama-nemotron-embed-vl-1b-v2:free"
+    embedding_model: str = "google/gemini-embedding-2"
+    embedding_dimensions: int = 1536
     fast_model: str = "openrouter/minimax/minimax-m2.5:free"
     vision_model: str = ""   # vision-capable model for OCR; empty disables OCR
     image_model: str = ""   # image generation model; empty disables image generation

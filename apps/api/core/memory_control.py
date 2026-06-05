@@ -380,10 +380,16 @@ async def list_memories(
 
 
 async def export_memories(member: Member) -> list[dict[str, Any]]:
-    """Portable JSON export of an org's active memories."""
+    """Portable JSON export of an org's non-deleted memories.
+
+    Archived entries are included and tagged so a user-visible organization
+    export does not silently drop memories the control center can still show.
+    Superseded entries remain excluded because they are retained as history, not
+    current memory state.
+    """
     rows = await list_memories(member, include_archived=True, include_superseded=False, limit=10000)
     fields = ("content", "scope", "scope_id", "source", "importance_score",
-              "is_pinned", "is_sensitive")
+              "is_archived", "is_pinned", "is_sensitive")
     export = [{k: r.get(k) for k in fields} for r in rows]
     await audit.log(
         "memory_export", member.id, "memory.export",
@@ -416,6 +422,8 @@ async def import_memories(member: Member, items: list[dict[str, Any]]) -> list[s
         )
         if item.get("is_pinned"):
             await _set_fields(entry_id, member.organization_id, is_pinned=True)
+        if item.get("is_archived"):
+            await _set_fields(entry_id, member.organization_id, is_archived=True)
         if item.get("is_sensitive"):
             await _set_fields(entry_id, member.organization_id, is_sensitive=True)
         ids.append(entry_id)

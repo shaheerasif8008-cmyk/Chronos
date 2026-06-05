@@ -18,6 +18,10 @@ FORBIDDEN_PATTERNS = [
     r"\bimport\s+(socket|requests|httpx|urllib|subprocess|multiprocessing|ctypes|resource)\b",
     r"\bfrom\s+(socket|requests|httpx|urllib|subprocess|multiprocessing|ctypes|resource)\b",
     r"__import__\s*\(",
+    r"\bimportlib\b",
+    r"\bimport_module\s*\(",
+    r"\bimport\s+builtins\b",
+    r"\bfrom\s+builtins\b",
     r"\bopen\s*\(\s*['\"]/",
     r"\bos\.(system|popen|spawn|exec)",
 ]

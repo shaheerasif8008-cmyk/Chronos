@@ -5,7 +5,7 @@ import io
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select, update
 
@@ -15,6 +15,7 @@ from core.connector_health import check_connectors
 from core.config import settings
 from core.db import engine, reflect_table
 from core.models import Member
+from core.memory_control import export_memories
 from core.settings_store import ADMIN_ROLES, DEFAULTS, ROLE_ORDER, get_settings_doc, require_admin, save_settings_doc
 
 router = APIRouter(prefix="/settings", tags=["settings"])
@@ -297,6 +298,22 @@ async def purge_memory(req: MemoryPurgeRequest, member: Member = Depends(get_cur
         )
     await audit.log("settings_change", member.id, "settings.memory.purge", organization_id=member.organization_id, resource_type="memory", payload={"deleted": result.rowcount}, decision="confirmed")
     return {"deleted": result.rowcount}
+
+
+@router.get("/memory/export.json")
+async def export_memory(member: Member = Depends(get_current_member)) -> JSONResponse:
+    require_admin(member)
+    items = await export_memories(member)
+    return JSONResponse(
+        {
+            "format": "json",
+            "scope": "organization",
+            "scope_id": member.organization_id,
+            "include": "non-deleted memories, including archived and excluding superseded",
+            "items": items,
+        },
+        headers={"Content-Disposition": "attachment; filename=chronos-memory-org-export.json"},
+    )
 
 
 @router.get("/audit")
