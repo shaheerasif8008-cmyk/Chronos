@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, Form
-from sqlalchemy import insert
+from sqlalchemy import insert, select
 
 from core import audit, permissions
 from core.artifacts import save_artifact
@@ -18,18 +18,103 @@ router = APIRouter(prefix="/attachments", tags=["attachments"])
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB
 
 
+async def _require_conversation_member(member: Member, conversation_id: str) -> None:
+    """Raise 404 when *conversation_id* does not exist in the member's org.
+
+    Enforces tenant isolation for conversation-linked uploads without relying
+    on the permissions stub.
+
+    Args:
+        member: The authenticated requester.
+        conversation_id: The target conversation UUID.
+
+    Raises:
+        HTTPException(404): When the conversation does not belong to this org.
+    """
+    conversations = await reflect_table("conversations")
+    async with engine.begin() as conn:
+        row = (
+            await conn.execute(
+                select(conversations.c.id).where(
+                    conversations.c.id == conversation_id,
+                    conversations.c.organization_id == member.organization_id,
+                )
+            )
+        ).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+
+async def _require_task_member(member: Member, task_id: str) -> None:
+    """Raise 404 when *task_id* does not exist in the member's org.
+
+    Args:
+        member: The authenticated requester.
+        task_id: The target task UUID.
+
+    Raises:
+        HTTPException(404): When the task does not belong to this org.
+    """
+    tasks = await reflect_table("tasks")
+    async with engine.begin() as conn:
+        row = (
+            await conn.execute(
+                select(tasks.c.id).where(
+                    tasks.c.id == task_id,
+                    tasks.c.organization_id == member.organization_id,
+                )
+            )
+        ).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+
+async def _require_research_run_member(member: Member, research_run_id: str) -> None:
+    """Raise 404 when *research_run_id* does not exist in the member's org.
+
+    Args:
+        member: The authenticated requester.
+        research_run_id: The target research run UUID.
+
+    Raises:
+        HTTPException(404): When the research run does not belong to this org.
+    """
+    research_runs = await reflect_table("research_runs")
+    async with engine.begin() as conn:
+        row = (
+            await conn.execute(
+                select(research_runs.c.id).where(
+                    research_runs.c.id == research_run_id,
+                    research_runs.c.organization_id == member.organization_id,
+                )
+            )
+        ).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Research run not found")
+
+
 @router.post("")
 async def upload_attachment(
     file: UploadFile = File(...),
     conversation_id: str | None = Form(default=None),
     project_id: str | None = Form(default=None),
+    task_id: str | None = Form(default=None),
+    research_run_id: str | None = Form(default=None),
     member: Member = Depends(get_current_member),
 ) -> dict:
     await permissions.check(member, "upload_attachment", conversation_id or "new_conversation")
+    # Enforce org-scoped ownership of the linked entity before storing anything.
+    if conversation_id:
+        await _require_conversation_member(member, conversation_id)
     if project_id:
         # Enforce membership before reading/storing (raises 404 for non-members).
         from routers.projects import _require_member
         await _require_member(member, project_id)
+    if task_id:
+        await _require_task_member(member, task_id)
+    if research_run_id:
+        await _require_research_run_member(member, research_run_id)
+
     raw = await file.read()
     if len(raw) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="File exceeds 25 MB limit")
@@ -39,6 +124,7 @@ async def upload_attachment(
         kind="attachment",
         title=file.filename or "upload",
         conversation_id=conversation_id,
+        task_id=task_id,
         mime_type=file.content_type,
         org_id=member.organization_id,
         parse_status="pending",
@@ -81,10 +167,29 @@ async def upload_attachment(
         from memory.source_indexing import index_source
         asyncio.create_task(index_source(source_id, member.organization_id))
 
+    if task_id:
+        await audit.log(
+            "attachment_linked_task", member.id, "attachments.link_task",
+            organization_id=member.organization_id,
+            resource_type="artifacts", resource_id=attachment_id,
+            payload={"task_id": task_id},
+        )
+
+    if research_run_id:
+        # research_runs has no artifact FK column; record the link in the audit log.
+        await audit.log(
+            "attachment_linked_research_run", member.id, "attachments.link_research_run",
+            organization_id=member.organization_id,
+            resource_type="artifacts", resource_id=attachment_id,
+            payload={"research_run_id": research_run_id},
+        )
+
     return {
         "attachment_id": attachment_id,
         "filename": file.filename,
         "mime_type": file.content_type,
         "size_bytes": len(raw),
         "source_id": source_id,
+        "task_id": task_id,
+        "research_run_id": research_run_id,
     }

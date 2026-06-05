@@ -30,6 +30,7 @@ _ALWAYS_APPROVAL_TOOLS = {
 # Hard safety limits enforced regardless of permissions.
 _SAFETY_LIMITS: dict[str, dict] = {
     "gmail.send": {"max_recipients": 10},
+    "image.generate": {"max_count": 4},
 }
 _MAX_DELETE_RECORDS = 5
 _MAX_FINANCIAL_AMOUNT = 100.0
@@ -170,6 +171,17 @@ def _check_safety_limits(tool: str, args: dict) -> None:
         if isinstance(recipients, list) and len(recipients) > _SAFETY_LIMITS["gmail.send"]["max_recipients"]:
             raise SafetyLimitViolation(f"gmail.send: {len(recipients)} recipients exceeds limit of 10")
 
+    if tool == "image.generate":
+        max_count = _SAFETY_LIMITS["image.generate"]["max_count"]
+        try:
+            count = int(args.get("count", 1))
+        except (TypeError, ValueError):
+            raise SafetyLimitViolation("image.generate: count must be an integer")
+        if not (1 <= count <= max_count):
+            raise SafetyLimitViolation(
+                f"image.generate: count {count} must be between 1 and {max_count}"
+            )
+
     # Generic delete guard
     if "delete" in tool:
         ids = args.get("ids", args.get("record_ids", []))
@@ -238,9 +250,21 @@ async def _route(agent: AgentContext, tool: str, args: dict, vault_ref: str, tie
         from connectors.code import code_connector
         return await code_connector.execute(tool, routed_args)
 
+    if provider == "image":
+        from connectors.image_gen import image_gen_connector
+        return await image_gen_connector.execute(tool, routed_args)
+
     if provider == "doc":
         from parsing.tool import doc_connector
         return await doc_connector.execute(tool, routed_args)
+
+    if provider == "voice":
+        from connectors.voice import voice_connector
+        return await voice_connector.execute(tool, routed_args)
+
+    if provider == "data":
+        from connectors.data_analysis import data_analysis_connector
+        return await data_analysis_connector.execute(tool, routed_args)
 
     if provider == "mcp":
         from connectors.mcp_client import mcp_connector
@@ -313,7 +337,7 @@ class ToolBroker:
         # when external OAuth or browser dependencies are not configured.
         provider = tool.split(".")[0]
         tier = await connector_tier(provider)
-        if tier == "live" and provider not in {"browser", "fs", "code", "doc"}:
+        if tier == "live" and provider not in {"browser", "fs", "code", "doc", "image", "voice", "data"}:
             from connectors.registry import get as registry_get
 
             connector = await registry_get(agent, tool)

@@ -17,7 +17,18 @@ from core.config import settings
 from core.context import assemble_context
 from core.db import engine, reflect_table
 from core.intent import classify_intent
-from core.llm import available_chat_models, normalize_chat_model, normalize_reasoning_effort
+from core.context import (
+    _IMAGE_MIMES,
+    _VISION_UNAVAILABLE_NOTE,
+    build_image_block,
+    build_user_turn_content,
+)
+from core.llm import (
+    available_chat_models,
+    model_supports_vision,
+    normalize_chat_model,
+    normalize_reasoning_effort,
+)
 from core.modes import available_modes
 from core.memory_writes import create_memory_entry, extract_explicit_memory_content
 from core.models import Member, RequesterContext
@@ -513,6 +524,43 @@ async def _agent_loop_stream(
     yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
 
+#: Per-image byte cap for inline base64 vision blocks. base64 inflates bytes ~33%,
+#: and providers bound the request body (OpenAI ~20MB), so a 25MB upload would blow
+#: the limit and fail opaquely at the provider. 5MB/image keeps us well inside it.
+_MAX_IMAGE_BYTES_VISION = 5 * 1024 * 1024
+
+
+async def _build_vision_blocks(
+    attachment_ids: list[str], org_id: str, model_id: str
+) -> tuple[list[dict], bool]:
+    """Resolve org-owned image attachments into vision content blocks.
+
+    Returns ``(image_blocks, has_images)`` where ``has_images`` is True if any
+    org-owned image attachment was present (even when no block was built — e.g. the
+    model lacks vision, or an image exceeded the size cap), so callers can choose the
+    honest degraded path. Cross-org or missing artifacts are skipped (tenant boundary).
+    Oversized images are skipped rather than embedded to avoid provider body-limit
+    failures. ``_get_artifact``/``_read_artifact_content`` are module globals so tests
+    can inject fixtures.
+    """
+    image_blocks: list[dict] = []
+    has_images = False
+    supports_vision = model_supports_vision(model_id)
+    for att_id in attachment_ids:
+        meta = await _get_artifact(att_id)
+        if not meta or str(meta.get("organization_id")) != str(org_id):
+            continue  # cross-org or missing — skip (security)
+        mime = str(meta.get("mime_type") or "")
+        if mime not in _IMAGE_MIMES:
+            continue
+        has_images = True
+        if supports_vision:
+            raw_bytes = await _read_artifact_content(att_id) or b""
+            if raw_bytes and len(raw_bytes) <= _MAX_IMAGE_BYTES_VISION:
+                image_blocks.append(build_image_block(raw_bytes, mime))
+    return image_blocks, has_images
+
+
 @router.post("/message")
 async def send_message(req: ChatRequest, member: Member = Depends(get_current_member)) -> StreamingResponse:
     from fastapi import HTTPException
@@ -524,12 +572,29 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    # ── Build artifact_refs for user message (from attachment metadata) ────────
+    # Resolve attachment metadata up-front so it can be persisted on the user
+    # message row. Only attachments belonging to this org are included.
+    _attachment_ids_raw: list[str] = getattr(req, "attachment_ids", []) or []
+    _user_artifact_refs: list[dict] = []
+    for _att_id in _attachment_ids_raw:
+        _meta = await _get_artifact(_att_id)
+        if _meta and str(_meta.get("organization_id")) == str(member.organization_id):
+            _user_artifact_refs.append({
+                "id": _att_id,
+                "title": _meta.get("title") or "attachment",
+                "kind": _meta.get("kind") or "attachment",
+                "mime_type": _meta.get("mime_type"),
+                "size_bytes": _meta.get("size_bytes"),
+            })
+
     # ── Conversation creation / project_id hydration ────────────────────────
     if req.conversation_id:
         # Existing conversation: save user message and fetch conversation row
         # (single round-trip) so we can hydrate project_id without an extra query.
         conv_row = await _save_message(
             req.conversation_id, "user", req.message,
+            artifact_refs=_user_artifact_refs or None,
             _member_id=member.id, _org_id=member.organization_id,
         )
         conversation_id = req.conversation_id
@@ -545,7 +610,10 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
         # New conversation: create it (with project_id if supplied), then save
         # the user message WITHOUT a RETURNING fetch (_member_id omitted).
         conversation_id = await _create_conversation(member, req.message, project_id=req.project_id)
-        await _save_message(conversation_id, "user", req.message)
+        await _save_message(
+            conversation_id, "user", req.message,
+            artifact_refs=_user_artifact_refs or None,
+        )
         effective_project_id = req.project_id
 
     requester_context = RequesterContext.from_member(member)
@@ -554,8 +622,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
     requester_context.project_id = effective_project_id
     explicit_memory = extract_explicit_memory_content(req.message)
 
-    _attachment_ids_for_memory = getattr(req, "attachment_ids", []) or []
-    if explicit_memory and not _attachment_ids_for_memory:
+    if explicit_memory and not _attachment_ids_raw:
         async def explicit_stream():
             entry_id = await create_memory_entry(
                 content=explicit_memory,
@@ -577,10 +644,9 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
 
         return StreamingResponse(explicit_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
-    attachment_ids: list[str] = getattr(req, "attachment_ids", []) or []
     attachments_context: list[dict] = []
-    if attachment_ids:
-        attachments_context = await _parse_attachments(attachment_ids, conversation_id, member.organization_id)
+    if _attachment_ids_raw:
+        attachments_context = await _parse_attachments(_attachment_ids_raw, conversation_id, member.organization_id)
 
     # classify_intent and assemble_context are independent, and both the task and
     # chat branches need the assembled context — so run them concurrently to overlap
@@ -623,9 +689,97 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
             headers=_SSE_HEADERS,
         )
 
+    # ── Image generation mode ─────────────────────────────────────────────────
+    # When the user explicitly selects Image mode, route directly through the
+    # tool broker to image.generate and surface the resulting artifact(s) in the
+    # chat.  No LLM turn is needed — the message IS the generation prompt.
+    # The honest degraded state (no provider configured) is returned by the
+    # connector itself and streamed back as an assistant message, not an error.
+    from core.modes import normalize_mode as _normalize_mode
+    if _normalize_mode(req.mode) == "image":
+        async def _image_mode_stream():
+            from core.models import AgentContext
+
+            # Emit conversation_id first (matching the task/chat paths) so the client
+            # binds the conversation before any artifact events arrive.
+            yield f"data: {json.dumps({'type': 'conversation', 'conversation_id': conversation_id})}\n\n"
+
+            agent = AgentContext(
+                id=member.id,
+                org_id=member.organization_id,
+                task_id=None,
+                member_id=member.id,
+                workspace_id=req.workspace_id,
+            )
+            from core.tool_broker import tool_broker as _tb
+
+            result = await _tb.execute(
+                agent,
+                "image.generate",
+                {"prompt": req.message},
+            )
+
+            if result.data.get("status") == "success":
+                artifact_ids: list[str] = result.data.get("artifact_ids") or []
+                assistant_text = result.summary
+                for art_id in artifact_ids:
+                    meta = await _get_artifact(art_id)
+                    if meta:
+                        yield f"data: {json.dumps({'type': 'artifact', 'artifact': {'artifact_id': art_id, 'title': meta.get('title') or 'Generated image', 'kind': 'image', 'mime_type': meta.get('mime_type') or 'image/png', 'size_bytes': meta.get('size_bytes')}})}\n\n"
+                await _save_message(
+                    conversation_id, "assistant", assistant_text,
+                    mode="image",
+                    artifact_refs=[
+                        {"id": aid, "kind": "image", "mime_type": "image/png"}
+                        for aid in artifact_ids
+                    ],
+                )
+            else:
+                # Honest degraded or error: surface the summary as an assistant message.
+                assistant_text = result.summary
+                await _save_message(conversation_id, "assistant", assistant_text, mode="image")
+
+            chunk_size = 40
+            for i in range(0, len(assistant_text), chunk_size):
+                yield f"data: {json.dumps({'type': 'token', 'content': assistant_text[i:i + chunk_size]})}\n\n"
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+        return StreamingResponse(_image_mode_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
+
     async def _sse_wrap(gen):
         async for event in gen:
             yield f"data: {json.dumps(event)}\n\n"
+
+    # ── Vision / multimodal user-turn assembly (chat path only) ──────────────
+    # Resolved here, after the task-mode return, so this org-scoped artifact I/O and
+    # base64 work runs only for the chat path that actually consumes it. The helper
+    # enforces the tenant boundary and the per-image size cap.
+    _image_blocks, _has_images = await _build_vision_blocks(
+        _attachment_ids_raw, member.organization_id, selected_model
+    )
+    _vision_active = bool(_image_blocks)
+
+    # Degraded path: embed OCR-extracted text from already-parsed image attachments so
+    # the model actually receives the image content. The honest "vision unavailable"
+    # note is only attached when extracted text exists — otherwise the note would
+    # overclaim (an image with no extractable text would carry a false promise).
+    _ocr_text: str | None = None
+    if _has_images and not _vision_active and attachments_context:
+        _ocr_parts = [
+            f"[Image: {entry.get('filename') or 'attachment'}]\n{entry['preview']}"
+            for entry in attachments_context
+            if entry.get("preview")
+        ]
+        if _ocr_parts:
+            _ocr_text = "\n\n".join(_ocr_parts)
+
+    _user_content = build_user_turn_content(
+        req.message,
+        _image_blocks,
+        vision_available=_vision_active,
+        ocr_text=_ocr_text,
+        ocr_note=_VISION_UNAVAILABLE_NOTE if (_has_images and not _vision_active and _ocr_text) else None,
+    )
 
     return StreamingResponse(
         _sse_wrap(
@@ -636,6 +790,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
                 requester_context=requester_context,
                 model=selected_model,
                 mode=req.mode,
+                user_content=_user_content,
                 reasoning_effort=selected_reasoning_effort,
             )
         ),
@@ -1117,3 +1272,142 @@ async def retry_message_from_here(
         member=member,
         action="retry_message",
     )
+
+
+# ── Voice endpoints ───────────────────────────────────────────────────────────
+
+
+class VoiceTranscribeRequest(BaseModel):
+    """Request body for voice.transcribe via the chat API."""
+
+    artifact_id: str
+    conversation_id: str | None = None
+
+
+class VoiceSpeakRequest(BaseModel):
+    """Request body for voice.speak via the chat API."""
+
+    text: str
+    voice: str = "alloy"
+    conversation_id: str | None = None
+
+
+def _make_voice_agent(member: Member) -> "core.models.AgentContext":  # type: ignore[name-defined]
+    """Build a minimal AgentContext from a member for voice tool calls."""
+    from core.models import AgentContext
+
+    return AgentContext(
+        id=member.id,
+        org_id=member.organization_id,
+        task_id=None,
+        member_id=member.id,
+    )
+
+
+@router.post("/voice/transcribe")
+async def voice_transcribe(
+    req: VoiceTranscribeRequest,
+    member: Member = Depends(get_current_member),
+) -> dict:
+    """Transcribe an uploaded audio artifact to text via the tool broker.
+
+    The caller must first upload the audio file via POST /attachments to get
+    an artifact_id, then pass it here. Routes through tool_broker.execute so
+    audit logging and permission checks are applied.
+
+    Returns the transcript text, transcript artifact id, and model used.
+    When STT is not configured, returns a 422 with a clear message rather than
+    silently failing.
+
+    Args:
+        req: Artifact id to transcribe + optional conversation id.
+        member: Authenticated member (injected by FastAPI).
+
+    Returns:
+        JSON with transcript, transcript_artifact_id, model, status.
+
+    Raises:
+        HTTPException(422): When the STT provider is not configured (degraded).
+        HTTPException(400): When the audio artifact is not found or access denied.
+    """
+    from core.tool_broker import tool_broker
+
+    agent = _make_voice_agent(member)
+    args: dict = {"artifact_id": req.artifact_id}
+    if req.conversation_id:
+        # Tenant isolation: never link a transcript to a foreign-org conversation.
+        from routers.attachments import _require_conversation_member
+        await _require_conversation_member(member, req.conversation_id)
+        args["conversation_id"] = req.conversation_id
+
+    result = await tool_broker.execute(agent, "voice.transcribe", args)
+
+    if result.data.get("status") == "unavailable":
+        raise HTTPException(
+            status_code=422,
+            detail=result.summary or "STT provider not configured",
+        )
+    if result.data.get("status") == "error":
+        raise HTTPException(
+            status_code=400,
+            detail=result.data.get("reason") or result.summary or "Transcription failed",
+        )
+
+    return {
+        "status": "success",
+        "transcript": result.data.get("transcript", ""),
+        "transcript_artifact_id": result.data.get("transcript_artifact_id"),
+        "model": result.data.get("model"),
+    }
+
+
+@router.post("/voice/speak")
+async def voice_speak(
+    req: VoiceSpeakRequest,
+    member: Member = Depends(get_current_member),
+) -> dict:
+    """Convert text to speech via the tool broker and return an audio artifact.
+
+    Routes through tool_broker.execute so audit logging and permission checks
+    are applied. The returned audio_artifact_id can be fetched via
+    GET /artifacts/{id}/content (audio/mpeg) for playback in the browser.
+
+    Args:
+        req: Text to synthesise, optional voice, optional conversation id.
+        member: Authenticated member (injected by FastAPI).
+
+    Returns:
+        JSON with audio_artifact_id, tts_meta, status.
+
+    Raises:
+        HTTPException(422): When the TTS provider is not configured (degraded).
+        HTTPException(400): When synthesis fails.
+    """
+    from core.tool_broker import tool_broker
+
+    agent = _make_voice_agent(member)
+    args: dict = {"text": req.text, "voice": req.voice}
+    if req.conversation_id:
+        # Tenant isolation: never link synthesized audio to a foreign-org conversation.
+        from routers.attachments import _require_conversation_member
+        await _require_conversation_member(member, req.conversation_id)
+        args["conversation_id"] = req.conversation_id
+
+    result = await tool_broker.execute(agent, "voice.speak", args)
+
+    if result.data.get("status") == "unavailable":
+        raise HTTPException(
+            status_code=422,
+            detail=result.summary or "TTS provider not configured",
+        )
+    if result.data.get("status") == "error":
+        raise HTTPException(
+            status_code=400,
+            detail=result.data.get("reason") or result.summary or "Speech synthesis failed",
+        )
+
+    return {
+        "status": "success",
+        "audio_artifact_id": result.data.get("audio_artifact_id"),
+        "tts_meta": result.data.get("tts_meta"),
+    }

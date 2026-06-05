@@ -220,6 +220,168 @@ DOC_READ = _fn(
     ["artifact_id"],
 )
 
+DOC_SUMMARIZE = _fn(
+    "doc__summarize",
+    "Summarize a document with verifiable citations. Each section of the summary "
+    "is anchored to a verbatim quote from the source (char offsets included). "
+    "Supports the same formats as doc__parse. Returns an honest warning when the "
+    "document cannot be parsed.",
+    {
+        "artifact_id": {"type": "string", "description": "Artifact id of the document to summarize."},
+    },
+    ["artifact_id"],
+)
+
+DOC_COMPARE = _fn(
+    "doc__compare",
+    "Compare two documents and return a structured list of similarities and differences "
+    "with verifiable citations into both sources.",
+    {
+        "artifact_id_a": {"type": "string", "description": "Artifact id of the first document."},
+        "artifact_id_b": {"type": "string", "description": "Artifact id of the second document."},
+    },
+    ["artifact_id_a", "artifact_id_b"],
+)
+
+# ── Image generation ──────────────────────────────────────────────────────────
+
+IMAGE_GENERATE = _fn(
+    "image__generate",
+    "Generate one or more images from a text description. "
+    "Returns image artifacts that render inline in the chat. "
+    "Use for illustrations, diagrams, mockups, or any visual output the user requests.",
+    {
+        "prompt": {
+            "type": "string",
+            "description": "Detailed text description of the image(s) to generate.",
+        },
+        "size": {
+            "type": "string",
+            "description": "Image dimensions (e.g. '1024x1024', '512x512'). Default: '1024x1024'.",
+            "default": "1024x1024",
+        },
+        "count": {
+            "type": "integer",
+            "description": "Number of images to generate (1–4). Default: 1.",
+            "default": 1,
+        },
+        "style": {
+            "type": "string",
+            "description": "Optional style hint (e.g. 'photorealistic', 'illustration', 'sketch').",
+        },
+    },
+    ["prompt"],
+)
+
+IMAGE_EDIT = _fn(
+    "image__edit",
+    "Edit an existing image artifact using a natural-language instruction. "
+    "Creates a new version of the source artifact non-destructively — original bytes are preserved. "
+    "Use for retouching, style changes, background swaps, or any modification to an image the user already has.",
+    {
+        "artifact_id": {
+            "type": "string",
+            "description": "Artifact id of the source image to edit.",
+        },
+        "prompt": {
+            "type": "string",
+            "description": "Natural-language edit instruction (e.g. 'make the sky purple', 'remove the background').",
+        },
+        "mask": {
+            "type": "string",
+            "description": "Optional mask: an artifact id of a mask image, or a base64-encoded mask. "
+                           "Transparent areas indicate regions to edit.",
+        },
+        "operation": {
+            "type": "string",
+            "description": "Edit operation type: 'edit' (default), 'variation', or 'background'.",
+            "enum": ["edit", "variation", "background"],
+            "default": "edit",
+        },
+    },
+    ["artifact_id", "prompt"],
+)
+
+# ── Voice (STT / TTS) ─────────────────────────────────────────────────────────
+
+VOICE_TRANSCRIBE = _fn(
+    "voice__transcribe",
+    "Transcribe an uploaded audio file to text (speech-to-text). "
+    "Pass the artifact_id of an uploaded audio attachment. "
+    "Returns the transcript text and a persistent transcript artifact. "
+    "Use when the user uploads a voice memo, meeting recording, or any audio they want transcribed.",
+    {
+        "artifact_id": {
+            "type": "string",
+            "description": "Artifact id of the uploaded audio file to transcribe.",
+        },
+        "audio_b64": {
+            "type": "string",
+            "description": "Alternative to artifact_id: raw audio encoded as base64.",
+        },
+        "mime_type": {
+            "type": "string",
+            "description": "MIME type of the audio (e.g. 'audio/mpeg', 'audio/webm'). "
+                           "Optional; defaults to audio/mpeg.",
+        },
+        "conversation_id": {
+            "type": "string",
+            "description": "Conversation id to link the transcript artifact to (optional).",
+        },
+    },
+    [],
+)
+
+VOICE_SPEAK = _fn(
+    "voice__speak",
+    "Convert text to speech and return an audio artifact the user can play. "
+    "Use when the user requests an audio version of a response, a reading of text, "
+    "or any synthesised narration.",
+    {
+        "text": {
+            "type": "string",
+            "description": "Text to convert to speech.",
+        },
+        "voice": {
+            "type": "string",
+            "description": "Voice identifier (e.g. 'alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer'). "
+                           "Default: 'alloy'.",
+        },
+        "conversation_id": {
+            "type": "string",
+            "description": "Conversation id to link the audio artifact to (optional).",
+        },
+    },
+    ["text"],
+)
+
+# ── Data analysis ─────────────────────────────────────────────────────────────
+
+DATA_RUN = _fn(
+    "data__run",
+    "Run Python data analysis code (pandas/matplotlib/numpy) against an uploaded dataset. "
+    "The dataset is identified by dataset_id (obtained from POST /datasets). "
+    "The code runs in a sandbox where the dataset is available as 'data.csv' (or 'data.json'). "
+    "Produce charts by saving matplotlib figures with plt.savefig('chart_N.png'). "
+    "Printed output (tables, stats) is captured as a report artifact. "
+    "Returns artifact ids for any generated charts and report.",
+    {
+        "dataset_id": {
+            "type": "string",
+            "description": "Dataset id (from POST /datasets) to analyze.",
+        },
+        "code": {
+            "type": "string",
+            "description": "Python code using pandas/matplotlib/numpy. "
+                           "Read data with: import pandas as pd; df = pd.read_csv('data.csv'). "
+                           "Save charts with: plt.savefig('chart_1.png'). "
+                           "Print tables with: print(df.head()). "
+                           "Network access, subprocess, and absolute paths are blocked.",
+        },
+    },
+    ["dataset_id", "code"],
+)
+
 # ── Sub-agent ─────────────────────────────────────────────────────────────────
 
 SPAWN_SUBAGENT = _fn(
@@ -275,6 +437,13 @@ ALL_TOOLS: list[dict[str, Any]] = [
     CODE_PYTHON,
     DOC_PARSE,
     DOC_READ,
+    DOC_SUMMARIZE,
+    DOC_COMPARE,
+    IMAGE_GENERATE,
+    IMAGE_EDIT,
+    VOICE_TRANSCRIBE,
+    VOICE_SPEAK,
+    DATA_RUN,
     SPAWN_SUBAGENT,
 ]
 
@@ -290,6 +459,13 @@ SUBAGENT_TOOLS: list[dict[str, Any]] = [
     CODE_PYTHON,
     DOC_PARSE,
     DOC_READ,
+    DOC_SUMMARIZE,
+    DOC_COMPARE,
+    IMAGE_GENERATE,
+    IMAGE_EDIT,
+    VOICE_TRANSCRIBE,
+    VOICE_SPEAK,
+    DATA_RUN,
 ]
 
 #: Names that always need explicit human approval before execution.
@@ -314,6 +490,13 @@ INLINE_CHAT_TOOLS: list[dict[str, Any]] = [
     CODE_PYTHON,
     DOC_PARSE,
     DOC_READ,
+    DOC_SUMMARIZE,
+    DOC_COMPARE,
+    IMAGE_GENERATE,
+    IMAGE_EDIT,
+    VOICE_TRANSCRIBE,
+    VOICE_SPEAK,
+    DATA_RUN,
     START_TASK,
 ]
 

@@ -334,9 +334,13 @@ async def test_upload_attachment_stores_and_returns_id(monkeypatch):
     async def fake_check(*a, **k):
         return True
 
+    async def fake_require_conv(*a, **k):
+        pass  # bypass real DB lookup for unit test
+
     monkeypatch.setattr(att_router, "save_artifact", fake_save)
     monkeypatch.setattr(att_router.audit, "log", fake_log)
     monkeypatch.setattr(att_router.permissions, "check", fake_check)
+    monkeypatch.setattr(att_router, "_require_conversation_member", fake_require_conv)
 
     # Adjust Member constructor kwargs to match core/models.py exactly.
     from core.models import Member
@@ -346,7 +350,10 @@ async def test_upload_attachment_stores_and_returns_id(monkeypatch):
         file=BytesIO(b"%PDF-1.4 data"),
         headers=Headers({"content-type": "application/pdf"}),
     )
-    out = await att_router.upload_attachment(file=upload, conversation_id="c1", project_id=None, member=member)
+    out = await att_router.upload_attachment(
+        file=upload, conversation_id="c1", project_id=None, task_id=None,
+        research_run_id=None, member=member,
+    )
     assert out["attachment_id"] == "att-123"
     assert out["filename"] == "report.pdf"
     assert saved["kind"] == "attachment"
