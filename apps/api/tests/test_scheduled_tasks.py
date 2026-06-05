@@ -33,6 +33,26 @@ def test_invalid_schedule_returns_none():
     assert st.compute_next_run({"schedule_kind": "cron", "cron": "not-a-cron"}, now) is None
 
 
+def test_phase12_named_schedule_kinds_compute_next_runs():
+    now = datetime(2026, 6, 5, 14, 30, 0, tzinfo=timezone.utc)
+
+    one_time = st.compute_next_run({"schedule_kind": "one_time", "run_at": "2026-06-05T16:00:00+00:00"}, now)
+    daily = st.compute_next_run({"schedule_kind": "daily", "time_of_day": "09:15"}, now)
+    weekly = st.compute_next_run({"schedule_kind": "weekly", "day_of_week": "monday", "time_of_day": "10:00"}, now)
+    monthly = st.compute_next_run({"schedule_kind": "monthly", "day_of_month": 15, "time_of_day": "11:00"}, now)
+
+    assert one_time == datetime(2026, 6, 5, 16, 0, 0, tzinfo=timezone.utc)
+    assert daily is not None and daily > now and daily.hour == 9 and daily.minute == 15
+    assert weekly is not None and weekly > now and weekly.weekday() == 0 and weekly.hour == 10
+    assert monthly is not None and monthly > now and monthly.day == 15 and monthly.hour == 11
+
+
+def test_event_driven_schedules_do_not_poll_for_next_run():
+    now = datetime(2026, 6, 5, 14, 30, 0, tzinfo=timezone.utc)
+    assert st.compute_next_run({"schedule_kind": "webhook"}, now) is None
+    assert st.compute_next_run({"schedule_kind": "connector_trigger"}, now) is None
+
+
 # ─── run_due_scheduled_tasks ────────────────────────────────────────────────────
 
 class _FakeCol:
@@ -114,6 +134,35 @@ async def test_due_rows_spawn_tasks_and_advance_next_run(monkeypatch):
     assert spawn.await_count == 2
     # Each row triggered an audit row and an update (advance next_run_at).
     assert st.audit.log.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_paused_due_rows_are_skipped_and_run_history_is_recorded(monkeypatch):
+    now = datetime(2026, 6, 5, 12, 0, 0, tzinfo=timezone.utc)
+    due = [
+        {"id": "s1", "organization_id": "default", "goal": "scan inbox",
+         "schedule_kind": "interval", "interval_seconds": 3600, "created_by": "m1", "status": "active"},
+        {"id": "s2", "organization_id": "default", "goal": "paused",
+         "schedule_kind": "interval", "interval_seconds": 3600, "created_by": "m1", "status": "paused"},
+    ]
+    ops: list[str] = []
+    engine = _engine([due, None, None, None], ops)
+    _patch(monkeypatch, engine, ops)
+
+    spawn = AsyncMock(return_value="task-1")
+    monkeypatch.setattr(st, "_spawn_task", spawn)
+    history = AsyncMock()
+    monkeypatch.setattr(st, "_record_schedule_run", history)
+
+    spawned = await st.run_due_scheduled_tasks(now=now)
+
+    assert spawned == ["task-1"]
+    assert spawn.await_count == 1
+    assert history.await_count == 1
+    values = history.await_args.kwargs
+    assert values["schedule_id"] == "s1"
+    assert values["status"] == "triggered"
+    assert values["trigger_source"] == "scheduler"
 
 
 @pytest.mark.asyncio

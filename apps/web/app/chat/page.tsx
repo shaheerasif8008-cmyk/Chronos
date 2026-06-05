@@ -886,7 +886,7 @@ function ChronosAppInner() {
         {route === "coding"     && <CodingAgentScreen />}
         {route === "tasks"      && <EmptyPanel label="Tasks" />}
         {route === "agents"     && <AgentsScreen />}
-        {route === "workflows"  && <EmptyPanel label="Workflows" />}
+        {route === "workflows"  && <WorkflowsScreen />}
         {route === "audit"      && <EmptyPanel label="Audit" />}
       </main>
       <InChatArtifactPanel />
@@ -5466,6 +5466,239 @@ function ProjectSourcesTab({
       )}
     </div>
   );
+}
+
+type Phase12Schedule = {
+  id: string;
+  name?: string | null;
+  goal?: string | null;
+  schedule_kind?: string | null;
+  enabled?: boolean;
+  status?: string | null;
+  next_run_at?: string | null;
+  last_run_at?: string | null;
+  last_task_id?: string | null;
+  trigger_source?: string | null;
+  trigger_event_type?: string | null;
+};
+
+type Phase12Workflow = { id: string; name: string; description?: string; status?: string; definition?: { steps?: Array<Record<string, unknown>> } };
+type Phase12Run = { id: string; workflow_id: string; status: string; trigger_source?: string; trigger_event_type?: string | null; updated_at?: string; created_at?: string };
+type Phase12Trigger = { id: string; workflow_id: string; trigger_type: string; source?: string; event_type?: string; status?: string; config?: Record<string, unknown> };
+type Phase12Monitor = { id: string; name: string; monitor_type: string; target: string; status: string; condition?: Record<string, unknown>; last_checked_at?: string | null; last_evidence?: Record<string, unknown> };
+type Phase12Alert = { id: string; monitor_id: string; severity: string; summary: string; status: string; evidence?: Record<string, unknown>; created_at?: string };
+
+function WorkflowsScreen() {
+  const [schedules, setSchedules] = useState<Phase12Schedule[]>([]);
+  const [workflows, setWorkflows] = useState<Phase12Workflow[]>([]);
+  const [runs, setRuns] = useState<Phase12Run[]>([]);
+  const [triggers, setTriggers] = useState<Phase12Trigger[]>([]);
+  const [monitors, setMonitors] = useState<Phase12Monitor[]>([]);
+  const [alerts, setAlerts] = useState<Phase12Alert[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [toast, setToast] = useState<{ kind: "ok" | "danger"; text: string } | null>(null);
+  const [scheduleName, setScheduleName] = useState("Daily brief");
+  const [scheduleGoal, setScheduleGoal] = useState("Prepare a daily operations digest.");
+  const [scheduleKind, setScheduleKind] = useState("daily");
+  const [workflowName, setWorkflowName] = useState("Source monitor workflow");
+  const [monitorName, setMonitorName] = useState("Pricing page monitor");
+  const [monitorTarget, setMonitorTarget] = useState("https://example.com/pricing");
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [scheduleData, workflowData, runData, triggerData, monitorData, alertData] = await Promise.all([
+        apiFetch("/schedules/").then(r => r.json()),
+        apiFetch("/workflows/").then(r => r.json()),
+        apiFetch("/workflows/runs").then(r => r.json()),
+        apiFetch("/workflows/triggers").then(r => r.json()),
+        apiFetch("/monitors/").then(r => r.json()),
+        apiFetch("/monitors/alerts").then(r => r.json()),
+      ]);
+      setSchedules(scheduleData as Phase12Schedule[]);
+      setWorkflows(workflowData as Phase12Workflow[]);
+      setRuns(runData as Phase12Run[]);
+      setTriggers(triggerData as Phase12Trigger[]);
+      setMonitors(monitorData as Phase12Monitor[]);
+      setAlerts(alertData as Phase12Alert[]);
+    } catch (exc) {
+      setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to load workflows" });
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { void load(); }, [load]);
+
+  async function createSchedule() {
+    try {
+      const body: Record<string, unknown> = { name: scheduleName, goal: scheduleGoal, schedule_kind: scheduleKind, enabled: true, status: "active" };
+      if (scheduleKind === "daily") body.time_of_day = "09:00";
+      if (scheduleKind === "weekly") { body.day_of_week = "monday"; body.time_of_day = "09:00"; }
+      if (scheduleKind === "monthly") { body.day_of_month = 1; body.time_of_day = "09:00"; }
+      if (scheduleKind === "interval") body.interval_seconds = 3600;
+      if (scheduleKind === "one_time") body.run_at = new Date(Date.now() + 3600_000).toISOString();
+      if (scheduleKind === "webhook" || scheduleKind === "connector_trigger") { body.trigger_source = scheduleKind === "webhook" ? "webhooks" : "gmail"; body.trigger_event_type = scheduleKind === "webhook" ? "event.received" : "message.created"; }
+      await apiFetch("/schedules/", { method: "POST", body: JSON.stringify(body) });
+      setToast({ kind: "ok", text: "Schedule created" });
+      await load();
+    } catch (exc) {
+      setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to create schedule" });
+    }
+  }
+
+  async function createWorkflow() {
+    try {
+      await apiFetch("/workflows/", {
+        method: "POST",
+        body: JSON.stringify({
+          name: workflowName,
+          description: "Reusable Phase 12 workflow with dependency-ready steps and event trigger metadata.",
+          steps: [{ id: "capture", tool_name: "internal_echo__echo", arguments: { message: "capture event" }, max_attempts: 2 }],
+          triggers: [{ trigger_type: "webhook", source: "webhooks", event_type: "event.received", config: { path: "/workflows/events" } }],
+        }),
+      });
+      setToast({ kind: "ok", text: "Workflow created" });
+      await load();
+    } catch (exc) {
+      setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to create workflow" });
+    }
+  }
+
+  async function runWorkflow(workflowId: string) {
+    try {
+      await apiFetch("/workflows/runs", { method: "POST", body: JSON.stringify({ workflow_id: workflowId, trigger_source: "manual" }) });
+      setToast({ kind: "ok", text: "Workflow run started" });
+      await load();
+    } catch (exc) {
+      setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to start workflow" });
+    }
+  }
+
+  async function updateRun(runId: string, action: "pause" | "resume" | "cancel") {
+    try {
+      await apiFetch(`/workflows/runs/${runId}/${action}`, { method: "POST", body: action === "pause" ? JSON.stringify({ reason: "operator pause" }) : undefined });
+      setToast({ kind: "ok", text: `Run ${action} requested` });
+      await load();
+    } catch (exc) {
+      setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to update run" });
+    }
+  }
+
+  async function createMonitor() {
+    try {
+      await apiFetch("/monitors/", {
+        method: "POST",
+        body: JSON.stringify({ name: monitorName, monitor_type: "website", target: monitorTarget, condition: { operator: "changed", severity: "info" }, status: "active" }),
+      });
+      setToast({ kind: "ok", text: "Monitor created" });
+      await load();
+    } catch (exc) {
+      setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to create monitor" });
+    }
+  }
+
+  async function evaluateMonitor(monitor: Phase12Monitor) {
+    try {
+      await apiFetch(`/monitors/${monitor.id}/evaluate`, {
+        method: "POST",
+        body: JSON.stringify({ observed: { hash: String(Date.now()), title: monitor.name, url: monitor.target, snippet: `${monitor.name} changed`, observed_at: new Date().toISOString() } }),
+      });
+      setToast({ kind: "ok", text: "Monitor evaluated" });
+      await load();
+    } catch (exc) {
+      setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to evaluate monitor" });
+    }
+  }
+
+  function toggleMonitor(monitor: Phase12Monitor) {
+    void apiFetch(`/monitors/${monitor.id}`, { method: "PATCH", body: JSON.stringify({ status: monitor.status === "paused" ? "active" : "paused" }) }).then(load).catch(exc => setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to update monitor" }));
+  }
+
+  return (
+    <div className="flex-1 flex flex-col min-w-0 overflow-y-auto">
+      <PageHeader
+        title="Workflows"
+        subtitle="Scheduled tasks, reusable workflows, event triggers, monitors, alerts, and run history."
+        right={<button className="btn btn-secondary btn-sm" onClick={() => void load()}><IC.Refresh size={14}/> Refresh</button>}
+      />
+      <div className="px-10 pb-10 space-y-7">
+        {toast && <div className="rounded-lg border px-3 py-2 text-[13px]" style={{ borderColor: toast.kind === "ok" ? "var(--ok)" : "var(--danger)", color: toast.kind === "ok" ? "var(--ok)" : "var(--danger)" }}>{toast.text}</div>}
+        {loading && <div className="text-[13px]" style={{ color: "var(--text-dim)" }}>Loading workflow state...</div>}
+
+        <section data-testid="phase12-schedules">
+          <div className="flex items-center justify-between mb-3"><h2 className="text-[16px] font-semibold">Scheduled tasks</h2><div className="flex gap-2"><TextInput ariaLabel="Schedule name" value={scheduleName} onChange={setScheduleName}/><SelectInput ariaLabel="Schedule kind" value={scheduleKind} onChange={setScheduleKind} options={["one_time", "daily", "weekly", "monthly", "interval", "webhook", "connector_trigger"]}/><button className="btn btn-accent btn-sm" onClick={() => void createSchedule()}><IC.Plus size={14}/> Create</button></div></div>
+          <TextInput ariaLabel="Schedule goal" wide value={scheduleGoal} onChange={setScheduleGoal}/>
+          <div className="surface border border-soft rounded-xl overflow-hidden mt-3">
+            {schedules.length === 0 ? <EmptyState title="No schedules" sub="Create a scheduled task to run Chronos work on a cadence or external trigger."/> : schedules.map(schedule => (
+              <div key={schedule.id} className="px-5 py-4 border-b hairline last:border-b-0 flex items-center justify-between gap-4">
+                <div className="min-w-0"><div className="font-medium text-[14px]">{schedule.name || schedule.goal}</div><div className="text-[12px] mt-1" style={{ color: "var(--text-dim)" }}>{schedule.schedule_kind} · {schedule.status || (schedule.enabled ? "active" : "paused")} · next {fmtDate(schedule.next_run_at)}</div></div>
+                <div className="flex items-center gap-2"><Tag variant={schedule.enabled === false || schedule.status === "paused" ? "warn" : "ok"}>{schedule.status || "active"}</Tag><button className="btn btn-sm" onClick={() => void apiFetch(`/schedules/${schedule.id}/run`, { method: "POST" }).then(load)}>Run now</button></div>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section>
+          <div className="flex items-center justify-between mb-3"><h2 className="text-[16px] font-semibold">Workflow definitions</h2><div className="flex gap-2"><TextInput ariaLabel="Workflow name" value={workflowName} onChange={setWorkflowName}/><button className="btn btn-accent btn-sm" onClick={() => void createWorkflow()}><IC.Plus size={14}/> Create</button></div></div>
+          <div className="surface border border-soft rounded-xl overflow-hidden">
+            {workflows.length === 0 ? <EmptyState title="No workflows" sub="Reusable workflows store connector steps, conditions, approvals, triggers, and run state."/> : workflows.map(workflow => (
+              <div key={workflow.id} className="px-5 py-4 border-b hairline last:border-b-0 flex items-center justify-between gap-4">
+                <div><div className="font-medium text-[14px]">{workflow.name}</div><div className="text-[12px] mt-1" style={{ color: "var(--text-dim)" }}>{workflow.status || "pending"} · {(workflow.definition?.steps || []).length} steps · {(triggers.filter(t => t.workflow_id === workflow.id)).length} triggers</div></div>
+                <button className="btn btn-sm" onClick={() => void runWorkflow(workflow.id)}><IC.ArrowRight size={14}/> Run</button>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section data-testid="phase12-workflow-runs">
+          <div className="flex items-center justify-between mb-3"><h2 className="text-[16px] font-semibold">Run history</h2><button className="btn btn-sm" onClick={() => void apiFetch("/workflows/dispatch", { method: "POST", body: JSON.stringify({ source: "webhooks", event_type: "event.received", payload: { type: "event.received" } }) }).then(load)}>Dispatch event</button></div>
+          <div className="surface border border-soft rounded-xl overflow-hidden">
+            {runs.length === 0 ? <EmptyState title="No workflow runs" sub="Manual, scheduled, webhook, and connector-triggered workflow runs appear here."/> : runs.map(run => (
+              <div key={run.id} className="px-5 py-4 border-b hairline last:border-b-0 flex items-center justify-between gap-4">
+                <div><div className="font-medium text-[14px]">{workflowNameFor(workflows, run.workflow_id)}</div><div className="text-[12px] mt-1" style={{ color: "var(--text-dim)" }}>{run.trigger_source || "manual"} {run.trigger_event_type ? `· ${run.trigger_event_type}` : ""} · {fmtDate(run.updated_at || run.created_at)}</div></div>
+                <div className="flex items-center gap-2"><Tag variant={run.status === "failed" ? "danger" : run.status === "paused" ? "warn" : run.status === "completed" ? "ok" : "info"}>{run.status}</Tag><button className="btn btn-sm" onClick={() => void updateRun(run.id, "pause")}><IC.Pause size={14}/></button><button className="btn btn-sm" onClick={() => void updateRun(run.id, "resume")}><IC.Refresh size={14}/></button></div>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section data-testid="phase12-monitors">
+          <div className="flex items-center justify-between mb-3"><h2 className="text-[16px] font-semibold">Monitors</h2><div className="flex gap-2"><TextInput ariaLabel="Monitor name" value={monitorName} onChange={setMonitorName}/><TextInput ariaLabel="Monitor target" value={monitorTarget} onChange={setMonitorTarget}/><button className="btn btn-accent btn-sm" onClick={() => void createMonitor()}><IC.Plus size={14}/> Create</button></div></div>
+          <div className="surface border border-soft rounded-xl overflow-hidden">
+            {monitors.length === 0 ? <EmptyState title="No monitors" sub="Watch websites, sources, connectors, inboxes, news, or recurring digests and create cited alerts."/> : monitors.map(monitor => (
+              <div key={monitor.id} className="px-5 py-4 border-b hairline last:border-b-0 flex items-center justify-between gap-4">
+                <div className="min-w-0"><div className="font-medium text-[14px]">{monitor.name}</div><div className="text-[12px] mt-1 truncate" style={{ color: "var(--text-dim)" }}>{monitor.monitor_type} · {monitor.target} · checked {fmtDate(monitor.last_checked_at)}</div></div>
+                <div className="flex items-center gap-2"><Tag variant={monitor.status === "paused" ? "warn" : "ok"}>{monitor.status}</Tag><button className="btn btn-sm" onClick={() => void evaluateMonitor(monitor)}><IC.Search size={14}/> Evaluate</button><button className="btn btn-sm" onClick={() => toggleMonitor(monitor)}>{monitor.status === "paused" ? "Resume" : "Pause"}</button></div>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section>
+          <h2 className="text-[16px] font-semibold mb-3">Monitor alerts</h2>
+          <div className="surface border border-soft rounded-xl overflow-hidden">
+            {alerts.length === 0 ? <EmptyState title="No monitor alerts" sub="Alerts include evidence links and snippets when monitor conditions match."/> : alerts.map(alert => (
+              <div key={alert.id} className="px-5 py-4 border-b hairline last:border-b-0">
+                <div className="flex items-center justify-between gap-4"><div className="font-medium text-[14px]">{alert.summary}</div><Tag variant={alert.severity === "critical" ? "danger" : "info"}>{alert.severity}</Tag></div>
+                <div className="text-[12px] mt-1" style={{ color: "var(--text-dim)" }}>{String(alert.evidence?.url || "no source")} · {fmtDate(alert.created_at)}</div>
+              </div>
+            ))}
+          </div>
+        </section>
+      </div>
+    </div>
+  );
+}
+
+function fmtDate(value?: string | null) {
+  if (!value) return "not set";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+}
+
+function workflowNameFor(workflows: Phase12Workflow[], id: string) {
+  return workflows.find(workflow => workflow.id === id)?.name || id;
 }
 
 function EmptyPanel({ label }: { label: string }) {

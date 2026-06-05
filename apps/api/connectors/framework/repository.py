@@ -79,6 +79,8 @@ class InMemoryConnectorRepository:
         self.workflow_dependencies: list[dict[str, Any]] = []
         self.workflow_states: dict[str, dict[str, Any]] = {}
         self.workflow_artifacts: list[dict[str, Any]] = []
+        self.workflow_triggers: list[dict[str, Any]] = []
+        self.workflow_run_events: list[dict[str, Any]] = []
 
     async def upsert_connector_definition(self, connector: ConnectorDef, tenant_id: str = "default") -> None:
         existing = self.connectors.get(connector.id, {})
@@ -447,6 +449,29 @@ class InMemoryConnectorRepository:
         row = {"id": f"wfartifact_{len(self.workflow_artifacts) + 1}", "created_at": now_iso(), **values}
         self.workflow_artifacts.insert(0, row)
         return dict(row)
+
+    async def create_workflow_trigger(self, **values: Any) -> dict[str, Any]:
+        row = {"id": f"wftrigger_{len(self.workflow_triggers) + 1}", "status": "active", "created_at": now_iso(), **values}
+        self.workflow_triggers.insert(0, row)
+        return dict(row)
+
+    async def list_workflow_triggers(self, workflow_id: str | None = None, *, tenant_id: str, status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        rows = [
+            row for row in self.workflow_triggers
+            if row["tenant_id"] == tenant_id
+            and (workflow_id is None or row["workflow_id"] == workflow_id)
+            and (status is None or row.get("status") == status)
+        ]
+        return [dict(row) for row in rows[:limit]]
+
+    async def record_workflow_run_event(self, **values: Any) -> dict[str, Any]:
+        row = {"id": f"wfevent_{len(self.workflow_run_events) + 1}", "created_at": now_iso(), **values}
+        self.workflow_run_events.append(row)
+        return dict(row)
+
+    async def list_workflow_run_history(self, run_id: str, *, tenant_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        rows = [row for row in self.workflow_run_events if row["tenant_id"] == tenant_id and row["run_id"] == run_id]
+        return [dict(row) for row in rows[-limit:]]
 
 
 class DatabaseConnectorRepository:
@@ -1374,21 +1399,25 @@ class DatabaseConnectorRepository:
         from core.db import engine, reflect_table
 
         table = await reflect_table("workflow_runs")
+        payload = {
+            "organization_id": values["tenant_id"],
+            "region": settings.region,
+            "workflow_id": values["workflow_id"],
+            "workspace_id": values["workspace_id"],
+            "employee_id": values["employee_id"],
+            "user_id": values.get("user_id"),
+            "status": values.get("status") or "pending",
+            "correlation_id": values["correlation_id"],
+            "started_at": text("NOW()") if values.get("status") == "running" else None,
+        }
+        for key in ("trigger_source", "trigger_event_type", "trigger_payload"):
+            if key in table.c and key in values:
+                payload[key] = values.get(key)
         async with engine.begin() as conn:
             row = (
                 await conn.execute(
                     insert(table)
-                    .values(
-                        organization_id=values["tenant_id"],
-                        region=settings.region,
-                        workflow_id=values["workflow_id"],
-                        workspace_id=values["workspace_id"],
-                        employee_id=values["employee_id"],
-                        user_id=values.get("user_id"),
-                        status=values.get("status") or "pending",
-                        correlation_id=values["correlation_id"],
-                        started_at=text("NOW()") if values.get("status") == "running" else None,
-                    )
+                    .values(**payload)
                     .returning(table)
                 )
             ).mappings().first()
@@ -1605,3 +1634,94 @@ class DatabaseConnectorRepository:
                 )
             ).mappings().first()
         return dict(row)
+
+    async def create_workflow_trigger(self, **values: Any) -> dict[str, Any]:
+        from sqlalchemy import insert
+
+        from core.config import settings
+        from core.db import engine, reflect_table
+
+        table = await reflect_table("workflow_triggers")
+        async with engine.begin() as conn:
+            row = (
+                await conn.execute(
+                    insert(table)
+                    .values(
+                        organization_id=values["tenant_id"],
+                        region=settings.region,
+                        workflow_id=values["workflow_id"],
+                        trigger_type=values["trigger_type"],
+                        config=values.get("config") or {},
+                        status=values.get("status") or "active",
+                    )
+                    .returning(table)
+                )
+            ).mappings().first()
+        data = dict(row)
+        data["source"] = (data.get("config") or {}).get("source")
+        data["event_type"] = (data.get("config") or {}).get("event_type")
+        return data
+
+    async def list_workflow_triggers(self, workflow_id: str | None = None, *, tenant_id: str, status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        from sqlalchemy import select
+
+        from core.db import engine, reflect_table
+
+        table = await reflect_table("workflow_triggers")
+        stmt = select(table).where(table.c.organization_id == tenant_id)
+        if workflow_id:
+            stmt = stmt.where(table.c.workflow_id == workflow_id)
+        if status:
+            stmt = stmt.where(table.c.status == status)
+        stmt = stmt.order_by(table.c.created_at.desc()).limit(limit)
+        async with engine.begin() as conn:
+            rows = (await conn.execute(stmt)).mappings().all()
+        result = []
+        for row in rows:
+            data = dict(row)
+            data["source"] = (data.get("config") or {}).get("source")
+            data["event_type"] = (data.get("config") or {}).get("event_type")
+            result.append(data)
+        return result
+
+    async def record_workflow_run_event(self, **values: Any) -> dict[str, Any]:
+        from sqlalchemy import insert
+
+        from core.config import settings
+        from core.db import engine, reflect_table
+
+        table = await reflect_table("workflow_run_events")
+        async with engine.begin() as conn:
+            row = (
+                await conn.execute(
+                    insert(table)
+                    .values(
+                        organization_id=values["tenant_id"],
+                        region=settings.region,
+                        workflow_id=values["workflow_id"],
+                        run_id=values["run_id"],
+                        event_type=values["event_type"],
+                        actor_id=values.get("actor_id"),
+                        payload=values.get("payload") or {},
+                    )
+                    .returning(table)
+                )
+            ).mappings().first()
+        return dict(row)
+
+    async def list_workflow_run_history(self, run_id: str, *, tenant_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        from sqlalchemy import select
+
+        from core.db import engine, reflect_table
+
+        table = await reflect_table("workflow_run_events")
+        async with engine.begin() as conn:
+            rows = (
+                await conn.execute(
+                    select(table)
+                    .where(table.c.run_id == run_id, table.c.organization_id == tenant_id)
+                    .order_by(table.c.created_at.asc())
+                    .limit(limit)
+                )
+            ).mappings().all()
+        return [dict(row) for row in rows]

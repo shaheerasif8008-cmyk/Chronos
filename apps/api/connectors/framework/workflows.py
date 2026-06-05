@@ -31,8 +31,9 @@ class WorkflowRuntime:
         name: str,
         steps: list[dict[str, Any]],
         description: str = "",
+        triggers: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        return await self.repo.create_workflow(
+        workflow = await self.repo.create_workflow(
             tenant_id=tenant_id,
             workspace_id=workspace_id,
             employee_id=employee_id,
@@ -41,8 +42,28 @@ class WorkflowRuntime:
             description=description,
             definition={"steps": steps},
         )
+        for trigger in triggers or []:
+            config = dict(trigger.get("config") or {})
+            config.setdefault("source", trigger.get("source"))
+            config.setdefault("event_type", trigger.get("event_type"))
+            await self.repo.create_workflow_trigger(
+                tenant_id=tenant_id,
+                workflow_id=workflow["id"],
+                trigger_type=trigger["trigger_type"],
+                config=config,
+                status=trigger.get("status") or "active",
+            )
+        return workflow
 
-    async def start_run(self, workflow_id: str, *, tenant_id: str) -> dict[str, Any]:
+    async def start_run(
+        self,
+        workflow_id: str,
+        *,
+        tenant_id: str,
+        trigger_source: str = "manual",
+        trigger_event_type: str | None = None,
+        trigger_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         workflow = await self.repo.get_workflow(workflow_id, tenant_id=tenant_id)
         if not workflow:
             raise ValueError("Workflow not found")
@@ -54,7 +75,11 @@ class WorkflowRuntime:
             user_id=workflow.get("user_id"),
             status="running",
             correlation_id=f"wf_{uuid.uuid4().hex}",
+            trigger_source=trigger_source,
+            trigger_event_type=trigger_event_type,
+            trigger_payload=trigger_payload or {},
         )
+        await self._record_run_event(run, "run_started", {"trigger_source": trigger_source, "trigger_event_type": trigger_event_type})
         for step in workflow["definition"].get("steps", []):
             await self.repo.create_workflow_step(
                 tenant_id=tenant_id,
@@ -78,6 +103,35 @@ class WorkflowRuntime:
                 )
         await self._checkpoint(run["id"], tenant_id=tenant_id)
         return run
+
+    async def dispatch_event(
+        self,
+        *,
+        tenant_id: str,
+        source: str,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        dispatched: list[dict[str, Any]] = []
+        triggers = await self.repo.list_workflow_triggers(tenant_id=tenant_id, status="active")
+        for trigger in triggers:
+            config = trigger.get("config") or {}
+            if config.get("source") != source or config.get("event_type") != event_type:
+                continue
+            workflow = await self.repo.get_workflow(trigger["workflow_id"], tenant_id=tenant_id)
+            if not workflow:
+                continue
+            if not self._workflow_conditions_match(workflow, payload):
+                continue
+            run = await self.start_run(
+                trigger["workflow_id"],
+                tenant_id=tenant_id,
+                trigger_source=source,
+                trigger_event_type=event_type,
+                trigger_payload=payload,
+            )
+            dispatched.append(run)
+        return dispatched
 
     async def tick(self, run_id: str, *, tenant_id: str) -> dict[str, Any]:
         run = await self.repo.get_workflow_run(run_id, tenant_id=tenant_id)
@@ -142,16 +196,19 @@ class WorkflowRuntime:
 
     async def pause_run(self, run_id: str, *, tenant_id: str, reason: str) -> dict[str, Any]:
         run = await self.repo.update_workflow_run(run_id, tenant_id=tenant_id, status="paused", pause_reason=reason)
+        await self._record_run_event(run, "run_paused", {"reason": reason})
         await self._checkpoint(run_id, tenant_id=tenant_id)
         return run
 
     async def resume_run(self, run_id: str, *, tenant_id: str) -> dict[str, Any]:
         run = await self.repo.update_workflow_run(run_id, tenant_id=tenant_id, status="running")
+        await self._record_run_event(run, "run_resumed", {})
         await self._checkpoint(run_id, tenant_id=tenant_id)
         return run
 
     async def cancel_run(self, run_id: str, *, tenant_id: str) -> dict[str, Any]:
         run = await self.repo.update_workflow_run(run_id, tenant_id=tenant_id, status="cancelled")
+        await self._record_run_event(run, "run_cancelled", {})
         await self._checkpoint(run_id, tenant_id=tenant_id)
         return run
 
@@ -163,6 +220,9 @@ class WorkflowRuntime:
                 candidates[run["id"]] = run
         for run in candidates.values():
             await self.repo.update_workflow_run(run["id"], tenant_id=tenant_id, status="recovering")
+            refreshed = await self.repo.get_workflow_run(run["id"], tenant_id=tenant_id)
+            if refreshed:
+                await self._record_run_event(refreshed, "run_recovered", {})
             await self._checkpoint(run["id"], tenant_id=tenant_id)
             recovered.append(run["id"])
         return recovered
@@ -199,4 +259,44 @@ class WorkflowRuntime:
             workflow_id=run["workflow_id"],
             run_id=run_id,
             snapshot=snapshot,
+        )
+
+    def _workflow_conditions_match(self, workflow: dict[str, Any], payload: dict[str, Any]) -> bool:
+        steps = (workflow.get("definition") or {}).get("steps") or []
+        conditions = [condition for step in steps for condition in (step.get("conditions") or [])]
+        if not conditions:
+            return True
+        return all(self._condition_matches(condition, payload) for condition in conditions)
+
+    def _condition_matches(self, condition: dict[str, Any], payload: dict[str, Any]) -> bool:
+        field = str(condition.get("field") or "")
+        if field.startswith("payload."):
+            field = field[len("payload."):]
+        value: Any = payload
+        for part in field.split("."):
+            if not part:
+                continue
+            if not isinstance(value, dict):
+                return False
+            value = value.get(part)
+        operator = condition.get("operator") or "equals"
+        expected = condition.get("value")
+        if operator == "equals":
+            return value == expected
+        if operator == "contains":
+            return str(expected) in str(value)
+        if operator == "exists":
+            return value is not None
+        return False
+
+    async def _record_run_event(self, run: dict[str, Any], event_type: str, payload: dict[str, Any]) -> None:
+        if not hasattr(self.repo, "record_workflow_run_event"):
+            return
+        await self.repo.record_workflow_run_event(
+            tenant_id=tenant_of(run),
+            workflow_id=run["workflow_id"],
+            run_id=run["id"],
+            event_type=event_type,
+            actor_id=run.get("user_id"),
+            payload=payload,
         )
