@@ -231,6 +231,35 @@ IMAGE_GENERATE = _fn(
     ["prompt"],
 )
 
+IMAGE_EDIT = _fn(
+    "image__edit",
+    "Edit an existing image artifact using a natural-language instruction. "
+    "Creates a new version of the source artifact non-destructively — original bytes are preserved. "
+    "Use for retouching, style changes, background swaps, or any modification to an image the user already has.",
+    {
+        "artifact_id": {
+            "type": "string",
+            "description": "Artifact id of the source image to edit.",
+        },
+        "prompt": {
+            "type": "string",
+            "description": "Natural-language edit instruction (e.g. 'make the sky purple', 'remove the background').",
+        },
+        "mask": {
+            "type": "string",
+            "description": "Optional mask: an artifact id of a mask image, or a base64-encoded mask. "
+                           "Transparent areas indicate regions to edit.",
+        },
+        "operation": {
+            "type": "string",
+            "description": "Edit operation type: 'edit' (default), 'variation', or 'background'.",
+            "enum": ["edit", "variation", "background"],
+            "default": "edit",
+        },
+    },
+    ["artifact_id", "prompt"],
+)
+
 # ── Sub-agent ─────────────────────────────────────────────────────────────────
 
 SPAWN_SUBAGENT = _fn(
@@ -288,6 +317,7 @@ ALL_TOOLS: list[dict[str, Any]] = [
     DOC_SUMMARIZE,
     DOC_COMPARE,
     IMAGE_GENERATE,
+    IMAGE_EDIT,
     SPAWN_SUBAGENT,
 ]
 
@@ -305,6 +335,7 @@ SUBAGENT_TOOLS: list[dict[str, Any]] = [
     DOC_SUMMARIZE,
     DOC_COMPARE,
     IMAGE_GENERATE,
+    IMAGE_EDIT,
 ]
 
 #: Names that always need explicit human approval before execution.
@@ -331,6 +362,7 @@ INLINE_CHAT_TOOLS: list[dict[str, Any]] = [
     DOC_SUMMARIZE,
     DOC_COMPARE,
     IMAGE_GENERATE,
+    IMAGE_EDIT,
     START_TASK,
 ]
 
