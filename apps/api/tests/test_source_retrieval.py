@@ -207,6 +207,7 @@ def test_citations_payload_carries_snippet():
         "marker": "S1",
         "source_id": "s1",
         "source_title": "Doc A",
+        "source_type": "project",
         "chunk_index": 2,
         "snippet": "alpha",
     }]

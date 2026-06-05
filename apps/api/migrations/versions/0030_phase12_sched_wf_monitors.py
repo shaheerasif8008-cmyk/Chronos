@@ -1,14 +1,18 @@
 """phase 12 scheduled workflows monitors
 
-Revision ID: 0030_phase12_scheduled_workflows_monitors
+Revision ID: 0030_phase12_sched_wf_monitors
 Revises: 0029_agents_phase13
 Create Date: 2026-06-05
+
+NOTE: the revision id is kept <=32 chars because Alembic's default
+``alembic_version.version_num`` column is ``VARCHAR(32)``; a longer id makes
+``alembic upgrade head`` fail on a clean database with StringDataRightTruncation.
 """
 from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
-revision = "0030_phase12_scheduled_workflows_monitors"
+revision = "0030_phase12_sched_wf_monitors"
 down_revision = "0029_agents_phase13"
 branch_labels = None
 depends_on = None

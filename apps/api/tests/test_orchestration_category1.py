@@ -65,7 +65,7 @@ async def test_native_loop_adds_controller_replan_instruction_after_tool_error(m
     async def fake_persist(task_arg, content, **kwargs):
         return None
 
-    async def fake_llm_step(history, tools, model):
+    async def fake_llm_step(history, tools, model, *, reasoning_effort=None):
         if len(step_calls) == 1:
             assert any(
                 message.get("role") == "system" and "revise the next action" in message.get("content", "")

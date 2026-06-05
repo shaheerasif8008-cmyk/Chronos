@@ -24,6 +24,12 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 cd "$ROOT/apps/api"
+# Ensure the browser operator runs LIVE (not degraded): install the Chromium
+# runtime once (no-op if already present). Set SKIP_BROWSER_INSTALL=1 to opt out.
+if [ "${SKIP_BROWSER_INSTALL:-0}" != "1" ]; then
+  "$PYTHON_BIN" -m playwright install chromium >/dev/null 2>&1 || \
+    echo "warning: 'playwright install chromium' failed; browser operator will run degraded" >&2
+fi
 "$PYTHON_BIN" -m uvicorn main:app --reload --port "${API_PORT:-8000}" &
 "$PYTHON_BIN" -m connectors.worker_main &
 
