@@ -138,6 +138,7 @@ function ArtifactCard({ artifactId }: { artifactId: string }) {
 
   useEffect(() => {
     let revoked = false;
+    let objectUrl: string | null = null;  // captured locally so cleanup can revoke it
     async function load() {
       try {
         const m = await fetchArtifactMeta(artifactId);
@@ -147,7 +148,8 @@ function ArtifactCard({ artifactId }: { artifactId: string }) {
         if (isImage) {
           const blob = await apiFetch(`/artifacts/${artifactId}/content`).then(r => r.blob());
           if (revoked) return;
-          setBlobUrl(URL.createObjectURL(blob));
+          objectUrl = URL.createObjectURL(blob);
+          setBlobUrl(objectUrl);
         } else {
           const text = await apiFetch(`/artifacts/${artifactId}/content`).then(r => r.text());
           if (revoked) return;
@@ -160,7 +162,7 @@ function ArtifactCard({ artifactId }: { artifactId: string }) {
     void load();
     return () => {
       revoked = true;
-      if (blobUrl) URL.revokeObjectURL(blobUrl);
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [artifactId]);

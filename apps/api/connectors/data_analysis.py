@@ -26,6 +26,8 @@ import asyncio
 import os
 import re
 import resource
+import shutil
+import signal
 import sys
 import uuid
 from pathlib import Path
@@ -40,6 +42,9 @@ DATA_TIMEOUT_SECONDS = 20
 DATA_RLIMIT_CPU = 15
 DATA_RLIMIT_AS = 2 * 1024 * 1024 * 1024   # 2 GB
 DATA_RLIMIT_FSIZE = 25 * 1024 * 1024       # 25 MB
+DATA_RLIMIT_NPROC = 64                      # cap forks (anti fork-bomb)
+#: Hard cap on the source artifact bytes read into the API process (anti-OOM).
+MAX_SOURCE_BYTES = 256 * 1024 * 1024        # 256 MB
 
 # Forbidden patterns for data sandbox (extends code.py patterns but allows pandas/matplotlib/numpy).
 _FORBIDDEN_DATA_PATTERNS = [
@@ -57,8 +62,12 @@ _FORBIDDEN_DATA_PATTERNS = [
     r"\bfrom\s+builtins\b",
     # Block absolute-path open
     r"\bopen\s*\(\s*['\"]/",
-    # Block shell execution
-    r"\bos\.(system|popen|spawn|exec)",
+    # Block shell execution and forking
+    r"\bos\.(system|popen|spawn|exec|fork|kill|killpg)",
+    # Block arbitrary code execution / introspection escapes
+    r"\beval\s*\(",
+    r"\bexec\s*\(",
+    r"\bcompile\s*\(",
 ]
 
 
@@ -71,11 +80,15 @@ def _data_workspace(org_id: str, run_id: str) -> Path:
 
 def _set_data_limits() -> None:
     """Set conservative resource limits for the data analysis subprocess."""
-    for limit, value in (
+    limits = [
         (resource.RLIMIT_CPU, (DATA_RLIMIT_CPU, DATA_RLIMIT_CPU)),
         (resource.RLIMIT_AS, (DATA_RLIMIT_AS, DATA_RLIMIT_AS)),
         (resource.RLIMIT_FSIZE, (DATA_RLIMIT_FSIZE, DATA_RLIMIT_FSIZE)),
-    ):
+    ]
+    # Cap process count to stop fork-bombs from exhausting the host process table.
+    if hasattr(resource, "RLIMIT_NPROC"):
+        limits.append((resource.RLIMIT_NPROC, (DATA_RLIMIT_NPROC, DATA_RLIMIT_NPROC)))
+    for limit, value in limits:
         try:
             resource.setrlimit(limit, value)
         except (OSError, ValueError):
@@ -143,9 +156,16 @@ async def _materialize_dataset(dataset_id: str, org_id: str, workspace: Path) ->
     if str(artifact_meta.get("organization_id", "")) != str(org_id):
         return None
 
+    # Reject oversized sources before reading them into the API process (anti-OOM).
+    declared_size = int(artifact_meta.get("size_bytes") or 0)
+    if declared_size > MAX_SOURCE_BYTES:
+        raise ValueError(f"dataset source exceeds {MAX_SOURCE_BYTES} byte limit")
+
     content = await read_artifact_content(source_artifact_id)
     if not content:
         return None
+    if len(content) > MAX_SOURCE_BYTES:
+        raise ValueError(f"dataset source exceeds {MAX_SOURCE_BYTES} byte limit")
 
     # 3. Write to workspace with a stable name.
     mime = str(artifact_meta.get("mime_type", "") or "")
@@ -221,9 +241,25 @@ class DataAnalysisConnector:
             )
 
         # Create a fresh per-run workspace so stale PNGs never contaminate results.
+        # The workspace (incl. the materialized tenant data file) is always removed
+        # after the run so tenant data never lingers on shared disk.
         run_id = str(uuid.uuid4())
         workspace = _data_workspace(org_id, run_id)
+        try:
+            return await self._run_in_workspace(
+                code=code, dataset_id=dataset_id, workspace=workspace,
+                org_id=org_id, task_id=task_id,
+            )
+        finally:
+            shutil.rmtree(workspace, ignore_errors=True)
 
+    async def _run_in_workspace(
+        self, *, code: str, dataset_id: str, workspace: Path, org_id: str, task_id: str | None
+    ) -> ToolResult:
+        """Materialize the dataset, run the analysis subprocess, and collect artifacts.
+
+        The caller owns ``workspace`` lifecycle (creation and guaranteed cleanup).
+        """
         # Materialize the dataset (org-checked).
         try:
             materialized = await _materialize_dataset(dataset_id, org_id, workspace)
@@ -269,6 +305,9 @@ class DataAnalysisConnector:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             preexec_fn=_set_data_limits if os.name == "posix" else None,
+            # New session/process-group so a timeout can kill the whole tree
+            # (the child plus any grandchildren it spawned), not just the child.
+            start_new_session=True,
         )
 
         try:
@@ -277,7 +316,10 @@ class DataAnalysisConnector:
             )
             timed_out = False
         except asyncio.TimeoutError:
-            process.kill()
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                process.kill()
             stdout_b, stderr_b = await process.communicate()
             timed_out = True
 
