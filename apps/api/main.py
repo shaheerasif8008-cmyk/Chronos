@@ -22,7 +22,7 @@ from jobs import context_update, profile_synthesis, scheduled_tasks
 from core.db import engine, reflect_table
 from runtime import task_runner
 from runtime.research_executor import start_research
-from routers import activity, approvals, artifact_share, artifacts, attachments, auth, chat, connectors, context, memory, projects, research, schedules, search, settings, tasks, workflows
+from routers import activity, approvals, artifact_share, artifacts, attachments, auth, chat, connectors, context, data, memory, projects, research, schedules, search, settings, tasks, workflows
 
 app = FastAPI(title="Chronos API", version="0.1.0")
 
@@ -58,6 +58,7 @@ app.include_router(settings.router)
 app.include_router(workflows.router)
 app.include_router(schedules.router)
 app.include_router(research.router)
+app.include_router(data.router)
 
 
 def _init_observability() -> None:

@@ -313,6 +313,33 @@ VOICE_SPEAK = _fn(
     ["text"],
 )
 
+# ── Data analysis ─────────────────────────────────────────────────────────────
+
+DATA_RUN = _fn(
+    "data__run",
+    "Run Python data analysis code (pandas/matplotlib/numpy) against an uploaded dataset. "
+    "The dataset is identified by dataset_id (obtained from POST /datasets). "
+    "The code runs in a sandbox where the dataset is available as 'data.csv' (or 'data.json'). "
+    "Produce charts by saving matplotlib figures with plt.savefig('chart_N.png'). "
+    "Printed output (tables, stats) is captured as a report artifact. "
+    "Returns artifact ids for any generated charts and report.",
+    {
+        "dataset_id": {
+            "type": "string",
+            "description": "Dataset id (from POST /datasets) to analyze.",
+        },
+        "code": {
+            "type": "string",
+            "description": "Python code using pandas/matplotlib/numpy. "
+                           "Read data with: import pandas as pd; df = pd.read_csv('data.csv'). "
+                           "Save charts with: plt.savefig('chart_1.png'). "
+                           "Print tables with: print(df.head()). "
+                           "Network access, subprocess, and absolute paths are blocked.",
+        },
+    },
+    ["dataset_id", "code"],
+)
+
 # ── Sub-agent ─────────────────────────────────────────────────────────────────
 
 SPAWN_SUBAGENT = _fn(
@@ -373,6 +400,7 @@ ALL_TOOLS: list[dict[str, Any]] = [
     IMAGE_EDIT,
     VOICE_TRANSCRIBE,
     VOICE_SPEAK,
+    DATA_RUN,
     SPAWN_SUBAGENT,
 ]
 
@@ -393,6 +421,7 @@ SUBAGENT_TOOLS: list[dict[str, Any]] = [
     IMAGE_EDIT,
     VOICE_TRANSCRIBE,
     VOICE_SPEAK,
+    DATA_RUN,
 ]
 
 #: Names that always need explicit human approval before execution.
@@ -422,6 +451,7 @@ INLINE_CHAT_TOOLS: list[dict[str, Any]] = [
     IMAGE_EDIT,
     VOICE_TRANSCRIBE,
     VOICE_SPEAK,
+    DATA_RUN,
     START_TASK,
 ]
 
