@@ -23,10 +23,28 @@ class WorkflowCreateRequest(BaseModel):
     workspace_id: str = "default"
     employee_id: str | None = None
     steps: list[dict[str, Any]] = Field(default_factory=list)
+    triggers: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class WorkflowRunRequest(BaseModel):
     workflow_id: str
+    trigger_source: str = "manual"
+    trigger_event_type: str | None = None
+    trigger_payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkflowTriggerRequest(BaseModel):
+    workflow_id: str
+    trigger_type: str = Field(pattern="^(schedule|webhook|connector)$")
+    source: str
+    event_type: str
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkflowEventDispatchRequest(BaseModel):
+    source: str
+    event_type: str
+    payload: dict[str, Any] = Field(default_factory=dict)
 
 
 class WorkflowStepCompleteRequest(BaseModel):
@@ -78,6 +96,7 @@ async def create_workflow(req: WorkflowCreateRequest, member: Member = Depends(g
         name=req.name,
         description=req.description,
         steps=req.steps,
+        triggers=req.triggers,
     )
 
 
@@ -92,9 +111,55 @@ async def list_workflow_runs(status: str | None = Query(default=None), member: M
 async def start_workflow_run(req: WorkflowRunRequest, member: Member = Depends(get_current_member)) -> dict[str, Any]:
     await permissions.check(member, "start_workflow_run", req.workflow_id)
     repo = await repository()
-    run = await runtime(repo).start_run(req.workflow_id, tenant_id=member.organization_id)
+    run = await runtime(repo).start_run(
+        req.workflow_id,
+        tenant_id=member.organization_id,
+        trigger_source=req.trigger_source,
+        trigger_event_type=req.trigger_event_type,
+        trigger_payload=req.trigger_payload,
+    )
     await runtime(repo).tick(run["id"], tenant_id=member.organization_id)
     return run
+
+
+@router.get("/triggers")
+async def list_workflow_triggers(
+    workflow_id: str | None = Query(default=None),
+    member: Member = Depends(get_current_member),
+) -> list[dict[str, Any]]:
+    await permissions.check(member, "list_workflow_triggers", member.organization_id)
+    repo = await repository()
+    return await repo.list_workflow_triggers(workflow_id, tenant_id=member.organization_id)
+
+
+@router.post("/triggers")
+async def create_workflow_trigger(req: WorkflowTriggerRequest, member: Member = Depends(get_current_member)) -> dict[str, Any]:
+    await permissions.check(member, "create_workflow_trigger", req.workflow_id)
+    repo = await repository()
+    workflow = await repo.get_workflow(req.workflow_id, tenant_id=member.organization_id)
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    config = {**req.config, "source": req.source, "event_type": req.event_type}
+    return await repo.create_workflow_trigger(
+        tenant_id=member.organization_id,
+        workflow_id=req.workflow_id,
+        trigger_type=req.trigger_type,
+        config=config,
+        status="active",
+    )
+
+
+@router.post("/dispatch")
+async def dispatch_workflow_event(req: WorkflowEventDispatchRequest, member: Member = Depends(get_current_member)) -> dict[str, Any]:
+    await permissions.check(member, "dispatch_workflow_event", member.organization_id)
+    repo = await repository()
+    runs = await runtime(repo).dispatch_event(
+        tenant_id=member.organization_id,
+        source=req.source,
+        event_type=req.event_type,
+        payload=req.payload,
+    )
+    return {"dispatched_run_ids": [run["id"] for run in runs], "count": len(runs)}
 
 
 @router.get("/runs/{run_id}")
@@ -109,6 +174,7 @@ async def get_workflow_run(run_id: str, member: Member = Depends(get_current_mem
         "steps": await repo.list_workflow_steps(run_id, tenant_id=member.organization_id),
         "dependencies": await repo.list_workflow_dependencies(run_id, tenant_id=member.organization_id),
         "state": await repo.get_workflow_state(run_id, tenant_id=member.organization_id),
+        "history": await repo.list_workflow_run_history(run_id, tenant_id=member.organization_id),
     }
 
 

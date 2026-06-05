@@ -26,20 +26,35 @@ router = APIRouter(prefix="/schedules", tags=["schedules"])
 class ScheduleRequest(BaseModel):
     name: str | None = None
     goal: str
-    schedule_kind: str = "interval"   # "interval" | "cron"
+    schedule_kind: str = "interval"
     interval_seconds: int | None = None
     cron: str | None = None
+    run_at: datetime | None = None
+    time_of_day: str | None = None
+    day_of_week: str | int | None = None
+    day_of_month: int | None = None
+    trigger_source: str | None = None
+    trigger_event_type: str | None = None
     persona_id: str | None = None
     workspace_id: str | None = None
     enabled: bool = True
+    status: str = "active"
 
 
 class ScheduleUpdate(BaseModel):
     name: str | None = None
     goal: str | None = None
+    schedule_kind: str | None = None
     interval_seconds: int | None = None
     cron: str | None = None
+    run_at: datetime | None = None
+    time_of_day: str | None = None
+    day_of_week: str | int | None = None
+    day_of_month: int | None = None
+    trigger_source: str | None = None
+    trigger_event_type: str | None = None
     enabled: bool | None = None
+    status: str | None = None
 
 
 def _validate(kind: str, interval_seconds: int | None, cron: str | None) -> None:
@@ -49,8 +64,10 @@ def _validate(kind: str, interval_seconds: int | None, cron: str | None) -> None
     elif kind == "cron":
         if not cron:
             raise HTTPException(status_code=422, detail="cron expression is required for cron schedules")
+    elif kind in {"one_time", "daily", "weekly", "monthly", "webhook", "connector_trigger"}:
+        return
     else:
-        raise HTTPException(status_code=422, detail="schedule_kind must be 'interval' or 'cron'")
+        raise HTTPException(status_code=422, detail="Unsupported schedule_kind")
 
 
 @router.post("/")
@@ -72,9 +89,16 @@ async def create_schedule(req: ScheduleRequest, member: Member = Depends(get_cur
                 schedule_kind=req.schedule_kind,
                 interval_seconds=req.interval_seconds,
                 cron=req.cron,
+                run_at=req.run_at,
+                time_of_day=req.time_of_day,
+                day_of_week=str(req.day_of_week) if req.day_of_week is not None else None,
+                day_of_month=req.day_of_month,
+                trigger_source=req.trigger_source,
+                trigger_event_type=req.trigger_event_type,
                 persona_id=req.persona_id,
                 workspace_id=req.workspace_id,
                 enabled=req.enabled,
+                status=req.status,
                 next_run_at=next_run,
                 created_by=member.id,
             )
@@ -120,7 +144,7 @@ async def update_schedule(
         return _serialize(row)
     # Recompute next_run_at if cadence fields change.
     merged = {**row, **values}
-    if {"interval_seconds", "cron"} & values.keys():
+    if {"schedule_kind", "interval_seconds", "cron", "run_at", "time_of_day", "day_of_week", "day_of_month"} & values.keys():
         values["next_run_at"] = compute_next_run(merged, datetime.now(timezone.utc))
     async with engine.begin() as conn:
         await conn.execute(update(scheduled).where(scheduled.c.id == schedule_id).values(**values))
@@ -168,6 +192,22 @@ async def run_schedule_now(schedule_id: str, member: Member = Depends(get_curren
     return {"schedule_id": schedule_id, "spawned_task_ids": spawned, "goal": row["goal"]}
 
 
+@router.get("/{schedule_id}/runs")
+async def list_schedule_runs(schedule_id: str, member: Member = Depends(get_current_member)) -> list[dict]:
+    await permissions.check(member, "list_schedule_runs", schedule_id)
+    await _require_schedule(member, schedule_id)
+    runs = await reflect_table("scheduled_task_runs")
+    async with engine.begin() as conn:
+        rows = (
+            await conn.execute(
+                select(runs)
+                .where(runs.c.schedule_id == schedule_id, runs.c.organization_id == member.organization_id)
+                .order_by(runs.c.created_at.desc())
+            )
+        ).mappings().all()
+    return [_serialize_run(dict(r)) for r in rows]
+
+
 async def _require_schedule(member: Member, schedule_id: str) -> dict:
     scheduled = await reflect_table("scheduled_tasks")
     async with engine.begin() as conn:
@@ -195,8 +235,33 @@ def _serialize(row: dict) -> dict:
         "schedule_kind": row.get("schedule_kind"),
         "interval_seconds": row.get("interval_seconds"),
         "cron": row.get("cron"),
+        "run_at": _iso(row.get("run_at")),
+        "time_of_day": row.get("time_of_day"),
+        "day_of_week": row.get("day_of_week"),
+        "day_of_month": row.get("day_of_month"),
+        "trigger_source": row.get("trigger_source"),
+        "trigger_event_type": row.get("trigger_event_type"),
         "enabled": row.get("enabled"),
+        "status": row.get("status") or ("active" if row.get("enabled") else "paused"),
         "last_run_at": _iso(row.get("last_run_at")),
         "next_run_at": _iso(row.get("next_run_at")),
         "last_task_id": str(row["last_task_id"]) if row.get("last_task_id") else None,
+    }
+
+
+def _serialize_run(row: dict) -> dict:
+    def _iso(value):
+        return value.isoformat() if isinstance(value, datetime) else value
+
+    return {
+        "id": str(row.get("id")),
+        "schedule_id": str(row.get("schedule_id")) if row.get("schedule_id") else None,
+        "task_id": str(row.get("task_id")) if row.get("task_id") else None,
+        "workflow_run_id": row.get("workflow_run_id"),
+        "monitor_id": str(row.get("monitor_id")) if row.get("monitor_id") else None,
+        "status": row.get("status"),
+        "trigger_source": row.get("trigger_source"),
+        "evidence": row.get("evidence") or {},
+        "next_run_at": _iso(row.get("next_run_at")),
+        "created_at": _iso(row.get("created_at")),
     }
