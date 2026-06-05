@@ -4122,6 +4122,18 @@ type CatalogApp = {
   name: string;
   description: string;
   icon_svg: string;
+  category?: string;
+  auth_type?: string;
+  scopes?: string[];
+  actions?: string[];
+  risk_levels?: string[];
+  sync_supported?: boolean;
+  policy?: string;
+  health_status?: string;
+  health_updated_at?: string | null;
+  last_used_at?: string;
+  client_id_env?: string;
+  client_secret_env?: string;
   configured: boolean;
   connected: boolean;
   account_handle: string;
@@ -4176,8 +4188,14 @@ function ConnectorsScreen() {
   }, []);
 
   async function connect(app: CatalogApp) {
+    if (app.auth_type && app.auth_type !== "oauth2") {
+      setError(`${app.name} uses ${app.auth_type} setup. Configure it from connector policy/schema settings before connecting live credentials.`);
+      return;
+    }
     if (!app.configured) {
-      setError(`Set ${app.id.toUpperCase()}_CLIENT_ID and ${app.id.toUpperCase()}_CLIENT_SECRET in your .env to enable ${app.name}.`);
+      const idEnv = app.client_id_env || `${app.id.toUpperCase()}_CLIENT_ID`;
+      const secretEnv = app.client_secret_env || `${app.id.toUpperCase()}_CLIENT_SECRET`;
+      setError(`Set ${idEnv} and ${secretEnv} in your .env to enable ${app.name}.`);
       return;
     }
     setConnecting(app.id);
@@ -4283,15 +4301,46 @@ function ConnectorsScreen() {
                   {app.description}
                 </p>
 
+                <div className="flex flex-wrap gap-1">
+                  {app.auth_type && <Tag>{app.auth_type}</Tag>}
+                  {app.sync_supported && <Tag variant="accent">Sync</Tag>}
+                  {app.health_status && <Tag variant={app.health_status === "healthy" || app.health_status === "connected" ? "ok" : app.health_status === "not_connected" ? "info" : "warn"}>{app.health_status}</Tag>}
+                  {(app.risk_levels || []).slice(0, 3).map(level => (
+                    <Tag key={level} variant={level === "read" ? "info" : level === "financial" || level === "destructive" ? "danger" : "warn"}>{level}</Tag>
+                  ))}
+                </div>
+
+                {(app.actions || []).length > 0 && (
+                  <div className="text-[11.5px] leading-5" style={{ color: "var(--text-dim)" }}>
+                    Actions: {(app.actions || []).join(", ")}
+                  </div>
+                )}
+
+                {(app.scopes || []).length > 0 && (
+                  <div className="text-[11.5px] leading-5 line-clamp-2" style={{ color: "var(--text-dim)" }}>
+                    Scopes: {(app.scopes || []).slice(0, 4).join(", ")}{(app.scopes || []).length > 4 ? "…" : ""}
+                  </div>
+                )}
+
+                <div className="text-[11.5px] leading-5" style={{ color: "var(--text-dim)" }}>
+                  Last used: {app.last_used_at || "never"}
+                </div>
+
+                {app.policy && (
+                  <p className="text-[11.5px] leading-[1.5]" style={{ color: "var(--text-muted)" }}>
+                    {app.policy}
+                  </p>
+                )}
+
                 <div className="mt-auto pt-1 flex gap-2">
                   {!app.connected ? (
                     <button
                       onClick={() => void connect(app)}
                       disabled={connecting === app.id}
                       className="btn btn-accent btn-sm w-full disabled:opacity-50"
-                      title={!app.configured ? `Add ${app.id.toUpperCase()}_CLIENT_ID + CLIENT_SECRET to .env first` : undefined}
+                      title={!app.configured ? `Add ${app.client_id_env || `${app.id.toUpperCase()}_CLIENT_ID`} + ${app.client_secret_env || "CLIENT_SECRET"} to .env first` : undefined}
                     >
-                      {connecting === app.id ? "Redirecting…" : app.configured ? "Connect" : "Configure first"}
+                      {connecting === app.id ? "Redirecting…" : app.auth_type !== "oauth2" ? "Configure" : app.configured ? "Connect" : "Configure first"}
                     </button>
                   ) : (
                     <>
