@@ -21,6 +21,7 @@ preserving all prior version bytes. The source bytes remain readable at their
 original version number.
 """
 
+import re
 from typing import Any
 
 from core.config import settings
@@ -29,6 +30,11 @@ from core.models import ToolResult
 _DEFAULT_SIZE = "1024x1024"
 _DEFAULT_COUNT = 1
 _MAX_COUNT = 4  # enforced by _check_safety_limits in broker; also capped here
+
+#: UUID heuristic for distinguishing a mask artifact id from inline base64 mask data.
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
+)
 
 
 async def _call_edit_provider(
@@ -377,9 +383,12 @@ class ImageGenConnector:
                 edit_summary=edit_summary,
                 created_by="image_gen_connector",
             )
-        except ValueError as exc:
+        except Exception as exc:
+            # create_version can raise ValueError (not found / TOCTOU delete), RuntimeError
+            # (version contention retry exhaustion), or DB errors. None of these may
+            # propagate into the broker/SSE stream — degrade honestly.
             return ToolResult(
-                data={"status": "error", "reason": f"version creation failed: {exc}"},
+                data={"status": "error", "reason": f"version creation failed: {type(exc).__name__}"},
                 summary=f"Image editing failed to save version: {exc}",
             )
 
@@ -418,10 +427,7 @@ class ImageGenConnector:
             Decoded mask bytes, or None if resolution fails.
         """
         import base64
-        import re
 
-        # Heuristic: UUIDs contain only hex digits and hyphens, have 4 hyphens.
-        _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
         if _UUID_RE.match(mask_raw.strip()):
             from core.artifacts import get_artifact, read_artifact_content
             meta = await get_artifact(mask_raw.strip())

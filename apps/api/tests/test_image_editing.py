@@ -334,3 +334,75 @@ def test_image_edit_in_all_tool_sets():
 def test_image_edit_broker_name_conversion():
     from runtime.tool_registry import to_broker_name
     assert to_broker_name("image__edit") == "image.edit"
+
+
+# ---------------------------------------------------------------------------
+# Test 8: _resolve_mask — all four branches
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_resolve_mask_same_org_artifact_returns_bytes(monkeypatch):
+    """A UUID mask pointing to a same-org artifact resolves to its bytes."""
+    from connectors.image_gen import image_gen_connector
+    org = _unique_org()
+    mask_id = await _make_source_artifact(org)  # any same-org image artifact
+    result = await image_gen_connector._resolve_mask(mask_id, org)
+    assert result == _FAKE_PNG
+
+
+@pytest.mark.asyncio
+async def test_resolve_mask_cross_org_artifact_ignored(monkeypatch):
+    """A UUID mask pointing to a DIFFERENT org's artifact is silently ignored (None)."""
+    from connectors.image_gen import image_gen_connector
+    org_a = _unique_org()
+    org_b = _unique_org()
+    mask_id = await _make_source_artifact(org_a)
+    # Requester is org_b — must not read org_a's artifact bytes.
+    result = await image_gen_connector._resolve_mask(mask_id, org_b)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_mask_valid_base64_decodes():
+    """A valid base64 mask string decodes to its raw bytes."""
+    import base64
+    from connectors.image_gen import image_gen_connector
+    raw = b"mask-pixels"
+    encoded = base64.b64encode(raw).decode()
+    result = await image_gen_connector._resolve_mask(encoded, "any-org")
+    assert result == raw
+
+
+@pytest.mark.asyncio
+async def test_resolve_mask_malformed_base64_returns_none():
+    """A malformed mask string degrades to None rather than raising."""
+    from connectors.image_gen import image_gen_connector
+    result = await image_gen_connector._resolve_mask("!!! not base64 @@@ %%%", "any-org")
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_image_edit_version_failure_degrades_honestly(monkeypatch):
+    """If create_version raises (e.g. contention/DB error), image.edit returns an
+    honest error ToolResult rather than propagating the exception."""
+    org = _unique_org()
+    agent = _make_agent(org_id=org)
+    _patch_broker_infra(monkeypatch)
+    _force_image_model(monkeypatch)
+    _stub_edit_provider(monkeypatch, [_EDITED_PNG])
+    source_id = await _make_source_artifact(org)
+
+    import connectors.image_gen as ig
+
+    async def boom_create_version(*a, **k):
+        raise RuntimeError("artifact version contention: exceeded retry attempts")
+
+    monkeypatch.setattr(ig, "create_version", boom_create_version, raising=False)
+    # create_version is imported inside _execute_edit; patch at its source module too.
+    import core.artifact_versions as av
+    monkeypatch.setattr(av, "create_version", boom_create_version)
+
+    from core.tool_broker import tool_broker
+    result = await tool_broker.execute(agent, "image.edit", {"artifact_id": source_id, "prompt": "blue"})
+    assert result.data["status"] == "error"
+    assert "version" in result.data.get("reason", "").lower()
