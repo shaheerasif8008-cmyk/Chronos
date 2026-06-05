@@ -271,58 +271,106 @@ def test_degraded_fallback_contains_truthful_note():
 # ── 6. Cross-org: foreign org artifact must not be embedded ──────────────────
 
 
+def _patch_artifact_store(monkeypatch, store: dict[str, tuple[dict, bytes]]):
+    """Patch the chat router's module-global artifact accessors with a fixture store.
+
+    ``store`` maps artifact_id -> (metadata dict, raw bytes). This drives the REAL
+    ``_build_vision_blocks`` helper rather than re-implementing its filter inline.
+    """
+    import routers.chat as chat_router
+
+    async def fake_get(att_id):
+        entry = store.get(att_id)
+        return entry[0] if entry else None
+
+    async def fake_read(att_id):
+        entry = store.get(att_id)
+        return entry[1] if entry else b""
+
+    monkeypatch.setattr(chat_router, "_get_artifact", fake_get)
+    monkeypatch.setattr(chat_router, "_read_artifact_content", fake_read)
+
+
 @pytest.mark.asyncio
 async def test_cross_org_image_not_embedded(monkeypatch):
-    """An image artifact belonging to a different org must not produce image blocks.
+    """An image artifact from a different org must not produce image blocks.
 
-    We simulate this by patching _get_artifact to return a different org_id and
-    verifying the chat-router code rejects it.
-
-    This test exercises the actual org-filter logic inside the chat router's
-    vision assembly block (the same filter that guards all attachment reads).
+    Drives the real ``_build_vision_blocks`` helper (the actual router guard) — not an
+    inline re-implementation — so deleting the org filter would fail this test.
     """
-    # Import what we need to test the filtering logic directly
-    from core.context import _IMAGE_MIMES, build_image_block
+    import routers.chat as chat_router
 
-    # Simulate the router's guard logic inline:
-    #   if str(_meta.get("organization_id")) != str(member_org_id): skip
     member_org = "org-alpha"
-    foreign_org = "org-beta"
-
-    # Artifact from foreign org
-    foreign_meta = {
-        "organization_id": foreign_org,
-        "mime_type": "image/png",
-        "kind": "attachment",
+    store = {
+        "foreign": ({"organization_id": "org-beta", "mime_type": "image/png", "kind": "attachment"}, b"\x89PNG-foreign"),
     }
+    _patch_artifact_store(monkeypatch, store)
 
-    image_blocks: list[dict] = []
-    # Router logic: check org before adding
-    if str(foreign_meta.get("organization_id")) == str(member_org):
-        mime = str(foreign_meta.get("mime_type") or "")
-        if mime in _IMAGE_MIMES:
-            image_blocks.append(build_image_block(b"fakedata", mime))
-
+    image_blocks, has_images = await chat_router._build_vision_blocks(
+        ["foreign"], member_org, "gpt-5.4-mini"
+    )
     assert image_blocks == [], "Foreign-org image must not produce image blocks"
+    assert has_images is False, "Foreign-org image must not even count as a present image"
 
 
 @pytest.mark.asyncio
-async def test_same_org_image_is_embedded():
-    """An image from the same org is embedded."""
-    from core.context import _IMAGE_MIMES, build_image_block
+async def test_same_org_image_is_embedded(monkeypatch):
+    """An image from the same org, with a vision model, is embedded via the real helper."""
+    import routers.chat as chat_router
 
     member_org = "org-alpha"
-    own_meta = {
-        "organization_id": member_org,
-        "mime_type": "image/png",
-        "kind": "attachment",
+    store = {
+        "own": ({"organization_id": member_org, "mime_type": "image/png", "kind": "attachment"}, b"\x89PNG-own-bytes"),
     }
+    _patch_artifact_store(monkeypatch, store)
 
-    image_blocks: list[dict] = []
-    if str(own_meta.get("organization_id")) == str(member_org):
-        mime = str(own_meta.get("mime_type") or "")
-        if mime in _IMAGE_MIMES:
-            image_blocks.append(build_image_block(b"fakedata", mime))
-
+    image_blocks, has_images = await chat_router._build_vision_blocks(
+        ["own"], member_org, "gpt-5.4-mini"
+    )
+    assert has_images is True
     assert len(image_blocks) == 1
     assert image_blocks[0]["type"] == "image_url"
+    # The data URL must encode the real stored bytes.
+    import base64
+    data_url = image_blocks[0]["image_url"]["url"]
+    b64 = data_url.split(",", 1)[1]
+    assert base64.b64decode(b64) == b"\x89PNG-own-bytes"
+
+
+@pytest.mark.asyncio
+async def test_non_vision_model_has_images_but_no_blocks(monkeypatch):
+    """A non-vision model with a same-org image: has_images True, but no blocks built
+    (so the router takes the honest OCR degraded path)."""
+    import routers.chat as chat_router
+
+    member_org = "org-alpha"
+    store = {
+        "own": ({"organization_id": member_org, "mime_type": "image/png", "kind": "attachment"}, b"img"),
+    }
+    _patch_artifact_store(monkeypatch, store)
+
+    image_blocks, has_images = await chat_router._build_vision_blocks(
+        ["own"], member_org, "deepseek-v4-pro"
+    )
+    assert has_images is True
+    assert image_blocks == []
+
+
+@pytest.mark.asyncio
+async def test_oversized_image_skipped_from_vision_blocks(monkeypatch):
+    """An image exceeding the per-image byte cap is not embedded (avoids provider
+    body-limit failures), though it still counts as a present image."""
+    import routers.chat as chat_router
+
+    member_org = "org-alpha"
+    big = b"x" * (chat_router._MAX_IMAGE_BYTES_VISION + 1)
+    store = {
+        "big": ({"organization_id": member_org, "mime_type": "image/png", "kind": "attachment"}, big),
+    }
+    _patch_artifact_store(monkeypatch, store)
+
+    image_blocks, has_images = await chat_router._build_vision_blocks(
+        ["big"], member_org, "gpt-5.4-mini"
+    )
+    assert has_images is True
+    assert image_blocks == [], "Oversized image must be skipped from inline vision blocks"

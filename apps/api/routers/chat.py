@@ -516,6 +516,43 @@ async def _agent_loop_stream(
     yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
 
+#: Per-image byte cap for inline base64 vision blocks. base64 inflates bytes ~33%,
+#: and providers bound the request body (OpenAI ~20MB), so a 25MB upload would blow
+#: the limit and fail opaquely at the provider. 5MB/image keeps us well inside it.
+_MAX_IMAGE_BYTES_VISION = 5 * 1024 * 1024
+
+
+async def _build_vision_blocks(
+    attachment_ids: list[str], org_id: str, model_id: str
+) -> tuple[list[dict], bool]:
+    """Resolve org-owned image attachments into vision content blocks.
+
+    Returns ``(image_blocks, has_images)`` where ``has_images`` is True if any
+    org-owned image attachment was present (even when no block was built — e.g. the
+    model lacks vision, or an image exceeded the size cap), so callers can choose the
+    honest degraded path. Cross-org or missing artifacts are skipped (tenant boundary).
+    Oversized images are skipped rather than embedded to avoid provider body-limit
+    failures. ``_get_artifact``/``_read_artifact_content`` are module globals so tests
+    can inject fixtures.
+    """
+    image_blocks: list[dict] = []
+    has_images = False
+    supports_vision = model_supports_vision(model_id)
+    for att_id in attachment_ids:
+        meta = await _get_artifact(att_id)
+        if not meta or str(meta.get("organization_id")) != str(org_id):
+            continue  # cross-org or missing — skip (security)
+        mime = str(meta.get("mime_type") or "")
+        if mime not in _IMAGE_MIMES:
+            continue
+        has_images = True
+        if supports_vision:
+            raw_bytes = await _read_artifact_content(att_id) or b""
+            if raw_bytes and len(raw_bytes) <= _MAX_IMAGE_BYTES_VISION:
+                image_blocks.append(build_image_block(raw_bytes, mime))
+    return image_blocks, has_images
+
+
 @router.post("/message")
 async def send_message(req: ChatRequest, member: Member = Depends(get_current_member)) -> StreamingResponse:
     from fastapi import HTTPException
@@ -602,48 +639,6 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
     if _attachment_ids_raw:
         attachments_context = await _parse_attachments(_attachment_ids_raw, conversation_id, member.organization_id)
 
-    # ── Vision / multimodal user-turn assembly ──────────────────────────────
-    # Collect image blocks for attachments that belong to this org and have an
-    # image mime type.  Done here (not inside stream_chat_turn) so the org filter
-    # is co-located with the existing artifact resolution logic above.
-    _image_blocks: list[dict] = []
-    _has_images = False
-    for _att_id in _attachment_ids_raw:
-        _meta = await _get_artifact(_att_id)
-        if not _meta or str(_meta.get("organization_id")) != str(member.organization_id):
-            continue  # cross-org or missing — skip (security)
-        mime = str(_meta.get("mime_type") or "")
-        if mime not in _IMAGE_MIMES:
-            continue
-        _has_images = True
-        if model_supports_vision(selected_model):
-            raw_bytes = await _read_artifact_content(_att_id) or b""
-            if raw_bytes:
-                _image_blocks.append(build_image_block(raw_bytes, mime))
-
-    _vision_active = model_supports_vision(selected_model) and bool(_image_blocks)
-
-    # Degraded path: gather OCR preview text from already-parsed image attachments
-    # so the model actually receives the extracted content.  This makes the
-    # "vision unavailable — used OCR text extraction" note truthful (not just stated).
-    _ocr_text: str | None = None
-    if _has_images and not _vision_active and attachments_context:
-        _ocr_parts = [
-            f"[Image: {entry.get('filename') or 'attachment'}]\n{entry['preview']}"
-            for entry in attachments_context
-            if entry.get("preview")
-        ]
-        if _ocr_parts:
-            _ocr_text = "\n\n".join(_ocr_parts)
-
-    _user_content = build_user_turn_content(
-        req.message,
-        _image_blocks,
-        vision_available=_vision_active,
-        ocr_text=_ocr_text,
-        ocr_note=_VISION_UNAVAILABLE_NOTE if (_has_images and not _vision_active) else None,
-    )
-
     # classify_intent and assemble_context are independent, and both the task and
     # chat branches need the assembled context — so run them concurrently to overlap
     # their LLM round-trips instead of paying for them in series. Obviously
@@ -688,11 +683,36 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
         async for event in gen:
             yield f"data: {json.dumps(event)}\n\n"
 
-    # Pass user_content only when it differs from the plain message string so
-    # the non-vision path remains byte-for-byte identical to before.
-    _user_content_kwarg: dict = {}
-    if _user_content is not req.message:
-        _user_content_kwarg = {"user_content": _user_content}
+    # ── Vision / multimodal user-turn assembly (chat path only) ──────────────
+    # Resolved here, after the task-mode return, so this org-scoped artifact I/O and
+    # base64 work runs only for the chat path that actually consumes it. The helper
+    # enforces the tenant boundary and the per-image size cap.
+    _image_blocks, _has_images = await _build_vision_blocks(
+        _attachment_ids_raw, member.organization_id, selected_model
+    )
+    _vision_active = bool(_image_blocks)
+
+    # Degraded path: embed OCR-extracted text from already-parsed image attachments so
+    # the model actually receives the image content. The honest "vision unavailable"
+    # note is only attached when extracted text exists — otherwise the note would
+    # overclaim (an image with no extractable text would carry a false promise).
+    _ocr_text: str | None = None
+    if _has_images and not _vision_active and attachments_context:
+        _ocr_parts = [
+            f"[Image: {entry.get('filename') or 'attachment'}]\n{entry['preview']}"
+            for entry in attachments_context
+            if entry.get("preview")
+        ]
+        if _ocr_parts:
+            _ocr_text = "\n\n".join(_ocr_parts)
+
+    _user_content = build_user_turn_content(
+        req.message,
+        _image_blocks,
+        vision_available=_vision_active,
+        ocr_text=_ocr_text,
+        ocr_note=_VISION_UNAVAILABLE_NOTE if (_has_images and not _vision_active and _ocr_text) else None,
+    )
 
     return StreamingResponse(
         _sse_wrap(
@@ -703,7 +723,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
                 requester_context=requester_context,
                 model=selected_model,
                 mode=req.mode,
-                **_user_content_kwarg,
+                user_content=_user_content,
             )
         ),
         media_type="text/event-stream",

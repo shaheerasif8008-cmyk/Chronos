@@ -2501,15 +2501,18 @@ function AttachmentChip({ artifact }: { artifact: ArtifactRef }) {
 
   useEffect(() => {
     if (!isImage) return;
+    let cancelled = false;
     let objectUrl: string | null = null;
     apiFetch(`/artifacts/${artifact.id}/content`)
       .then(r => r.blob())
       .then(blob => {
+        if (cancelled) return;  // unmounted/re-ran before fetch resolved
         objectUrl = URL.createObjectURL(blob);
         setThumbUrl(objectUrl);
       })
       .catch(() => { /* silently fall back to chip */ });
     return () => {
+      cancelled = true;
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps

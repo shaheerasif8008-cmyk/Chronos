@@ -1202,7 +1202,7 @@ async def stream_chat_turn(
     model: str | None,
     mode: str | None = None,
     emit_conversation: bool = True,
-    user_content: Any | None = None,
+    user_content: str | list[dict] | None = None,
 ):
     """Stream one chat turn inline.
 
