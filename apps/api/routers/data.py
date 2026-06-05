@@ -272,7 +272,7 @@ async def analyze_dataset(
     dataset = await _require_dataset(member, dataset_id)
 
     agent = AgentContext(
-        id=f"member:{member.id}",
+        id=str(uuid.uuid4()),
         org_id=member.organization_id,
         member_id=str(member.id),
     )
@@ -282,7 +282,7 @@ async def analyze_dataset(
     result = await tool_broker.execute(
         agent,
         "data.run",
-        {"dataset_id": dataset["id"], "code": req.code},
+        {"dataset_id": str(dataset["id"]), "code": req.code},
     )
 
     await audit.log(

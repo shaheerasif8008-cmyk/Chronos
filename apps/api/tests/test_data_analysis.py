@@ -197,6 +197,12 @@ async def test_dataset_create_http():
     assert row is not None
     assert row["row_count"] == 3
 
+    # Assert schema round-trips through JSONB (not just the in-memory response).
+    schema_in_db = row["schema"]
+    assert isinstance(schema_in_db, dict), f"Schema in DB is not a dict: {type(schema_in_db)}"
+    db_col_names = [c["name"] for c in schema_in_db["columns"]]
+    assert "name" in db_col_names, f"'name' column not persisted in JSONB; got: {db_col_names}"
+
 
 # ---------------------------------------------------------------------------
 # Test 3 — Analyze → produces chart + report artifacts
@@ -411,16 +417,6 @@ async def test_cross_org_http_get_404():
     """GET /datasets/{id} from a different org returns 404."""
     from httpx import AsyncClient, ASGITransport
 
-    # Create org A with a dataset.
-    org_a_id, _, _ = await _make_org_and_member()
-    artifact_id = await _save_csv_artifact(org_a_id)
-
-    async with AsyncClient(transport=ASGITransport(app=main.app), base_url="http://test") as client:
-        _, member_a_id, token_a = await _make_org_and_member()
-        # Re-create org A's member with org_a_id
-        pass
-
-    # Simpler: create org A and B cleanly.
     org_a_id2, member_a_id2, token_a2 = await _make_org_and_member()
     org_b_id, member_b_id, token_b = await _make_org_and_member()
 
@@ -442,6 +438,71 @@ async def test_cross_org_http_get_404():
             headers={"Authorization": f"Bearer {token_b}"},
         )
         assert resp_b.status_code == 404, f"Expected 404 for cross-org GET, got {resp_b.status_code}"
+
+
+# ---------------------------------------------------------------------------
+# Test 7 — HTTP analyze endpoint wiring
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@_requires_db
+async def test_analyze_endpoint_http(monkeypatch):
+    """POST /datasets/{id}/analyze via HTTP returns artifact_ids and status=success."""
+    from httpx import AsyncClient, ASGITransport
+
+    org_id, member_id, token = await _make_org_and_member()
+    artifact_id = await _save_csv_artifact(org_id)
+
+    # Patch broker infra so the test DB/redis doesn't need rate-limit warmth.
+    # Note: monkeypatch on the module-level objects works with ASGI too because
+    # the router imports `tool_broker` at call time.
+    import core.tool_broker as tb
+    from unittest.mock import AsyncMock
+
+    async def fake_log(event_type, actor, action, **kw):
+        pass
+
+    async def fake_check(*a, **k):
+        return True
+
+    async def fake_tool_policy(*a, **k):
+        return {}
+
+    monkeypatch.setattr(tb.audit, "log", fake_log)
+    monkeypatch.setattr(tb.permissions, "check", fake_check)
+    monkeypatch.setattr(tb, "tool_policy", fake_tool_policy)
+    monkeypatch.setattr(tb, "connector_tier", AsyncMock(return_value="live"))
+
+    analysis_code = (
+        "import pandas as pd\n"
+        "df = pd.read_csv('data.csv')\n"
+        "print(df.head().to_string())\n"
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=main.app), base_url="http://test", follow_redirects=True) as client:
+        # Create dataset.
+        resp = await client.post(
+            "/datasets/",
+            json={"source_artifact_id": artifact_id},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200, resp.text
+        dataset_id = resp.json()["id"]
+
+        # Run analysis.
+        resp2 = await client.post(
+            f"/datasets/{dataset_id}/analyze",
+            json={"code": analysis_code},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    assert resp2.status_code == 200, resp2.text
+    body2 = resp2.json()
+    assert body2["status"] == "success", f"Expected success, got: {body2}"
+    # Should have at least a report artifact (stdout is non-empty).
+    assert len(body2["artifact_ids"]) >= 1, f"Expected at least 1 artifact; got: {body2['artifact_ids']}"
+    assert "stdout_preview" in body2
 
 
 # ---------------------------------------------------------------------------

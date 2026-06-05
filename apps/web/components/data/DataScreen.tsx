@@ -42,10 +42,12 @@ async function uploadCsvFile(file: File): Promise<string> {
   const token = getToken();
   const headers: Record<string, string> = {};
   if (token) headers["Authorization"] = `Bearer ${token}`;
-  const res = await fetch(`${apiBase()}/attachments/upload`, { method: "POST", body: form, headers });
+  // POST /attachments (no trailing slash — route is mounted at "")
+  const res = await fetch(`${apiBase()}/attachments`, { method: "POST", body: form, headers });
   if (!res.ok) throw new Error(await res.text());
   const data = await res.json();
-  return data.artifact_id as string;
+  // Response key is attachment_id (same UUID as the artifact)
+  return (data.attachment_id ?? data.artifact_id) as string;
 }
 
 async function createDataset(artifactId: string, name?: string): Promise<Dataset> {
