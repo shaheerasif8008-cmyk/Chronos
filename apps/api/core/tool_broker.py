@@ -255,6 +255,10 @@ async def _route(agent: AgentContext, tool: str, args: dict, vault_ref: str, tie
         from parsing.tool import doc_connector
         return await doc_connector.execute(tool, routed_args)
 
+    if provider == "voice":
+        from connectors.voice import voice_connector
+        return await voice_connector.execute(tool, routed_args)
+
     if provider == "mcp":
         from connectors.mcp_client import mcp_connector
         return await mcp_connector.execute(tool, routed_args, agent)
@@ -326,7 +330,7 @@ class ToolBroker:
         # when external OAuth or browser dependencies are not configured.
         provider = tool.split(".")[0]
         tier = await connector_tier(provider)
-        if tier == "live" and provider not in {"browser", "fs", "code", "doc", "image"}:
+        if tier == "live" and provider not in {"browser", "fs", "code", "doc", "image", "voice"}:
             from connectors.registry import get as registry_get
 
             connector = await registry_get(agent, tool)

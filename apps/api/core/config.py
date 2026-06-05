@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     fast_model: str = "openrouter/minimax/minimax-m2.5:free"
     vision_model: str = ""   # vision-capable model for OCR; empty disables OCR
     image_model: str = ""   # image generation model; empty disables image generation
+    stt_model: str = ""    # speech-to-text model; empty disables STT
+    tts_model: str = ""    # text-to-speech model; empty disables TTS
     local_llm_timeout_seconds: float = 2.0
     memory_retrieve_timeout_seconds: float = 1.5
     task_runner_max_concurrency: int = 4

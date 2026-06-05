@@ -260,6 +260,59 @@ IMAGE_EDIT = _fn(
     ["artifact_id", "prompt"],
 )
 
+# ── Voice (STT / TTS) ─────────────────────────────────────────────────────────
+
+VOICE_TRANSCRIBE = _fn(
+    "voice__transcribe",
+    "Transcribe an uploaded audio file to text (speech-to-text). "
+    "Pass the artifact_id of an uploaded audio attachment. "
+    "Returns the transcript text and a persistent transcript artifact. "
+    "Use when the user uploads a voice memo, meeting recording, or any audio they want transcribed.",
+    {
+        "artifact_id": {
+            "type": "string",
+            "description": "Artifact id of the uploaded audio file to transcribe.",
+        },
+        "audio_b64": {
+            "type": "string",
+            "description": "Alternative to artifact_id: raw audio encoded as base64.",
+        },
+        "mime_type": {
+            "type": "string",
+            "description": "MIME type of the audio (e.g. 'audio/mpeg', 'audio/webm'). "
+                           "Required only when using audio_b64.",
+        },
+        "conversation_id": {
+            "type": "string",
+            "description": "Conversation id to link the transcript artifact to (optional).",
+        },
+    },
+    [],
+)
+
+VOICE_SPEAK = _fn(
+    "voice__speak",
+    "Convert text to speech and return an audio artifact the user can play. "
+    "Use when the user requests an audio version of a response, a reading of text, "
+    "or any synthesised narration.",
+    {
+        "text": {
+            "type": "string",
+            "description": "Text to convert to speech.",
+        },
+        "voice": {
+            "type": "string",
+            "description": "Voice identifier (e.g. 'alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer'). "
+                           "Default: 'alloy'.",
+        },
+        "conversation_id": {
+            "type": "string",
+            "description": "Conversation id to link the audio artifact to (optional).",
+        },
+    },
+    ["text"],
+)
+
 # ── Sub-agent ─────────────────────────────────────────────────────────────────
 
 SPAWN_SUBAGENT = _fn(
@@ -318,6 +371,8 @@ ALL_TOOLS: list[dict[str, Any]] = [
     DOC_COMPARE,
     IMAGE_GENERATE,
     IMAGE_EDIT,
+    VOICE_TRANSCRIBE,
+    VOICE_SPEAK,
     SPAWN_SUBAGENT,
 ]
 
@@ -336,6 +391,8 @@ SUBAGENT_TOOLS: list[dict[str, Any]] = [
     DOC_COMPARE,
     IMAGE_GENERATE,
     IMAGE_EDIT,
+    VOICE_TRANSCRIBE,
+    VOICE_SPEAK,
 ]
 
 #: Names that always need explicit human approval before execution.
@@ -363,6 +420,8 @@ INLINE_CHAT_TOOLS: list[dict[str, Any]] = [
     DOC_COMPARE,
     IMAGE_GENERATE,
     IMAGE_EDIT,
+    VOICE_TRANSCRIBE,
+    VOICE_SPEAK,
     START_TASK,
 ]
 
