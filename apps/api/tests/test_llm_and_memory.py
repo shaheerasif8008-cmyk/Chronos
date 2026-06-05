@@ -484,6 +484,20 @@ async def test_code_connector_runs_restricted_python(tmp_path, monkeypatch):
             {"code": "import socket\nprint('no')", "__org_id": "default", "__task_id": "task-1"},
         )
 
+    # Dynamic-import bypasses must be rejected too (they evade the static blocklist).
+    bypass_snippets = [
+        "import importlib\nprint('no')",
+        "import importlib\nimportlib.import_module('socket')",
+        "import builtins\nbuiltins.__import__('subprocess')",
+        "from builtins import __import__\n__import__('socket')",
+    ]
+    for snippet in bypass_snippets:
+        with pytest.raises(ValueError, match="unsafe"):
+            await code_connector_module.code_connector.execute(
+                "code.python",
+                {"code": snippet, "__org_id": "default", "__task_id": "task-1"},
+            )
+
 
 @pytest.mark.asyncio
 async def test_mcp_discovery_uses_real_stdio_protocol(tmp_path):
