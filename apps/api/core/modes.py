@@ -44,9 +44,9 @@ _MODE_METADATA: tuple[dict, ...] = (
     {
         "id": "browser",
         "label": "Browser",
-        "description": "Uses browser search and fetch tools; full browser operation is not yet available.",
-        "capabilities": ["web_search", "fetch", "screenshots"],
-        "status": "foundation",
+        "description": "Runs persistent governed browser sessions with navigation, form actions, screenshots, takeover, and revocation.",
+        "capabilities": ["web_search", "fetch", "navigate", "click", "type", "screenshots", "takeover"],
+        "status": "available",
         "creates_task": True,
     },
     {

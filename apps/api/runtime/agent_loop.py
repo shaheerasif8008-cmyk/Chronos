@@ -25,6 +25,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import litellm
@@ -75,6 +76,7 @@ _UNTRUSTED_WRITE_NAMES = {
     "gmail__send",
     "fs__write",
 }
+_TASK_WORKSPACE_ROOT = Path("/tmp/chronos_task_workspaces")
 
 # Strong references to fire-and-forget background tasks so they are not
 # garbage-collected mid-flight; failures are logged rather than lost.
@@ -784,10 +786,8 @@ async def _maybe_create_artifact(task: dict[str, Any], args: dict[str, Any]) -> 
     kind, mime = mapping
     if not isinstance(file_content, str):
         try:
-            from connectors.filesystem import WORKSPACE_ROOT, _jailed_path
-
-            root = (WORKSPACE_ROOT / str(task.get("organization_id") or "default") / str(task["id"])).resolve()
-            candidate = _jailed_path(root, path)
+            root = (_TASK_WORKSPACE_ROOT / str(task.get("organization_id") or "default") / str(task["id"])).resolve()
+            candidate = _jailed_task_path(root, path)
             if not candidate.is_file():
                 return None
             file_content = candidate.read_text(encoding="utf-8", errors="replace")
@@ -819,6 +819,16 @@ async def _maybe_create_artifact(task: dict[str, Any], args: dict[str, Any]) -> 
         "mime_type": mime,
         "size_bytes": len(file_content.encode("utf-8")),
     }
+
+
+def _jailed_task_path(root: Path, requested: str) -> Path:
+    relative = requested.strip().lstrip("/")
+    if not relative or relative in {".", ".."}:
+        return root
+    path = (root / relative).resolve()
+    if root != path and root not in path.parents:
+        raise ValueError("Path escapes the task workspace")
+    return path
 
 
 async def _run_subagent(

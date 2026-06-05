@@ -118,10 +118,28 @@ class BrowserAdapter:
         id="browser",
         name="Browser",
         provider="browser",
-        description="Search, fetch, and extract structured page data through an isolated Playwright browser context.",
+        description="Search, fetch, and operate persistent isolated browser sessions with screenshots, downloads, and takeover.",
         type="native",
         auth_type="none",
-        scopes=["browser.search", "browser.fetch", "browser.extract_contacts"],
+        scopes=[
+            "browser.search",
+            "browser.fetch",
+            "browser.extract_contacts",
+            "browser.navigate",
+            "browser.click",
+            "browser.type",
+            "browser.select",
+            "browser.scroll",
+            "browser.wait",
+            "browser.extract",
+            "browser.screenshot",
+            "browser.download",
+            "browser.upload",
+            "browser.read_dom",
+            "browser.get_state",
+            "browser.close",
+            "browser.request_takeover",
+        ],
         actions=[
             ConnectorActionDef(
                 name="search",
@@ -171,6 +189,33 @@ class BrowserAdapter:
                 risk_level="read",
                 approval_required=False,
             ),
+            *[
+                ConnectorActionDef(
+                    name=name,
+                    description=description,
+                    parameters_schema={"type": "object", "properties": properties, "required": required},
+                    output_schema={"type": "object"},
+                    required_permissions=[f"browser.{name}"],
+                    risk_level=risk,
+                    approval_required=approval_required,
+                )
+                for name, description, properties, required, risk, approval_required in [
+                    ("navigate", "Open a URL in a persistent browser session.", {"url": {"type": "string"}, "session_id": {"type": "string"}, "consent": {"type": "object"}}, ["url"], "read", False),
+                    ("click", "Click a selector in a persistent browser session.", {"session_id": {"type": "string"}, "selector": {"type": "string"}}, ["session_id", "selector"], "write", False),
+                    ("type", "Type text into a selector in a persistent browser session.", {"session_id": {"type": "string"}, "selector": {"type": "string"}, "text": {"type": "string"}}, ["session_id", "selector", "text"], "write", False),
+                    ("select", "Select an option in a persistent browser session.", {"session_id": {"type": "string"}, "selector": {"type": "string"}, "value": {"type": "string"}}, ["session_id", "selector", "value"], "write", False),
+                    ("scroll", "Scroll a persistent browser session.", {"session_id": {"type": "string"}, "x": {"type": "integer"}, "y": {"type": "integer"}}, ["session_id"], "read", False),
+                    ("wait", "Wait for selector or timeout in a persistent browser session.", {"session_id": {"type": "string"}, "selector": {"type": "string"}, "milliseconds": {"type": "integer"}}, ["session_id"], "read", False),
+                    ("extract", "Extract visible text from a selector.", {"session_id": {"type": "string"}, "selector": {"type": "string"}}, ["session_id"], "read", False),
+                    ("screenshot", "Capture the current browser viewport.", {"session_id": {"type": "string"}}, ["session_id"], "read", False),
+                    ("download", "Click a selector and record the resulting download.", {"session_id": {"type": "string"}, "selector": {"type": "string"}}, ["session_id", "selector"], "write", False),
+                    ("upload", "Upload a task-accessible file through a file input selector.", {"session_id": {"type": "string"}, "selector": {"type": "string"}, "path": {"type": "string"}}, ["session_id", "selector", "path"], "write", True),
+                    ("read_dom", "Read DOM HTML from a selector.", {"session_id": {"type": "string"}, "selector": {"type": "string"}}, ["session_id"], "read", False),
+                    ("get_state", "Return current browser session state.", {"session_id": {"type": "string"}}, ["session_id"], "read", False),
+                    ("close", "Close a browser session.", {"session_id": {"type": "string"}}, ["session_id"], "write", False),
+                    ("request_takeover", "Pause automation and ask the user to take over.", {"session_id": {"type": "string"}, "reason": {"type": "string"}}, ["session_id", "reason"], "write", False),
+                ]
+            ],
         ],
     )
 
@@ -178,11 +223,14 @@ class BrowserAdapter:
         return self.connector.actions
 
     async def execute(self, action_name: str, args: dict[str, Any], context: dict[str, Any]) -> ConnectorResult:
-        from connectors.browser import browser_connector
-
         tool = f"browser.{action_name}"
         try:
-            result = await browser_connector.execute(tool, dict(args))
+            if action_name in {"search", "fetch", "extract_contacts"}:
+                from connectors.browser import browser_connector
+                result = await browser_connector.execute(tool, dict(args))
+            else:
+                from connectors.browser_operator import browser_operator
+                result = await browser_operator.execute(tool, dict(args))
         except ValueError as exc:
             return ConnectorResult(status="validation_error", error=str(exc))
         return ConnectorResult(status="success", output={"summary": result.summary, "data": result.data})

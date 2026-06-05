@@ -65,6 +65,48 @@ BROWSER_EXTRACT_CONTACTS = _fn(
     ["url"],
 )
 
+BROWSER_NAVIGATE = _fn(
+    "browser__navigate",
+    "Open a URL in a persistent isolated browser session. Requires session consent and per-task approval for sensitive sites.",
+    {
+        "url": {"type": "string", "description": "URL to open."},
+        "session_id": {"type": "string", "description": "Existing browser session id. Omit to create one.", "default": ""},
+        "consent": {"type": "object", "description": "Session purpose and allowed_domains when creating a session.", "default": {}},
+    },
+    ["url"],
+)
+
+BROWSER_CLICK = _fn("browser__click", "Click a selector in a persistent browser session.", {"session_id": {"type": "string"}, "selector": {"type": "string"}}, ["session_id", "selector"])
+BROWSER_TYPE = _fn("browser__type", "Type text into a selector in a persistent browser session.", {"session_id": {"type": "string"}, "selector": {"type": "string"}, "text": {"type": "string"}}, ["session_id", "selector", "text"])
+BROWSER_SELECT = _fn("browser__select", "Select an option in a persistent browser session.", {"session_id": {"type": "string"}, "selector": {"type": "string"}, "value": {"type": "string"}}, ["session_id", "selector", "value"])
+BROWSER_SCROLL = _fn("browser__scroll", "Scroll a persistent browser session.", {"session_id": {"type": "string"}, "x": {"type": "integer", "default": 0}, "y": {"type": "integer", "default": 700}}, ["session_id"])
+BROWSER_WAIT = _fn("browser__wait", "Wait for a selector or timeout in a persistent browser session.", {"session_id": {"type": "string"}, "selector": {"type": "string", "default": ""}, "milliseconds": {"type": "integer", "default": 1000}}, ["session_id"])
+BROWSER_EXTRACT = _fn("browser__extract", "Extract visible text from a selector and mark it as untrusted browser content.", {"session_id": {"type": "string"}, "selector": {"type": "string", "default": "body"}}, ["session_id"])
+BROWSER_SCREENSHOT = _fn("browser__screenshot", "Capture the current browser viewport and persist it on the session.", {"session_id": {"type": "string"}}, ["session_id"])
+BROWSER_DOWNLOAD = _fn("browser__download", "Click a selector and record the resulting browser download.", {"session_id": {"type": "string"}, "selector": {"type": "string"}}, ["session_id", "selector"])
+BROWSER_UPLOAD = _fn("browser__upload", "Upload a task-accessible file through a file input selector.", {"session_id": {"type": "string"}, "selector": {"type": "string"}, "path": {"type": "string"}}, ["session_id", "selector", "path"])
+BROWSER_READ_DOM = _fn("browser__read_dom", "Read DOM HTML from a selector and mark it as untrusted browser content.", {"session_id": {"type": "string"}, "selector": {"type": "string", "default": "body"}}, ["session_id"])
+BROWSER_GET_STATE = _fn("browser__get_state", "Return current URL, screenshot, takeover, download, and consent state for a browser session.", {"session_id": {"type": "string"}}, ["session_id"])
+BROWSER_CLOSE = _fn("browser__close", "Close a persistent browser session.", {"session_id": {"type": "string"}}, ["session_id"])
+BROWSER_REQUEST_TAKEOVER = _fn("browser__request_takeover", "Pause automation and request user takeover for MFA, CAPTCHA, or manual input.", {"session_id": {"type": "string"}, "reason": {"type": "string"}}, ["session_id", "reason"])
+
+BROWSER_OPERATOR_TOOLS = [
+    BROWSER_NAVIGATE,
+    BROWSER_CLICK,
+    BROWSER_TYPE,
+    BROWSER_SELECT,
+    BROWSER_SCROLL,
+    BROWSER_WAIT,
+    BROWSER_EXTRACT,
+    BROWSER_SCREENSHOT,
+    BROWSER_DOWNLOAD,
+    BROWSER_UPLOAD,
+    BROWSER_READ_DOM,
+    BROWSER_GET_STATE,
+    BROWSER_CLOSE,
+    BROWSER_REQUEST_TAKEOVER,
+]
+
 # ── Gmail ─────────────────────────────────────────────────────────────────────
 
 GMAIL_DRAFT = _fn(
@@ -224,6 +266,7 @@ ALL_TOOLS: list[dict[str, Any]] = [
     BROWSER_SEARCH,
     BROWSER_FETCH,
     BROWSER_EXTRACT_CONTACTS,
+    *BROWSER_OPERATOR_TOOLS,
     GMAIL_DRAFT,
     GMAIL_SEARCH,
     FS_LIST,
@@ -240,6 +283,7 @@ SUBAGENT_TOOLS: list[dict[str, Any]] = [
     BROWSER_SEARCH,
     BROWSER_FETCH,
     BROWSER_EXTRACT_CONTACTS,
+    *BROWSER_OPERATOR_TOOLS,
     FS_LIST,
     FS_READ,
     FS_WRITE,
@@ -261,6 +305,7 @@ INLINE_CHAT_TOOLS: list[dict[str, Any]] = [
     BROWSER_SEARCH,
     BROWSER_FETCH,
     BROWSER_EXTRACT_CONTACTS,
+    *BROWSER_OPERATOR_TOOLS,
     GMAIL_DRAFT,
     GMAIL_SEARCH,
     FS_LIST,

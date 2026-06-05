@@ -224,8 +224,11 @@ async def _route(agent: AgentContext, tool: str, args: dict, vault_ref: str, tie
         return await gmail_connector.execute(tool, routed_args, vault_ref)
 
     if provider == "browser":
-        from connectors.browser import browser_connector
-        return await browser_connector.execute(tool, routed_args)
+        if tool in {"browser.search", "browser.fetch", "browser.extract_contacts"}:
+            from connectors.browser import browser_connector
+            return await browser_connector.execute(tool, routed_args)
+        from connectors.browser_operator import browser_operator
+        return await browser_operator.execute(tool, routed_args)
 
     if provider == "fs":
         from connectors.filesystem import filesystem_connector
