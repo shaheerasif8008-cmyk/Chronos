@@ -193,6 +193,67 @@ CODE_PYTHON = _fn(
     ["code"],
 )
 
+# ── Cloud and local computer ──────────────────────────────────────────────────
+
+COMPUTER_CREATE_SESSION = _fn(
+    "computer__create_session",
+    "Create a durable cloud computer workspace for a task, with sandboxed filesystem and terminal state.",
+    {"purpose": {"type": "string", "description": "Why this computer session is needed.", "default": "computer task"}},
+    [],
+)
+
+COMPUTER_EXEC = _fn(
+    "computer__exec",
+    "Run a shell command inside the sandboxed cloud computer workspace. Commands are audited, timed out, and resource-limited.",
+    {
+        "session_id": {"type": "string", "description": "Cloud computer session id. Omit to create one.", "default": ""},
+        "command": {"type": "string", "description": "Shell command to run inside the workspace."},
+        "timeout_seconds": {"type": "integer", "description": "Timeout in seconds, capped at 30.", "default": 10},
+    },
+    ["command"],
+)
+
+COMPUTER_LIST_FILES = _fn("computer__list_files", "List files in a cloud computer workspace.", {"session_id": {"type": "string"}, "path": {"type": "string", "default": "."}}, ["session_id"])
+COMPUTER_READ_FILE = _fn("computer__read_file", "Read a UTF-8 file from a cloud computer workspace.", {"session_id": {"type": "string"}, "path": {"type": "string"}}, ["session_id", "path"])
+COMPUTER_WRITE_FILE = _fn("computer__write_file", "Write a UTF-8 file inside a cloud computer workspace.", {"session_id": {"type": "string"}, "path": {"type": "string"}, "content": {"type": "string"}}, ["session_id", "path", "content"])
+COMPUTER_INSTALL_PACKAGE = _fn(
+    "computer__install_package",
+    "Install a package inside the cloud computer workspace using pip or npm. The command is audited and resource-limited.",
+    {
+        "session_id": {"type": "string"},
+        "manager": {"type": "string", "enum": ["pip", "npm"], "default": "pip"},
+        "package": {"type": "string"},
+        "timeout_seconds": {"type": "integer", "default": 30},
+    },
+    ["session_id", "package"],
+)
+COMPUTER_SCREENSHOT = _fn("computer__screenshot", "Capture the cloud computer desktop screenshot, or return a truthful degraded state if no desktop runtime is attached.", {"session_id": {"type": "string"}}, ["session_id"])
+COMPUTER_EXPORT_ARTIFACT = _fn("computer__export_artifact", "Export a file or directory from a cloud computer workspace as a durable artifact.", {"session_id": {"type": "string"}, "path": {"type": "string"}, "title": {"type": "string", "default": ""}, "kind": {"type": "string", "default": "file"}, "mime_type": {"type": "string", "default": "application/octet-stream"}}, ["session_id", "path"])
+
+LOCAL_COMPUTER_GRANT = _fn("local_computer__grant", "Authorize a local folder for this task's desktop bridge actions.", {"folder_path": {"type": "string"}, "purpose": {"type": "string", "default": "local computer task"}}, ["folder_path"])
+LOCAL_COMPUTER_LIST_FILES = _fn("local_computer__list_files", "List files inside an authorized local folder grant.", {"grant_id": {"type": "string"}, "path": {"type": "string", "default": "."}}, ["grant_id"])
+LOCAL_COMPUTER_READ_FILE = _fn("local_computer__read_file", "Read a file inside an authorized local folder grant.", {"grant_id": {"type": "string"}, "path": {"type": "string"}}, ["grant_id", "path"])
+LOCAL_COMPUTER_EXEC = _fn("local_computer__exec", "Run an approved shell command inside an authorized local folder. Requires a human approval record.", {"grant_id": {"type": "string"}, "command": {"type": "string"}, "timeout_seconds": {"type": "integer", "default": 10}}, ["grant_id", "command"])
+LOCAL_COMPUTER_OPEN_APP = _fn("local_computer__open_app", "Request opening a local app through the desktop bridge. Requires a human approval record.", {"grant_id": {"type": "string"}, "app": {"type": "string"}}, ["grant_id", "app"])
+LOCAL_COMPUTER_REVOKE = _fn("local_computer__revoke", "Revoke an authorized local folder grant.", {"grant_id": {"type": "string"}}, ["grant_id"])
+
+COMPUTER_TOOLS = [
+    COMPUTER_CREATE_SESSION,
+    COMPUTER_EXEC,
+    COMPUTER_LIST_FILES,
+    COMPUTER_READ_FILE,
+    COMPUTER_WRITE_FILE,
+    COMPUTER_INSTALL_PACKAGE,
+    COMPUTER_SCREENSHOT,
+    COMPUTER_EXPORT_ARTIFACT,
+    LOCAL_COMPUTER_GRANT,
+    LOCAL_COMPUTER_LIST_FILES,
+    LOCAL_COMPUTER_READ_FILE,
+    LOCAL_COMPUTER_EXEC,
+    LOCAL_COMPUTER_OPEN_APP,
+    LOCAL_COMPUTER_REVOKE,
+]
+
 # ── Repo workspace ────────────────────────────────────────────────────────────
 
 REPO_OPEN_FIXTURE = _fn(
@@ -507,6 +568,7 @@ ALL_TOOLS: list[dict[str, Any]] = [
     FS_READ,
     FS_WRITE,
     CODE_PYTHON,
+    *COMPUTER_TOOLS,
     *REPO_WORKSPACE_TOOLS,
     DOC_PARSE,
     DOC_READ,
@@ -530,6 +592,7 @@ SUBAGENT_TOOLS: list[dict[str, Any]] = [
     FS_READ,
     FS_WRITE,
     CODE_PYTHON,
+    *COMPUTER_TOOLS,
     *REPO_WORKSPACE_TOOLS,
     DOC_PARSE,
     DOC_READ,
@@ -544,7 +607,7 @@ SUBAGENT_TOOLS: list[dict[str, Any]] = [
 
 #: Names that always need explicit human approval before execution.
 ALWAYS_APPROVAL_TOOL_NAMES: frozenset[str] = frozenset(
-    {"gmail__send", "twitter__post", "linkedin__post", "website__publish"}
+    {"gmail__send", "twitter__post", "linkedin__post", "website__publish", "local_computer__exec", "local_computer__open_app"}
 )
 
 _SUBAGENT_TOOL_NAME = "spawn__subagent"
@@ -562,6 +625,7 @@ INLINE_CHAT_TOOLS: list[dict[str, Any]] = [
     FS_READ,
     FS_WRITE,
     CODE_PYTHON,
+    *COMPUTER_TOOLS,
     DOC_PARSE,
     DOC_READ,
     DOC_SUMMARIZE,

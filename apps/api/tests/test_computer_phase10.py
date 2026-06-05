@@ -1,4 +1,5 @@
 import pytest
+from uuid import uuid4
 
 
 def _agent(org_id: str = "org-1"):
@@ -46,7 +47,7 @@ async def test_cloud_computer_runs_in_sandbox_enforces_timeout_and_exports_artif
     from core import tool_broker
     from core.artifacts import read_artifact_content
 
-    agent = _agent()
+    agent = _agent(f"org-cloud-{uuid4()}")
     created = await tool_broker.execute(
         agent,
         "computer.create_session",
@@ -71,7 +72,7 @@ async def test_cloud_computer_runs_in_sandbox_enforces_timeout_and_exports_artif
     )
     assert ran.data["status"] == "success"
     assert ran.data["stdout"] == "ready"
-    assert ran.data["workspace"].startswith("/tmp/chronos_computers/")
+    assert f"/chronos_computers/{agent.org_id}/" in ran.data["workspace"]
 
     timed_out = await tool_broker.execute(
         agent,
@@ -104,7 +105,7 @@ async def test_local_computer_bridge_blocks_unauthorized_folder_and_runs_approve
     from core import tool_broker
     from core.exceptions import ApprovalRequired
 
-    agent = _agent()
+    agent = _agent(f"org-local-{uuid4()}")
     authorized = tmp_path / "authorized"
     authorized.mkdir()
     (authorized / "input.txt").write_text("local data", encoding="utf-8")
