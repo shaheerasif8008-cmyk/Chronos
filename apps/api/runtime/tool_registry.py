@@ -193,6 +193,78 @@ CODE_PYTHON = _fn(
     ["code"],
 )
 
+# ── Repo workspace ────────────────────────────────────────────────────────────
+
+REPO_OPEN_FIXTURE = _fn(
+    "repo__open_fixture",
+    "Open a bundled fixture repository inside the current task workspace. "
+    "This is the supported repo-workspace MVP: no arbitrary clone or host access.",
+    {
+        "name": {"type": "string", "description": "Fixture repo name. Default: python_bug.", "default": "python_bug"},
+        "repo_path": {"type": "string", "description": "Workspace-relative destination path. Default: repos/<name>.", "default": ""},
+    },
+    [],
+)
+
+REPO_CREATE_BRANCH = _fn(
+    "repo__create_branch",
+    "Create or reset a branch in the current task repo workspace.",
+    {
+        "branch": {"type": "string", "description": "Branch name, for example fix/bug."},
+        "repo_path": {"type": "string", "description": "Workspace-relative repo path. Default: repos/python_bug.", "default": "repos/python_bug"},
+    },
+    ["branch"],
+)
+
+REPO_READ_FILE = _fn(
+    "repo__read_file",
+    "Read a UTF-8 source file from the current task repo workspace.",
+    {
+        "path": {"type": "string", "description": "Repo-relative file path."},
+        "repo_path": {"type": "string", "description": "Workspace-relative repo path. Default: repos/python_bug.", "default": "repos/python_bug"},
+    },
+    ["path"],
+)
+
+REPO_WRITE_FILE = _fn(
+    "repo__write_file",
+    "Write or overwrite a UTF-8 source file in the current task repo workspace.",
+    {
+        "path": {"type": "string", "description": "Repo-relative file path."},
+        "content": {"type": "string", "description": "Full replacement file content."},
+        "repo_path": {"type": "string", "description": "Workspace-relative repo path. Default: repos/python_bug.", "default": "repos/python_bug"},
+    },
+    ["path", "content"],
+)
+
+REPO_RUN_TESTS = _fn(
+    "repo__run_tests",
+    "Run the constrained repo test loop: pytest -q, without shell access.",
+    {
+        "repo_path": {"type": "string", "description": "Workspace-relative repo path. Default: repos/python_bug.", "default": "repos/python_bug"},
+        "timeout_seconds": {"type": "integer", "description": "Max runtime, capped at 30 seconds.", "default": 20},
+    },
+    [],
+)
+
+REPO_DIFF = _fn(
+    "repo__diff",
+    "Return git diff for the current task repo workspace.",
+    {
+        "repo_path": {"type": "string", "description": "Workspace-relative repo path. Default: repos/python_bug.", "default": "repos/python_bug"},
+    },
+    [],
+)
+
+REPO_WORKSPACE_TOOLS = [
+    REPO_OPEN_FIXTURE,
+    REPO_CREATE_BRANCH,
+    REPO_READ_FILE,
+    REPO_WRITE_FILE,
+    REPO_RUN_TESTS,
+    REPO_DIFF,
+]
+
 # ── Documents ─────────────────────────────────────────────────────────────────
 
 DOC_PARSE = _fn(
@@ -435,6 +507,7 @@ ALL_TOOLS: list[dict[str, Any]] = [
     FS_READ,
     FS_WRITE,
     CODE_PYTHON,
+    *REPO_WORKSPACE_TOOLS,
     DOC_PARSE,
     DOC_READ,
     DOC_SUMMARIZE,
@@ -457,6 +530,7 @@ SUBAGENT_TOOLS: list[dict[str, Any]] = [
     FS_READ,
     FS_WRITE,
     CODE_PYTHON,
+    *REPO_WORKSPACE_TOOLS,
     DOC_PARSE,
     DOC_READ,
     DOC_SUMMARIZE,

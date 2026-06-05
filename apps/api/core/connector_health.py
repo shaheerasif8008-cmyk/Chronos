@@ -77,6 +77,12 @@ async def check_connectors(*, refresh: bool = False) -> ConnectorHealth:
             "reason": "Restricted Python subprocess execution is available with timeout and resource limits.",
             "setup": None,
         },
+        "repo": {
+            "status": "live",
+            "tier": "live",
+            "reason": "Bundled fixture repo workspaces are available with branch, file, pytest, and diff tools inside the task workspace jail.",
+            "setup": None,
+        },
         "mcp": {
             "status": "available",
             "tier": "live",

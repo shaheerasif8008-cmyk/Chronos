@@ -5,12 +5,11 @@ import os
 import re
 import resource
 import sys
-from pathlib import Path
 from typing import Any
 
 from core.models import ToolResult
+from core.workspace import task_workspace_root_from_args
 
-WORKSPACE_ROOT = Path("/tmp/chronos_task_workspaces")
 MAX_CODE_BYTES = 64_000
 MAX_OUTPUT_BYTES = 64_000
 DEFAULT_TIMEOUT_SECONDS = 5
@@ -25,14 +24,6 @@ FORBIDDEN_PATTERNS = [
     r"\bopen\s*\(\s*['\"]/",
     r"\bos\.(system|popen|spawn|exec)",
 ]
-
-
-def _workspace_root(args: dict[str, Any]) -> Path:
-    org_id = str(args.pop("__org_id", "default") or "default")
-    task_id = str(args.pop("__task_id", "manual") or "manual")
-    root = (WORKSPACE_ROOT / org_id / task_id).resolve()
-    root.mkdir(parents=True, exist_ok=True)
-    return root
 
 
 def _set_limits() -> None:
@@ -63,7 +54,7 @@ class CodeConnector:
         return await self._python(args)
 
     async def _python(self, args: dict[str, Any]) -> ToolResult:
-        root = _workspace_root(args)
+        root = task_workspace_root_from_args(args)
         code = str(args.get("code") or "")
         timeout_seconds = min(int(args.get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS), 10)
         _validate_code(code)

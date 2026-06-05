@@ -39,7 +39,7 @@ from core.models import AgentContext
 from core.redis import redis_client
 from core.task_envelope import build_task_envelope, envelope_to_agent_prompt
 from core.tool_manifest import generate_tool_manifest
-from core.workspace import WORKSPACE_ROOT, jailed_path
+from core.workspace import jailed_path, task_workspace_root
 from runtime.tool_registry import (
     ALL_TOOLS,
     ALWAYS_APPROVAL_TOOL_NAMES,
@@ -787,7 +787,7 @@ async def _maybe_create_artifact(task: dict[str, Any], args: dict[str, Any]) -> 
     kind, mime = mapping
     if not isinstance(file_content, str):
         try:
-            root = (WORKSPACE_ROOT / str(task.get("organization_id") or "default") / str(task["id"])).resolve()
+            root = task_workspace_root(str(task.get("organization_id") or "default"), str(task["id"]))
             candidate = jailed_path(root, path)
             if not candidate.is_file():
                 return None

@@ -488,7 +488,7 @@ async def test_task_scratchpad_memory_is_returned_before_long_term(monkeypatch):
 async def test_filesystem_connector_jails_task_workspace(tmp_path, monkeypatch):
     from connectors import filesystem
 
-    monkeypatch.setattr(filesystem, "WORKSPACE_ROOT", tmp_path)
+    monkeypatch.setattr("core.workspace.WORKSPACE_ROOT", tmp_path)
 
     write = await filesystem.filesystem_connector.execute(
         "fs.write",
@@ -513,7 +513,7 @@ async def test_filesystem_connector_jails_task_workspace(tmp_path, monkeypatch):
 async def test_code_connector_runs_restricted_python(tmp_path, monkeypatch):
     from connectors import code as code_connector_module
 
-    monkeypatch.setattr(code_connector_module, "WORKSPACE_ROOT", tmp_path)
+    monkeypatch.setattr("core.workspace.WORKSPACE_ROOT", tmp_path)
 
     result = await code_connector_module.code_connector.execute(
         "code.python",
@@ -541,6 +541,34 @@ async def test_code_connector_runs_restricted_python(tmp_path, monkeypatch):
                 "code.python",
                 {"code": snippet, "__org_id": "default", "__task_id": "task-1"},
             )
+
+
+@pytest.mark.asyncio
+async def test_task_workspace_root_is_shared_by_fs_code_and_doc_tools(tmp_path, monkeypatch):
+    from connectors import code as code_connector_module
+    from connectors import filesystem
+    from parsing import tool as doc_tool
+
+    monkeypatch.setattr("core.workspace.WORKSPACE_ROOT", tmp_path)
+    scope = {"__org_id": "default", "__task_id": "task-1"}
+
+    await filesystem.filesystem_connector.execute(
+        "fs.write",
+        {"path": "notes/shared.txt", "content": "shared workspace file", **scope},
+    )
+
+    code_result = await code_connector_module.code_connector.execute(
+        "code.python",
+        {"code": "from pathlib import Path\nprint(Path('notes/shared.txt').read_text())", **scope},
+    )
+    assert code_result.data["status"] == "success"
+    assert code_result.data["stdout"].strip() == "shared workspace file"
+
+    doc_result = await doc_tool.doc_connector.execute(
+        "doc.parse",
+        {"path": "notes/shared.txt", **scope},
+    )
+    assert "shared workspace file" in doc_result.data["preview"]
 
 
 @pytest.mark.asyncio

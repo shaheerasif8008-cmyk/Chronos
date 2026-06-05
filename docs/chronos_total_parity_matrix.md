@@ -149,10 +149,10 @@ Chronos already has foundations for chat, tool use, governed execution, scoped m
 
 | Capability | Target parity | Current state | Implementation area | Interface and persistence | Acceptance proof |
 |---|---|---|---|---|---|
-| Repo workspace | Clone/import repos, create branch, inspect/edit/test/diff. | Missing as productized coding agent. | Coding runtime, GitHub connector, cloud/local computer. | Repo workspace, branch, diff, command logs. | Clone fixture repo, edit, run tests, show diff. |
+| Repo workspace | Clone/import repos, create branch, inspect/edit/test/diff. | Partial MVP: broker-visible `repo.*` task-workspace tools open a bundled fixture repo, initialize git, create a branch, read/write jailed repo files, run constrained `pytest -q` without shell access, and return git diff. Arbitrary remote clone/GitHub PR work remains future scope. | Coding runtime, GitHub connector, cloud/local computer. | Repo workspace path, branch, test stdout/stderr/status, diff. | `tests/test_repo_workspace.py`: open fixture repo, branch, inspect/edit, red test, patch, green rerun, diff. |
 | Commit/PR flow | Commit and open PR under approval/policy. | Missing. | GitHub connector, broker, approvals. | Commit SHA, PR URL, approval chain. | Approved PR creation records URL and audit. |
 | Code review | Review PR/issues with inline findings and suggested patches. | Missing. | Coding agent, GitHub connector, UI. | Review artifact/comments. | Review fixture PR and produce actionable findings. |
-| Test/debug loop | Run tests, inspect failures, patch, rerun, summarize. | Partial via `code.python` only; repo command loop missing. | Computer/coding tools. | Test command records and result artifacts. | Failing fixture test fixed with green rerun. |
+| Test/debug loop | Run tests, inspect failures, patch, rerun, summarize. | Partial MVP: repo fixture loop now supports fixed no-shell pytest execution with captured stdout/stderr/status plus diff after patch. General command loops and long-running sandbox consoles remain future scope. | Computer/coding tools. | Test command status/stdout/stderr and diff. | `tests/test_repo_workspace.py`: failing fixture test fixed with green rerun. |
 
 ## Scheduled Work, Workflows, and Agents
 

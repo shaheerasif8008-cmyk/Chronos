@@ -14,12 +14,11 @@ from parsing.engine import ParsedDocument, parse_document
 
 
 def _workspace_file(args: dict[str, Any], rel: str) -> bytes:
-    from core.workspace import WORKSPACE_ROOT, jailed_path
+    from core.workspace import jailed_path, task_workspace_root
 
     org_id = str(args.get("__org_id", "default") or "default")
     task_id = str(args.get("__task_id", "manual") or "manual")
-    root = (WORKSPACE_ROOT / org_id / task_id).resolve()
-    root.mkdir(parents=True, exist_ok=True)
+    root = task_workspace_root(org_id, task_id)
     path = jailed_path(root, rel)
     if not path.is_file():
         raise FileNotFoundError(rel)
