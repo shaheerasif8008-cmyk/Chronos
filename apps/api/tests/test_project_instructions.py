@@ -454,7 +454,8 @@ async def test_send_message_pushes_req_project_id_into_requester_context(monkeyp
     class FakeReq:
         message = "hi"
         conversation_id = None
-        model = None
+        model = "gpt-5.4-mini"
+        reasoning_effort = None
         mode = None
         persona_id = None
         workspace_id = None
@@ -514,7 +515,8 @@ async def test_send_message_hydrates_project_id_from_existing_conversation(monke
     class FakeReq:
         message = "hi"
         conversation_id = "conv-existing-1"
-        model = None
+        model = "gpt-5.4-mini"
+        reasoning_effort = None
         mode = None
         persona_id = None
         workspace_id = None
@@ -643,7 +645,8 @@ async def test_send_message_raises_422_when_project_id_mismatches_conversation(m
     class FakeReq:
         message = "hi"
         conversation_id = "conv-existing-1"
-        model = None
+        model = "gpt-5.4-mini"
+        reasoning_effort = None
         mode = None
         persona_id = None
         workspace_id = None
@@ -705,7 +708,8 @@ async def test_send_message_skips_hydration_when_no_conversation_id(monkeypatch)
     class FakeReq:
         message = "hi"
         conversation_id = None   # no existing conversation
-        model = None
+        model = "gpt-5.4-mini"
+        reasoning_effort = None
         mode = None
         persona_id = None
         workspace_id = None

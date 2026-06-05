@@ -36,6 +36,13 @@ _MANAGE_ACTIONS = {
     "remove_project_member",
 }
 
+# Deciding an approval (approving/rejecting a risky write) is the core enterprise
+# governance gate. It is enforced deterministically by role — independent of
+# OpenFGA — so the guarantee "an unauthorized user cannot approve" holds even
+# when no policy engine is configured. Only these roles may decide.
+_APPROVAL_DECISION_ACTIONS = {"decide_approval"}
+_APPROVER_ROLES = {"admin", "owner", "approver"}
+
 # Actors that represent the system itself, not a human — they bypass FGA.
 _INTERNAL_ACTOR_IDS = {"chronos", "source_sync", "system", "scheduler"}
 _INTERNAL_ROLES = {"agent", "system"}
@@ -62,6 +69,23 @@ async def check(actor: Member, action: str, resource: str) -> bool:
     and the authorization model denies the action (or OpenFGA is unreachable —
     enforcement fails closed).
     """
+    # Approval decisions: deny non-privileged human actors up front, always on.
+    if (
+        action in _APPROVAL_DECISION_ACTIONS
+        and not _is_internal(actor)
+        and actor.role not in _APPROVER_ROLES
+    ):
+        await audit.log(
+            "permission_check",
+            actor.id,
+            action,
+            organization_id=actor.organization_id,
+            resource_type="approval",
+            resource_id=resource,
+            decision="denied",
+        )
+        raise PermissionDenied(actor.id, action, resource)
+
     relation = _relation_for(action)
     enforce = authz.is_enabled() and relation is not None and not _is_internal(actor)
 

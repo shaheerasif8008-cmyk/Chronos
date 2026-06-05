@@ -1,0 +1,165 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend-tests:
+    name: Backend (migrate + pytest)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        # pgvector image: the schema uses VECTOR columns + ivfflat indexes.
+        image: pgvector/pgvector:pg15
+        env:
+          POSTGRES_DB: chronos
+          POSTGRES_USER: chronos
+          POSTGRES_PASSWORD: chronos
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U chronos"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+asyncpg://chronos:chronos@localhost:5432/chronos
+      REDIS_URL: redis://localhost:6379/0
+      # Deterministic 64-hex test key (no real secret).
+      VAULT_ENCRYPTION_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      # Force the local object-storage fallback (no MinIO service in CI).
+      MINIO_ENDPOINT: "localhost:1"
+    defaults:
+      run:
+        working-directory: apps/api
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: apps/api/requirements.txt
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Migrate to head
+        # Also guards the migration chain: a too-long revision id (>VARCHAR(32))
+        # would fail here on a clean DB.
+        run: alembic upgrade head
+      - name: Run tests
+        run: pytest -q
+
+  web-build:
+    name: Web (typecheck + build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - run: npm ci
+      - run: npm run build
+
+  e2e-static:
+    name: Web E2E (static route guards)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - run: npm ci
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+      - name: Run static specs
+        # Self-contained route/source guards (read source files; no live API or
+        # model key). Scoped to *-static specs so server-dependent specs are
+        # excluded from this job.
+        run: npx playwright test --config e2e/static.config.ts e2e/*-static.spec.ts
+
+  # Behavioral E2E (chat/research/etc.) drives the real API + a live model and
+  # needs provider secrets + the dual-server harness. It runs only when a model
+  # key is configured as a repo secret, so default CI stays green without secrets.
+  e2e-behavioral:
+    name: Web E2E (behavioral, gated on secret)
+    runs-on: ubuntu-latest
+    if: ${{ secrets.OPENROUTER_API_KEY != '' }}
+    services:
+      postgres:
+        image: pgvector/pgvector:pg15
+        env:
+          POSTGRES_DB: chronos
+          POSTGRES_USER: chronos
+          POSTGRES_PASSWORD: chronos
+        ports: ["55433:5432"]
+        options: >-
+          --health-cmd "pg_isready -U chronos"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      E2E_DATABASE_URL: postgresql+asyncpg://chronos:chronos@localhost:55433/chronos
+      E2E_REDIS_URL: redis://localhost:6379/3
+      VAULT_ENCRYPTION_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      MINIO_ENDPOINT: "localhost:1"
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - name: Install API deps into apps/api/.venv
+        working-directory: apps/api
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -r requirements.txt
+          # Live browser operator (Phase 9) needs the Chromium runtime in the API venv.
+          .venv/bin/python -m playwright install --with-deps chromium
+      - name: Migrate test DB
+        working-directory: apps/api
+        env:
+          DATABASE_URL: ${{ env.E2E_DATABASE_URL }}
+        run: .venv/bin/alembic upgrade head
+      - name: Web deps + Playwright
+        working-directory: apps/web
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: Run behavioral specs
+        working-directory: apps/web
+        run: npx playwright test

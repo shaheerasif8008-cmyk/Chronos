@@ -177,7 +177,7 @@ async def test_agent_loop_uses_model_decisions_and_broker_checkpoint(monkeypatch
     async def fake_persist(task_arg, content, **kwargs):
         return None
 
-    async def fake_llm_step(messages, tools, model=None):
+    async def fake_llm_step(messages, tools, model=None, *, reasoning_effort=None):
         assert tools
         decision = decisions.pop(0)
         if decision["type"] == "tool_call":
@@ -239,7 +239,7 @@ async def test_agent_loop_pauses_and_checkpoints_on_approval(monkeypatch):
     async def fake_emit(task_id, event, actor_id="chronos"):
         return None
 
-    async def fake_llm_step(messages, tools, model=None):
+    async def fake_llm_step(messages, tools, model=None, *, reasoning_effort=None):
         return None, [
             {
                 "id": "call-1",
