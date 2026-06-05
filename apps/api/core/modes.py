@@ -68,9 +68,9 @@ _MODE_METADATA: tuple[dict, ...] = (
     {
         "id": "image",
         "label": "Image",
-        "description": "Reserved for image understanding and generation workflows.",
-        "capabilities": [],
-        "status": "unavailable",
+        "description": "Generate images from text descriptions. Results appear as image artifacts in the chat.",
+        "capabilities": ["image_generate", "artifacts"],
+        "status": "foundation",
         "creates_task": False,
     },
     {

@@ -679,6 +679,60 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
             headers=_SSE_HEADERS,
         )
 
+    # ── Image generation mode ─────────────────────────────────────────────────
+    # When the user explicitly selects Image mode, route directly through the
+    # tool broker to image.generate and surface the resulting artifact(s) in the
+    # chat.  No LLM turn is needed — the message IS the generation prompt.
+    # The honest degraded state (no provider configured) is returned by the
+    # connector itself and streamed back as an assistant message, not an error.
+    from core.modes import normalize_mode as _normalize_mode
+    if _normalize_mode(req.mode) == "image":
+        async def _image_mode_stream():
+            from core.models import AgentContext
+
+            agent = AgentContext(
+                id=member.id,
+                org_id=member.organization_id,
+                task_id=None,
+                member_id=member.id,
+                workspace_id=req.workspace_id,
+            )
+            from core.tool_broker import tool_broker as _tb
+
+            result = await _tb.execute(
+                agent,
+                "image.generate",
+                {"prompt": req.message},
+            )
+
+            if result.data.get("status") == "success":
+                artifact_ids: list[str] = result.data.get("artifact_ids") or []
+                assistant_text = result.summary
+                for art_id in artifact_ids:
+                    meta = await _get_artifact(art_id)
+                    if meta:
+                        yield f"data: {json.dumps({'type': 'artifact', 'artifact': {'artifact_id': art_id, 'title': meta.get('title') or 'Generated image', 'kind': 'image', 'mime_type': meta.get('mime_type') or 'image/png', 'size_bytes': meta.get('size_bytes')}})}\n\n"
+                await _save_message(
+                    conversation_id, "assistant", assistant_text,
+                    mode="image",
+                    artifact_refs=[
+                        {"id": aid, "kind": "image", "mime_type": "image/png"}
+                        for aid in artifact_ids
+                    ],
+                )
+            else:
+                # Honest degraded or error: surface the summary as an assistant message.
+                assistant_text = result.summary
+                await _save_message(conversation_id, "assistant", assistant_text, mode="image")
+
+            yield f"data: {json.dumps({'type': 'conversation', 'conversation_id': conversation_id})}\n\n"
+            chunk_size = 40
+            for i in range(0, len(assistant_text), chunk_size):
+                yield f"data: {json.dumps({'type': 'token', 'content': assistant_text[i:i + chunk_size]})}\n\n"
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+        return StreamingResponse(_image_mode_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
+
     async def _sse_wrap(gen):
         async for event in gen:
             yield f"data: {json.dumps(event)}\n\n"

@@ -201,6 +201,36 @@ DOC_COMPARE = _fn(
     ["artifact_id_a", "artifact_id_b"],
 )
 
+# ── Image generation ──────────────────────────────────────────────────────────
+
+IMAGE_GENERATE = _fn(
+    "image__generate",
+    "Generate one or more images from a text description. "
+    "Returns image artifacts that render inline in the chat. "
+    "Use for illustrations, diagrams, mockups, or any visual output the user requests.",
+    {
+        "prompt": {
+            "type": "string",
+            "description": "Detailed text description of the image(s) to generate.",
+        },
+        "size": {
+            "type": "string",
+            "description": "Image dimensions (e.g. '1024x1024', '512x512'). Default: '1024x1024'.",
+            "default": "1024x1024",
+        },
+        "count": {
+            "type": "integer",
+            "description": "Number of images to generate (1–4). Default: 1.",
+            "default": 1,
+        },
+        "style": {
+            "type": "string",
+            "description": "Optional style hint (e.g. 'photorealistic', 'illustration', 'sketch').",
+        },
+    },
+    ["prompt"],
+)
+
 # ── Sub-agent ─────────────────────────────────────────────────────────────────
 
 SPAWN_SUBAGENT = _fn(
@@ -257,6 +287,7 @@ ALL_TOOLS: list[dict[str, Any]] = [
     DOC_READ,
     DOC_SUMMARIZE,
     DOC_COMPARE,
+    IMAGE_GENERATE,
     SPAWN_SUBAGENT,
 ]
 
@@ -273,6 +304,7 @@ SUBAGENT_TOOLS: list[dict[str, Any]] = [
     DOC_READ,
     DOC_SUMMARIZE,
     DOC_COMPARE,
+    IMAGE_GENERATE,
 ]
 
 #: Names that always need explicit human approval before execution.
@@ -298,6 +330,7 @@ INLINE_CHAT_TOOLS: list[dict[str, Any]] = [
     DOC_READ,
     DOC_SUMMARIZE,
     DOC_COMPARE,
+    IMAGE_GENERATE,
     START_TASK,
 ]
 
