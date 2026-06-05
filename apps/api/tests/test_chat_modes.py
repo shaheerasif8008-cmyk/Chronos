@@ -69,7 +69,19 @@ def test_available_modes_expose_productized_metadata():
     assert by_id["voice"]["status"] == "unavailable"
 
 
-def test_model_kwargs_threads_reasoning_effort():
+def test_model_kwargs_threads_reasoning_effort_for_supported_providers():
+    from core.llm import model_kwargs
+
+    kwargs = model_kwargs(
+        "openai/gpt-5.4-mini",
+        messages=[{"role": "user", "content": "hi"}],
+        reasoning_effort="High",
+    )
+
+    assert kwargs["reasoning_effort"] == "high"
+
+
+def test_model_kwargs_drops_reasoning_effort_for_openrouter():
     from core.llm import model_kwargs
 
     kwargs = model_kwargs(
@@ -78,7 +90,7 @@ def test_model_kwargs_threads_reasoning_effort():
         reasoning_effort="High",
     )
 
-    assert kwargs["reasoning_effort"] == "high"
+    assert "reasoning_effort" not in kwargs
 
 
 def test_model_kwargs_rejects_unknown_reasoning_effort():

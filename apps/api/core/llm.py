@@ -8,6 +8,8 @@ from typing import Any
 import asyncio
 import litellm
 
+litellm.drop_params = True
+
 from core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -152,9 +154,18 @@ def normalize_reasoning_effort(reasoning_effort: str | None) -> str | None:
     return normalized
 
 
+def model_accepts_reasoning_effort(model: str | None) -> bool:
+    if not model:
+        return False
+    # OpenRouter rejects reasoning_effort for at least some routed models; sending
+    # it breaks otherwise valid chat/task turns. Keep the UI setting as a no-op
+    # for routed providers rather than failing the whole task.
+    return not model.startswith("openrouter/")
+
+
 def apply_reasoning_effort(kwargs: dict[str, Any], reasoning_effort: str | None) -> dict[str, Any]:
     normalized = normalize_reasoning_effort(reasoning_effort)
-    if normalized:
+    if normalized and model_accepts_reasoning_effort(str(kwargs.get("model") or "")):
         kwargs["reasoning_effort"] = normalized
     return kwargs
 

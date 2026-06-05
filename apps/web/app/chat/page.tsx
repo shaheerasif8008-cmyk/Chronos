@@ -328,6 +328,27 @@ function taskLiveMessage(task: Task): Message | null {
   };
 }
 
+function taskIsTerminal(task: Task | null | undefined): boolean {
+  return task?.status === "complete" || task?.status === "failed" || task?.status === "cancelled";
+}
+
+function messageIdentity(message: Message): string | null {
+  if (message.id) return message.id;
+  return null;
+}
+
+function dedupeMessages(messages: Message[]): Message[] {
+  const out: Message[] = [];
+  const seen = new Set<string>();
+  for (const message of messages) {
+    const identity = messageIdentity(message);
+    if (identity && seen.has(identity)) continue;
+    if (identity) seen.add(identity);
+    out.push(message);
+  }
+  return out;
+}
+
 function taskAnswer(task: Task | null, event?: TaskStreamEvent): string {
   const eventResult = event?.result;
   if (eventResult && typeof eventResult === "object" && "answer" in eventResult) {
@@ -1376,10 +1397,13 @@ function ChatScreen({
     });
 
     const hasAssistant = normalized.some(m => m.role === "assistant" && m.content.trim());
+    const shouldShowTaskFallback = !!latestTask && (
+      !taskIsTerminal(latestTask) || !hasAssistant
+    );
     if (!hasAssistant && opts?.streamedContent?.trim()) {
       normalized.push({ role: "assistant", content: opts.streamedContent.trim(), status: "complete" });
     }
-    if (!hasAssistant && !opts?.streamedContent?.trim() && latestTask) {
+    if (shouldShowTaskFallback && !hasAssistant && !opts?.streamedContent?.trim() && latestTask) {
       const liveMessage = taskLiveMessage(latestTask);
       if (liveMessage) normalized.push(liveMessage);
     }
@@ -1389,17 +1413,21 @@ function ChatScreen({
       // Preserve a just-streamed structured_response if the refreshed DB row
       // doesn't have one yet (avoids cards vanishing on a resync that wins a race).
       const prevById = new Map(prev.filter(m => m.id).map(m => [m.id!, m]));
-      return normalized.map(message => {
+      const merged = normalized.map(message => {
         if (!message.id) return message;
         const existing = prevById.get(message.id);
         return !message.structured_response && existing?.structured_response
           ? { ...message, structured_response: existing.structured_response }
           : message;
       });
+      return dedupeMessages(merged);
     });
-    if (latestTask?.id) {
+    if (latestTask?.id && shouldShowTaskFallback && !taskIsTerminal(latestTask)) {
       setActiveTaskId(latestTask.id);
       setActiveTask(latestTask);
+    } else if (latestTask?.id && taskIsTerminal(latestTask)) {
+      setActiveTaskId(null);
+      setActiveTask(null);
     }
   }, []);
 
@@ -1556,7 +1584,7 @@ function ChatScreen({
       if (last?.role === "assistant" && last.status === "streaming" && !last.content.trim()) {
         return [...prev.slice(0, -1), { ...last, ...liveMessage, id: last.id }];
       }
-      return [...prev, liveMessage];
+      return dedupeMessages([...prev, liveMessage]);
     });
   }, [activeTaskId, activeTask, activeTaskEvents]);
 
@@ -2437,7 +2465,7 @@ function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: Mes
     if (!mid || isBusy("save-memory")) return;
     startAction("save-memory");
     try {
-      await apiFetch(`/chat/conversations/${conversationId}/messages/${mid}/save-memory`, {
+      await apiFetch(`/chat/conversations/${conversationId}/messages/${mid}/save-to-memory`, {
         method: "POST",
         body: JSON.stringify({ scope: "org" }),
       });
@@ -2566,7 +2594,7 @@ function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: Mes
         aria-haspopup="menu"
         aria-expanded={open}
         aria-label="Message actions"
-        className="p-1 rounded-md opacity-0 group-hover:opacity-100 focus-visible:opacity-100 smooth hover:bg-[var(--surface-2)]"
+        className={`p-1 rounded-md opacity-100 smooth hover:bg-[var(--surface-2)] ${open ? "bg-[var(--surface-2)]" : ""}`}
         style={{ color: "var(--text-dim)" }}
         title="Message actions"
       >

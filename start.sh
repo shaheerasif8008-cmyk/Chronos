@@ -13,7 +13,7 @@ docker compose up -d
 
 echo "==> Backend (FastAPI)..."
 cd apps/api
-../.venv/bin/alembic upgrade head
+.venv/bin/alembic upgrade head
 cd ../..
 echo "  Starting uvicorn..."
 SSL_CERT_FILE="$CERT_PATH" nohup apps/api/.venv/bin/uvicorn main:app --reload --port 8000 > /tmp/backend.log 2>&1 &
