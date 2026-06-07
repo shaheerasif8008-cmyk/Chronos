@@ -1,7 +1,7 @@
 import asyncio
 from pathlib import Path
 
-from sqlalchemy import insert, select
+from sqlalchemy import insert, select, update
 
 from core.config import settings
 from core.db import engine, reflect_table
@@ -31,12 +31,12 @@ async def upsert_seed() -> None:
 
         member = (
             await conn.execute(
-                select(members.c.id).where(
+                select(members.c.id, members.c.role).where(
                     members.c.organization_id == settings.org_id,
                     members.c.email == settings.admin_email,
                 )
             )
-        ).first()
+        ).mappings().first()
         if member is None:
             await conn.execute(
                 insert(members).values(
@@ -46,6 +46,12 @@ async def upsert_seed() -> None:
                     role="admin",
                     name="Chronos Admin",
                 )
+            )
+        elif member["role"] not in {"admin", "owner"}:
+            await conn.execute(
+                update(members)
+                .where(members.c.id == member["id"])
+                .values(role="admin", region=settings.region)
             )
 
     # Seed the OpenFGA org-admin tuple for the admin member (no-op unless an
