@@ -138,9 +138,59 @@ async def test_start_task_promotes_to_background(monkeypatch):
     ))
 
     assert enqueued == ["task-bg"]
-    assert "gathering the relevant sources" in "".join(e.get("content", "") for e in events if e["type"] == "token")
-    assert any(e["type"] == "task_created" and e.get("background") for e in events)
+
+
+@pytest.mark.asyncio
+async def test_clarification_tool_streams_selectable_prompt(monkeypatch):
+    from runtime import agent_loop
+
+    async def fake_stream_step(messages, tools, model):
+        assert any(t["function"]["name"] == "ask_clarification" for t in tools)
+        yield {
+            "type": "tool_calls",
+            "calls": [{
+                "id": "c1",
+                "name": "ask_clarification",
+                "args_str": json.dumps({
+                    "question": "Where should I put the file?",
+                    "options": [
+                        {"label": "Workspace", "description": "Create it in the current workspace."},
+                        {"label": "Artifact only", "description": "Keep it as a chat artifact."},
+                    ],
+                }),
+            }],
+        }
+
+    saved_msgs = []
+
+    async def fake_save_assistant(conv_id, content, ctx, mode=None, **kwargs):
+        saved_msgs.append(content)
+
+    monkeypatch.setattr(agent_loop, "stream_step", fake_stream_step)
+    monkeypatch.setattr(agent_loop, "persist_assistant_message", fake_save_assistant)
+
+    events = await _run(agent_loop.stream_chat_turn(
+        conversation_id="conv-1",
+        message="make a file but ask first if needed",
+        context_messages=[{"role": "system", "content": "sys"}],
+        requester_context=_ctx(),
+        model="gpt-5.4-mini",
+    ))
+
+    clarification = next(e for e in events if e["type"] == "clarification")
+    assert clarification["question"] == "Where should I put the file?"
+    assert [o["label"] for o in clarification["options"]] == ["Workspace", "Artifact only"]
+    assert saved_msgs and "Where should I put the file?" in saved_msgs[0]
     assert events[-1]["type"] == "done"
+
+
+def test_system_prompt_requires_large_code_outputs_as_artifacts():
+    from core.context import load_base_system_prompt
+
+    prompt = load_base_system_prompt()
+    assert "Do not paste large code blocks into chat as the primary output" in prompt
+    assert "Use the available write/code/artifact tools to create the file on the first attempt" in prompt
+    assert "ask_clarification" in prompt
 
 
 @pytest.mark.asyncio

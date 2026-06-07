@@ -661,6 +661,31 @@ START_TASK = _fn(
     ["goal"],
 )
 
+ASK_CLARIFICATION = _fn(
+    "ask_clarification",
+    "Ask the user for one short decision before continuing. Use this instead of writing a plain yes/no question "
+    "when a missing choice materially affects the work. Provide 2-3 concrete options; the chat UI will also show "
+    "an Other option for custom instructions.",
+    {
+        "question": {"type": "string", "description": "One concise question for the user."},
+        "options": {
+            "type": "array",
+            "description": "Two or three concrete options the user can choose from.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string", "description": "Short button label."},
+                    "description": {"type": "string", "description": "One short sentence explaining the tradeoff."},
+                },
+                "required": ["label"],
+            },
+            "minItems": 2,
+            "maxItems": 3,
+        },
+    },
+    ["question", "options"],
+)
+
 # ── Registry sets ─────────────────────────────────────────────────────────────
 
 #: Full tool set available to top-level agent loops.
@@ -749,9 +774,11 @@ INLINE_CHAT_TOOLS: list[dict[str, Any]] = [
     VOICE_SPEAK,
     DATA_RUN,
     START_TASK,
+    ASK_CLARIFICATION,
 ]
 
 _START_TASK_TOOL_NAME = "start_task"
+_ASK_CLARIFICATION_TOOL_NAME = "ask_clarification"
 
 
 def to_broker_name(registry_name: str) -> str:
