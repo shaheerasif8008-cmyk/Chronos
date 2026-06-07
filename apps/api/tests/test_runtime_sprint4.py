@@ -366,8 +366,8 @@ async def test_browser_screenshot_creates_missing_minio_bucket(monkeypatch):
             calls.append(("bucket_exists", bucket))
             return False
 
-        def make_bucket(self, bucket):
-            calls.append(("make_bucket", bucket))
+        def make_bucket(self, bucket, location=None):
+            calls.append(("make_bucket", bucket, location))
 
         def put_object(self, bucket, object_name, data, length, content_type):
             calls.append(("put_object", bucket, length, content_type))
@@ -377,9 +377,13 @@ async def test_browser_screenshot_creates_missing_minio_bucket(monkeypatch):
     object_name = await browser._save_screenshot(FakePage(), "fetch")
 
     assert object_name and object_name.startswith("browser-screenshots/")
-    assert ("bucket_exists", browser.settings.minio_bucket) in calls
-    assert ("make_bucket", browser.settings.minio_bucket) in calls
-    assert ("put_object", browser.settings.minio_bucket, 3, "image/png") in calls
+    assert ("bucket_exists", browser.settings.object_storage_bucket) in calls
+    assert (
+        "make_bucket",
+        browser.settings.object_storage_bucket,
+        browser.settings.object_storage_bucket_location,
+    ) in calls
+    assert ("put_object", browser.settings.object_storage_bucket, 3, "image/png") in calls
 
 
 @pytest.mark.asyncio

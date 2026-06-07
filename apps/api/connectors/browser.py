@@ -7,7 +7,7 @@ Capabilities:
   browser.extract_contacts — extract name/email/title from a company page
 
 Each call gets a fresh BrowserContext (no cookie/session cross-contamination).
-Screenshots are captured after each step and stored in MinIO.
+Screenshots are captured after each step and stored in object storage.
 
 Setup: playwright install chromium  (run once after pip install)
 """
@@ -34,8 +34,30 @@ _USER_AGENT = (
 )
 
 
+def _sync_storage_auth_kwargs() -> dict[str, Any]:
+    if (
+        settings.object_storage_is_s3
+        and not (settings.object_storage_access_key and settings.object_storage_secret_key)
+    ):
+        from minio.credentials.providers import ChainedProvider, EnvAWSProvider, IamAwsProvider
+
+        return {
+            "credentials": ChainedProvider(
+                [
+                    EnvAWSProvider(),
+                    IamAwsProvider(region=settings.aws_s3_region),
+                ]
+            )
+        }
+    return {
+        "access_key": settings.object_storage_access_key,
+        "secret_key": settings.object_storage_secret_key,
+        "session_token": settings.object_storage_session_token or None,
+    }
+
+
 async def _save_screenshot(page, label: str) -> str | None:
-    """Capture screenshot and upload to MinIO.  Returns the object path, or None on failure."""
+    """Capture screenshot and upload to object storage. Returns the object path, or None on failure."""
     try:
         from minio import Minio  # type: ignore[import]
         import io
@@ -45,15 +67,18 @@ async def _save_screenshot(page, label: str) -> str | None:
         object_name = f"browser-screenshots/{ts}-{label}-{secrets.token_hex(4)}.png"
 
         client = Minio(
-            settings.minio_endpoint,
-            access_key=settings.minio_access_key,
-            secret_key=settings.minio_secret_key,
-            secure=settings.minio_secure,
+            settings.object_storage_endpoint,
+            secure=settings.object_storage_secure,
+            region=settings.object_storage_region,
+            **_sync_storage_auth_kwargs(),
         )
-        if not client.bucket_exists(settings.minio_bucket):
-            client.make_bucket(settings.minio_bucket)
+        if not client.bucket_exists(settings.object_storage_bucket):
+            client.make_bucket(
+                settings.object_storage_bucket,
+                location=settings.object_storage_bucket_location,
+            )
         client.put_object(
-            settings.minio_bucket,
+            settings.object_storage_bucket,
             object_name,
             io.BytesIO(png),
             length=len(png),

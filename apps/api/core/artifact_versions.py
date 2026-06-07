@@ -58,7 +58,11 @@ async def create_version(
             client = await _minio_client()
             await _ensure_bucket(client)
             await client.put_object(
-                settings.minio_bucket, minio_path, io.BytesIO(raw), length=size, content_type=mime
+                settings.object_storage_bucket,
+                minio_path,
+                io.BytesIO(raw),
+                length=size,
+                content_type=mime,
             )
         except Exception:
             import pathlib as _pl
@@ -130,7 +134,7 @@ async def read_version_content(artifact_id: str, version: int, org_id: str) -> b
     client = None
     try:
         client = await _minio_client()
-        response = await client.get_object(settings.minio_bucket, path)
+        response = await client.get_object(settings.object_storage_bucket, path)
         return await response.read()
     except Exception:
         import pathlib

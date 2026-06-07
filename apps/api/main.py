@@ -210,22 +210,20 @@ async def health() -> dict:
     except Exception as exc:
         checks["redis"] = f"error: {exc}"
 
-    # MinIO
+    # Object storage (MinIO locally, AWS S3 when enabled).
+    storage_health_name = "object_storage"
     try:
         from core.config import settings as cfg
-        from miniopy_async import Minio  # type: ignore[import]
-        client = Minio(cfg.minio_endpoint, access_key=cfg.minio_access_key,
-                       secret_key=cfg.minio_secret_key, secure=cfg.minio_secure)
+        from core.artifacts import _close_minio, _minio_client
+        storage_health_name = cfg.object_storage_health_name
+        client = await _minio_client()
         try:
-            await client.bucket_exists(cfg.minio_bucket)
-            checks["minio"] = "ok"
+            await client.bucket_exists(cfg.object_storage_bucket)
+            checks[storage_health_name] = "ok"
         finally:
-            try:
-                await client.close_session()
-            except Exception:
-                pass
+            await _close_minio(client)
     except Exception as exc:
-        checks["minio"] = f"error: {exc}"
+        checks[storage_health_name] = f"error: {exc}"
 
     # Model reachability (quick probe — no retries)
     try:

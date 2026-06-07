@@ -1,4 +1,4 @@
-"""Artifact storage: persist agent outputs to MinIO and record metadata in DB.
+"""Artifact storage: persist agent outputs to object storage and record metadata in DB.
 
 Usage (from executor, router, or any async context):
     artifact_id = await save_artifact(
@@ -29,15 +29,38 @@ from core.config import settings
 from core.db import engine, reflect_table
 
 
+def _explicit_storage_credentials() -> bool:
+    return bool(settings.object_storage_access_key and settings.object_storage_secret_key)
+
+
 async def _minio_client():
-    """Return an async MinIO client (lazy import to avoid hard dep at startup)."""
+    """Return an async S3-compatible client (lazy import to avoid hard dep at startup)."""
     from miniopy_async import Minio  # type: ignore[import]
 
+    auth: dict[str, Any]
+    if settings.object_storage_is_s3 and not _explicit_storage_credentials():
+        from miniopy_async.credentials.providers import ChainedProvider, EnvAWSProvider, IamAwsProvider
+
+        auth = {
+            "credentials": ChainedProvider(
+                [
+                    EnvAWSProvider(),
+                    IamAwsProvider(region=settings.aws_s3_region),
+                ]
+            )
+        }
+    else:
+        auth = {
+            "access_key": settings.object_storage_access_key,
+            "secret_key": settings.object_storage_secret_key,
+            "session_token": settings.object_storage_session_token or None,
+        }
+
     return Minio(
-        settings.minio_endpoint,
-        access_key=settings.minio_access_key,
-        secret_key=settings.minio_secret_key,
-        secure=settings.minio_secure,
+        settings.object_storage_endpoint,
+        secure=settings.object_storage_secure,
+        region=settings.object_storage_region,
+        **auth,
     )
 
 
@@ -56,9 +79,12 @@ async def _close_minio(client) -> None:
 
 
 async def _ensure_bucket(client) -> None:
-    exists = await client.bucket_exists(settings.minio_bucket)
+    exists = await client.bucket_exists(settings.object_storage_bucket)
     if not exists:
-        await client.make_bucket(settings.minio_bucket)
+        await client.make_bucket(
+            settings.object_storage_bucket,
+            location=settings.object_storage_bucket_location,
+        )
 
 
 async def save_artifact(
@@ -76,7 +102,7 @@ async def save_artifact(
     parse_status: str | None = None,
     created_by: str | None = None,
 ) -> str:
-    """Persist an artifact to MinIO and record metadata in the artifacts table.
+    """Persist an artifact to object storage and record metadata in the artifacts table.
 
     Returns the artifact UUID string.
     """
@@ -92,13 +118,13 @@ async def save_artifact(
     version = 1
     minio_path = f"artifacts/{org_id}/{artifact_id}/v{version}"
 
-    # --- Upload to MinIO ---
+    # --- Upload to object storage ---
     client = None
     try:
         client = await _minio_client()
         await _ensure_bucket(client)
         await client.put_object(
-            settings.minio_bucket,
+            settings.object_storage_bucket,
             minio_path,
             io.BytesIO(raw),
             length=size,
@@ -168,7 +194,7 @@ async def get_artifact(artifact_id: str) -> dict[str, Any] | None:
 
 
 async def read_artifact_content(artifact_id: str) -> bytes | None:
-    """Download artifact bytes from MinIO (or local fallback)."""
+    """Download artifact bytes from object storage (or local fallback)."""
     meta = await get_artifact(artifact_id)
     if not meta:
         return None
@@ -177,11 +203,11 @@ async def read_artifact_content(artifact_id: str) -> bytes | None:
     if path.startswith("local://"):
         return _read_local_artifact(path, artifact_id, meta.get("version", 1))
 
-    # Try MinIO first.
+    # Try object storage first.
     client = None
     try:
         client = await _minio_client()
-        response = await client.get_object(settings.minio_bucket, path)
+        response = await client.get_object(settings.object_storage_bucket, path)
         return await response.read()
     except Exception:
         pass
