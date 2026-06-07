@@ -5,7 +5,6 @@ import { usePathname, useRouter } from "next/navigation";
 import ArtifactsScreen from "../../components/artifacts/ArtifactsScreen";
 import AgentsScreen from "../../components/agents/AgentsScreen";
 import BrowserOperatorScreen from "../../components/browser/BrowserOperatorScreen";
-import CodingAgentScreen from "../../components/coding/CodingAgentScreen";
 import ComputerScreen from "../../components/computer/ComputerScreen";
 import InChatArtifactPanel from "../../components/artifacts/InChatArtifactPanel";
 import ResearchScreen from "../../components/research/ResearchScreen";
@@ -32,7 +31,7 @@ function formatFileSize(bytes: number) {
 }
 
 // ─── Types ───────────────────────────────────────────────────────────────────
-type Route = "chat" | "activity" | "approvals" | "memory" | "connectors" | "assistants" | "settings" | "projects" | "research" | "browser" | "computer" | "coding" | "tasks" | "artifacts" | "agents" | "workflows" | "audit";
+type Route = "chat" | "activity" | "approvals" | "memory" | "connectors" | "assistants" | "settings" | "projects" | "research" | "browser" | "computer" | "tasks" | "artifacts" | "agents" | "workflows" | "audit";
 type SettingsTab = "general" | "profile" | "organization" | "members" | "permissions" | "employees" | "runtime" | "memory-settings" | "tools-settings" | "approval-settings" | "notifications" | "security" | "billing" | "audit" | "developer" | "danger";
 type Conversation = { id: string; title: string | null; updated_at?: string; created_at?: string };
 type MessageRole = "user" | "assistant" | "system" | "tool";
@@ -497,7 +496,6 @@ function routeFromPath(pathname: string | null): Route {
   if (pathname === "/research") return "research";
   if (pathname === "/browser") return "browser";
   if (pathname === "/computer") return "computer";
-  if (pathname === "/coding") return "coding";
   if (pathname === "/tasks") return "tasks";
   if (pathname === "/agents") return "agents";
   if (pathname === "/workflows") return "workflows";
@@ -883,7 +881,6 @@ function ChronosAppInner() {
         {route === "research"   && <ResearchScreen />}
         {route === "browser"    && <BrowserOperatorScreen />}
         {route === "computer"   && <ComputerScreen />}
-        {route === "coding"     && <CodingAgentScreen />}
         {route === "tasks"      && <EmptyPanel label="Tasks" />}
         {route === "agents"     && <AgentsScreen />}
         {route === "workflows"  && <WorkflowsScreen />}
@@ -922,7 +919,6 @@ function Sidebar({
     { id: "research"   as Route, icon: <IC.Search size={15}/>,     label: "Research" },
     { id: "browser"    as Route, icon: <IC.Globe size={15}/>,      label: "Browser" },
     { id: "computer"   as Route, icon: <IC.Briefcase size={15}/>,  label: "Computer" },
-    { id: "coding"     as Route, icon: <IC.Pencil size={15}/>,     label: "Coding" },
     { id: "tasks"      as Route, icon: <IC.Check size={15}/>,      label: "Tasks" },
     { id: "agents"     as Route, icon: <IC.Sparkles size={15}/>,   label: "Agents" },
     { id: "workflows"  as Route, icon: <IC.Refresh size={15}/>,    label: "Workflows" },
