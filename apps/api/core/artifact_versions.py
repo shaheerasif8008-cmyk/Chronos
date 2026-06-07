@@ -2,16 +2,15 @@
 from __future__ import annotations
 
 import difflib
-import io
 from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import insert, select, update
 from sqlalchemy.exc import IntegrityError
 
-from core.artifacts import _close_minio, _ensure_bucket, _minio_client, get_artifact
-from core.config import settings
+from core.artifacts import _object_path_column, get_artifact
 from core.db import engine, reflect_table
+from core.object_storage import get_object, put_object
 
 _MAX_VERSION_ATTEMPTS = 4
 
@@ -50,28 +49,17 @@ async def create_version(
         current_version = int(head["version"])
         next_version = current_version + 1
         mime = mime_type or head.get("mime_type") or "text/plain"
-        minio_path = f"artifacts/{org_id}/{artifact_id}/v{next_version}"
+        object_path = f"artifacts/{org_id}/{artifact_id}/v{next_version}"
 
         # Write bytes outside the DB transaction (never hold a row lock across upload).
-        client = None
         try:
-            client = await _minio_client()
-            await _ensure_bucket(client)
-            await client.put_object(
-                settings.object_storage_bucket,
-                minio_path,
-                io.BytesIO(raw),
-                length=size,
-                content_type=mime,
-            )
+            await put_object(object_path, raw, mime)
         except Exception:
             import pathlib as _pl
             _d = _pl.Path("/tmp/chronos_artifacts") / artifact_id
             _d.mkdir(parents=True, exist_ok=True)
             (_d / f"v{next_version}").write_bytes(raw)
-            minio_path = f"local://{artifact_id}/v{next_version}"
-        finally:
-            await _close_minio(client)
+            object_path = f"local://{artifact_id}/v{next_version}"
 
         try:
             async with engine.begin() as conn:
@@ -81,11 +69,11 @@ async def create_version(
                         region=head.get("region", "us"),
                         artifact_id=artifact_id,
                         version=next_version,
-                        minio_path=minio_path,
                         mime_type=mime,
                         size_bytes=size,
                         edit_summary=edit_summary,
                         created_by=created_by,
+                        **{_object_path_column(versions): object_path},
                     )
                 )
                 await conn.execute(
@@ -93,10 +81,10 @@ async def create_version(
                     .where(artifacts.c.id == artifact_id, artifacts.c.version == current_version)
                     .values(
                         version=next_version,
-                        minio_path=minio_path,
                         mime_type=mime,
                         size_bytes=size,
                         updated_at=datetime.now(timezone.utc),
+                        **{_object_path_column(artifacts): object_path},
                     )
                 )
             return await get_artifact(artifact_id)
@@ -130,19 +118,14 @@ async def read_version_content(artifact_id: str, version: int, org_id: str) -> b
         )).mappings().first()
     if not row:
         return None
-    path = row["minio_path"]
-    client = None
+    path = row[_object_path_column(versions)]
     try:
-        client = await _minio_client()
-        response = await client.get_object(settings.object_storage_bucket, path)
-        return await response.read()
+        return await get_object(path)
     except Exception:
         import pathlib
         fname = path.split("local://")[-1] if path.startswith("local://") else f"{artifact_id}/v{version}"
         local = pathlib.Path("/tmp/chronos_artifacts") / fname
         return local.read_bytes() if local.exists() else None
-    finally:
-        await _close_minio(client)
 
 
 async def restore_version(

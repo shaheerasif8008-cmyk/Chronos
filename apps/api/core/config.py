@@ -70,17 +70,11 @@ class Settings(BaseSettings):
     # Base URL for all OAuth callbacks (should be your public API URL)
     oauth_callback_base_url: str = "http://localhost:8000"
     demo_mode: bool = False
-    # MinIO
-    object_storage_backend: str = "minio"  # minio | s3
-    minio_endpoint: str = "localhost:9000"
-    minio_access_key: str = "chronos"
-    minio_secret_key: str = "chronos123"
-    minio_secure: bool = False
-    minio_bucket: str = "chronos"
-    # AWS S3. Used when OBJECT_STORAGE_BACKEND=s3.
+    # Object storage: AWS S3 only.
+    object_storage_backend: str = "s3"
     aws_s3_bucket: str = ""
     aws_s3_region: str = "us-east-1"
-    aws_s3_endpoint: str = ""  # optional S3-compatible override; blank uses AWS regional endpoint
+    aws_s3_endpoint: str = ""  # optional custom endpoint; blank uses AWS regional S3
     aws_access_key_id: str = ""
     aws_secret_access_key: str = ""
     aws_session_token: str = ""
@@ -88,57 +82,51 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_object_storage(self) -> "Settings":
         backend = self.object_storage_backend.lower()
-        if backend not in {"minio", "s3"}:
-            raise ValueError("OBJECT_STORAGE_BACKEND must be 'minio' or 's3'")
-        if backend == "s3" and not self.aws_s3_bucket:
+        if backend != "s3":
+            raise ValueError("OBJECT_STORAGE_BACKEND must be 's3'")
+        if not self.aws_s3_bucket:
             raise ValueError("AWS_S3_BUCKET is required when OBJECT_STORAGE_BACKEND=s3")
         return self
 
     @property
     def object_storage_is_s3(self) -> bool:
-        return self.object_storage_backend.lower() == "s3"
+        return True
 
     @property
     def object_storage_bucket(self) -> str:
-        if self.object_storage_is_s3:
-            return self.aws_s3_bucket
-        return self.minio_bucket
+        return self.aws_s3_bucket
 
     @property
     def object_storage_endpoint(self) -> str:
-        if self.object_storage_is_s3:
-            return self.aws_s3_endpoint or f"s3.{self.aws_s3_region}.amazonaws.com"
-        return self.minio_endpoint
+        return self.aws_s3_endpoint or f"s3.{self.aws_s3_region}.amazonaws.com"
 
     @property
     def object_storage_access_key(self) -> str:
-        return self.aws_access_key_id if self.object_storage_is_s3 else self.minio_access_key
+        return self.aws_access_key_id
 
     @property
     def object_storage_secret_key(self) -> str:
-        return self.aws_secret_access_key if self.object_storage_is_s3 else self.minio_secret_key
+        return self.aws_secret_access_key
 
     @property
     def object_storage_session_token(self) -> str:
-        return self.aws_session_token if self.object_storage_is_s3 else ""
+        return self.aws_session_token
 
     @property
     def object_storage_secure(self) -> bool:
-        return True if self.object_storage_is_s3 else self.minio_secure
+        return True
 
     @property
     def object_storage_region(self) -> str | None:
-        return self.aws_s3_region if self.object_storage_is_s3 else None
+        return self.aws_s3_region
 
     @property
     def object_storage_bucket_location(self) -> str | None:
-        if not self.object_storage_is_s3:
-            return None
         return None if self.aws_s3_region == "us-east-1" else self.aws_s3_region
 
     @property
     def object_storage_health_name(self) -> str:
-        return "s3" if self.object_storage_is_s3 else "minio"
+        return "s3"
 
     # Authorization (OpenFGA). Enforcement is OFF by default so the Phase-1 stub
     # behavior (allow-all) is preserved until an operator opts in. When

@@ -124,7 +124,7 @@ Backend:       Python 3.11+, FastAPI (async), Pydantic v2, SQLAlchemy Core, Alem
 Model layer:   litellm (local LLM primary, BYOK API key fallback)
 Database:      Postgres 15 + pgvector extension
 Cache/pubsub:  Redis
-File storage:  MinIO (S3-compatible, local in dev)
+File storage:  S3 (S3-compatible, local in dev)
 Frontend:      Next.js 14 (App Router), TypeScript, Tailwind
 Auth:          Email OTP + JWT currently; WorkOS/Clerk or equivalent enterprise auth later.
 Connectors:    MCP (primary interface). Composio for Gmail/HubSpot adapters.
@@ -427,9 +427,9 @@ async def assemble_context(
     base = load_base_system_prompt()
 
     # Layer 1: Org context folder (all .md files)
-    org_files = await minio.list_files(f"context/{requester_context.org_id}/")
+    org_files = await object_storage.list_files(f"context/{requester_context.org_id}/")
     for f in org_files:
-        content = await minio.read(f.path)
+        content = await object_storage.read(f.path)
         base += f"\n\n## {f.name}\n{content}"
 
     # Layer 2: Active persona
@@ -708,10 +708,12 @@ DATABASE_URL=postgresql+asyncpg://chronos:chronos@localhost:5432/chronos
 # Redis
 REDIS_URL=redis://localhost:6379
 
-# MinIO
-MINIO_ENDPOINT=localhost:9000
-MINIO_ACCESS_KEY=chronos
-MINIO_SECRET_KEY=chronos123
+# Object storage
+OBJECT_STORAGE_BACKEND=s3
+AWS_S3_BUCKET=chronos-dev
+AWS_S3_REGION=us-east-1
+AWS_ACCESS_KEY_ID=
+AWS_SECRET_ACCESS_KEY=
 
 # Model layer
 LOCAL_LLM_BASE_URL=http://localhost:11434  # Ollama or similar
@@ -742,7 +744,7 @@ cd chronos
 cp .env.example .env
 
 # Start infrastructure
-docker-compose up -d  # Postgres+pgvector, Redis, MinIO
+docker-compose up -d  # Postgres+pgvector, Redis, OpenFGA
 
 # Backend
 cd apps/api
@@ -768,7 +770,7 @@ The seed script creates:
 - One org: `id = 'default'`, `slug = 'default'`
 - One member: the admin email from `.env`
 - Context folder: `context/default/org.md` with a starter template
-- Skill packs loaded into MinIO: `general/` and `sdr-outreach/`
+- Skill packs loaded into S3: `general/` and `sdr-outreach/`
 
 ---
 
@@ -788,13 +790,10 @@ services:
     image: redis:7-alpine
     ports: ["6379:6379"]
 
-  minio:
-    image: minio/minio
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: chronos
-      MINIO_ROOT_PASSWORD: chronos123
-    ports: ["9000:9000", "9001:9001"]
+  openfga:
+    image: openfga/openfga:latest
+    command: run
+    ports: ["8080:8080", "8081:8081", "3010:3000"]
 ```
 
 ---

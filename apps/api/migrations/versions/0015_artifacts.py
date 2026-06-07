@@ -24,7 +24,7 @@ def upgrade() -> None:
         sa.Column("message_id", sa.UUID(), nullable=True),
         sa.Column("kind", sa.Text(), nullable=False),  # 'markdown'|'code'|'file'|'doc'|'data'
         sa.Column("title", sa.Text(), nullable=True),
-        sa.Column("minio_path", sa.Text(), nullable=False),
+        sa.Column("object_path", sa.Text(), nullable=False),
         sa.Column("mime_type", sa.Text(), nullable=True),
         sa.Column("size_bytes", sa.Integer(), nullable=True),
         sa.Column("version", sa.Integer(), nullable=False, server_default="1"),

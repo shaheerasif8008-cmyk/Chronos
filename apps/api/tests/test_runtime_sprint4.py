@@ -346,7 +346,7 @@ async def test_browser_search_operator_workflow_fixture_avoids_live_duckduckgo(m
 
 
 @pytest.mark.asyncio
-async def test_browser_screenshot_creates_missing_minio_bucket(monkeypatch):
+async def test_browser_screenshot_creates_missing_s3_bucket(monkeypatch):
     import sys
     import types
 
@@ -358,32 +358,34 @@ async def test_browser_screenshot_creates_missing_minio_bucket(monkeypatch):
         async def screenshot(self, full_page=False):
             return b"png"
 
-    class FakeMinio:
-        def __init__(self, *args, **kwargs):
+    class FakeS3Client:
+        def __init__(self):
             pass
 
-        def bucket_exists(self, bucket):
-            calls.append(("bucket_exists", bucket))
-            return False
+        def head_bucket(self, Bucket):
+            calls.append(("head_bucket", Bucket))
+            raise Exception("missing")
 
-        def make_bucket(self, bucket, location=None):
-            calls.append(("make_bucket", bucket, location))
+        def create_bucket(self, **kwargs):
+            calls.append(("create_bucket", kwargs))
 
-        def put_object(self, bucket, object_name, data, length, content_type):
-            calls.append(("put_object", bucket, length, content_type))
+        def put_object(self, Bucket, Key, Body, ContentType):
+            calls.append(("put_object", Bucket, Key, len(Body), ContentType))
 
-    monkeypatch.setitem(sys.modules, "minio", types.SimpleNamespace(Minio=FakeMinio))
+    fake_client = FakeS3Client()
+    monkeypatch.setitem(sys.modules, "boto3", types.SimpleNamespace(client=lambda *args, **kwargs: fake_client))
 
     object_name = await browser._save_screenshot(FakePage(), "fetch")
 
     assert object_name and object_name.startswith("browser-screenshots/")
-    assert ("bucket_exists", browser.settings.object_storage_bucket) in calls
-    assert (
-        "make_bucket",
-        browser.settings.object_storage_bucket,
-        browser.settings.object_storage_bucket_location,
-    ) in calls
-    assert ("put_object", browser.settings.object_storage_bucket, 3, "image/png") in calls
+    assert ("head_bucket", browser.settings.object_storage_bucket) in calls
+    create_bucket_kwargs = {"Bucket": browser.settings.object_storage_bucket}
+    if browser.settings.object_storage_bucket_location:
+        create_bucket_kwargs["CreateBucketConfiguration"] = {
+            "LocationConstraint": browser.settings.object_storage_bucket_location
+        }
+    assert ("create_bucket", create_bucket_kwargs) in calls
+    assert ("put_object", browser.settings.object_storage_bucket, object_name, 3, "image/png") in calls
 
 
 @pytest.mark.asyncio

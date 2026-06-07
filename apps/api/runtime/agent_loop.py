@@ -397,6 +397,9 @@ async def _agent_system_message(tools: list[dict[str, Any]] | None = None) -> di
             "directly and conversationally. Use tools only when they genuinely help: "
             "use browser__search for the latest / current / recent / time-sensitive facts "
             f"(Current date: {current_date}) instead of relying on model memory; "
+            "use chat_history__recent or chat_history__search when the user asks about previous chats, "
+            "recent chats, what was discussed before, or continuing an earlier Chronos conversation; "
+            "when prior chats inform the answer, cite them with their `/chat?c=...` URLs from the tool result. "
             "read or write files, draft emails. You may call multiple independent tools in "
             "parallel. Do not narrate tool use you are not doing, and stop calling tools once "
             "you can answer. "
@@ -724,10 +727,17 @@ async def _execute_tool(
             logger.warning("Sub-agent failed: %s", exc)
             content = json.dumps({"error": str(exc)})
             await emit_activity(task_id, {"type": "tool_error", "tool": tool_name, "error": str(exc)})
-        return {"role": "tool", "tool_call_id": call["id"], "name": tool_name, "content": content}
+        return {
+            "role": "tool",
+            "tool_call_id": call["id"],
+            "name": tool_name,
+            "content": content,
+            "artifacts": [],
+        }
 
     # All other tools go through the ToolBroker
     broker_name = to_broker_name(tool_name)
+    created_artifacts: list[dict[str, Any]] = []
     try:
         result = await tool_broker.execute(agent, broker_name, args)
         payload = {"summary": result.summary, "data": result.data}
@@ -741,6 +751,16 @@ async def _execute_tool(
         if tool_name == "fs__write":
             artifact = await _maybe_create_artifact(task, args)
             if artifact:
+                created_artifacts.append(artifact)
+                await emit_activity(task_id, {"type": "artifact", **artifact})
+        # `code__python` (and any other tool that can write real bytes) is
+        # followed by a workspace scan so binary office formats — pptx, docx,
+        # xlsx, pdf — created via python-pptx / python-docx / openpyxl /
+        # reportlab become user-facing artifacts. `_fs__write` cannot produce
+        # these (text only), so the scan is the only path.
+        elif tool_name == "code__python":
+            created_artifacts = await _scan_workspace_for_artifacts(task)
+            for artifact in created_artifacts:
                 await emit_activity(task_id, {"type": "artifact", **artifact})
     except ApprovalRequired:
         raise  # propagate — caller decides whether to gate
@@ -749,10 +769,22 @@ async def _execute_tool(
         content = json.dumps({"error": str(exc)})
         await emit_activity(task_id, {"type": "tool_error", "tool": tool_name, "error": str(exc)})
 
-    return {"role": "tool", "tool_call_id": call["id"], "name": tool_name, "content": content}
+    return {
+        "role": "tool",
+        "tool_call_id": call["id"],
+        "name": tool_name,
+        "content": content,
+        # Non-standard extension: callers (stream_chat_turn) pop this and
+        # yield each entry as a `{"type": "artifact", "artifact": a}` SSE
+        # event so live chats surface artifacts without waiting for refresh.
+        "artifacts": created_artifacts,
+    }
 
 
 # Renderable file extensions → (artifact kind, mime type).
+# Includes binary office formats; these must be produced by `code__python`
+# (python-pptx / python-docx / openpyxl / reportlab) — `fs__write` is text-only
+# and would emit a corrupt file if used for these extensions.
 _RENDERABLE_EXT: dict[str, tuple[str, str]] = {
     ".html": ("html", "text/html"),
     ".htm": ("html", "text/html"),
@@ -765,7 +797,16 @@ _RENDERABLE_EXT: dict[str, tuple[str, str]] = {
     ".svg": ("image", "image/svg+xml"),
     ".py": ("code", "text/plain"),
     ".txt": ("text", "text/plain"),
+    ".pdf": ("pdf", "application/pdf"),
+    ".pptx": ("presentation", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+    ".docx": ("document", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+    ".xlsx": ("spreadsheet", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
 }
+
+# Extensions that are always binary. We refuse to honour `fs__write`'s text
+# payload for these — the only legitimate path is `code__python` writing
+# real bytes to disk, which we then read back via the workspace scan.
+_BINARY_EXT = {".pdf", ".pptx", ".docx", ".xlsx"}
 
 
 async def _maybe_create_artifact(task: dict[str, Any], args: dict[str, Any]) -> dict[str, Any] | None:
@@ -773,6 +814,9 @@ async def _maybe_create_artifact(task: dict[str, Any], args: dict[str, Any]) -> 
 
     Returns an event payload {artifact_id, title, kind, mime_type, size_bytes}
     for the activity stream, or None if the file is not a renderable type.
+    Binary office formats (pptx/docx/xlsx/pdf) are rejected here — the model
+    must produce them via `code__python`, which is picked up by the
+    workspace scan in `_scan_workspace_for_artifacts`.
     """
     import os
 
@@ -783,6 +827,8 @@ async def _maybe_create_artifact(task: dict[str, Any], args: dict[str, Any]) -> 
     ext = os.path.splitext(path)[1].lower()
     mapping = _RENDERABLE_EXT.get(ext)
     if not mapping:
+        return None
+    if ext in _BINARY_EXT:
         return None
     kind, mime = mapping
     if not isinstance(file_content, str):
@@ -820,6 +866,98 @@ async def _maybe_create_artifact(task: dict[str, Any], args: dict[str, Any]) -> 
         "mime_type": mime,
         "size_bytes": len(file_content.encode("utf-8")),
 }
+
+
+async def _scan_workspace_for_artifacts(task: dict[str, Any]) -> list[dict[str, Any]]:
+    """Find renderable files in the task workspace that have not yet been
+    archived, persist them as artifacts, and return event payloads.
+
+    Used as a post-execution hook after `code__python` (or any other tool
+    that can write real bytes to disk). Without this, files like .pptx /
+    .docx / .pdf produced by python-pptx etc. would never become user-facing
+    artifacts. Dedup is by (task_id, relative path) so a re-scan does not
+    re-archive the same file.
+    """
+    import os
+
+    org_id = str(task.get("organization_id") or "default")
+    task_id = str(task["id"])
+    region = str(task.get("region") or "us")
+    try:
+        root = task_workspace_root(org_id, task_id)
+    except Exception:
+        return []
+    if not root.exists():
+        return []
+
+    # Existing titles for this task — dedup key.
+    artifacts_tbl = await reflect_table("artifacts")
+    try:
+        async with engine.begin() as conn:
+            existing_rows = (await conn.execute(
+                select(artifacts_tbl.c.title)
+                .where(
+                    artifacts_tbl.c.task_id == task_id,
+                    artifacts_tbl.c.organization_id == org_id,
+                    artifacts_tbl.c.is_deleted == False,  # noqa: E712
+                )
+            )).all()
+    except Exception as exc:
+        logger.warning("Workspace scan: existing artifact lookup failed: %r", exc)
+        existing_rows = []
+    existing_titles = {row[0] for row in existing_rows if row[0]}
+
+    from core.artifacts import save_artifact
+
+    created: list[dict[str, Any]] = []
+    try:
+        candidates = sorted(p for p in root.rglob("*") if p.is_file())
+    except Exception as exc:
+        logger.warning("Workspace scan: rglob failed: %r", exc)
+        return []
+
+    for candidate in candidates:
+        ext = candidate.suffix.lower()
+        mapping = _RENDERABLE_EXT.get(ext)
+        if not mapping:
+            continue
+        kind, mime = mapping
+        rel_path = str(candidate.relative_to(root))
+        if rel_path in existing_titles:
+            continue
+        # Skip files inside hidden / cache directories.
+        parts = candidate.relative_to(root).parts
+        if any(part.startswith(".") or part == "__pycache__" for part in parts):
+            continue
+        try:
+            content_bytes = candidate.read_bytes()
+        except Exception as exc:
+            logger.warning("Workspace scan: read failed for %s: %r", rel_path, exc)
+            continue
+        try:
+            artifact_id = await save_artifact(
+                content_bytes,
+                kind=kind,
+                title=rel_path,
+                conversation_id=_conversation_id_for(task),
+                task_id=task_id,
+                org_id=org_id,
+                region=region,
+                mime_type=mime,
+                created_by=f"task:{task_id}",
+            )
+        except Exception as exc:
+            logger.warning("Workspace scan: save_artifact failed for %s: %r", rel_path, exc)
+            continue
+        created.append({
+            "artifact_id": artifact_id,
+            "title": rel_path,
+            "kind": kind,
+            "mime_type": mime,
+            "size_bytes": len(content_bytes),
+        })
+        existing_titles.add(rel_path)
+    return created
 
 
 async def _run_subagent(
@@ -1339,6 +1477,15 @@ async def stream_chat_turn(
                 yield {"type": "awaiting_approval", "task_id": task_id}
                 yield {"type": "done"}
                 return
+            # `_execute_tool` may have created artifacts (workspace scan after
+            # `code__python`, or `fs__write` for text formats). Surface them as
+            # `{"type": "artifact", "artifact": ...}` events so the chat SSE
+            # stream — which does NOT subscribe to Redis pub/sub — still shows
+            # Open/Download cards live. Pop the non-standard key before
+            # appending the message to LLM history.
+            created_artifacts = tool_msg.pop("artifacts", []) or []
+            for artifact in created_artifacts:
+                yield {"type": "artifact", "artifact": artifact}
             history.append(tool_msg)
             summary = ""
             try:
@@ -1515,6 +1662,10 @@ async def run_loop(
             except ApprovalRequired:
                 await _open_approval_gate(task, calls, history, iteration, model=effective_model)
                 return {"status": "awaiting_approval"}
+            # Artifacts from this tool call were already emitted to Redis pub/sub
+            # inside `_execute_tool`; strip the non-standard key before the
+            # tool message enters the LLM history.
+            tool_msg.pop("artifacts", None)
             tool_messages.append(tool_msg)
             history.append(tool_msg)
         else:
@@ -1540,6 +1691,7 @@ async def run_loop(
                     tool_messages.append(tool_msg)
                     history.append(tool_msg)
                 else:
+                    r.pop("artifacts", None)
                     tool_messages.append(r)
                     history.append(r)
 

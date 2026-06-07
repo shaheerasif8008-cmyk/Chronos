@@ -3,18 +3,18 @@ import pytest
 from core.config import Settings
 
 
-def test_object_storage_defaults_to_local_minio() -> None:
-    settings = Settings(_env_file=None)
+def test_object_storage_defaults_to_s3_when_bucket_is_configured() -> None:
+    settings = Settings(_env_file=None, aws_s3_bucket="chronos-prod")
 
-    assert settings.object_storage_is_s3 is False
-    assert settings.object_storage_health_name == "minio"
-    assert settings.object_storage_endpoint == "localhost:9000"
-    assert settings.object_storage_bucket == "chronos"
-    assert settings.object_storage_access_key == "chronos"
-    assert settings.object_storage_secret_key == "chronos123"
+    assert settings.object_storage_is_s3 is True
+    assert settings.object_storage_health_name == "s3"
+    assert settings.object_storage_endpoint == "s3.us-east-1.amazonaws.com"
+    assert settings.object_storage_bucket == "chronos-prod"
+    assert settings.object_storage_access_key == ""
+    assert settings.object_storage_secret_key == ""
     assert settings.object_storage_session_token == ""
-    assert settings.object_storage_secure is False
-    assert settings.object_storage_region is None
+    assert settings.object_storage_secure is True
+    assert settings.object_storage_region == "us-east-1"
     assert settings.object_storage_bucket_location is None
 
 
@@ -66,7 +66,7 @@ def test_object_storage_s3_can_use_custom_compatible_endpoint() -> None:
 
 def test_object_storage_s3_requires_bucket() -> None:
     with pytest.raises(ValueError, match="AWS_S3_BUCKET"):
-        Settings(_env_file=None, object_storage_backend="s3")
+        Settings(_env_file=None)
 
 
 def test_object_storage_rejects_unknown_backend() -> None:

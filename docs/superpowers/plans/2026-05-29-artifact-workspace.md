@@ -6,14 +6,14 @@
 
 **Architecture:** Backend extends the existing `artifacts` table with a dedicated `artifact_versions` table (version-addressed object storage so old bytes survive edits) and an `artifact_shares` table (signed-token public links with revocation). All artifact mutations route through `permission.check` and emit `audit.log`. Publish/unpublish/edit/restore/delete are auditable. The frontend keeps the single-SPA convention but isolates new UI into `apps/web/components/artifacts/` and a shared `apps/web/lib/api.ts`, touching the 3289-line `chat/page.tsx` in exactly one contained task (add route + nav + screen mount).
 
-**Tech Stack:** Python 3.11, FastAPI, SQLAlchemy Core + `reflect_table`, Alembic (next revision `0018`), MinIO + local `/tmp` fallback, pytest (DB-guarded async). Next.js 16 (App Router), React 18, TypeScript, Tailwind. Renderers: `marked`-free (hand markdown) is current; use sandboxed `<iframe srcdoc>` + CSP for HTML/SVG/React-as-text.
+**Tech Stack:** Python 3.11, FastAPI, SQLAlchemy Core + `reflect_table`, Alembic (next revision `0018`), S3 + local `/tmp` fallback, pytest (DB-guarded async). Next.js 16 (App Router), React 18, TypeScript, Tailwind. Renderers: `marked`-free (hand markdown) is current; use sandboxed `<iframe srcdoc>` + CSP for HTML/SVG/React-as-text.
 
 **Proof strategy (decided with user):** API + build proof. Durable state, versioning, restore, publish/share ACL, permission+audit are proven with DB-backed pytest (using the existing `_requires_db` guard pattern). UI is proven with `npm --prefix apps/web run build` (TypeScript typecheck + Next build) passing. Full Playwright E2E is explicitly out of scope (no harness exists in repo); note this deviation in the final summary.
 
 **Scope bar (explicit assumption):** Rich preview + edit for text-class types (markdown, code, json, csv, html, svg, image-preview). Binary/office/notebook types (pdf, docx, xlsx, pptx, ipynb, zip) get preview-or-download fallback, not bespoke editors. This satisfies the matrix acceptance proofs without building 15 editors.
 
 **Current state (verified):**
-- `artifacts` table columns: `id, organization_id, region, conversation_id, task_id, message_id, kind, title, minio_path, mime_type, size_bytes, version (default 1), created_at, parent_artifact_id, parse_status`. (`parent_artifact_id` is already used to link parsed-text children to attachments — DO NOT reuse it for version lineage.)
+- `artifacts` table columns: `id, organization_id, region, conversation_id, task_id, message_id, kind, title, object_path, mime_type, size_bytes, version (default 1), created_at, parent_artifact_id, parse_status`. (`parent_artifact_id` is already used to link parsed-text children to attachments — DO NOT reuse it for version lineage.)
 - `core/artifacts.py`: `save_artifact`, `get_artifact`, `read_artifact_content`, `_infer_mime`, `_local_fallback`, `set_parse_status`. Storage key is `artifacts/{org}/{artifact_id}` (single-key, would clobber on edit).
 - `routers/artifacts.py`: `GET /artifacts` (list by convo/task), `GET /artifacts/{id}`, `GET /artifacts/{id}/content`. Raw org compare; no permission seam, no audit.
 - Frontend: one SPA `apps/web/app/chat/page.tsx`; other routes re-export it. `Route` type at line 21; nav array ~line 642; route switch ~line 607. `ArtifactCard` at ~line 1531. `apiFetch`/`getToken`/`apiBase` defined inline (~lines 7–17, 287–304). No `apps/web/components/` or `apps/web/lib/` dirs exist yet.
@@ -93,7 +93,7 @@ def upgrade() -> None:
         sa.Column("region", sa.Text(), nullable=False, server_default="us"),
         sa.Column("artifact_id", sa.UUID(), nullable=False),
         sa.Column("version", sa.Integer(), nullable=False),
-        sa.Column("minio_path", sa.Text(), nullable=False),
+        sa.Column("object_path", sa.Text(), nullable=False),
         sa.Column("mime_type", sa.Text(), nullable=True),
         sa.Column("size_bytes", sa.Integer(), nullable=True),
         sa.Column("edit_summary", sa.Text(), nullable=True),
@@ -135,25 +135,25 @@ def downgrade() -> None:
 
 - [ ] **Step 2: Update `core/artifacts.py` to version-addressed keys + initial version row**
 
-In `save_artifact`, change the storage key from `f"artifacts/{org_id}/{artifact_id}"` to a version-addressed key and write the first `artifact_versions` row. Replace the body from the `minio_path = ...` line through the metadata insert with:
+In `save_artifact`, change the storage key from `f"artifacts/{org_id}/{artifact_id}"` to a version-addressed key and write the first `artifact_versions` row. Replace the body from the `object_path = ...` line through the metadata insert with:
 
 ```python
     version = 1
-    minio_path = f"artifacts/{org_id}/{artifact_id}/v{version}"
+    object_path = f"artifacts/{org_id}/{artifact_id}/v{version}"
 
-    # --- Upload to MinIO ---
+    # --- Upload to S3 ---
     try:
-        client = await _minio_client()
+        client = await _object_storage_client()
         await _ensure_bucket(client)
         await client.put_object(
-            settings.minio_bucket,
-            minio_path,
+            settings.object_storage_bucket,
+            object_path,
             io.BytesIO(raw),
             length=size,
             content_type=mime_type,
         )
     except Exception:
-        minio_path = await _local_fallback(f"{artifact_id}_v{version}", raw, org_id)
+        object_path = await _local_fallback(f"{artifact_id}_v{version}", raw, org_id)
 
     # --- Insert artifact head row + initial version row ---
     artifacts = await reflect_table("artifacts")
@@ -169,7 +169,7 @@ In `save_artifact`, change the storage key from `f"artifacts/{org_id}/{artifact_
                 message_id=message_id,
                 kind=kind,
                 title=title,
-                minio_path=minio_path,
+                object_path=object_path,
                 mime_type=mime_type,
                 size_bytes=size,
                 version=version,
@@ -184,7 +184,7 @@ In `save_artifact`, change the storage key from `f"artifacts/{org_id}/{artifact_
                 region=region,
                 artifact_id=artifact_id,
                 version=version,
-                minio_path=minio_path,
+                object_path=object_path,
                 mime_type=mime_type,
                 size_bytes=size,
                 edit_summary="initial",
@@ -194,7 +194,7 @@ In `save_artifact`, change the storage key from `f"artifacts/{org_id}/{artifact_
     return artifact_id
 ```
 
-Also add a `created_by: str | None = None` keyword parameter to `save_artifact`'s signature (after `parse_status`). And update `_local_fallback` to accept the composite key (it already takes `artifact_id` first positional — pass `f"{artifact_id}_v{version}"`; the function writes to `scratch / artifact_id`, so it already keys by the string passed). Update `read_artifact_content`'s local fallback to try `local / meta["minio_path"].split("/")[-1]`-style: since `minio_path` now ends with `.../v{n}` and the local file is named `{artifact_id}_v{n}`, change the local fallback in `read_artifact_content` to:
+Also add a `created_by: str | None = None` keyword parameter to `save_artifact`'s signature (after `parse_status`). And update `_local_fallback` to accept the composite key (it already takes `artifact_id` first positional — pass `f"{artifact_id}_v{version}"`; the function writes to `scratch / artifact_id`, so it already keys by the string passed). Update `read_artifact_content`'s local fallback to try `local / meta["object_path"].split("/")[-1]`-style: since `object_path` now ends with `.../v{n}` and the local file is named `{artifact_id}_v{n}`, change the local fallback in `read_artifact_content` to:
 
 ```python
     # Local fallback.
@@ -207,7 +207,7 @@ Also add a `created_by: str | None = None` keyword parameter to `save_artifact`'
     return None
 ```
 
-(Keep MinIO path as the primary read; local fallback is only for no-MinIO environments.)
+(Keep S3 path as the primary read; local fallback is only for no-S3 environments.)
 
 - [ ] **Step 3: Write the failing test**
 
@@ -250,7 +250,7 @@ async def test_save_artifact_writes_head_and_initial_version():
     assert meta is not None
     assert meta["version"] == 1
     assert meta["created_by"] == "member:tester"
-    assert meta["minio_path"].endswith("/v1")
+    assert meta["object_path"].endswith("/v1")
     content = await read_artifact_content(aid)
     assert content == b"# Hello\nWorld"
 
@@ -297,7 +297,7 @@ from typing import Any
 
 from sqlalchemy import insert, select, update
 
-from core.artifacts import _ensure_bucket, _local_fallback, _minio_client, get_artifact
+from core.artifacts import _ensure_bucket, _local_fallback, _object_storage_client, get_artifact
 from core.config import settings
 from core.db import engine, reflect_table
 
@@ -323,16 +323,16 @@ async def create_version(
     raw: bytes = content.encode() if isinstance(content, str) else content
     size = len(raw)
     mime = mime_type or head.get("mime_type") or "text/plain"
-    minio_path = f"artifacts/{org_id}/{artifact_id}/v{next_version}"
+    object_path = f"artifacts/{org_id}/{artifact_id}/v{next_version}"
 
     try:
-        client = await _minio_client()
+        client = await _object_storage_client()
         await _ensure_bucket(client)
         await client.put_object(
-            settings.minio_bucket, minio_path, io.BytesIO(raw), length=size, content_type=mime
+            settings.object_storage_bucket, object_path, io.BytesIO(raw), length=size, content_type=mime
         )
     except Exception:
-        minio_path = await _local_fallback(f"{artifact_id}_v{next_version}", raw, org_id)
+        object_path = await _local_fallback(f"{artifact_id}_v{next_version}", raw, org_id)
 
     artifacts = await reflect_table("artifacts")
     versions = await reflect_table("artifact_versions")
@@ -343,7 +343,7 @@ async def create_version(
                 region=head.get("region", "us"),
                 artifact_id=artifact_id,
                 version=next_version,
-                minio_path=minio_path,
+                object_path=object_path,
                 mime_type=mime,
                 size_bytes=size,
                 edit_summary=edit_summary,
@@ -355,7 +355,7 @@ async def create_version(
             .where(artifacts.c.id == artifact_id)
             .values(
                 version=next_version,
-                minio_path=minio_path,
+                object_path=object_path,
                 mime_type=mime,
                 size_bytes=size,
                 updated_at=__import__("datetime").datetime.utcnow(),
@@ -387,10 +387,10 @@ async def read_version_content(artifact_id: str, version: int, org_id: str) -> b
         )).mappings().first()
     if not row:
         return None
-    path = row["minio_path"]
+    path = row["object_path"]
     try:
-        client = await _minio_client()
-        response = await client.get_object(settings.minio_bucket, path)
+        client = await _object_storage_client()
+        response = await client.get_object(settings.object_storage_bucket, path)
         return await response.read()
     except Exception:
         import pathlib

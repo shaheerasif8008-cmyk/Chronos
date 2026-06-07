@@ -263,12 +263,17 @@ async def list_conversations(member: Member = Depends(get_current_member)) -> li
 @router.get("/conversations/{conversation_id}/messages")
 async def list_messages(conversation_id: str, member: Member = Depends(get_current_member)) -> list[dict]:
     await permissions.check(member, "view_conversation", conversation_id)
+    conversations = await reflect_table("conversations")
     messages = await reflect_table("messages")
     async with engine.begin() as conn:
+        await _check_conversation_ownership(conn, conversations, conversation_id, member)
         rows = (
             await conn.execute(
                 select(messages)
-                .where(messages.c.conversation_id == conversation_id)
+                .where(
+                    messages.c.conversation_id == conversation_id,
+                    messages.c.organization_id == member.organization_id,
+                )
                 .order_by(messages.c.created_at.asc())
             )
         ).mappings().all()

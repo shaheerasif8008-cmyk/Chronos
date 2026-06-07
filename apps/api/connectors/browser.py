@@ -23,6 +23,7 @@ import httpx
 
 from core.config import settings
 from core.models import ToolResult
+from core.object_storage import put_object_sync
 from core.untrusted_content import scan_untrusted_content
 
 log = logging.getLogger(__name__)
@@ -33,57 +34,13 @@ _USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-
-def _sync_storage_auth_kwargs() -> dict[str, Any]:
-    if (
-        settings.object_storage_is_s3
-        and not (settings.object_storage_access_key and settings.object_storage_secret_key)
-    ):
-        from minio.credentials.providers import ChainedProvider, EnvAWSProvider, IamAwsProvider
-
-        return {
-            "credentials": ChainedProvider(
-                [
-                    EnvAWSProvider(),
-                    IamAwsProvider(region=settings.aws_s3_region),
-                ]
-            )
-        }
-    return {
-        "access_key": settings.object_storage_access_key,
-        "secret_key": settings.object_storage_secret_key,
-        "session_token": settings.object_storage_session_token or None,
-    }
-
-
 async def _save_screenshot(page, label: str) -> str | None:
     """Capture screenshot and upload to object storage. Returns the object path, or None on failure."""
     try:
-        from minio import Minio  # type: ignore[import]
-        import io
-
         png = await page.screenshot(full_page=False)
         ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
         object_name = f"browser-screenshots/{ts}-{label}-{secrets.token_hex(4)}.png"
-
-        client = Minio(
-            settings.object_storage_endpoint,
-            secure=settings.object_storage_secure,
-            region=settings.object_storage_region,
-            **_sync_storage_auth_kwargs(),
-        )
-        if not client.bucket_exists(settings.object_storage_bucket):
-            client.make_bucket(
-                settings.object_storage_bucket,
-                location=settings.object_storage_bucket_location,
-            )
-        client.put_object(
-            settings.object_storage_bucket,
-            object_name,
-            io.BytesIO(png),
-            length=len(png),
-            content_type="image/png",
-        )
+        put_object_sync(object_name, png, "image/png")
         return object_name
     except Exception as exc:
         log.warning("Screenshot upload failed (non-fatal): %s", exc)

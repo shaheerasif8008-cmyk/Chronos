@@ -30,6 +30,13 @@ function formatFileSize(bytes: number) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function formatSearchResultTime(value?: string) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 type Route = "chat" | "activity" | "approvals" | "memory" | "connectors" | "assistants" | "settings" | "projects" | "research" | "browser" | "computer" | "tasks" | "artifacts" | "agents" | "workflows" | "audit";
 type SettingsTab = "general" | "profile" | "organization" | "members" | "permissions" | "employees" | "runtime" | "memory-settings" | "tools-settings" | "approval-settings" | "notifications" | "security" | "billing" | "audit" | "developer" | "danger";
@@ -515,7 +522,7 @@ const ACCENT_PALETTES: Record<string, { accent: string; hover: string; soft: str
 };
 
 // ─── Search palette types (module scope) ─────────────────────────────────────
-type SearchResult = { type: string; id: string; title: string; snippet: string; url: string };
+type SearchResult = { type: string; id: string; title: string; snippet: string; url: string; updated_at?: string; created_at?: string };
 
 const PALETTE_TYPE_LABELS: Record<string, string> = {
   conversations: "Conversations",
@@ -781,6 +788,17 @@ function ChronosAppInner() {
   }, [pathname]);
 
   useEffect(() => {
+    if (pathname !== "/chat") return;
+    const conversationId = new URLSearchParams(window.location.search).get("c");
+    if (!conversationId) return;
+    setActiveConvoId(conversationId);
+    setNewConversationOpen(false);
+    newConversationOpenRef.current = false;
+    void loadConversations(conversationId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pathname]);
+
+  useEffect(() => {
     void loadConversations();
   }, [route]);
 
@@ -791,6 +809,15 @@ function ChronosAppInner() {
   function navigateRoute(next: Route) {
     setRoute(next);
     router.push(pathForRoute(next));
+  }
+
+  function openConversation(id: string) {
+    setActiveConvoId(id);
+    setNewConversationOpen(false);
+    newConversationOpenRef.current = false;
+    setRoute("chat");
+    router.push(`/chat?c=${encodeURIComponent(id)}`);
+    void loadConversations(id);
   }
 
   async function loadConversations(selectId?: string) {
@@ -851,7 +878,7 @@ function ChronosAppInner() {
         conversations={conversations}
         conversationsLoading={conversationsLoading}
         activeConvoId={activeConvoId}
-        onSelectConvo={(id) => { setActiveConvoId(id); setNewConversationOpen(false); newConversationOpenRef.current = false; navigateRoute("chat"); }}
+        onSelectConvo={openConversation}
         onNewConvo={() => { setActiveConvoId(null); setNewConversationOpen(true); newConversationOpenRef.current = true; navigateRoute("chat"); }}
         onDeleteConvo={deleteConversation}
         pendingApprovals={pendingApprovals}
@@ -862,7 +889,7 @@ function ChronosAppInner() {
       />
 
       <main className="flex-1 min-w-0 flex flex-col" style={{ background: "var(--bg)" }}>
-        {route === "chat"       && <ChatScreen activeConvoId={activeConvoId} activePersonaId={activePersonaId} onPersonaChange={setActivePersonaId} onConvoCreated={(id) => loadConversations(id)} onApprovalsChanged={loadPendingApprovals} paletteOpen={searchPaletteOpen} onPaletteOpenChange={setSearchPaletteOpen} />}
+        {route === "chat"       && <ChatScreen activeConvoId={activeConvoId} activePersonaId={activePersonaId} onPersonaChange={setActivePersonaId} onConvoCreated={(id) => loadConversations(id)} onConvoSelected={openConversation} onApprovalsChanged={loadPendingApprovals} paletteOpen={searchPaletteOpen} onPaletteOpenChange={setSearchPaletteOpen} />}
         {route === "activity"   && <ActivityScreen />}
         {route === "approvals"  && <ApprovalsScreen onDecision={loadPendingApprovals} />}
         {route === "memory"     && <MemoryScreen />}
@@ -1165,6 +1192,7 @@ function ChatScreen({
   activePersonaId,
   onPersonaChange,
   onConvoCreated,
+  onConvoSelected,
   onApprovalsChanged,
   paletteOpen,
   onPaletteOpenChange,
@@ -1173,6 +1201,7 @@ function ChatScreen({
   activePersonaId: string;
   onPersonaChange: (personaId: string) => void;
   onConvoCreated: (id: string) => void;
+  onConvoSelected: (id: string) => void;
   onApprovalsChanged: () => void;
   paletteOpen: boolean;
   onPaletteOpenChange: (open: boolean) => void;
@@ -1279,7 +1308,8 @@ function ChatScreen({
       const ctrl = new AbortController();
       paletteAbortRef.current = ctrl;
       try {
-        const res = await apiFetch(`/search?q=${encodeURIComponent(paletteQuery.trim())}`, { signal: ctrl.signal });
+        const q = encodeURIComponent(paletteQuery.trim());
+        const res = await apiFetch(`/search?q=${q}&types=conversations,messages`, { signal: ctrl.signal });
         if (!res.ok) return;
         const data = (await res.json()) as SearchResult[];
         if (!ctrl.signal.aborted) { setPaletteResults(data); setPaletteSelectedIdx(-1); }
@@ -1301,6 +1331,11 @@ function ChatScreen({
   function handlePaletteSelect(result: SearchResult) {
     onPaletteOpenChange(false);
     setPaletteQuery("");
+    const conversationId = new URL(result.url, window.location.origin).searchParams.get("c");
+    if (conversationId) {
+      onConvoSelected(conversationId);
+      return;
+    }
     router.push(result.url);
   }
 
@@ -2305,8 +2340,8 @@ function ChatScreen({
                 value={paletteQuery}
                 onChange={e => setPaletteQuery(e.target.value)}
                 onKeyDown={handlePaletteKeyDown}
-                placeholder="Search conversations, memory, tasks…"
-                aria-label="Search"
+                placeholder="Search previous chats..."
+                aria-label="Search previous chats"
                 className="flex-1 bg-transparent text-[14px] outline-none"
                 style={{ color: "var(--text)" }}
               />
@@ -2337,7 +2372,14 @@ function ChatScreen({
                         style={{ background: isSelected ? "var(--accent-soft)" : undefined }}
                       >
                         <div className="flex-1 min-w-0">
-                          <div className="text-[13.5px] font-medium truncate">{result.title}</div>
+                          <div className="flex items-center gap-2 min-w-0">
+                            <div className="text-[13.5px] font-medium truncate">{result.title}</div>
+                            {formatSearchResultTime(result.updated_at ?? result.created_at) && (
+                              <span className="text-[11px] flex-shrink-0" style={{ color: "var(--text-dim)" }}>
+                                {formatSearchResultTime(result.updated_at ?? result.created_at)}
+                              </span>
+                            )}
+                          </div>
                           {result.snippet && result.snippet !== result.title && (
                             <div className="text-[12px] truncate mt-0.5" style={{ color: "var(--text-dim)" }}>
                               {result.snippet}
@@ -2352,7 +2394,7 @@ function ChatScreen({
               ))}
               {!paletteQuery.trim() && (
                 <div className="px-4 py-6 text-center text-[13px]" style={{ color: "var(--text-dim)" }}>
-                  Type to search across conversations, memory, tasks, and more.
+                  Type a keyword from a previous conversation.
                 </div>
               )}
             </div>

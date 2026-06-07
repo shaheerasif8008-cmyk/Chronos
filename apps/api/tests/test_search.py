@@ -96,6 +96,7 @@ async def test_search_returns_only_caller_org_rows(monkeypatch):
         sa.Column("organization_id", sa.String, nullable=False),
         sa.Column("member_id", sa.String, nullable=False),
         sa.Column("title", sa.String),
+        sa.Column("created_at", sa.String),
         sa.Column("updated_at", sa.String),
     )
     messages_tbl = sa.Table(
@@ -128,7 +129,7 @@ async def test_search_returns_only_caller_org_rows(monkeypatch):
         # Insert one matching row per table for the CALLER org "default"
         await conn.execute(conversations_tbl.insert().values(
             id="conv-default", organization_id="default", member_id="member-1",
-            title="acme project", updated_at="2024-01-01T00:00:00Z",
+            title="acme project", created_at="2024-01-01T00:00:00Z", updated_at="2024-01-01T00:00:00Z",
         ))
         await conn.execute(messages_tbl.insert().values(
             id="msg-default", organization_id="default", conversation_id="conv-default",
@@ -145,7 +146,7 @@ async def test_search_returns_only_caller_org_rows(monkeypatch):
         # Insert matching rows for a DIFFERENT org — these must NEVER appear.
         await conn.execute(conversations_tbl.insert().values(
             id="conv-other", organization_id="other-org", member_id="member-x",
-            title="acme other org", updated_at="2024-01-01T00:00:00Z",
+            title="acme other org", created_at="2024-01-01T00:00:00Z", updated_at="2024-01-01T00:00:00Z",
         ))
         await conn.execute(messages_tbl.insert().values(
             id="msg-other", organization_id="other-org", conversation_id="conv-other",
@@ -223,7 +224,7 @@ async def test_search_types_filter_only_queries_requested_types(monkeypatch):
 
     member = _make_member()
 
-    conversations_table = _FakeTable(["id", "title", "member_id", "organization_id", "updated_at"])
+    conversations_table = _FakeTable(["id", "title", "member_id", "organization_id", "created_at", "updated_at"])
     queried_tables: list[str] = []
 
     async def fake_reflect_table(name: str):
@@ -378,7 +379,7 @@ async def test_search_permission_and_audit_fire_on_every_call(monkeypatch):
     audit_calls: list = []
 
     async def fake_reflect_table(name: str):
-        table = _FakeTable(["id", "title", "member_id", "organization_id", "updated_at",
+        table = _FakeTable(["id", "title", "member_id", "organization_id", "created_at", "updated_at",
                              "goal", "content", "conversation_id", "created_at"])
         return table
 
@@ -464,6 +465,7 @@ async def test_search_like_metacharacters_escaped(monkeypatch):
         sa.Column("organization_id", sa.String, nullable=False),
         sa.Column("member_id", sa.String, nullable=False),
         sa.Column("title", sa.String),
+        sa.Column("created_at", sa.String),
         sa.Column("updated_at", sa.String),
     )
 
@@ -472,12 +474,12 @@ async def test_search_like_metacharacters_escaped(monkeypatch):
         # This row SHOULD match (literal "50%" in title)
         await conn.execute(conversations_tbl.insert().values(
             id="conv-pct", organization_id="default", member_id="member-1",
-            title="discount 50% off", updated_at="2024-01-01T00:00:00Z",
+            title="discount 50% off", created_at="2024-01-01T00:00:00Z", updated_at="2024-01-01T00:00:00Z",
         ))
         # This row must NOT match (has "50x", only matches if % is unescaped wildcard)
         await conn.execute(conversations_tbl.insert().values(
             id="conv-other", organization_id="default", member_id="member-1",
-            title="discount 50x off", updated_at="2024-01-01T00:00:00Z",
+            title="discount 50x off", created_at="2024-01-01T00:00:00Z", updated_at="2024-01-01T00:00:00Z",
         ))
 
     async def fake_reflect_table(name: str):

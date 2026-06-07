@@ -44,7 +44,7 @@ async def _search_conversations(q: str, member: Member) -> list[dict[str, Any]]:
     async with engine.begin() as conn:
         rows = (
             await conn.execute(
-                select(tbl.c.id, tbl.c.title, tbl.c.updated_at)
+                select(tbl.c.id, tbl.c.title, tbl.c.created_at, tbl.c.updated_at)
                 .where(
                     and_(
                         tbl.c.organization_id == member.organization_id,
@@ -63,6 +63,8 @@ async def _search_conversations(q: str, member: Member) -> list[dict[str, Any]]:
             "title": row["title"] or "Untitled",
             "snippet": _snippet(row["title"]),
             "url": f"/chat?c={row['id']}",
+            "created_at": str(row["created_at"]) if row["created_at"] is not None else None,
+            "updated_at": str(row["updated_at"]) if row["updated_at"] is not None else None,
         }
         for row in rows
     ]
@@ -72,24 +74,23 @@ async def _search_messages(q: str, member: Member) -> list[dict[str, Any]]:
     escaped = _escape_like(q)
     msgs = await reflect_table("messages")
     convos = await reflect_table("conversations")
-    # Subquery: IDs of conversations owned by this member in this org
-    owned_convo_ids = (
-        select(convos.c.id)
-        .where(
-            and_(
-                convos.c.organization_id == member.organization_id,
-                convos.c.member_id == member.id,
-            )
-        )
-    )
     async with engine.begin() as conn:
         rows = (
             await conn.execute(
-                select(msgs.c.id, msgs.c.content, msgs.c.conversation_id, msgs.c.created_at)
+                select(
+                    msgs.c.id,
+                    msgs.c.content,
+                    msgs.c.conversation_id,
+                    msgs.c.created_at,
+                    convos.c.title.label("conversation_title"),
+                    convos.c.updated_at.label("conversation_updated_at"),
+                )
+                .select_from(msgs.join(convos, msgs.c.conversation_id == convos.c.id))
                 .where(
                     and_(
                         msgs.c.organization_id == member.organization_id,
-                        msgs.c.conversation_id.in_(owned_convo_ids),
+                        convos.c.organization_id == member.organization_id,
+                        convos.c.member_id == member.id,
                         msgs.c.content.ilike(f"%{escaped}%", escape="\\"),
                     )
                 )
@@ -101,9 +102,11 @@ async def _search_messages(q: str, member: Member) -> list[dict[str, Any]]:
         {
             "type": "messages",
             "id": str(row["id"]),
-            "title": _snippet(row["content"], max_len=60),
+            "title": row["conversation_title"] or _snippet(row["content"], max_len=60),
             "snippet": _snippet(row["content"]),
             "url": f"/chat?c={row['conversation_id']}",
+            "created_at": str(row["created_at"]) if row["created_at"] is not None else None,
+            "updated_at": str(row["conversation_updated_at"]) if row["conversation_updated_at"] is not None else None,
         }
         for row in rows
     ]

@@ -27,7 +27,7 @@ def upgrade() -> None:
         sa.Column("region", sa.Text(), nullable=False, server_default="us"),
         sa.Column("artifact_id", sa.UUID(), nullable=False),
         sa.Column("version", sa.Integer(), nullable=False),
-        sa.Column("minio_path", sa.Text(), nullable=False),
+        sa.Column("object_path", sa.Text(), nullable=False),
         sa.Column("mime_type", sa.Text(), nullable=True),
         sa.Column("size_bytes", sa.Integer(), nullable=True),
         sa.Column("edit_summary", sa.Text(), nullable=True),

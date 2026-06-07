@@ -31,7 +31,7 @@ type ArtifactMeta = {
   kind: string;
   title: string | null;
   mime_type: string | null;
-  minio_path: string;
+  object_path: string;
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

@@ -141,6 +141,42 @@ GMAIL_SEARCH = _fn(
     ["query"],
 )
 
+# ── Previous chat history ─────────────────────────────────────────────────────
+
+CHAT_HISTORY_SEARCH = _fn(
+    "chat_history__search",
+    "Search this user's previous Chronos conversations by exact keywords in titles and message content. "
+    "Use when the user asks what was discussed before, wants to find an earlier chat by topic, "
+    "or asks to continue a prior conversation. Results are scoped to the current member and organization.",
+    {
+        "query": {
+            "type": "string",
+            "description": "Specific keyword or phrase to search for in previous chat titles and messages.",
+        },
+        "limit": {
+            "type": "integer",
+            "description": "Maximum conversations to return, capped by the broker connector.",
+            "default": 10,
+        },
+    },
+    ["query"],
+)
+
+CHAT_HISTORY_RECENT = _fn(
+    "chat_history__recent",
+    "Retrieve this user's most recent previous Chronos conversations with compact transcript excerpts. "
+    "Use for requests like 'summarize the last 10 chats' or 'what have we talked about recently'. "
+    "Results are scoped to the current member and organization.",
+    {
+        "limit": {
+            "type": "integer",
+            "description": "Maximum recent conversations to return, capped by the broker connector.",
+            "default": 10,
+        },
+    },
+    [],
+)
+
 # ── Filesystem ────────────────────────────────────────────────────────────────
 
 FS_LIST = _fn(
@@ -635,6 +671,8 @@ ALL_TOOLS: list[dict[str, Any]] = [
     *BROWSER_OPERATOR_TOOLS,
     GMAIL_DRAFT,
     GMAIL_SEARCH,
+    CHAT_HISTORY_SEARCH,
+    CHAT_HISTORY_RECENT,
     FS_LIST,
     FS_READ,
     FS_WRITE,
@@ -659,6 +697,8 @@ SUBAGENT_TOOLS: list[dict[str, Any]] = [
     BROWSER_FETCH,
     BROWSER_EXTRACT_CONTACTS,
     *BROWSER_OPERATOR_TOOLS,
+    CHAT_HISTORY_SEARCH,
+    CHAT_HISTORY_RECENT,
     FS_LIST,
     FS_READ,
     FS_WRITE,
@@ -692,6 +732,8 @@ INLINE_CHAT_TOOLS: list[dict[str, Any]] = [
     *BROWSER_OPERATOR_TOOLS,
     GMAIL_DRAFT,
     GMAIL_SEARCH,
+    CHAT_HISTORY_SEARCH,
+    CHAT_HISTORY_RECENT,
     FS_LIST,
     FS_READ,
     FS_WRITE,

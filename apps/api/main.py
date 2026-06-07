@@ -210,18 +210,14 @@ async def health() -> dict:
     except Exception as exc:
         checks["redis"] = f"error: {exc}"
 
-    # Object storage (MinIO locally, AWS S3 when enabled).
+    # Object storage.
     storage_health_name = "object_storage"
     try:
         from core.config import settings as cfg
-        from core.artifacts import _close_minio, _minio_client
+        from core.object_storage import ensure_bucket
         storage_health_name = cfg.object_storage_health_name
-        client = await _minio_client()
-        try:
-            await client.bucket_exists(cfg.object_storage_bucket)
-            checks[storage_health_name] = "ok"
-        finally:
-            await _close_minio(client)
+        await ensure_bucket()
+        checks[storage_health_name] = "ok"
     except Exception as exc:
         checks[storage_health_name] = f"error: {exc}"
 

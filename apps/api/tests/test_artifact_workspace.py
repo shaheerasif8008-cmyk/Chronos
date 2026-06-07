@@ -37,7 +37,7 @@ async def test_save_artifact_writes_head_and_initial_version():
     assert meta is not None
     assert meta["version"] == 1
     assert meta["created_by"] == "member:tester"
-    assert meta["minio_path"].endswith("/v1")
+    assert meta["object_path"].endswith("/v1")
     content = await read_artifact_content(aid)
     assert content == b"# Hello\nWorld"
 

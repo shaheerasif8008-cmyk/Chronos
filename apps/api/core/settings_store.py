@@ -85,6 +85,7 @@ DEFAULTS: dict[str, dict[str, Any]] = {
     "tool_settings": {
         "browser": {"enabled": True, "approval_required": False, "risk": "low"},
         "gmail": {"enabled": True, "approval_required": True, "risk": "high"},
+        "chat_history": {"enabled": True, "approval_required": False, "risk": "low"},
     },
     "approval": {
         "mode": "manual",

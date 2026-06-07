@@ -15,9 +15,9 @@ source .venv/bin/activate
 # Isolated storage for the harness (override-able from the environment).
 export DATABASE_URL="${E2E_DATABASE_URL:-postgresql+asyncpg://chronos:chronos@localhost:55433/chronos}"
 export REDIS_URL="${E2E_REDIS_URL:-redis://localhost:6379/3}"
-export MINIO_ENDPOINT="${MINIO_ENDPOINT:-localhost:9000}"
-export MINIO_ACCESS_KEY="${MINIO_ACCESS_KEY:-chronos}"
-export MINIO_SECRET_KEY="${MINIO_SECRET_KEY:-chronos123}"
+export OBJECT_STORAGE_BACKEND=s3
+export AWS_S3_BUCKET="${E2E_AWS_S3_BUCKET:-chronos-e2e-local-fallback}"
+export AWS_S3_REGION="${AWS_S3_REGION:-us-east-1}"
 export VAULT_ENCRYPTION_KEY="${VAULT_ENCRYPTION_KEY:-$(printf '0%.0s' $(seq 1 64))}"
 
 LOG_DIR="$HERE/.artifacts"

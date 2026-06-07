@@ -422,6 +422,8 @@ class InMemoryConnectorRepository:
         row = self.workflow_steps[(run_id, step_id)]
         if row["tenant_id"] != tenant_id:
             raise ValueError("Workflow step not found")
+        if row.get("status") in {"success", "failed", "skipped"} and values.get("status") == "running":
+            return dict(row)
         row.update(values)
         row["updated_at"] = now_iso()
         return dict(row)
@@ -1516,6 +1518,9 @@ class DatabaseConnectorRepository:
         from core.db import engine, reflect_table
 
         table = await reflect_table("workflow_steps")
+        existing = await self._workflow_step_row(run_id, step_id, tenant_id=tenant_id)
+        if existing and existing.get("status") in {"success", "failed", "skipped"} and values.get("status") == "running":
+            return existing
         payload = {key: value for key, value in values.items() if key in table.c}
         payload["updated_at"] = text("NOW()")
         if payload.get("status") == "running":
@@ -1533,6 +1538,26 @@ class DatabaseConnectorRepository:
         if not row:
             raise ValueError("Workflow step not found")
         return dict(row)
+
+    async def _workflow_step_row(self, run_id: str, step_id: str, *, tenant_id: str) -> dict[str, Any] | None:
+        from sqlalchemy import select
+
+        from core.db import engine, reflect_table
+
+        table = await reflect_table("workflow_steps")
+        async with engine.begin() as conn:
+            row = (
+                await conn.execute(
+                    select(table).where(table.c.run_id == run_id, table.c.id == step_id, table.c.organization_id == tenant_id)
+                )
+            ).mappings().first()
+            if not row and "step_key" in table.c:
+                row = (
+                    await conn.execute(
+                        select(table).where(table.c.run_id == run_id, table.c.step_key == step_id, table.c.organization_id == tenant_id)
+                    )
+                ).mappings().first()
+        return dict(row) if row else None
 
     async def create_workflow_dependency(self, **values: Any) -> dict[str, Any]:
         from sqlalchemy import insert

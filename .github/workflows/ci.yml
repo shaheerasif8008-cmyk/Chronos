@@ -40,8 +40,10 @@ jobs:
       REDIS_URL: redis://localhost:6379/0
       # Deterministic 64-hex test key (no real secret).
       VAULT_ENCRYPTION_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-      # Force the local object-storage fallback (no MinIO service in CI).
-      MINIO_ENDPOINT: "localhost:1"
+      # Force the local object-storage fallback (no live S3 bucket in CI).
+      OBJECT_STORAGE_BACKEND: s3
+      AWS_S3_BUCKET: chronos-ci-local-fallback
+      AWS_S3_REGION: us-east-1
     defaults:
       run:
         working-directory: apps/api
@@ -131,7 +133,9 @@ jobs:
       E2E_DATABASE_URL: postgresql+asyncpg://chronos:chronos@localhost:55433/chronos
       E2E_REDIS_URL: redis://localhost:6379/3
       VAULT_ENCRYPTION_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-      MINIO_ENDPOINT: "localhost:1"
+      OBJECT_STORAGE_BACKEND: s3
+      AWS_S3_BUCKET: chronos-ci-local-fallback
+      AWS_S3_REGION: us-east-1
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
     steps:
       - uses: actions/checkout@v4

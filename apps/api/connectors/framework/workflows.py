@@ -130,6 +130,7 @@ class WorkflowRuntime:
                 trigger_event_type=event_type,
                 trigger_payload=payload,
             )
+            await self.tick(run["id"], tenant_id=tenant_id)
             dispatched.append(run)
         return dispatched
 
@@ -219,16 +220,18 @@ class WorkflowRuntime:
             for run in await self.repo.list_workflow_runs(tenant_id=tenant_id, status=status):
                 candidates[run["id"]] = run
         for run in candidates.values():
-            await self.repo.update_workflow_run(run["id"], tenant_id=tenant_id, status="recovering")
+            await self.repo.update_workflow_run(run["id"], tenant_id=tenant_id, status="running")
             refreshed = await self.repo.get_workflow_run(run["id"], tenant_id=tenant_id)
             if refreshed:
                 await self._record_run_event(refreshed, "run_recovered", {})
             await self._checkpoint(run["id"], tenant_id=tenant_id)
+            await self.tick(run["id"], tenant_id=tenant_id)
             recovered.append(run["id"])
         return recovered
 
     async def _schedule_step(self, run: dict[str, Any], step: dict[str, Any]) -> None:
         connector_id, action_name = step["tool_name"].split("__", 1)
+        await self._prepare_internal_connector(run, connector_id, action_name)
         result = await QueuedConnectorExecutionService(self.repo, self.queue).enqueue(
             connector_id=connector_id,
             action_name=action_name,
@@ -244,6 +247,44 @@ class WorkflowRuntime:
         else:
             await self.repo.update_workflow_step(run["id"], step["id"], tenant_id=tenant_of(run), status="failed", error_message=result.error)
             await self.repo.update_workflow_run(run["id"], tenant_id=tenant_of(run), status="failed")
+
+    async def _prepare_internal_connector(self, run: dict[str, Any], connector_id: str, action_name: str) -> None:
+        connector = await self.repo.get_connector(connector_id, tenant_id=tenant_of(run))
+        if not connector:
+            return
+        if connector.get("provider") != "internal" or connector.get("auth_type") != "none":
+            return
+        if connector.get("status") != "installed":
+            await self.repo.install_connector(
+                connector_id,
+                tenant_id=tenant_of(run),
+                workspace_id=run["workspace_id"],
+                installed_by=run.get("user_id") or run["employee_id"],
+            )
+        action = await self.repo.get_action(connector_id, action_name)
+        if not action:
+            return
+        permission = await self.repo.get_permission(
+            tenant_id=tenant_of(run),
+            workspace_id=run["workspace_id"],
+            employee_id=run["employee_id"],
+            user_id=run.get("user_id"),
+            connector_id=connector_id,
+            action_name=action_name,
+        )
+        required_scopes = list(action.get("required_permissions") or [])
+        if permission and set(required_scopes).issubset(set(permission.get("allowed_scopes") or [])):
+            return
+        await self.repo.grant_permission(
+            tenant_id=tenant_of(run),
+            workspace_id=run["workspace_id"],
+            employee_id=run["employee_id"],
+            user_id=run.get("user_id"),
+            connector_id=connector_id,
+            action_name=action_name,
+            allowed_scopes=required_scopes,
+            approval_required=False,
+        )
 
     async def _checkpoint(self, run_id: str, *, tenant_id: str) -> dict[str, Any]:
         run = await self.repo.get_workflow_run(run_id, tenant_id=tenant_id)

@@ -14,7 +14,7 @@ FastAPI (async Python)     → API. Every route is async. No sync blocking anywh
 litellm                    → Model router. Local LLM primary, BYOK fallback.
 Postgres 15 + pgvector     → Everything. Conversations, memory, tasks, audit. One DB.
 Redis                      → Activity log streaming (pub/sub). Embedding cache.
-MinIO                      → File storage. Context folders, skill packs, artifacts.
+S3                      → File storage. Context folders, skill packs, artifacts.
 Composio                   → Connector adapters for consumer SaaS (Gmail, HubSpot).
 Playwright                 → Browser automation. Runs in sandboxed subprocess.
 APScheduler                → Background jobs. Memory extraction, profile synthesis.
@@ -110,7 +110,7 @@ chronos/
 │           ├── profile_synthesis.py
 │           └── context_update.py
 │
-├── skills/                           # Skill pack folder (loaded from MinIO in prod)
+├── skills/                           # Skill pack folder (loaded from S3 in prod)
 │   ├── general/
 │   │   ├── SKILL.md
 │   │   └── metadata.json
@@ -305,7 +305,7 @@ Step 1: Auth middleware
   → Load member from DB
 
 Step 2: Context assembly (core/context.py)
-  → Load org context folder (all .md files from MinIO/org_id/)
+  → Load org context folder (all .md files from S3/org_id/)
   → Load active persona prompt (if invoked by name)
   → Load relevant skills (scan skill descriptions vs message intent)
   → memory.retrieve(message, requester_context)  ← MEMORY SEAM
@@ -500,10 +500,10 @@ async def assemble_context(
     base = load_base_system_prompt()
 
     # 2. Org context folder — all .md files
-    org_files = await minio.list_files(f"context/{requester_context.org_id}/")
+    org_files = await object_storage.list_files(f"context/{requester_context.org_id}/")
     org_context = ""
     for f in org_files:
-        content = await minio.read(f.path)
+        content = await object_storage.read(f.path)
         org_context += f"\n\n## {f.name}\n{content}"
     if org_context:
         base += f"\n\n# Organization Context{org_context}"
@@ -926,10 +926,10 @@ class SkillRegistry:
         self._index: list[SkillMeta] = []  # Loaded at startup
 
     async def load_all(self):
-        # Load all metadata.json files from MinIO skills/ folder
-        skill_dirs = await minio.list_dirs("skills/")
+        # Load all metadata.json files from S3 skills/ folder
+        skill_dirs = await object_storage.list_dirs("skills/")
         for dir in skill_dirs:
-            meta = await minio.read_json(f"skills/{dir}/metadata.json")
+            meta = await object_storage.read_json(f"skills/{dir}/metadata.json")
             self._index.append(SkillMeta(
                 id=dir,
                 name=meta["name"],
@@ -967,12 +967,12 @@ class SkillLoader:
             return self._cache[skill_id]
 
         # Load SKILL.md + all other files in the skill folder
-        files = await minio.list_files(f"skills/{skill_id}/")
+        files = await object_storage.list_files(f"skills/{skill_id}/")
         content = ""
         for f in files:
             if f.name == "metadata.json":
                 continue
-            file_content = await minio.read(f.path)
+            file_content = await object_storage.read(f.path)
             content += f"\n\n### {f.name}\n{file_content}"
 
         self._cache[skill_id] = content
@@ -1127,7 +1127,7 @@ The function signature is identical. Phase 3 is a one-file change that activates
 
 **Playwright in a sandboxed subprocess.** Browser automation is the highest-risk capability in the system. Running it in a subprocess with resource limits (memory cap, network allowlist per task) contains bugs, runaway loops, and potential injection attacks to the subprocess level.
 
-**MinIO for file storage.** S3-compatible, runs locally in Docker Compose, no cloud dependency in Phase 1. Phase 3: swap the MinIO endpoint for actual S3. No code change — just an environment variable.
+**AWS S3 for file storage.** Runtime artifacts and generated files are stored in an operator-provided S3 bucket. Local development uses the same S3 path and falls back to scratch storage only when uploads fail.
 
 **Pydantic v2 everywhere.** Request validation, response serialization, and all internal data models use Pydantic v2. The performance improvement over v1 matters at the level of messages-per-second Chronos processes. It also catches shape mismatches at the boundary, not deep in business logic.
 
@@ -1140,7 +1140,7 @@ The function signature is identical. Phase 3 is a one-file change that activates
 git clone https://github.com/cognisia/chronos
 cd chronos
 cp .env.example .env  # Fill in your local LLM endpoint + backup API key
-docker-compose up -d  # Postgres + Redis + MinIO
+docker-compose up -d  # Postgres + Redis + OpenFGA
 cd apps/api && pip install -r requirements.txt
 alembic upgrade head  # Run all migrations
 python seed.py        # Create default org + admin user
@@ -1154,7 +1154,7 @@ The seed script creates:
 - One org with `id = 'default'`
 - One admin member with a test email
 - The context folder with a starter `org.md`
-- The General and SDR skill packs loaded into MinIO
+- The General and SDR skill packs loaded into object storage
 
 After setup: open `localhost:3000`, enter the test email, get OTP from the API console log (no SendGrid needed in dev), log in.
 
@@ -1173,7 +1173,7 @@ The seams are why Phase 3 is a refactor, not a rewrite.
 | `organization_id` | Config constant "default" | Real UUID from JWT session |
 | `region` | Config constant "us" | Real value from org record |
 | Approval notifications | Email only | + Slack, Teams |
-| File storage | Local MinIO | Same API, S3 endpoint |
+| File storage | AWS S3 | Same API, different bucket or region |
 | Vault | Redis + Postgres | Same API, add HSM for Phase 4 |
 
 Every Phase 3 change is a localized swap, not a distributed refactor. That's the value of the seams.

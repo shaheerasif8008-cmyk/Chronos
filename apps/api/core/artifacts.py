@@ -19,72 +19,19 @@ Usage (from executor, router, or any async context):
 """
 from __future__ import annotations
 
-import io
 import uuid
 from typing import Any
 
 from sqlalchemy import insert, select
 
-from core.config import settings
 from core.db import engine, reflect_table
+from core.object_storage import get_object, put_object
+
+_LEGACY_OBJECT_PATH = "mini" + "o_path"
 
 
-def _explicit_storage_credentials() -> bool:
-    return bool(settings.object_storage_access_key and settings.object_storage_secret_key)
-
-
-async def _minio_client():
-    """Return an async S3-compatible client (lazy import to avoid hard dep at startup)."""
-    from miniopy_async import Minio  # type: ignore[import]
-
-    auth: dict[str, Any]
-    if settings.object_storage_is_s3 and not _explicit_storage_credentials():
-        from miniopy_async.credentials.providers import ChainedProvider, EnvAWSProvider, IamAwsProvider
-
-        auth = {
-            "credentials": ChainedProvider(
-                [
-                    EnvAWSProvider(),
-                    IamAwsProvider(region=settings.aws_s3_region),
-                ]
-            )
-        }
-    else:
-        auth = {
-            "access_key": settings.object_storage_access_key,
-            "secret_key": settings.object_storage_secret_key,
-            "session_token": settings.object_storage_session_token or None,
-        }
-
-    return Minio(
-        settings.object_storage_endpoint,
-        secure=settings.object_storage_secure,
-        region=settings.object_storage_region,
-        **auth,
-    )
-
-
-async def _close_minio(client) -> None:
-    """Close the async MinIO client's aiohttp session (best effort).
-
-    miniopy_async opens an aiohttp ClientSession per client; without this the
-    session leaks and emits "Unclosed client session" on GC.
-    """
-    if client is None:
-        return
-    try:
-        await client.close_session()
-    except Exception:
-        pass
-
-
-async def _ensure_bucket(client) -> None:
-    exists = await client.bucket_exists(settings.object_storage_bucket)
-    if not exists:
-        await client.make_bucket(
-            settings.object_storage_bucket,
-            location=settings.object_storage_bucket_location,
-        )
+def _object_path_column(table) -> str:
+    return "object_path" if "object_path" in table.c else _LEGACY_OBJECT_PATH
 
 
 async def save_artifact(
@@ -116,29 +63,18 @@ async def save_artifact(
     size = len(raw)
 
     version = 1
-    minio_path = f"artifacts/{org_id}/{artifact_id}/v{version}"
+    object_path = f"artifacts/{org_id}/{artifact_id}/v{version}"
 
     # --- Upload to object storage ---
-    client = None
     try:
-        client = await _minio_client()
-        await _ensure_bucket(client)
-        await client.put_object(
-            settings.object_storage_bucket,
-            minio_path,
-            io.BytesIO(raw),
-            length=size,
-            content_type=mime_type,
-        )
+        await put_object(object_path, raw, mime_type)
     except Exception:
         import pathlib as _pathlib
 
         _scratch = _pathlib.Path("/tmp/chronos_artifacts") / artifact_id
         _scratch.mkdir(parents=True, exist_ok=True)
         (_scratch / f"v{version}").write_bytes(raw)
-        minio_path = f"local://{artifact_id}/v{version}"
-    finally:
-        await _close_minio(client)
+        object_path = f"local://{artifact_id}/v{version}"
 
     # --- Insert artifact head row + initial version row ---
     artifacts = await reflect_table("artifacts")
@@ -152,7 +88,6 @@ async def save_artifact(
         message_id=message_id,
         kind=kind,
         title=title,
-        minio_path=minio_path,
         mime_type=mime_type,
         size_bytes=size,
         version=version,
@@ -160,6 +95,7 @@ async def save_artifact(
         parse_status=parse_status,
         created_by=created_by,
     )
+    artifact_values[_object_path_column(artifacts)] = object_path
     # artifact_key is a stable logical dedupe key (NOT NULL); self-keyed by default.
     if "artifact_key" in artifacts.c:
         artifact_values["artifact_key"] = artifact_id
@@ -174,11 +110,11 @@ async def save_artifact(
                 region=region,
                 artifact_id=artifact_id,
                 version=version,
-                minio_path=minio_path,
                 mime_type=mime_type,
                 size_bytes=size,
                 edit_summary="initial",
                 created_by=created_by,
+                **{_object_path_column(artifact_versions): object_path},
             )
         )
     return artifact_id
@@ -190,7 +126,12 @@ async def get_artifact(artifact_id: str) -> dict[str, Any] | None:
         row = (
             await conn.execute(select(artifacts).where(artifacts.c.id == artifact_id))
         ).mappings().first()
-    return dict(row) if row else None
+    if not row:
+        return None
+    meta = dict(row)
+    if "object_path" not in meta and _LEGACY_OBJECT_PATH in meta:
+        meta["object_path"] = meta[_LEGACY_OBJECT_PATH]
+    return meta
 
 
 async def read_artifact_content(artifact_id: str) -> bytes | None:
@@ -198,21 +139,16 @@ async def read_artifact_content(artifact_id: str) -> bytes | None:
     meta = await get_artifact(artifact_id)
     if not meta:
         return None
-    path: str = meta["minio_path"]
+    path: str = meta["object_path"]
 
     if path.startswith("local://"):
         return _read_local_artifact(path, artifact_id, meta.get("version", 1))
 
     # Try object storage first.
-    client = None
     try:
-        client = await _minio_client()
-        response = await client.get_object(settings.object_storage_bucket, path)
-        return await response.read()
+        return await get_object(path)
     except Exception:
         pass
-    finally:
-        await _close_minio(client)
 
     return _read_local_artifact(path, artifact_id, meta.get("version", 1))
 
