@@ -8,6 +8,7 @@ import BrowserOperatorScreen from "../../components/browser/BrowserOperatorScree
 import ComputerScreen from "../../components/computer/ComputerScreen";
 import InChatArtifactPanel from "../../components/artifacts/InChatArtifactPanel";
 import ResearchScreen from "../../components/research/ResearchScreen";
+import Markdown from "../../components/Markdown";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 const CONFIGURED_API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
@@ -3369,12 +3370,10 @@ function AssistantMessage({ message, content, status, persona, toolTraces, reaso
         {/* Answer */}
         {(content || (isStreaming && !thinking)) && (
           <div className="prose-body" style={{ color: "var(--text)" }}>
-            {content}
-            {isStreaming && !content && hasTraces
-              ? null  /* traces visible; no extra caret until tokens arrive */
-              : isStreaming && !content && thinking
-              ? null  /* thinking indicator is showing */
-              : isStreaming && <span className="caret ml-0.5" style={{ borderLeft: "2px solid var(--text)" }}>&nbsp;</span>}
+            {content && <Markdown content={content} />}
+            {/* No trailing caret: Markdown renders block elements, so an inline
+                caret would orphan onto its own line. Streaming is signalled by
+                the growing text plus the thinking/typing/working states below. */}
           </div>
         )}
 
