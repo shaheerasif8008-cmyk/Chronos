@@ -1,0 +1,5 @@
+{"type":"click","text":"Temporary Sandbox\n      Default per-task workspace for one-off code, files, documents, analysis, and artifact creation. Ephemeral but replayable.","choice":"sandbox","id":null,"timestamp":1780866305580}
+{"type":"click","text":"Cloud Computer\n      Persistent workspace with plan, state, services, ports, process history, saved files, and attached cloud browser.","choice":"cloud-computer","id":null,"timestamp":1780866320194}
+{"type":"click","text":"Temporary Sandbox\n      Default per-task workspace for one-off code, files, documents, analysis, and artifact creation. Ephemeral but replayable.","choice":"sandbox","id":null,"timestamp":1780866328276}
+{"type":"click","text":"Cloud Computer\n      Persistent workspace with plan, state, services, ports, process history, saved files, and attached cloud browser.","choice":"cloud-computer","id":null,"timestamp":1780866328809}
+{"type":"click","text":"My Computer\n      Local bridge with authorized folder grants, explicit command/app approvals, revoke controls, and local event audit.","choice":"my-computer","id":null,"timestamp":1780866330010}

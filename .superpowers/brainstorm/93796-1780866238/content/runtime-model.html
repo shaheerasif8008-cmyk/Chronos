@@ -1,0 +1,50 @@
+<h2>Manus-like Computer Runtime Model</h2>
+<p class="subtitle">Proposed Chronos target: three environments with one task router and shared replay/artifact model.</p>
+
+<div class="cards">
+  <div class="card" data-choice="sandbox" onclick="toggleSelect(this)">
+    <div class="card-body">
+      <h3>Temporary Sandbox</h3>
+      <p>Default per-task workspace for one-off code, files, documents, analysis, and artifact creation. Ephemeral but replayable.</p>
+    </div>
+  </div>
+  <div class="card" data-choice="cloud-computer" onclick="toggleSelect(this)">
+    <div class="card-body">
+      <h3>Cloud Computer</h3>
+      <p>Persistent workspace with plan, state, services, ports, process history, saved files, and attached cloud browser.</p>
+    </div>
+  </div>
+  <div class="card" data-choice="my-computer" onclick="toggleSelect(this)">
+    <div class="card-body">
+      <h3>My Computer</h3>
+      <p>Local bridge with authorized folder grants, explicit command/app approvals, revoke controls, and local event audit.</p>
+    </div>
+  </div>
+</div>
+
+<div class="mockup">
+  <div class="mockup-header">Runtime Routing</div>
+  <div class="mockup-body">
+    <div style="display:grid;grid-template-columns:1fr auto 1fr;gap:16px;align-items:center">
+      <div class="option" style="margin:0">
+        <div class="content">
+          <h3>Chat / Task</h3>
+          <p>User asks Chronos to build, research, run, host, automate, or edit local files.</p>
+        </div>
+      </div>
+      <div style="font-size:28px;color:#f97316">→</div>
+      <div class="option" style="margin:0">
+        <div class="content">
+          <h3>Environment Router</h3>
+          <p>Chooses sandbox, persistent cloud computer, local bridge, and cloud browser based on task needs and permissions.</p>
+        </div>
+      </div>
+    </div>
+    <div style="margin-top:18px;display:grid;grid-template-columns:repeat(4,1fr);gap:12px">
+      <div class="option" style="margin:0"><div class="content"><h3>Services</h3><p>Ports, URLs, processes.</p></div></div>
+      <div class="option" style="margin:0"><div class="content"><h3>Files</h3><p>Workspace and exports.</p></div></div>
+      <div class="option" style="margin:0"><div class="content"><h3>Browser</h3><p>Sessions, takeover, downloads.</p></div></div>
+      <div class="option" style="margin:0"><div class="content"><h3>Replay</h3><p>Durable timeline across refresh.</p></div></div>
+    </div>
+  </div>
+</div>
