@@ -45,6 +45,7 @@ from runtime.tool_registry import (
     ALWAYS_APPROVAL_TOOL_NAMES,
     INLINE_CHAT_TOOLS,
     SUBAGENT_TOOLS,
+    _ASK_CLARIFICATION_TOOL_NAME,
     _START_TASK_TOOL_NAME,
     _SUBAGENT_TOOL_NAME,
     to_broker_name,
@@ -403,6 +404,13 @@ async def _agent_system_message(tools: list[dict[str, Any]] | None = None) -> di
             "read or write files, draft emails. You may call multiple independent tools in "
             "parallel. Do not narrate tool use you are not doing, and stop calling tools once "
             "you can answer. "
+            "When the user asks you to create code, an HTML page, a Python script, a document, "
+            "or any other substantial file, do not paste the full file into chat. Write the file "
+            "with fs__write or code__python so Chronos creates a durable artifact, then summarize "
+            "what was created and surface the artifact. Inline code snippets are only for small "
+            "examples or explanations. "
+            "If you truly need a user decision before acting, call ask_clarification with one "
+            "question and 2-3 concrete options instead of asking a plain prose question. "
             "If a request is a large, multi-step, long-running job (deep research, batch "
             "outreach, anything spanning many steps or sub-agents), call start_task to run it "
             "as a durable background task instead of doing it all inline. "
@@ -1435,6 +1443,36 @@ async def stream_chat_turn(
             )
             await task_runner.enqueue_task(bg_id)
             yield {"type": "task_created", "task_id": bg_id, "background": True}
+            yield {"type": "done"}
+            return
+
+        clarification = next((c for c in calls if c["name"] == _ASK_CLARIFICATION_TOOL_NAME), None)
+        if clarification:
+            args = _parse_args(clarification["args_str"])
+            question = str(args.get("question") or "").strip() or "Which direction should I take?"
+            raw_options = args.get("options") if isinstance(args.get("options"), list) else []
+            options: list[dict[str, str]] = []
+            for item in raw_options[:3]:
+                if not isinstance(item, dict):
+                    continue
+                label = str(item.get("label") or "").strip()
+                if not label:
+                    continue
+                options.append({
+                    "label": label[:80],
+                    "description": str(item.get("description") or "").strip()[:220],
+                })
+            if len(options) < 2:
+                options = [
+                    {"label": "Proceed", "description": "Continue with the most likely interpretation."},
+                    {"label": "Revise", "description": "Use a different direction that I provide."},
+                ]
+            assistant_text = question + "\n\n" + "\n".join(
+                f"{idx + 1}. {option['label']}" + (f" - {option['description']}" if option.get("description") else "")
+                for idx, option in enumerate(options)
+            )
+            await save_inline_answer(assistant_text)
+            yield {"type": "clarification", "question": question, "options": options}
             yield {"type": "done"}
             return
 

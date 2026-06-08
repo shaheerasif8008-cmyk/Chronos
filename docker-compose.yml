@@ -23,6 +23,24 @@ services:
       timeout: 5s
       retries: 10
 
+  # MinIO — S3-compatible object storage for local dev (artifacts, source
+  # uploads, screenshots). The API talks to it via boto3 using AWS_S3_ENDPOINT;
+  # production points the same code at real AWS S3. Console at http://localhost:9001.
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: chronos
+      MINIO_ROOT_PASSWORD: chronos123
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   # OpenFGA — authorization engine behind the permission seam.
   # Dev uses the in-memory datastore (tuples reset on restart; the API
   # re-seeds them on member/project creation). Set OPENFGA_API_URL=http://localhost:8080

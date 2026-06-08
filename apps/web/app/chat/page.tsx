@@ -59,10 +59,13 @@ type Message = {
   pinned?: boolean;
   parent_message_id?: string | null;
   structured_response?: StructuredResponse | null;
+  clarification?: ClarificationPrompt | null;
 };
 type ToolTrace = { id: string; tool: string; summary: string; status: MessageStatus };
 type ReasoningSummary = { id: string; iteration?: number; summary: string; status: MessageStatus };
 type ArtifactRef = { id: string; title: string; kind: string; mime_type?: string; size_bytes?: number };
+type ClarificationOption = { label: string; description?: string };
+type ClarificationPrompt = { question: string; options: ClarificationOption[] };
 type PendingAttachment = {
   id: string;
   name: string;
@@ -1227,6 +1230,7 @@ function ChatScreen({
   const abortRef = useRef<AbortController | null>(null);
   const streamingRef = useRef(false);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const voiceInputRef = useRef<HTMLInputElement>(null);
   const [voiceError, setVoiceError] = useState<string | null>(null);
@@ -1754,6 +1758,15 @@ function ChatScreen({
     });
   }
 
+  function replyToClarification(choice: string) {
+    if (choice) {
+      setDraft(choice);
+    } else {
+      setDraft("");
+    }
+    requestAnimationFrame(() => composerRef.current?.focus());
+  }
+
   async function sendMessage() {
     if (!draft.trim() || streaming) return;
     const text = draft.trim();
@@ -1778,6 +1791,8 @@ function ChatScreen({
       event?: { type: string; tool?: string | null; summary?: string; error?: string; confidence?: number; iteration?: number; args_preview?: Record<string, unknown>; step?: { description?: string }; approval_ids?: string[]; goal?: string };
       artifact?: { artifact_id: string; title?: string; kind?: string; mime_type?: string; size_bytes?: number };
       structured_response?: StructuredResponse;
+      question?: string;
+      options?: ClarificationOption[];
     };
 
     let partial = "";
@@ -1902,6 +1917,23 @@ function ChatScreen({
           if (last?.role !== "assistant") return updated;
           return [...updated.slice(0, -1), { ...last, structured_response: sr }];
         });
+      } else if (ev.type === "clarification" && ev.question) {
+        const prompt: ClarificationPrompt = {
+          question: ev.question,
+          options: (ev.options ?? []).slice(0, 3).filter(option => option.label),
+        };
+        partial = ev.question;
+        setMessages(prev => {
+          const updated = [...prev];
+          const last = updated[updated.length - 1];
+          if (last?.role !== "assistant") return updated;
+          return [...updated.slice(0, -1), {
+            ...last,
+            content: ev.question ?? last.content,
+            clarification: prompt,
+            thinking: false,
+          }];
+        });
       } else if (ev.type === "task_created" && ev.task_id) {
         const taskId = ev.task_id;
         createdTaskId = taskId;
@@ -1940,9 +1972,9 @@ function ChatScreen({
             const reasoning = (last.reasoning_summaries ?? []).map(item => ({ ...item, status: "complete" as MessageStatus }));
             updated[updated.length - 1] = {
               ...last,
-              status: createdTaskId ? "streaming" : "complete",
+              status: "complete",
               content: partial || last.content,
-              thinking: Boolean(createdTaskId),
+              thinking: false,
               tool_traces: traces,
               reasoning_summaries: reasoning,
             };
@@ -2112,7 +2144,7 @@ function ChatScreen({
               {messages.map((m, i) => (
                 m.role === "user"
                   ? <UserMessage key={m.id ?? `user-${i}`} message={m} conversationId={activeConvoId ?? ""} onRefresh={() => { if (activeConvoId) void loadMessagesFromServer(activeConvoId); }} onBranch={(newConvoId) => { onConvoCreated(newConvoId); }}/>
-                  : <AssistantMessage key={m.id ?? `assistant-${i}`} message={m} content={m.content} conversationId={activeConvoId ?? ""} status={m.status ?? "complete"} persona={activePersona} toolTraces={m.tool_traces} reasoningSummaries={m.reasoning_summaries} artifacts={m.artifacts} thinking={m.thinking} mode={m.mode} structuredResponse={m.structured_response} onRefresh={() => { if (activeConvoId) void loadMessagesFromServer(activeConvoId); }} onBranch={(newConvoId) => { onConvoCreated(newConvoId); }}/>
+                  : <AssistantMessage key={m.id ?? `assistant-${i}`} message={m} content={m.content} conversationId={activeConvoId ?? ""} status={m.status ?? "complete"} persona={activePersona} toolTraces={m.tool_traces} reasoningSummaries={m.reasoning_summaries} artifacts={m.artifacts} thinking={m.thinking} mode={m.mode} structuredResponse={m.structured_response} onRefresh={() => { if (activeConvoId) void loadMessagesFromServer(activeConvoId); }} onBranch={(newConvoId) => { onConvoCreated(newConvoId); }} onClarificationReply={replyToClarification}/>
               ))}
               {streaming && messages[messages.length - 1]?.role !== "assistant" && (
                 <div className="flex gap-4">
@@ -2204,6 +2236,7 @@ function ChatScreen({
                 </div>
               )}
               <textarea
+                ref={composerRef}
                 value={draft}
                 onChange={e => setDraft(e.target.value)}
                 onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void sendMessage(); } }}
@@ -3257,7 +3290,47 @@ function ToolActivityLine({
   );
 }
 
-function AssistantMessage({ message, content, status, persona, toolTraces, reasoningSummaries, artifacts, thinking, mode, structuredResponse, conversationId, onRefresh, onBranch }: { message: Message; content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[]; reasoningSummaries?: ReasoningSummary[]; artifacts?: ArtifactRef[]; thinking?: boolean; mode?: string; structuredResponse?: StructuredResponse | null; conversationId: string; onRefresh: () => void; onBranch: (id: string) => void }) {
+function ClarificationCard({
+  prompt,
+  onReply,
+}: {
+  prompt: ClarificationPrompt;
+  onReply: (text: string) => void;
+}) {
+  const options = prompt.options.slice(0, 3);
+  return (
+    <div className="mt-3 surface border border-soft rounded-lg p-3 max-w-[680px]">
+      <div className="text-[13px] font-medium mb-2">{prompt.question}</div>
+      <div className="grid gap-2 sm:grid-cols-2">
+        {options.map((option, index) => (
+          <button
+            key={`${option.label}-${index}`}
+            type="button"
+            onClick={() => onReply(option.label)}
+            className="text-left rounded-md border border-soft px-3 py-2 smooth hover:border-[var(--accent)]"
+            style={{ background: "var(--surface-2)" }}
+          >
+            <div className="text-[13px] font-medium">{option.label}</div>
+            {option.description && (
+              <div className="mt-0.5 text-[12px]" style={{ color: "var(--text-dim)" }}>{option.description}</div>
+            )}
+          </button>
+        ))}
+        <button
+          type="button"
+          onClick={() => onReply("")}
+          className="text-left rounded-md border border-soft px-3 py-2 smooth hover:border-[var(--accent)]"
+          style={{ background: "var(--surface-2)" }}
+        >
+          <div className="text-[13px] font-medium">Other...</div>
+          <div className="mt-0.5 text-[12px]" style={{ color: "var(--text-dim)" }}>Type a different instruction.</div>
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function AssistantMessage({ message, content, status, persona, toolTraces, reasoningSummaries, artifacts, thinking, mode, structuredResponse, conversationId, onRefresh, onBranch, onClarificationReply }: { message: Message; content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[]; reasoningSummaries?: ReasoningSummary[]; artifacts?: ArtifactRef[]; thinking?: boolean; mode?: string; structuredResponse?: StructuredResponse | null; conversationId: string; onRefresh: () => void; onBranch: (id: string) => void; onClarificationReply: (text: string) => void }) {
   const hasTraces = !!(toolTraces && toolTraces.length > 0);
   const hasReasoning = !!(reasoningSummaries && reasoningSummaries.length > 0);
   const isStreaming = status === "streaming";
@@ -3306,6 +3379,10 @@ function AssistantMessage({ message, content, status, persona, toolTraces, reaso
         )}
 
         {(hasTraces || hasReasoning) && <ToolActivityLine traces={toolTraces} reasoning={reasoningSummaries} streaming={isStreaming} />}
+
+        {message.clarification && (
+          <ClarificationCard prompt={message.clarification} onReply={onClarificationReply} />
+        )}
 
         {/* Artifacts — openable / downloadable files Chronos produced */}
         {artifacts && artifacts.length > 0 && (
