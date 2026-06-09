@@ -104,10 +104,25 @@ jobs:
   # Behavioral E2E (chat/research/etc.) drives the real API + a live model and
   # needs provider secrets + the dual-server harness. It runs only when a model
   # key is configured as a repo secret, so default CI stays green without secrets.
+  #
+  # The `secrets` context is not available in job-level `if` expressions —
+  # referencing it there invalidates the whole workflow (every job, including
+  # backend tests, silently never runs). Gate via a tiny job whose step CAN
+  # read secrets, and have the behavioral job depend on its output.
+  e2e-behavioral-gate:
+    name: Check behavioral E2E secret
+    runs-on: ubuntu-latest
+    outputs:
+      has_key: ${{ steps.check.outputs.has_key }}
+    steps:
+      - id: check
+        run: echo "has_key=${{ secrets.OPENROUTER_API_KEY != '' }}" >> "$GITHUB_OUTPUT"
+
   e2e-behavioral:
     name: Web E2E (behavioral, gated on secret)
     runs-on: ubuntu-latest
-    if: ${{ secrets.OPENROUTER_API_KEY != '' }}
+    needs: e2e-behavioral-gate
+    if: ${{ needs.e2e-behavioral-gate.outputs.has_key == 'true' }}
     services:
       postgres:
         image: pgvector/pgvector:pg15
