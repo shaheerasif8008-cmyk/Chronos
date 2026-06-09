@@ -56,6 +56,9 @@ jobs:
           cache-dependency-path: apps/api/requirements.txt
       - name: Install dependencies
         run: pip install -r requirements.txt
+      - name: Install Playwright browser
+        # The browser-operator tests launch real Chromium sessions.
+        run: python -m playwright install --with-deps chromium
       - name: Migrate to head
         # Also guards the migration chain: a too-long revision id (>VARCHAR(32))
         # would fail here on a clean DB.

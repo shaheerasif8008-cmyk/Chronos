@@ -42,7 +42,11 @@ DATA_TIMEOUT_SECONDS = 20
 DATA_RLIMIT_CPU = 15
 DATA_RLIMIT_AS = 2 * 1024 * 1024 * 1024   # 2 GB
 DATA_RLIMIT_FSIZE = 25 * 1024 * 1024       # 25 MB
-DATA_RLIMIT_NPROC = 64                      # cap forks (anti fork-bomb)
+# RLIMIT_NPROC counts ALL processes/threads of the UID, not just this subprocess.
+# On shared hosts (CI runners) the user already holds hundreds of threads, so a
+# tight cap blocks even single-thread spawns (e.g. matplotlib's font manager:
+# "can't start new thread"). 4096 still contains a runaway fork bomb.
+DATA_RLIMIT_NPROC = 4096
 #: Hard cap on the source artifact bytes read into the API process (anti-OOM).
 MAX_SOURCE_BYTES = 256 * 1024 * 1024        # 256 MB
 
