@@ -224,6 +224,9 @@ async def test_list_messages_returns_rich_fields(monkeypatch):
             class M:
                 def all(self_inner):
                     return [rich_row]
+                def first(self_inner):
+                    # Satisfies the _check_conversation_ownership lookup.
+                    return {"id": "conv-1", "member_id": "member-1", "organization_id": "default"}
             return M()
 
     class _FakeConn:
@@ -246,6 +249,9 @@ async def test_list_messages_returns_rich_fields(monkeypatch):
 
     class _FakeTable:
         class c:
+            id = _FakeColumn()
+            member_id = _FakeColumn()
+            organization_id = _FakeColumn()
             conversation_id = _FakeColumn()
             created_at = _FakeColumn()
 

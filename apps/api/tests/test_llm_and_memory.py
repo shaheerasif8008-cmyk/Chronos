@@ -86,12 +86,17 @@ def test_available_chat_models_include_configured_options(monkeypatch):
     models = llm.available_chat_models()
 
     assert [model["id"] for model in models] == [
+        "auto",
         "gpt-5.4-mini",
         "gpt-5.4-nano",
         "deepseek-v4-pro",
         "deepseek-v4-flash",
     ]
     by_id = {model["id"]: model for model in models}
+    # "Auto" is the default user-facing selection and resolves to a real model.
+    assert by_id["auto"]["model"] == "openrouter/openai/gpt-5.4-mini"
+    assert llm.default_chat_model_id() == "auto"
+    assert llm.resolve_agent_model("auto") == "openrouter/openai/gpt-5.4-mini"
     assert by_id["gpt-5.4-mini"]["model"] == "openrouter/openai/gpt-5.4-mini"
     assert by_id["gpt-5.4-nano"]["model"] == "openrouter/openai/gpt-5.4-nano"
     assert by_id["deepseek-v4-pro"]["model"] == "openrouter/deepseek/deepseek-v4-pro"

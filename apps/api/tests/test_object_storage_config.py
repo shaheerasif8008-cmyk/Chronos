@@ -64,7 +64,10 @@ def test_object_storage_s3_can_use_custom_compatible_endpoint() -> None:
     assert settings.object_storage_endpoint == "s3.example.internal"
 
 
-def test_object_storage_s3_requires_bucket() -> None:
+def test_object_storage_s3_requires_bucket(monkeypatch) -> None:
+    # _env_file=None skips the dotenv file but NOT process env vars; CI/dev
+    # shells export AWS_S3_BUCKET, which would satisfy the validator.
+    monkeypatch.delenv("AWS_S3_BUCKET", raising=False)
     with pytest.raises(ValueError, match="AWS_S3_BUCKET"):
         Settings(_env_file=None)
 

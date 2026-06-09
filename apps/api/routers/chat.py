@@ -300,6 +300,49 @@ async def latest_conversation_task(conversation_id: str, member: Member = Depend
     return dict(row) if row else None
 
 
+class RenameConversationRequest(BaseModel):
+    title: str
+
+
+@router.patch("/conversations/{conversation_id}")
+async def rename_conversation(
+    conversation_id: str,
+    req: RenameConversationRequest,
+    member: Member = Depends(get_current_member),
+) -> dict:
+    title = req.title.strip()[:80]
+    if not title:
+        raise HTTPException(status_code=422, detail="title must not be empty")
+    await permissions.check(member, "rename_conversation", conversation_id)
+    conversations = await reflect_table("conversations")
+    async with engine.begin() as conn:
+        row = (
+            await conn.execute(
+                select(conversations.c.id).where(
+                    conversations.c.id == conversation_id,
+                    conversations.c.member_id == member.id,
+                    conversations.c.organization_id == member.organization_id,
+                )
+            )
+        ).first()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        await conn.execute(
+            update(conversations)
+            .where(conversations.c.id == conversation_id)
+            .values(title=title, updated_at=datetime.now(timezone.utc))
+        )
+    await audit.log(
+        "conversation_renamed",
+        member.id,
+        "chat.rename_conversation",
+        organization_id=member.organization_id,
+        resource_type="conversations",
+        resource_id=conversation_id,
+    )
+    return {"id": conversation_id, "title": title}
+
+
 @router.delete("/conversations/{conversation_id}")
 async def delete_conversation(conversation_id: str, member: Member = Depends(get_current_member)) -> dict:
     await permissions.check(member, "delete_conversation", conversation_id)
@@ -507,7 +550,8 @@ async def _agent_loop_stream(
                     yield f"data: {json.dumps({'type': 'structured_response', 'structured_response': _sr})}\n\n"
                 break
             elif event_type == "task_failed":
-                final_answer = f"The task stopped: {event.get('error') or 'unknown error'}"
+                # The loop emits user-facing failure copy in the event already.
+                final_answer = str(event.get("error") or "The task stopped before it finished.")
                 break
     finally:
         await pubsub.unsubscribe(activity_channel(task_id))
@@ -1222,12 +1266,16 @@ async def _replay_message_turn(
     requester_context = RequesterContext.from_member(member)
     output = ""
     task_id: str | None = None
+    from core.llm import default_chat_model_id
+
     async for event in stream_chat_turn(
         conversation_id=conversation_id,
         message=payload["message"],
         context_messages=payload["context_messages"],
         requester_context=requester_context,
-        model=req.model,
+        # The UI sends an empty body for regenerate/retry; resolve_agent_model
+        # raises on None, so fall back to the default model explicitly.
+        model=req.model or default_chat_model_id(),
         mode=req.mode,
         emit_conversation=False,
     ):

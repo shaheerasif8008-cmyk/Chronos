@@ -61,18 +61,29 @@ type Message = {
   parent_message_id?: string | null;
   structured_response?: StructuredResponse | null;
   clarification?: ClarificationPrompt | null;
+  error_detail?: string;
 };
 type ToolTrace = { id: string; tool: string; summary: string; status: MessageStatus };
 type ReasoningSummary = { id: string; iteration?: number; summary: string; status: MessageStatus };
 type ArtifactRef = { id: string; title: string; kind: string; mime_type?: string; size_bytes?: number };
 type ClarificationOption = { label: string; description?: string };
 type ClarificationPrompt = { question: string; options: ClarificationOption[] };
+type AttachmentState = "uploading" | "processing" | "ready" | "unsupported" | "failed";
 type PendingAttachment = {
   id: string;
   name: string;
   size: number;
   type: string;
   previewUrl?: string;
+  state: AttachmentState;
+};
+
+const ATTACHMENT_STATE_LABELS: Record<AttachmentState, string> = {
+  uploading: "Uploading…",
+  processing: "Processing…",
+  ready: "Ready",
+  unsupported: "Can't read this file yet",
+  failed: "Couldn't read this file",
 };
 type ResponseActionRecord = { verb: string; description: string; target?: string | null };
 type StructuredResponse = {
@@ -180,7 +191,29 @@ type TaskStreamEvent = {
   size_bytes?: number;
   payload?: Record<string, unknown>;
 };
-type Approval = { id: string; task_id: string; step_id: string; action_type: string; action_payload: Record<string, unknown>; requested_at?: string; status: string };
+type Approval = { id: string; task_id: string; step_id: string; action_type: string; action_payload: Record<string, unknown>; requested_at?: string; status: string; summary?: string };
+
+// Payload keys that are runtime plumbing, never useful to an approver.
+const INTERNAL_PAYLOAD_KEYS = new Set(["call_id", "agent_loop", "batch_id", "tool", "args", "justification", "step_id", "task_id"]);
+
+/** Flatten an approval payload into readable label/value pairs for display. */
+function approvalDisplayFields(payload: Record<string, unknown>): Array<{ label: string; value: string }> {
+  const args = (payload.args && typeof payload.args === "object" ? payload.args : {}) as Record<string, unknown>;
+  const merged: Record<string, unknown> = { ...payload, ...args };
+  const out: Array<{ label: string; value: string }> = [];
+  for (const [key, value] of Object.entries(merged)) {
+    if (INTERNAL_PAYLOAD_KEYS.has(key)) continue;
+    if (value == null || typeof value === "object" || typeof value === "function") continue;
+    const words = key.replaceAll("_", " ");
+    out.push({ label: words.charAt(0).toUpperCase() + words.slice(1), value: String(value) });
+  }
+  return out.slice(0, 8);
+}
+
+function humanizeActionType(actionType: string) {
+  const words = actionType.replace(/__/g, " ").replace(/[._]/g, " ").trim();
+  return words ? words.charAt(0).toUpperCase() + words.slice(1) : "Action";
+}
 type ActivityAction = {
   id: string;
   type: string;
@@ -202,7 +235,7 @@ type ActivityAction = {
 };
 
 const MODEL_STORAGE_KEY = "chronos.chat.selectedModel";
-const DEFAULT_MODEL_ID = "gpt-5.4-mini";
+const DEFAULT_MODEL_ID = "auto";
 const MODE_STORAGE_KEY = "chronos.chat.selectedMode";
 const REASONING_STORAGE_KEY = "chronos.chat.reasoningEffort";
 const REASONING_OPTIONS = [
@@ -215,9 +248,10 @@ const DEFAULT_REASONING_EFFORT: ReasoningEffort = "medium";
 
 function modelOptionText(model: ChatModel) {
   if (model.id === "unavailable") return model.label;
-  if (model.model === model.id || model.model === model.label) return model.model;
+  // Show only the friendly label; the vendor model string stays in the tooltip
+  // (modelOptionTitle) so the picker reads like "Auto / Fast / Best", not IDs.
   const status = model.status && model.status !== "available" ? ` (${model.status})` : "";
-  return `${model.label}: ${model.model}${status}`;
+  return `${model.label}${status}`;
 }
 
 function modelOptionTitle(model: ChatModel) {
@@ -245,7 +279,7 @@ function taskMessageStatus(task: Task): MessageStatus {
 }
 
 function taskMessageContent(task: Task): string {
-  if (task.status === "failed") return `The task stopped: ${task.error ?? "unknown error"}`;
+  if (task.status === "failed") return formatTaskError(task.error ?? undefined);
   if (task.status === "awaiting_approval") return "Waiting for approval before Chronos continues.";
   if (task.status === "paused") return "Paused. Chronos will continue when the pause is cleared.";
   if (task.status === "complete") {
@@ -456,7 +490,7 @@ function applyTaskEventToMessage(message: Message, task: Task | null, event: Tas
     return {
       ...message,
       status: "error",
-      content: message.content || `The task stopped: ${formatTaskError(event.error)}`,
+      content: message.content || formatTaskError(event.error),
       thinking: false,
       artifacts: nextArtifacts,
       tool_traces: traces,
@@ -764,6 +798,8 @@ function ChronosAppInner() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [conversationsLoading, setConversationsLoading] = useState(false);
   const [pendingApprovals, setPendingApprovals] = useState(0);
+  const [shellNotice, setShellNotice] = useState<{ text: string; kind: "ok" | "warn" | "danger" } | null>(null);
+  const taskStatusesRef = useRef<Record<string, string> | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [theme, setTheme] = useState<"light" | "dark">("dark");
   const [accent, setAccent] = useState("coral");
@@ -871,6 +907,53 @@ function ChronosAppInner() {
     } catch { /* silently */ }
   }
 
+  async function renameConversation(id: string, title: string) {
+    const trimmed = title.trim();
+    if (!trimmed) return;
+    try {
+      await apiFetch(`/chat/conversations/${id}`, { method: "PATCH", body: JSON.stringify({ title: trimmed }) });
+      setConversations(prev => prev.map(c => c.id === id ? { ...c, title: trimmed } : c));
+    } catch { /* keep old title */ }
+  }
+
+  // Light notification loop: keep the approvals badge fresh and surface task
+  // completions/failures/approval waits even when the user is on another screen.
+  const checkTaskTransitions = useCallback(async () => {
+    try {
+      const tasks = (await (await apiFetch("/tasks/")).json()) as Array<{ id: string; status: string; goal: string }>;
+      const prev = taskStatusesRef.current;
+      const next: Record<string, string> = {};
+      for (const t of tasks) next[t.id] = t.status;
+      if (prev) {
+        for (const t of tasks) {
+          const before = prev[t.id];
+          if (!before || before === t.status) continue;
+          const goal = t.goal.length > 60 ? `${t.goal.slice(0, 60)}…` : t.goal;
+          if (t.status === "complete") setShellNotice({ text: `Task finished: ${goal}`, kind: "ok" });
+          else if (t.status === "failed") setShellNotice({ text: `A task stopped and can be retried: ${goal}`, kind: "danger" });
+          else if (t.status === "awaiting_approval") setShellNotice({ text: `A task is waiting for your approval: ${goal}`, kind: "warn" });
+        }
+      }
+      taskStatusesRef.current = next;
+    } catch { /* offline — try next tick */ }
+  }, []);
+
+  useEffect(() => {
+    void checkTaskTransitions();
+    const timer = setInterval(() => {
+      void loadPendingApprovals();
+      void checkTaskTransitions();
+    }, 60_000);
+    return () => clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [checkTaskTransitions]);
+
+  useEffect(() => {
+    if (!shellNotice) return;
+    const timer = setTimeout(() => setShellNotice(null), 8_000);
+    return () => clearTimeout(timer);
+  }, [shellNotice]);
+
   return (
     <div className="flex" style={{ height: "100vh", background: "var(--bg)", color: "var(--text)" }}>
       <Sidebar
@@ -885,6 +968,7 @@ function ChronosAppInner() {
         onSelectConvo={openConversation}
         onNewConvo={() => { setActiveConvoId(null); setNewConversationOpen(true); newConversationOpenRef.current = true; navigateRoute("chat"); }}
         onDeleteConvo={deleteConversation}
+        onRenameConvo={renameConversation}
         pendingApprovals={pendingApprovals}
         onOpenSettings={openSettings}
         onSignOut={signOut}
@@ -918,6 +1002,28 @@ function ChronosAppInner() {
         {route === "audit"      && <EmptyPanel label="Audit" />}
       </main>
       <InChatArtifactPanel />
+      {shellNotice && (
+        <div
+          className="fixed bottom-5 right-5 z-50 flex items-center gap-3 rounded-xl border px-4 py-3 shadow-lg fadein max-w-[420px]"
+          style={{
+            background: "var(--surface)",
+            borderColor: shellNotice.kind === "ok" ? "var(--ok)" : shellNotice.kind === "warn" ? "var(--warn)" : "var(--danger)",
+          }}
+          role="status"
+        >
+          <Dot color={shellNotice.kind === "ok" ? "var(--ok)" : shellNotice.kind === "warn" ? "var(--warn)" : "var(--danger)"} size={7}/>
+          <span className="flex-1 min-w-0 text-[13px]" style={{ color: "var(--text)" }}>{shellNotice.text}</span>
+          <button
+            onClick={() => { setShellNotice(null); navigateRoute(shellNotice.kind === "warn" ? "approvals" : "activity"); }}
+            className="btn btn-secondary btn-sm flex-shrink-0"
+          >
+            View
+          </button>
+          <button type="button" aria-label="Dismiss notification" onClick={() => setShellNotice(null)} className="smooth hover:opacity-70 flex-shrink-0" style={{ color: "var(--text-dim)" }}>
+            <IC.X size={13}/>
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -925,35 +1031,53 @@ function ChronosAppInner() {
 // ─── Sidebar ──────────────────────────────────────────────────────────────────
 function Sidebar({
   collapsed, onCollapse, onExpand, route, onNavigate, conversations, conversationsLoading, activeConvoId,
-  onSelectConvo, onNewConvo, onDeleteConvo, pendingApprovals, onOpenSettings, onSignOut, onRefreshConversations,
+  onSelectConvo, onNewConvo, onDeleteConvo, onRenameConvo, pendingApprovals, onOpenSettings, onSignOut, onRefreshConversations,
   onOpenSearch,
 }: {
   collapsed: boolean; onCollapse: () => void; onExpand: () => void;
   route: Route; onNavigate: (r: Route) => void;
   conversations: Conversation[]; conversationsLoading: boolean; activeConvoId: string | null;
   onSelectConvo: (id: string) => void; onNewConvo: () => void;
-  onDeleteConvo: (id: string) => void; pendingApprovals: number;
+  onDeleteConvo: (id: string) => void; onRenameConvo: (id: string, title: string) => void; pendingApprovals: number;
   onOpenSettings: (tab: SettingsTab) => void; onSignOut: () => void;
   onOpenSearch?: () => void;
   onRefreshConversations: () => void;
 }) {
   const [accountOpen, setAccountOpen] = useState(false);
   const [convoMenu, setConvoMenu] = useState<string | null>(null);
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+  const [advancedOpen, setAdvancedOpen] = useState(false);
 
+  useEffect(() => {
+    setAdvancedOpen(window.localStorage.getItem("chronos.sidebar.advancedOpen") === "1");
+  }, []);
+
+  function toggleAdvanced() {
+    setAdvancedOpen(open => {
+      window.localStorage.setItem("chronos.sidebar.advancedOpen", open ? "0" : "1");
+      return !open;
+    });
+  }
+
+  // Chat-first navigation: the everyday surfaces stay at the top level; the
+  // agent-platform surfaces live under a collapsed "Advanced" group.
   const nav = [
     { id: "activity"   as Route, icon: <IC.Activity size={15}/>,   label: "Activity" },
     { id: "approvals"  as Route, icon: <IC.Approvals size={15}/>,  label: "Approvals",  badge: pendingApprovals || null, badgeKind: "warn" },
     { id: "artifacts"  as Route, icon: <IC.Folder size={15}/>,     label: "Artifacts" },
-    { id: "connectors" as Route, icon: <IC.Connectors size={15}/>, label: "Connectors" },
-    { id: "assistants" as Route, icon: <IC.Personas size={15}/>,   label: "Assistants" },
     { id: "projects"   as Route, icon: <IC.Folder size={15}/>,     label: "Projects" },
-    { id: "research"   as Route, icon: <IC.Search size={15}/>,     label: "Research" },
-    { id: "browser"    as Route, icon: <IC.Globe size={15}/>,      label: "Browser" },
-    { id: "computer"   as Route, icon: <IC.Briefcase size={15}/>,  label: "Computer" },
-    { id: "tasks"      as Route, icon: <IC.Check size={15}/>,      label: "Tasks" },
-    { id: "agents"     as Route, icon: <IC.Sparkles size={15}/>,   label: "Agents" },
-    { id: "workflows"  as Route, icon: <IC.Refresh size={15}/>,    label: "Workflows" },
+    { id: "connectors" as Route, icon: <IC.Connectors size={15}/>, label: "Connectors" },
   ];
+  const advancedNav = [
+    { id: "assistants" as Route, icon: <IC.Personas size={15}/>,   label: "Assistants", badge: null, badgeKind: undefined },
+    { id: "research"   as Route, icon: <IC.Search size={15}/>,     label: "Research",   badge: null, badgeKind: undefined },
+    { id: "browser"    as Route, icon: <IC.Globe size={15}/>,      label: "Browser",    badge: null, badgeKind: undefined },
+    { id: "computer"   as Route, icon: <IC.Briefcase size={15}/>,  label: "Computer",   badge: null, badgeKind: undefined },
+    { id: "agents"     as Route, icon: <IC.Sparkles size={15}/>,   label: "Agents",     badge: null, badgeKind: undefined },
+    { id: "workflows"  as Route, icon: <IC.Refresh size={15}/>,    label: "Workflows",  badge: null, badgeKind: undefined },
+  ];
+  const advancedActive = advancedNav.some(it => it.id === route);
 
   // Group conversations by recency
   const groups = useMemo(() => {
@@ -984,7 +1108,7 @@ function Sidebar({
         </button>
         <div className="w-8 h-px" style={{ background: "var(--border-soft)" }}/>
         <div className="flex flex-col items-center gap-2 overflow-y-auto no-scrollbar w-full px-2">
-          {nav.map(it => (
+          {[...nav, ...advancedNav].map(it => (
             <button key={it.id}
                     onClick={() => onNavigate(it.id)}
                     title={it.label}
@@ -1052,6 +1176,21 @@ function Sidebar({
             ) : null}
           </button>
         ))}
+        <button onClick={toggleAdvanced}
+                className={`nav-item w-full ${advancedActive && !advancedOpen ? "active" : ""}`}
+                aria-expanded={advancedOpen || advancedActive}>
+          <span className="nav-icon flex-shrink-0"><IC.Settings size={15}/></span>
+          <span className="flex-1 text-left">Advanced</span>
+          <IC.ChevronDown size={13} style={{ color: "var(--text-dim)", transform: advancedOpen || advancedActive ? "rotate(180deg)" : undefined, transition: "transform .15s" }}/>
+        </button>
+        {(advancedOpen || advancedActive) && advancedNav.map(it => (
+          <button key={it.id}
+                  onClick={() => onNavigate(it.id)}
+                  className={`nav-item w-full pl-7 ${route === it.id ? "active" : ""}`}>
+            <span className="nav-icon flex-shrink-0">{it.icon}</span>
+            <span className="flex-1 text-left">{it.label}</span>
+          </button>
+        ))}
       </div>
 
       <div className="mt-3 mb-1 mx-3 border-t hairline"/>
@@ -1082,6 +1221,25 @@ function Sidebar({
             <div className="space-y-0.5">
               {g.items.map(c => {
                 const isActive = c.id === activeConvoId && route === "chat";
+                if (renamingId === c.id) {
+                  return (
+                    <div key={c.id} className="px-1 py-0.5">
+                      <input
+                        autoFocus
+                        value={renameValue}
+                        onChange={e => setRenameValue(e.target.value)}
+                        onKeyDown={e => {
+                          if (e.key === "Enter") { onRenameConvo(c.id, renameValue); setRenamingId(null); }
+                          if (e.key === "Escape") setRenamingId(null);
+                        }}
+                        onBlur={() => { onRenameConvo(c.id, renameValue); setRenamingId(null); }}
+                        aria-label="Rename conversation"
+                        className="w-full rounded-md border px-2 py-1.5 text-[13px] outline-none"
+                        style={{ borderColor: "var(--accent)", background: "var(--surface)", color: "var(--text)" }}
+                      />
+                    </div>
+                  );
+                }
                 return (
                   <div key={c.id} className="relative group">
                     <button onClick={() => onSelectConvo(c.id)}
@@ -1097,6 +1255,11 @@ function Sidebar({
                     {convoMenu === c.id && (
                       <div className="surface absolute right-1 top-8 z-30 w-36 overflow-hidden rounded-lg border shadow-lg"
                            style={{ borderColor: "var(--border)" }}>
+                        <button onClick={() => { setRenameValue(c.title ?? ""); setRenamingId(c.id); setConvoMenu(null); }}
+                                className="flex w-full items-center gap-2 px-3 py-2 text-[13px] text-left hover:bg-[var(--surface-2)]"
+                                style={{ color: "var(--text)" }}>
+                          <IC.Pencil size={13}/> Rename
+                        </button>
                         <button onClick={() => { onDeleteConvo(c.id); setConvoMenu(null); }}
                                 className="flex w-full items-center gap-2 px-3 py-2 text-[13px] text-left hover:bg-[var(--danger-soft)]"
                                 style={{ color: "var(--danger)" }}>
@@ -1220,6 +1383,10 @@ function ChatScreen({
   const [modesLoadError, setModesLoadError] = useState("");
   const [selectedReasoningEffort, setSelectedReasoningEffort] = useState<ReasoningEffort>(DEFAULT_REASONING_EFFORT);
   const [streaming, setStreaming] = useState(false);
+  const [memoryNotice, setMemoryNotice] = useState<{ id: string; content: string; undone?: boolean; error?: string } | null>(null);
+  const memoryNoticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [retryBusy, setRetryBusy] = useState(false);
+  const [taskStreamRetry, setTaskStreamRetry] = useState(0);
   const [activityOpen, setActivityOpen] = useState(false);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
   const [activeTask, setActiveTask] = useState<Task | null>(null);
@@ -1601,7 +1768,7 @@ function ChatScreen({
 
     void connectTaskStream();
     return () => controller.abort();
-  }, [activeTaskId]);
+  }, [activeTaskId, taskStreamRetry]);
 
   useEffect(() => {
     if (!activeTaskId || !activeTask) return;
@@ -1637,6 +1804,83 @@ function ChatScreen({
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  function showMemoryNotice(entryId: string, content: string) {
+    if (memoryNoticeTimer.current) clearTimeout(memoryNoticeTimer.current);
+    setMemoryNotice({ id: entryId, content });
+    // Matches the server-side undo window (60s); the notice quietly retires with it.
+    memoryNoticeTimer.current = setTimeout(() => setMemoryNotice(null), 60_000);
+  }
+
+  async function undoMemoryNotice(entryId: string) {
+    try {
+      await apiFetch(`/memory/${entryId}/undo`, { method: "POST" });
+      setMemoryNotice(prev => prev && prev.id === entryId ? { ...prev, undone: true } : prev);
+      if (memoryNoticeTimer.current) clearTimeout(memoryNoticeTimer.current);
+      memoryNoticeTimer.current = setTimeout(() => setMemoryNotice(null), 4_000);
+    } catch {
+      setMemoryNotice(prev => prev && prev.id === entryId ? { ...prev, error: "The undo window has expired — you can remove it from the Memory page." } : prev);
+    }
+  }
+
+  // Autonomous memory extraction runs after the reply finishes, so its
+  // "memory_saved" notices arrive over the per-conversation memory event
+  // stream rather than the message stream.
+  useEffect(() => {
+    if (!activeConvoId) return;
+    const controller = new AbortController();
+
+    async function listenMemoryEvents() {
+      try {
+        const res = await apiFetch(`/memory/events/${activeConvoId}`, { signal: controller.signal });
+        const reader = res.body?.getReader();
+        if (!reader) return;
+        const decoder = new TextDecoder();
+        let buffer = "";
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+          for (const line of lines) {
+            if (!line.startsWith("data: ")) continue;
+            try {
+              const event = JSON.parse(line.slice(6)) as { type?: string; entry_id?: string; content?: string };
+              if (event.type === "memory_saved" && event.entry_id && event.content) {
+                showMemoryNotice(event.entry_id, event.content);
+              }
+            } catch { /* keepalive or partial frame */ }
+          }
+        }
+      } catch { /* stream closed — notices resume on next conversation open */ }
+    }
+
+    void listenMemoryEvents();
+    return () => controller.abort();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeConvoId]);
+
+  function setAttachmentState(id: string, state: AttachmentState) {
+    setAttachments(prev => prev.map(a => a.id === id ? { ...a, state } : a));
+  }
+
+  /** Poll parse status briefly so the chip can show ready/unreadable honestly.
+   *  If parsing is still pending after the window, leave the chip "ready" —
+   *  the file is attached and the send path finishes parsing on use. */
+  async function watchParseStatus(attachmentId: string) {
+    for (let attempt = 0; attempt < 8; attempt++) {
+      await new Promise(r => setTimeout(r, 1500));
+      try {
+        const meta = await apiFetch(`/artifacts/${attachmentId}`).then(r => r.json()) as { parse_status?: string };
+        const status = String(meta.parse_status ?? "pending");
+        if (status === "parsed") { setAttachmentState(attachmentId, "ready"); return; }
+        if (status === "unparseable") { setAttachmentState(attachmentId, "unsupported"); return; }
+        if (status === "failed") { setAttachmentState(attachmentId, "failed"); return; }
+      } catch { /* transient — keep polling */ }
+    }
+    setAttachmentState(attachmentId, "ready");
+  }
+
   async function uploadFiles(files: FileList) {
     // Must use bare fetch, NOT apiFetch: apiFetch forces Content-Type: application/json
     // on any request with a body (see apiFetch line ~178), which breaks multipart
@@ -1647,6 +1891,8 @@ function ChatScreen({
     for (const file of Array.from(files)) {
       const previewUrl = file.type.startsWith("image/") ? URL.createObjectURL(file) : undefined;
       if (previewUrl) attachmentPreviewUrlsRef.current.add(previewUrl);
+      const localId = `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      setAttachments(prev => [...prev, { id: localId, name: file.name, size: file.size, type: file.type, previewUrl, state: "uploading" }]);
       const form = new FormData();
       form.append("file", file);
       if (activeConvoId) form.append("conversation_id", activeConvoId);
@@ -1658,8 +1904,13 @@ function ChatScreen({
         });
         if (res.ok) {
           const data = await res.json() as { attachment_id: string; filename: string; size_bytes: number };
-          setAttachments(prev => [...prev, { id: data.attachment_id, name: data.filename, size: data.size_bytes, type: file.type, previewUrl }]);
+          const isImage = file.type.startsWith("image/");
+          setAttachments(prev => prev.map(a => a.id === localId
+            ? { ...a, id: data.attachment_id, name: data.filename, size: data.size_bytes, state: isImage ? "ready" : "processing" }
+            : a));
+          if (!isImage) void watchParseStatus(data.attachment_id);
         } else {
+          setAttachments(prev => prev.filter(a => a.id !== localId));
           if (previewUrl) {
             URL.revokeObjectURL(previewUrl);
             attachmentPreviewUrlsRef.current.delete(previewUrl);
@@ -1669,6 +1920,7 @@ function ChatScreen({
           setUploadError(detail);
         }
       } catch (err) {
+        setAttachments(prev => prev.filter(a => a.id !== localId));
         if (previewUrl) {
           URL.revokeObjectURL(previewUrl);
           attachmentPreviewUrlsRef.current.delete(previewUrl);
@@ -1768,11 +2020,20 @@ function ChatScreen({
     requestAnimationFrame(() => composerRef.current?.focus());
   }
 
-  async function sendMessage() {
-    if (!draft.trim() || streaming) return;
-    const text = draft.trim();
+  async function sendMessage(textOverride?: string) {
+    const source = textOverride ?? draft;
+    if (!source.trim()) return;
+    // Interruptibility: sending while Chronos is responding stops the current
+    // stream first (durable tasks keep running server-side), then sends.
+    if (streaming) {
+      abortRef.current?.abort();
+      await new Promise(r => setTimeout(r, 80));
+      if (streamingRef.current) return; // abort didn't settle — keep input intact
+    }
+    const text = source.trim();
     setDraft("");
-    const pendingAttachmentIds = attachments.map(a => a.id);
+    // Exclude files still uploading (local- ids are not yet server artifacts).
+    const pendingAttachmentIds = attachments.filter(a => !a.id.startsWith("local-")).map(a => a.id);
     clearAttachments();
     setUploadError(null);
     setMessages(prev => [
@@ -1788,7 +2049,7 @@ function ChatScreen({
     let convoId = activeConvoId;
 
     type StreamEvent = {
-      type: string; content?: string; conversation_id?: string; task_id?: string;
+      type: string; content?: string; conversation_id?: string; task_id?: string; entry_id?: string;
       event?: { type: string; tool?: string | null; summary?: string; error?: string; confidence?: number; iteration?: number; args_preview?: Record<string, unknown>; step?: { description?: string }; approval_ids?: string[]; goal?: string };
       artifact?: { artifact_id: string; title?: string; kind?: string; mime_type?: string; size_bytes?: number };
       structured_response?: StructuredResponse;
@@ -1935,6 +2196,8 @@ function ChatScreen({
             thinking: false,
           }];
         });
+      } else if (ev.type === "memory_saved" && ev.entry_id) {
+        showMemoryNotice(ev.entry_id, ev.content ?? "");
       } else if (ev.type === "task_created" && ev.task_id) {
         const taskId = ev.task_id;
         createdTaskId = taskId;
@@ -1954,7 +2217,7 @@ function ChatScreen({
               {
                 id: `task-created-${taskId}`,
                 tool: "task.runtime",
-                summary: `Created task ${taskId.slice(0, 8)} and attached live activity stream`,
+                summary: "Started working on this as a background task — progress appears in the side panel",
                 status: "streaming",
               },
             ],
@@ -2014,8 +2277,6 @@ function ChatScreen({
     const myConvoId = convoId;
 
     try {
-      const pendingAttachmentIds = attachments.map(a => a.id);
-      clearAttachments();
       const resp = await apiFetch("/chat/message", {
         method: "POST",
         headers: { Accept: "text/event-stream" },
@@ -2055,18 +2316,67 @@ function ChatScreen({
       if (sseBuffer.trim()) consumeSseLine(sseBuffer.trim());
     } catch (e) {
       if ((e as Error).name !== "AbortError") {
-        const errText = e instanceof Error ? e.message : "Something went wrong.";
+        // Keep the raw error behind an expandable "technical details" section;
+        // the visible message stays plain English with a retry path.
+        const detail = e instanceof Error ? e.message : String(e);
+        const friendly = "Chronos hit an error while responding.";
         setMessages(prev => {
           const last = prev[prev.length - 1];
           if (last?.role === "assistant") {
-            return [...prev.slice(0, -1), { ...last, status: "error", content: last.content || errText }];
+            return [...prev.slice(0, -1), { ...last, status: "error", content: last.content || friendly, error_detail: detail }];
           }
-          return [...prev, { role: "assistant", content: errText, status: "error" }];
+          return [...prev, { role: "assistant", content: friendly, status: "error", error_detail: detail }];
         });
+        // If the conversation never reached the server, the typed message only
+        // exists locally — put it back in the composer so it can't be lost.
+        if (!convoId) setDraft(text);
       }
     } finally {
       streamingRef.current = false;
       setStreaming(false);
+      // A stopped/aborted stream must not leave the last message spinning in
+      // "streaming" state forever (live task messages are driven separately
+      // by the task stream and will keep updating).
+      setMessages(prev => {
+        const last = prev[prev.length - 1];
+        if (last?.role === "assistant" && last.status === "streaming" && !createdTaskId) {
+          return [...prev.slice(0, -1), { ...last, status: "complete", thinking: false, content: last.content || "Stopped." }];
+        }
+        return prev;
+      });
+    }
+  }
+
+  async function retryLastTurn() {
+    if (streaming || retryBusy) return;
+    const lastUser = [...messages].reverse().find(m => m.role === "user");
+    if (!lastUser) return;
+    if (!activeConvoId) {
+      // Nothing was persisted — clear the failed turn and resend it fresh.
+      setMessages([]);
+      await sendMessage(lastUser.content);
+      return;
+    }
+    setRetryBusy(true);
+    try {
+      // Live-streamed messages have no local id; resolve the persisted id of the
+      // last user turn, then replay it server-side and reload the thread.
+      const rows = await apiFetch(`/chat/conversations/${activeConvoId}/messages`).then(r => r.json()) as Array<{ id: string; role: string }>;
+      const lastUserRow = [...rows].reverse().find(r => r.role === "user");
+      if (!lastUserRow) {
+        setMessages(prev => prev.filter(m => m.status !== "error"));
+        await sendMessage(lastUser.content);
+        return;
+      }
+      await apiFetch(`/chat/conversations/${activeConvoId}/messages/${lastUserRow.id}/retry-from-here`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      await loadMessagesFromServer(activeConvoId);
+    } catch {
+      // The error message (with its own retry button) stays in place.
+    } finally {
+      setRetryBusy(false);
     }
   }
 
@@ -2145,7 +2455,7 @@ function ChatScreen({
               {messages.map((m, i) => (
                 m.role === "user"
                   ? <UserMessage key={m.id ?? `user-${i}`} message={m} conversationId={activeConvoId ?? ""} onRefresh={() => { if (activeConvoId) void loadMessagesFromServer(activeConvoId); }} onBranch={(newConvoId) => { onConvoCreated(newConvoId); }}/>
-                  : <AssistantMessage key={m.id ?? `assistant-${i}`} message={m} content={m.content} conversationId={activeConvoId ?? ""} status={m.status ?? "complete"} persona={activePersona} toolTraces={m.tool_traces} reasoningSummaries={m.reasoning_summaries} artifacts={m.artifacts} thinking={m.thinking} mode={m.mode} structuredResponse={m.structured_response} onRefresh={() => { if (activeConvoId) void loadMessagesFromServer(activeConvoId); }} onBranch={(newConvoId) => { onConvoCreated(newConvoId); }} onClarificationReply={replyToClarification}/>
+                  : <AssistantMessage key={m.id ?? `assistant-${i}`} message={m} content={m.content} conversationId={activeConvoId ?? ""} status={m.status ?? "complete"} persona={activePersona} toolTraces={m.tool_traces} reasoningSummaries={m.reasoning_summaries} artifacts={m.artifacts} thinking={m.thinking} mode={m.mode} structuredResponse={m.structured_response} onRefresh={() => { if (activeConvoId) void loadMessagesFromServer(activeConvoId); }} onBranch={(newConvoId) => { onConvoCreated(newConvoId); }} onClarificationReply={replyToClarification} onRetry={i === messages.length - 1 && m.status === "error" ? () => void retryLastTurn() : undefined} retryBusy={retryBusy}/>
               ))}
               {streaming && messages[messages.length - 1]?.role !== "assistant" && (
                 <div className="flex gap-4">
@@ -2183,6 +2493,26 @@ function ChatScreen({
               className="hidden"
               onChange={e => { if (e.target.files) void uploadVoice(e.target.files); e.target.value = ""; }}
             />
+            {memoryNotice && (
+              <div
+                className="mb-2 flex items-center gap-2.5 rounded-lg border px-3 py-2 text-[12.5px] fadein"
+                style={{ borderColor: "var(--border-soft)", background: "var(--surface)", color: "var(--text-muted)" }}
+                role="status"
+              >
+                <IC.Memory size={13} style={{ color: "var(--accent)", flexShrink: 0 }}/>
+                {memoryNotice.undone ? (
+                  <span className="flex-1">Memory removed.</span>
+                ) : (
+                  <>
+                    <span className="flex-1 min-w-0 truncate">Saved to memory: {memoryNotice.content}</span>
+                    {memoryNotice.error
+                      ? <span className="flex-shrink-0" style={{ color: "var(--danger)" }}>{memoryNotice.error}</span>
+                      : <button onClick={() => void undoMemoryNotice(memoryNotice.id)} className="btn btn-ghost btn-sm flex-shrink-0">Undo</button>}
+                  </>
+                )}
+                <button type="button" aria-label="Dismiss" onClick={() => setMemoryNotice(null)} className="smooth hover:opacity-70 flex-shrink-0"><IC.X size={12}/></button>
+              </div>
+            )}
             <div className="composer-shell">
               {uploadError && (
                 <div
@@ -2222,7 +2552,11 @@ function ChatScreen({
                       </div>
                       <div className="min-w-0 flex-1 pr-5">
                         <div className="truncate text-[12.5px] font-medium" style={{ color: "var(--text)" }}>{a.name}</div>
-                        <div className="mt-0.5 text-[11px]" style={{ color: "var(--text-dim)" }}>{formatFileSize(a.size)}</div>
+                        <div className="mt-0.5 flex items-center gap-1.5 text-[11px]" style={{ color: a.state === "failed" || a.state === "unsupported" ? "var(--danger)" : "var(--text-dim)" }}>
+                          {(a.state === "uploading" || a.state === "processing") && <IC.Refresh size={10} style={{ animation: "spin 1s linear infinite", flexShrink: 0 }}/>}
+                          {a.state === "ready" && <IC.Check size={10} style={{ color: "var(--ok)", flexShrink: 0 }}/>}
+                          <span className="truncate">{a.state === "ready" ? formatFileSize(a.size) : ATTACHMENT_STATE_LABELS[a.state]}</span>
+                        </div>
                       </div>
                       <button
                         type="button"
@@ -2285,7 +2619,7 @@ function ChatScreen({
                       window.localStorage.setItem(MODEL_STORAGE_KEY, event.target.value);
                     }}
                     disabled={streaming || !!modelsLoadError || chatModels.length === 0}
-                    className="surface border border-soft rounded-md px-2 py-1.5 text-[12.5px] outline-none disabled:opacity-60 w-[300px] max-w-[42vw]"
+                    className="surface border border-soft rounded-md px-2 py-1.5 text-[12.5px] outline-none disabled:opacity-60 max-w-[42vw]"
                     data-selected-model={chatModels.find(model => model.id === selectedModel)?.model ?? selectedModel}
                     data-selected-model-status={chatModels.find(model => model.id === selectedModel)?.status ?? "unknown"}
                     style={{ color: "var(--text)" }}
@@ -2347,6 +2681,7 @@ function ChatScreen({
           task={activeTask}
           events={activeTaskEvents}
           streamError={activeTaskStreamError}
+          onReconnect={() => setTaskStreamRetry(n => n + 1)}
           onClose={() => setActivityOpen(false)}
         />
       )}
@@ -2564,8 +2899,8 @@ function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: Mes
         method: "POST",
         body: JSON.stringify({}),
       });
-      const data = await res.json() as { task_id: string };
-      showToast(`Task created: ${data.task_id.slice(0, 8)}…`);
+      await res.json();
+      showToast("Task created — track it in Activity");
     } catch { showToast("Failed"); }
     finally { endAction("convert-task"); }
     setOpen(false);
@@ -2579,8 +2914,8 @@ function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: Mes
         method: "POST",
         body: JSON.stringify({}),
       });
-      const data = await res.json() as { workflow_id: string };
-      showToast(`Workflow created: ${data.workflow_id.slice(0, 8)}…`);
+      await res.json();
+      showToast("Workflow created — find it under Advanced › Workflows");
     } catch { showToast("Failed"); }
     finally { endAction("convert-workflow"); }
     setOpen(false);
@@ -3128,7 +3463,6 @@ function InlineTaskApprovals({
             <div>
               <div className="flex items-center gap-2 mb-1">
                 <Tag variant="warn">Approval required</Tag>
-                {taskId && <span className="text-[11.5px] font-mono" style={{ color: "var(--text-dim)" }}>task {taskId.slice(0, 8)}</span>}
               </div>
               <div className="text-[14px] font-medium">Review this action before Chronos continues</div>
               <div className="text-[12.5px] mt-1" style={{ color: "var(--text-muted)" }}>
@@ -3168,16 +3502,18 @@ function InlineTaskApprovals({
               {pending.map(approval => {
                 const payload = approval.action_payload ?? {};
                 const args = (payload.args || {}) as Record<string, unknown>;
-                const subject = String(args.subject ?? payload.subject ?? approval.action_type);
+                const title = approval.summary
+                  || String(args.subject ?? payload.subject ?? humanizeActionType(approval.action_type));
                 const recipient = String(args.to ?? payload.to ?? "");
                 const body = String(args.body ?? payload.body ?? "");
+                const fields = approvalDisplayFields(payload);
                 return (
                   <div key={approval.id} className="rounded-lg border border-soft p-3" style={{ background: "var(--bg)" }}>
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0">
-                        <div className="text-[13.5px] font-medium truncate">{subject}</div>
+                        <div className="text-[13.5px] font-medium truncate">{title}</div>
                         <div className="mt-1 flex items-center gap-2 flex-wrap text-[12px]" style={{ color: "var(--text-dim)" }}>
-                          <Tag>{approval.action_type}</Tag>
+                          <Tag>{humanizeActionType(approval.action_type)}</Tag>
                           {recipient && <span>To {recipient}</span>}
                           {approval.requested_at && <span>{labelTime(approval.requested_at)}</span>}
                         </div>
@@ -3203,10 +3539,19 @@ function InlineTaskApprovals({
                       <div className="mt-3 max-h-40 overflow-auto rounded-md px-3 py-2 text-[12.5px] whitespace-pre-wrap" style={{ background: "var(--surface-2)", color: "var(--text-muted)" }}>
                         {body}
                       </div>
+                    ) : fields.length > 0 ? (
+                      <div className="mt-3 max-h-40 overflow-auto rounded-md px-3 py-2 text-[12.5px] space-y-1" style={{ background: "var(--surface-2)", color: "var(--text-muted)" }}>
+                        {fields.map(field => (
+                          <div key={field.label} className="flex gap-2 min-w-0">
+                            <span className="flex-shrink-0 font-medium" style={{ color: "var(--text-dim)" }}>{field.label}:</span>
+                            <span className="min-w-0 break-words">{field.value}</span>
+                          </div>
+                        ))}
+                      </div>
                     ) : (
-                      <pre className="mt-3 max-h-40 overflow-auto rounded-md px-3 py-2 text-[11.5px]" style={{ background: "var(--surface-2)", color: "var(--text-muted)" }}>
-                        {JSON.stringify(payload, null, 2)}
-                      </pre>
+                      <div className="mt-3 rounded-md px-3 py-2 text-[12.5px]" style={{ background: "var(--surface-2)", color: "var(--text-dim)" }}>
+                        No preview is available for this action.
+                      </div>
                     )}
                   </div>
                 );
@@ -3239,7 +3584,7 @@ function ToolActivityLine({
   const latestTrace = [...visibleTraces].reverse().find(trace => trace.status === "streaming") ?? visibleTraces[visibleTraces.length - 1];
   const latestReasoning = visibleReasoning[visibleReasoning.length - 1];
   const latestText = latestTrace?.summary || latestReasoning?.summary || "";
-  const label = running || streaming ? "Ran a command, used a tool" : errors ? `${errors} tool issue${errors === 1 ? "" : "s"}` : "Used tools";
+  const label = running || streaming ? "Working — using tools" : errors ? `${errors} tool issue${errors === 1 ? "" : "s"}` : "Used tools";
   const countParts = [
     visibleTraces.length ? `${visibleTraces.length} tool${visibleTraces.length === 1 ? "" : "s"}` : "",
     visibleReasoning.length ? `${visibleReasoning.length} reasoning update${visibleReasoning.length === 1 ? "" : "s"}` : "",
@@ -3331,7 +3676,7 @@ function ClarificationCard({
   );
 }
 
-function AssistantMessage({ message, content, status, persona, toolTraces, reasoningSummaries, artifacts, thinking, mode, structuredResponse, conversationId, onRefresh, onBranch, onClarificationReply }: { message: Message; content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[]; reasoningSummaries?: ReasoningSummary[]; artifacts?: ArtifactRef[]; thinking?: boolean; mode?: string; structuredResponse?: StructuredResponse | null; conversationId: string; onRefresh: () => void; onBranch: (id: string) => void; onClarificationReply: (text: string) => void }) {
+function AssistantMessage({ message, content, status, persona, toolTraces, reasoningSummaries, artifacts, thinking, mode, structuredResponse, conversationId, onRefresh, onBranch, onClarificationReply, onRetry, retryBusy }: { message: Message; content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[]; reasoningSummaries?: ReasoningSummary[]; artifacts?: ArtifactRef[]; thinking?: boolean; mode?: string; structuredResponse?: StructuredResponse | null; conversationId: string; onRefresh: () => void; onBranch: (id: string) => void; onClarificationReply: (text: string) => void; onRetry?: () => void; retryBusy?: boolean }) {
   const hasTraces = !!(toolTraces && toolTraces.length > 0);
   const hasReasoning = !!(reasoningSummaries && reasoningSummaries.length > 0);
   const isStreaming = status === "streaming";
@@ -3374,6 +3719,28 @@ function AssistantMessage({ message, content, status, persona, toolTraces, reaso
             {/* No trailing caret: Markdown renders block elements, so an inline
                 caret would orphan onto its own line. Streaming is signalled by
                 the growing text plus the thinking/typing/working states below. */}
+          </div>
+        )}
+
+        {/* Error recovery — plain-English message, retry path, expandable detail */}
+        {status === "error" && (
+          <div className="mt-3 rounded-lg border p-3 text-[13px] max-w-[680px]" style={{ borderColor: "var(--danger)", background: "var(--surface)" }}>
+            <div className="flex items-center justify-between gap-3">
+              <span style={{ color: "var(--text-muted)" }}>
+                Your message is saved — you can retry, or edit it and try again.
+              </span>
+              {onRetry && (
+                <button onClick={onRetry} disabled={retryBusy} className="btn btn-secondary btn-sm flex-shrink-0 disabled:opacity-50">
+                  <IC.Refresh size={13}/> {retryBusy ? "Retrying…" : "Retry"}
+                </button>
+              )}
+            </div>
+            {message.error_detail && (
+              <details className="mt-2">
+                <summary className="cursor-pointer text-[12px]" style={{ color: "var(--text-dim)" }}>Technical details</summary>
+                <pre className="mt-1 text-[11.5px] whitespace-pre-wrap break-words" style={{ color: "var(--text-dim)" }}>{message.error_detail}</pre>
+              </details>
+            )}
           </div>
         )}
 
@@ -3433,6 +3800,14 @@ function AssistantMessage({ message, content, status, persona, toolTraces, reaso
 }
 
 function EmptyChatState({ persona, onSubmit }: { persona: typeof PERSONAS[0]; onSubmit: (q: string) => void }) {
+  const [showIntro, setShowIntro] = useState(false);
+  useEffect(() => {
+    setShowIntro(window.localStorage.getItem("chronos.onboarding.dismissed") !== "1");
+  }, []);
+  function dismissIntro() {
+    window.localStorage.setItem("chronos.onboarding.dismissed", "1");
+    setShowIntro(false);
+  }
   const suggestions = [
     { icon: <IC.Mail size={16}/>, label: "Draft outreach to a list of leads", q: "Draft personalized outreach to 20 Series B SaaS leads" },
     { icon: <IC.Folder size={16}/>, label: "Summarize this week's customer calls", q: "Summarize this week's customer calls and pull common themes." },
@@ -3450,6 +3825,21 @@ function EmptyChatState({ persona, onSubmit }: { persona: typeof PERSONAS[0]; on
         </div>
         <h1 className="h-display mb-2" style={{ letterSpacing: "-0.03em" }}>What can I help with?</h1>
         <p className="text-[15px] mb-8" style={{ color: "var(--text-dim)" }}>Ask anything, or pick one to get started.</p>
+        {showIntro && (
+          <div className="mb-6 surface border border-soft rounded-xl p-4 fadein" role="note">
+            <div className="flex items-start justify-between gap-3">
+              <div className="space-y-1.5 text-[13.5px]" style={{ color: "var(--text-muted)" }}>
+                <div className="flex items-center gap-2"><IC.Chat size={14} style={{ color: "var(--accent)", flexShrink: 0 }}/> Ask normal questions — Chronos answers right away.</div>
+                <div className="flex items-center gap-2"><IC.Activity size={14} style={{ color: "var(--accent)", flexShrink: 0 }}/> Longer work runs as a task with visible progress you can check anytime.</div>
+                <div className="flex items-center gap-2"><IC.Approvals size={14} style={{ color: "var(--accent)", flexShrink: 0 }}/> Sensitive actions like sending email always wait for your approval.</div>
+                <div className="pt-1 text-[12.5px]" style={{ color: "var(--text-dim)" }}>
+                  Optional: <a href="/connectors" className="underline hover:opacity-80" style={{ color: "var(--accent-text)" }}>connect Gmail, Calendar, or Drive</a> to let Chronos work with them.
+                </div>
+              </div>
+              <button type="button" aria-label="Dismiss intro" onClick={dismissIntro} className="btn btn-ghost btn-icon flex-shrink-0"><IC.X size={14}/></button>
+            </div>
+          </div>
+        )}
         <div className="grid grid-cols-2 gap-3">
           {suggestions.map((s, i) => (
             <button key={i} className="suggestion fadeup" style={{ animationDelay: `${i * 50}ms` }}
@@ -3472,12 +3862,14 @@ function ActivityDrawer({
   task,
   events,
   streamError,
+  onReconnect,
   onClose,
 }: {
   taskId: string | null;
   task: Task | null;
   events: TaskStreamEvent[];
   streamError: string;
+  onReconnect?: () => void;
   onClose: () => void;
 }) {
   const steps = Array.isArray(task?.plan) ? task.plan : task?.plan?.steps ?? [];
@@ -3486,6 +3878,24 @@ function ActivityDrawer({
   const approvalEvent = [...events].reverse().find(event => event.type === "awaiting_approval");
   const failureEvent = [...events].reverse().find(event => event.type === "task_failed");
   const completionEvent = [...events].reverse().find(event => event.type === "task_complete");
+  const [controlBusy, setControlBusy] = useState(false);
+  const [controlError, setControlError] = useState("");
+  const isTerminal = task ? ["complete", "failed", "cancelled"].includes(task.status) : false;
+  const canRetry = task ? ["failed", "cancelled"].includes(task.status) : false;
+
+  async function taskControl(action: "cancel" | "retry") {
+    if (!taskId || controlBusy) return;
+    setControlBusy(true);
+    setControlError("");
+    try {
+      await apiFetch(`/tasks/${taskId}/${action}`, { method: "POST" });
+      onReconnect?.();
+    } catch {
+      setControlError(action === "cancel" ? "Couldn't cancel the task — try again." : "Couldn't retry the task — try again.");
+    } finally {
+      setControlBusy(false);
+    }
+  }
 
   return (
     <aside className="flex-shrink-0 flex flex-col border-l hairline slidein" style={{ width: 400, background: "var(--bg)" }}>
@@ -3508,14 +3918,37 @@ function ActivityDrawer({
               </div>
               <h2 className="text-[15px] font-semibold leading-snug">{task?.goal ?? "Connecting to task stream..."}</h2>
               <div className="mt-2 flex items-center gap-2 text-[12px]" style={{ color: "var(--text-dim)" }}>
-                <span className="inline-ref">{taskId.slice(0, 8)}</span>
                 <span>Step {Math.min(currentStep, steps.length)} of {steps.length || "..."}</span>
               </div>
+              {task && (!isTerminal || canRetry) && (
+                <div className="mt-3 flex items-center gap-2">
+                  {!isTerminal && (
+                    <button onClick={() => void taskControl("cancel")} disabled={controlBusy} className="btn btn-danger-soft btn-sm disabled:opacity-50">
+                      <IC.X size={13}/> {controlBusy ? "Working…" : "Cancel task"}
+                    </button>
+                  )}
+                  {canRetry && (
+                    <button onClick={() => void taskControl("retry")} disabled={controlBusy} className="btn btn-secondary btn-sm disabled:opacity-50">
+                      <IC.Refresh size={13}/> {controlBusy ? "Working…" : "Retry task"}
+                    </button>
+                  )}
+                </div>
+              )}
+              {controlError && <div className="mt-2 text-[12px]" style={{ color: "var(--danger)" }}>{controlError}</div>}
             </div>
 
             {streamError ? (
-              <div className="rounded-lg border px-3 py-2 text-[12.5px]" style={{ borderColor: "var(--danger)", color: "var(--danger)" }}>
-                {streamError}
+              <div className="rounded-lg border px-3 py-2.5" style={{ borderColor: "var(--danger)" }}>
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-[12.5px]" style={{ color: "var(--text-muted)" }}>
+                    The live progress feed disconnected. The task keeps running in the background.
+                  </span>
+                  {onReconnect && (
+                    <button onClick={onReconnect} className="btn btn-secondary btn-sm flex-shrink-0">
+                      <IC.Refresh size={13}/> Reconnect
+                    </button>
+                  )}
+                </div>
               </div>
             ) : null}
 
@@ -3647,16 +4080,34 @@ function stepStateLabel(state: string) {
   return ({ done: "Finished", waiting: "Waiting for approval", failed: "Failed", active: "In progress", queued: "Queued" } as Record<string, string>)[state] ?? state;
 }
 
+// Human-readable labels for internal activity event types. Anything unmapped
+// falls back to a generic label rather than leaking the raw event name.
+const EVENT_TYPE_LABELS: Record<string, string> = {
+  tool_call: "Using a tool",
+  tool_result: "Tool finished",
+  tool_error: "A tool hit an error",
+  model_step: "Thinking",
+  thinking: "Thinking",
+  model_result: "Decided on the next step",
+  reasoning_summary: "Reasoning update",
+  route_decision: "Chose an approach",
+  artifact: "Created a file",
+  sub_agent_spawned: "Started a helper task",
+  sub_agent_complete: "Helper task finished",
+  task_state: "Task update",
+  catch_up: "Caught up on progress",
+};
+
 function eventLabel(event: TaskStreamEvent) {
   if (event.summary) return event.summary;
-  if (event.type === "step_start") return `Started: ${event.step?.description ?? event.step?.id ?? "step"}`;
-  if (event.type === "step_done") return `Finished: ${event.step?.description ?? event.step?.id ?? "step"}`;
-  if (event.type === "step_retry") return `Retry ${event.attempt ?? ""}: ${event.step?.description ?? event.step?.id ?? "step"}`;
+  if (event.type === "step_start") return `Started: ${event.step?.description ?? "next step"}`;
+  if (event.type === "step_done") return `Finished: ${event.step?.description ?? "step"}`;
+  if (event.type === "step_retry") return `Retrying: ${event.step?.description ?? "step"}`;
   if (event.type === "awaiting_approval") return "Approval requested";
-  if (event.type === "task_failed") return `Failed: ${event.error ?? "unknown error"}`;
+  if (event.type === "task_failed") return `Failed: ${formatTaskError(event.error)}`;
   if (event.type === "task_complete") return "Task completed";
   if (event.type === "approval_decided") return "Approval decision recorded";
-  return event.type.replaceAll("_", " ");
+  return EVENT_TYPE_LABELS[event.type] ?? "Working…";
 }
 
 function eventColor(event: TaskStreamEvent) {
@@ -3940,6 +4391,12 @@ function formatTaskError(error?: string): string {
   if (error === "task_timeout") {
     return "The task exceeded the runtime limit before it finished. Try again, or narrow the task if it still takes too long.";
   }
+  // Raw exception text (stack traces, provider errors, HTTP codes) belongs in
+  // logs, not chat. Pass through only copy that already reads like a sentence.
+  const technical = /Traceback|Exception|Error:|HTTP\s*\d{3}|\b\d{3}\b.*(error|failed)|litellm|openrouter\//i;
+  if (technical.test(error) && !/^The /.test(error)) {
+    return "The task hit an unexpected error and stopped. Your progress so far is saved — you can retry it.";
+  }
   return error;
 }
 
@@ -4002,8 +4459,44 @@ function TaskResult({ task }: { task: Task }) {
   if (findings.length) {
     return <div className="space-y-2">{findings.map((finding, index) => <div key={index} className="text-[12.5px]"><div className="font-medium">{String(finding.title || "Finding")}</div><div style={{ color: "var(--text-dim)" }}>{String(finding.summary || "")}</div></div>)}</div>;
   }
+  // Prefer the readable answer/summary fields; never dump raw JSON in the
+  // default view — it stays available behind "Technical details".
+  const answer = typeof result.answer === "string" && result.answer.trim()
+    ? result.answer.trim()
+    : typeof result.summary === "string" && result.summary.trim()
+    ? result.summary.trim()
+    : "";
+  const rows = Object.entries(result)
+    .filter(([key, value]) => key !== "answer" && key !== "summary" && value != null && typeof value !== "object")
+    .slice(0, 8);
+  if (answer || rows.length) {
+    return (
+      <div className="space-y-2">
+        {answer && <div className="text-[12.5px] leading-relaxed whitespace-pre-wrap" style={{ color: "var(--text-muted)" }}>{answer}</div>}
+        {rows.length > 0 && (
+          <div className="text-[12.5px] space-y-1" style={{ color: "var(--text-muted)" }}>
+            {rows.map(([key, value]) => (
+              <div key={key} className="flex gap-2 min-w-0">
+                <span className="flex-shrink-0 font-medium" style={{ color: "var(--text-dim)" }}>{key.replaceAll("_", " ")}:</span>
+                <span className="min-w-0 break-words">{String(value)}</span>
+              </div>
+            ))}
+          </div>
+        )}
+        <details>
+          <summary className="cursor-pointer text-[11.5px]" style={{ color: "var(--text-dim)" }}>Technical details</summary>
+          <pre className="text-[11.5px] max-h-56 overflow-auto rounded-md p-3 mt-1" style={{ background: "var(--surface-2)", color: "var(--text-muted)" }}>{JSON.stringify(result, null, 2)}</pre>
+        </details>
+      </div>
+    );
+  }
   if (Object.keys(result).length) {
-    return <pre className="text-[11.5px] max-h-56 overflow-auto rounded-md p-3" style={{ background: "var(--surface-2)", color: "var(--text-muted)" }}>{JSON.stringify(result, null, 2)}</pre>;
+    return (
+      <details>
+        <summary className="cursor-pointer text-[11.5px]" style={{ color: "var(--text-dim)" }}>Technical details</summary>
+        <pre className="text-[11.5px] max-h-56 overflow-auto rounded-md p-3 mt-1" style={{ background: "var(--surface-2)", color: "var(--text-muted)" }}>{JSON.stringify(result, null, 2)}</pre>
+      </details>
+    );
   }
   return <div className="text-[12.5px]" style={{ color: "var(--text-muted)" }}>No result has been recorded yet.</div>;
 }
@@ -4124,10 +4617,10 @@ function ApprovalsScreen({ onDecision }: { onDecision: () => void }) {
                 </div>
                 <div className="flex-1 min-w-0">
                   <div className="text-[13.5px] font-medium truncate" style={{ color: "var(--text)" }}>
-                    {String(a.action_payload?.subject ?? a.action_type)}
+                    {a.summary || String(a.action_payload?.subject ?? humanizeActionType(a.action_type))}
                   </div>
                   <div className="text-[12px] mt-0.5" style={{ color: "var(--text-dim)" }}>
-                    {a.action_type} · {a.requested_at ? new Date(a.requested_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "—"}
+                    {humanizeActionType(a.action_type)} · {a.requested_at ? new Date(a.requested_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "—"}
                   </div>
                 </div>
                 {d && <Tag variant={d === "approved" ? "ok" : "danger"}>{d === "approved" ? "Approved" : "Rejected"}</Tag>}
@@ -4147,7 +4640,7 @@ function ApprovalsScreen({ onDecision }: { onDecision: () => void }) {
           <div className="px-8 py-8 max-w-[680px]">
             <div className="mb-6">
               <div className="flex items-center gap-2 mb-1">
-                <Tag variant="warn">{active.action_type}</Tag>
+                <Tag variant="warn">{humanizeActionType(active.action_type)}</Tag>
                 {active.requested_at && (
                   <span className="text-[12px]" style={{ color: "var(--text-dim)" }}>
                     Requested {new Date(active.requested_at).toLocaleString()}
@@ -4155,19 +4648,46 @@ function ApprovalsScreen({ onDecision }: { onDecision: () => void }) {
                 )}
               </div>
               <h2 className="h-section mt-2">
-                {String(active.action_payload?.subject ?? active.action_type)}
+                {active.summary || String(active.action_payload?.subject ?? humanizeActionType(active.action_type))}
               </h2>
-              <p className="text-[13.5px] mt-2 leading-relaxed" style={{ color: "var(--text-muted)" }}>
-                Step ID: <span className="inline-ref">{active.step_id}</span>
-              </p>
             </div>
 
-            {/* Payload */}
+            {/* Payload — readable fields first, raw payload behind a toggle */}
             <div className="surface border border-soft rounded-xl p-5 mb-6">
               <div className="text-[12px] font-semibold uppercase tracking-wider mb-3" style={{ color: "var(--text-dim)" }}>Action details</div>
-              <pre className="text-[12.5px] font-mono leading-relaxed overflow-x-auto" style={{ color: "var(--text-muted)", whiteSpace: "pre-wrap" }}>
-                {JSON.stringify(active.action_payload, null, 2)}
-              </pre>
+              {(() => {
+                const payload = active.action_payload ?? {};
+                const args = (payload.args && typeof payload.args === "object" ? payload.args : {}) as Record<string, unknown>;
+                const body = String(args.body ?? payload.body ?? "");
+                const fields = approvalDisplayFields(payload).filter(f => f.label.toLowerCase() !== "body");
+                return (
+                  <div className="space-y-3">
+                    {fields.length > 0 ? (
+                      <div className="text-[13px] space-y-1.5" style={{ color: "var(--text-muted)" }}>
+                        {fields.map(field => (
+                          <div key={field.label} className="flex gap-2 min-w-0">
+                            <span className="flex-shrink-0 font-medium" style={{ color: "var(--text-dim)" }}>{field.label}:</span>
+                            <span className="min-w-0 break-words">{field.value}</span>
+                          </div>
+                        ))}
+                      </div>
+                    ) : !body ? (
+                      <div className="text-[13px]" style={{ color: "var(--text-dim)" }}>No preview is available for this action.</div>
+                    ) : null}
+                    {body && (
+                      <div className="rounded-md px-3 py-2 text-[13px] leading-relaxed whitespace-pre-wrap max-h-72 overflow-auto" style={{ background: "var(--surface-2)", color: "var(--text-muted)" }}>
+                        {body}
+                      </div>
+                    )}
+                    <details>
+                      <summary className="cursor-pointer text-[12px]" style={{ color: "var(--text-dim)" }}>Technical details</summary>
+                      <pre className="mt-2 text-[12px] font-mono leading-relaxed overflow-x-auto" style={{ color: "var(--text-muted)", whiteSpace: "pre-wrap" }}>
+                        {JSON.stringify(payload, null, 2)}
+                      </pre>
+                    </details>
+                  </div>
+                );
+              })()}
             </div>
 
             {/* Decisions */}
@@ -4527,7 +5047,7 @@ function MemoryCard({ m, onDelete, onUpdate, onFlag }: { m: MemoryEntry; onDelet
               {isAuto ? <><IC.Sparkles size={11}/> Saved by Chronos</> : <><IC.Pencil size={11}/> Saved by you</>}
             </span>
             {m.scope && <><span>·</span><span>{m.scope}</span></>}
-            {typeof m.importance_score === "number" && <><span>·</span><span>{Math.round(m.importance_score * 100)}% importance</span></>}
+            {typeof m.importance_score === "number" && <><span>·</span><span>{m.importance_score >= 0.75 ? "High" : m.importance_score >= 0.45 ? "Medium" : "Low"} importance</span></>}
             {m.created_by && <><span>·</span><span>by {m.created_by}</span></>}
             {m.is_pinned && <><span>·</span><span style={{ color: "var(--accent)" }}>Pinned</span></>}
             {m.is_sensitive && <><span>·</span><span style={{ color: "var(--danger)" }}>Sensitive</span></>}
@@ -4748,7 +5268,9 @@ function ConnectorsScreen() {
                   {app.sync_supported && <Tag variant="accent">Sync</Tag>}
                   {app.health_status && <Tag variant={app.health_status === "healthy" || app.health_status === "connected" ? "ok" : app.health_status === "not_connected" ? "info" : "warn"}>{app.health_status}</Tag>}
                   {(app.risk_levels || []).slice(0, 3).map(level => (
-                    <Tag key={level} variant={level === "read" ? "info" : level === "financial" || level === "destructive" ? "danger" : "warn"}>{level}</Tag>
+                    <Tag key={level} variant={level === "read" ? "info" : level === "financial" || level === "destructive" ? "danger" : "warn"}>
+                      {({ read: "Reads data", write: "Makes changes", external_write: "Acts externally", financial: "Can move money", destructive: "Can delete data" } as Record<string, string>)[level] ?? level.replaceAll("_", " ")}
+                    </Tag>
                   ))}
                 </div>
 
@@ -4902,23 +5424,26 @@ function AssistantsScreen({ onStartConversation }: { onStartConversation: (perso
 }
 
 // ─── Settings Screen ──────────────────────────────────────────────────────────
-const SETTING_TABS: Array<{ id: SettingsTab; label: string; icon: ReactNode; keywords: string }> = [
-  { id: "general", label: "General", icon: <IC.Settings size={15}/>, keywords: "workspace name timezone language theme notifications landing" },
-  { id: "profile", label: "Profile", icon: <IC.Personas size={15}/>, keywords: "name avatar email role response citations interaction" },
-  { id: "organization", label: "Organization", icon: <IC.Briefcase size={15}/>, keywords: "org logo domain plan seats workspace creation" },
-  { id: "members", label: "Members & roles", icon: <IC.Personas size={15}/>, keywords: "member invite role remove owner admin manager operator viewer" },
-  { id: "permissions", label: "Permissions", icon: <IC.Lock size={15}/>, keywords: "rbac matrix workspace employee tools approval memory audit" },
-  { id: "employees", label: "AI employees", icon: <IC.Sparkles size={15}/>, keywords: "employee runtime memory scope sub agent depth" },
-  { id: "runtime", label: "Runtime", icon: <IC.Activity size={15}/>, keywords: "mode isolation heartbeat restart logs queue recovery budget" },
-  { id: "memory-settings", label: "Memory", icon: <IC.Memory size={15}/>, keywords: "retention review auto save sensitive export purge" },
-  { id: "tools-settings", label: "Tools & integrations", icon: <IC.Connectors size={15}/>, keywords: "connectors oauth disconnect scopes approval required risk enabled" },
-  { id: "approval-settings", label: "Approvals", icon: <IC.Approvals size={15}/>, keywords: "mode thresholds rules external sub agent runtime memory" },
-  { id: "notifications", label: "Notifications", icon: <IC.Bell size={15}/>, keywords: "email in app runtime alerts approval task weekly digest security" },
-  { id: "security", label: "Security", icon: <IC.Lock size={15}/>, keywords: "sessions password two factor api keys login history revoke" },
-  { id: "billing", label: "Billing", icon: <IC.Audit size={15}/>, keywords: "plan usage seats runtime tokens storage invoices stripe" },
-  { id: "audit", label: "Audit logs", icon: <IC.Audit size={15}/>, keywords: "actor action target date risk search export" },
-  { id: "developer", label: "Developer", icon: <IC.Lightbulb size={15}/>, keywords: "feature flags api mode webhooks debug experimental environment model provider" },
-  { id: "danger", label: "Danger zone", icon: <IC.Trash size={15}/>, keywords: "reset delete leave transfer ownership irreversible" },
+// User-focused settings first, workspace governance second, platform internals
+// last — so everyday options aren't buried under admin/platform jargon.
+type SettingsGroup = "You" | "Workspace" | "Advanced";
+const SETTING_TABS: Array<{ id: SettingsTab; label: string; icon: ReactNode; keywords: string; group: SettingsGroup }> = [
+  { id: "general", label: "General", icon: <IC.Settings size={15}/>, keywords: "workspace name timezone language theme notifications landing appearance", group: "You" },
+  { id: "profile", label: "Profile", icon: <IC.Personas size={15}/>, keywords: "name avatar email role response citations interaction", group: "You" },
+  { id: "memory-settings", label: "Memory", icon: <IC.Memory size={15}/>, keywords: "retention review auto save sensitive export purge privacy", group: "You" },
+  { id: "notifications", label: "Notifications", icon: <IC.Bell size={15}/>, keywords: "email in app runtime alerts approval task weekly digest security", group: "You" },
+  { id: "organization", label: "Organization", icon: <IC.Briefcase size={15}/>, keywords: "org logo domain plan seats workspace creation", group: "Workspace" },
+  { id: "members", label: "Members & roles", icon: <IC.Personas size={15}/>, keywords: "member invite role remove owner admin manager operator viewer", group: "Workspace" },
+  { id: "permissions", label: "Permissions", icon: <IC.Lock size={15}/>, keywords: "rbac matrix workspace employee tools approval memory audit", group: "Workspace" },
+  { id: "tools-settings", label: "Tools & integrations", icon: <IC.Connectors size={15}/>, keywords: "connectors oauth disconnect scopes approval required risk enabled", group: "Workspace" },
+  { id: "approval-settings", label: "Approvals", icon: <IC.Approvals size={15}/>, keywords: "mode thresholds rules external sub agent runtime memory", group: "Workspace" },
+  { id: "security", label: "Security", icon: <IC.Lock size={15}/>, keywords: "sessions password two factor api keys login history revoke privacy", group: "Workspace" },
+  { id: "billing", label: "Billing", icon: <IC.Audit size={15}/>, keywords: "plan usage seats runtime tokens storage invoices stripe", group: "Workspace" },
+  { id: "audit", label: "Audit logs", icon: <IC.Audit size={15}/>, keywords: "actor action target date risk search export", group: "Workspace" },
+  { id: "employees", label: "AI employees", icon: <IC.Sparkles size={15}/>, keywords: "employee runtime memory scope sub agent depth", group: "Advanced" },
+  { id: "runtime", label: "Runtime", icon: <IC.Activity size={15}/>, keywords: "mode isolation heartbeat restart logs queue recovery budget", group: "Advanced" },
+  { id: "developer", label: "Developer", icon: <IC.Lightbulb size={15}/>, keywords: "feature flags api mode webhooks debug experimental environment model provider", group: "Advanced" },
+  { id: "danger", label: "Danger zone", icon: <IC.Trash size={15}/>, keywords: "reset delete leave transfer ownership irreversible", group: "Advanced" },
 ];
 
 // ─── Projects ─────────────────────────────────────────────────────────────────
@@ -5930,12 +6455,21 @@ function SettingsScreen({ tab, setTab, theme, setTheme, accent, setAccent, signO
           </div>
         </div>
         <div className="px-3 space-y-0.5 overflow-y-auto" style={{ maxHeight: "calc(100vh - 116px)" }}>
-          {visibleTabs.map(item => (
-            <button key={item.id} onClick={() => selectTab(item.id)} className={`nav-item w-full ${tab === item.id ? "active" : ""}`}>
-              <span className="nav-icon">{item.icon}</span>
-              <span className="flex-1 text-left">{item.label}</span>
-            </button>
-          ))}
+          {(["You", "Workspace", "Advanced"] as SettingsGroup[]).map(group => {
+            const items = visibleTabs.filter(item => item.group === group);
+            if (!items.length) return null;
+            return (
+              <div key={group} className="mb-2">
+                <div className="px-2.5 pt-2 pb-1 text-[11px] font-semibold uppercase tracking-wider" style={{ color: "var(--text-dim)" }}>{group}</div>
+                {items.map(item => (
+                  <button key={item.id} onClick={() => selectTab(item.id)} className={`nav-item w-full ${tab === item.id ? "active" : ""}`}>
+                    <span className="nav-icon">{item.icon}</span>
+                    <span className="flex-1 text-left">{item.label}</span>
+                  </button>
+                ))}
+              </div>
+            );
+          })}
         </div>
       </div>
 
@@ -6118,7 +6652,17 @@ function AuditSettings() {
     anchor.click();
     URL.revokeObjectURL(url);
   }
-  return <><div className="flex gap-2 mb-4"><TextInput ariaLabel="Search audit logs" value={query} onChange={setQuery}/><button className="btn btn-sm" onClick={() => void exportCsv()}>Export CSV</button></div><div className="surface border border-soft rounded-xl overflow-hidden">{rows.map(row => <button key={String(row.id)} onClick={() => setSelected(row)} className="w-full text-left px-4 py-3 border-b hairline last:border-b-0 hover:bg-[var(--surface-2)]"><div className="font-medium text-[13px]">{String(row.action)}</div><div className="text-[12px]" style={{ color: "var(--text-dim)" }}>{String(row.actor_id || "system")} · {row.created_at ? new Date(String(row.created_at)).toLocaleString() : "—"}</div></button>)}</div>{selected && <div className="mt-4 surface border border-soft rounded-xl p-4"><div className="font-medium mb-2">Audit detail</div><pre className="text-[12px] overflow-auto" style={{ color: "var(--text-muted)" }}>{JSON.stringify(selected, null, 2)}</pre></div>}</>;
+  // Business-readable summary fields first; the raw entry stays behind a toggle.
+  const detailRows = selected
+    ? ([
+        ["What happened", String(selected.action || selected.event_type || "—")],
+        ["Who", String(selected.actor_id || "system")],
+        ["When", selected.created_at ? new Date(String(selected.created_at)).toLocaleString() : "—"],
+        ["Target", [selected.resource_type, selected.resource_id].filter(Boolean).join(" ") || "—"],
+        ["Decision", String(selected.decision || "—")],
+      ] as Array<[string, string]>)
+    : [];
+  return <><div className="flex gap-2 mb-4"><TextInput ariaLabel="Search audit logs" value={query} onChange={setQuery}/><button className="btn btn-sm" onClick={() => void exportCsv()}>Export CSV</button></div><div className="surface border border-soft rounded-xl overflow-hidden">{rows.map(row => <button key={String(row.id)} onClick={() => setSelected(row)} className="w-full text-left px-4 py-3 border-b hairline last:border-b-0 hover:bg-[var(--surface-2)]"><div className="font-medium text-[13px]">{String(row.action)}</div><div className="text-[12px]" style={{ color: "var(--text-dim)" }}>{String(row.actor_id || "system")} · {row.created_at ? new Date(String(row.created_at)).toLocaleString() : "—"}</div></button>)}</div>{selected && <div className="mt-4 surface border border-soft rounded-xl p-4"><div className="font-medium mb-2">Audit detail</div><div className="space-y-1.5 text-[13px]" style={{ color: "var(--text-muted)" }}>{detailRows.map(([label, value]) => <div key={label} className="flex gap-2"><span className="w-32 flex-shrink-0 font-medium" style={{ color: "var(--text-dim)" }}>{label}</span><span className="min-w-0 break-words">{value}</span></div>)}</div><details className="mt-3"><summary className="cursor-pointer text-[12px]" style={{ color: "var(--text-dim)" }}>Technical details</summary><pre className="mt-2 text-[12px] overflow-auto" style={{ color: "var(--text-muted)" }}>{JSON.stringify(selected, null, 2)}</pre></details></div>}</>;
 }
 
 function DeveloperSettings({ data, patch, capabilities }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void; capabilities: SettingsOverview["capabilities"] }) {
