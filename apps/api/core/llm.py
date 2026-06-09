@@ -21,6 +21,16 @@ _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 CHAT_MODEL_OPTIONS: tuple[dict[str, Any], ...] = (
     {
+        "id": "auto",
+        "label": "Auto",
+        "model": "openrouter/openai/gpt-5.4-mini",
+        "description": "Chronos picks the best available model for each request.",
+        "capabilities": ["chat", "tool_use", "agent_loop", "structured_json", "vision"],
+        "tool_use": True,
+        "fallback_for": [],
+        "policy": "Default selection; Chronos routes to the best configured model.",
+    },
+    {
         "id": "gpt-5.4-mini",
         "label": "GPT-5.4 Mini",
         "model": "openrouter/openai/gpt-5.4-mini",

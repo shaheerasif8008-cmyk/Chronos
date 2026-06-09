@@ -23,6 +23,50 @@ class ApprovalDecision(BaseModel):
     batch: bool = False
 
 
+def approval_summary(action_type: str, payload: dict | None) -> str:
+    """Plain-English description of a pending action for the approval UI.
+
+    Built from the action type plus the most recognizable payload fields so the
+    approver never has to read raw tool arguments.
+    """
+    payload = payload or {}
+    args = payload.get("args") if isinstance(payload.get("args"), dict) else {}
+    merged = {**payload, **args}
+    action = (action_type or "").replace("__", ".").lower()
+
+    recipient = merged.get("to") or merged.get("recipient") or merged.get("email")
+    subject = merged.get("subject") or merged.get("title")
+    target = merged.get("url") or merged.get("target") or merged.get("path")
+
+    if "gmail" in action or "email" in action or "mail" in action:
+        verb = "Create an email draft" if "draft" in action else "Send an email"
+        parts = [verb]
+        if recipient:
+            parts.append(f"to {recipient}")
+        if subject:
+            parts.append(f"— “{subject}”")
+        return " ".join(parts)
+    if "calendar" in action or "event" in action:
+        base = "Create a calendar event" if ("create" in action or "add" in action) else "Update the calendar"
+        return f"{base}{f' — “{subject}”' if subject else ''}"
+    if "publish" in action or "post" in action:
+        return f"Publish content{f' to {target}' if target else ''}{f' — “{subject}”' if subject else ''}"
+    if "delete" in action or "remove" in action:
+        return f"Delete {target or subject or 'records'}"
+
+    # Generic fallback: humanize the action name, append the clearest target.
+    readable = action.replace(".", " ").replace("_", " ").strip() or "run an action"
+    suffix = f" — {recipient or subject or target}" if (recipient or subject or target) else ""
+    return f"Run “{readable}”{suffix}"
+
+
+def _with_summary(row: dict) -> dict:
+    row["summary"] = approval_summary(
+        str(row.get("action_type") or ""), row.get("action_payload")
+    )
+    return row
+
+
 @router.get("/")
 async def list_approvals(
     status: str = Query(default="pending"),
@@ -41,7 +85,7 @@ async def list_approvals(
     )
     async with engine.begin() as conn:
         rows = (await conn.execute(stmt)).mappings().all()
-    return [dict(row) for row in rows]
+    return [_with_summary(dict(row)) for row in rows]
 
 
 @router.get("/{approval_id}")
@@ -52,7 +96,7 @@ async def get_approval(approval_id: str, member: Member = Depends(get_current_me
         row = (await conn.execute(select(approvals).where(approvals.c.id == approval_id))).mappings().first()
     if not row:
         raise HTTPException(status_code=404, detail="Approval not found")
-    return dict(row)
+    return _with_summary(dict(row))
 
 
 @router.post("/{approval_id}/decide")

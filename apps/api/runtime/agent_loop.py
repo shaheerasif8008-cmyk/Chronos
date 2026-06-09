@@ -1603,9 +1603,15 @@ async def run_loop(
             )
         except Exception as exc:
             logger.error("LLM error in agent loop for task %s: %s", task_id, exc)
+            # task.error keeps the raw exception for diagnostics; everything the
+            # user sees (conversation message, activity event) stays plain English.
             await save_task(task_id, status="failed", error=str(exc))
-            failed_msg_id = await _persist_to_conversation(task, f"The task stopped due to a model error: {exc}")
-            failed_event: dict[str, Any] = {"type": "task_failed", "error": f"LLM error: {exc}"}
+            friendly = (
+                "The AI model hit an error while working on this task, so it stopped. "
+                "Your progress so far is saved — you can retry the task or try a different model."
+            )
+            failed_msg_id = await _persist_to_conversation(task, friendly)
+            failed_event: dict[str, Any] = {"type": "task_failed", "error": friendly}
             if failed_msg_id:
                 failed_event["message_id"] = failed_msg_id
             await emit_activity(task_id, failed_event)
