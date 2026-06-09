@@ -99,10 +99,13 @@ export default function LoginPage() {
     <main className="min-h-screen bg-[#f6f7f9] px-6 py-10">
       <section className="mx-auto flex min-h-[calc(100vh-5rem)] max-w-md flex-col justify-center">
         <h1 className="text-3xl font-semibold tracking-normal text-[#15171a]">Chronos</h1>
+        <p className="mt-2 text-sm leading-6 text-[#525866]">
+          Chronos helps you complete work through chat, files, and durable AI tasks.
+        </p>
         <p className="mt-3 text-sm leading-6 text-[#525866]">
           {cognitoEnabled
-            ? "Sign in with your organization account (Amazon Cognito)."
-            : "Sign in with the seeded admin email. In dev, the OTP prints in the API console."}
+            ? "Sign in with your organization account."
+            : "Sign in with your email to receive a one-time code. (Development mode: the code also appears in the server logs.)"}
         </p>
 
         {!authConfig && (

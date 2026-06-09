@@ -7,6 +7,7 @@ with the empty request bodies the frontend actually sends.
 """
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 import httpx
@@ -147,6 +148,31 @@ async def test_rename_conversation_persists_and_is_scoped_to_owner():
             headers={"Authorization": f"Bearer {token2}"},
         )
         assert cross.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_upload_parses_document_eagerly():
+    """Uploads kick a background parse so the UI can show ready/unreadable
+    states up front instead of discovering them at send time."""
+    _org_id, _member_id, token = await _make_org_member_token()
+    auth = {"Authorization": f"Bearer {token}"}
+    transport = httpx.ASGITransport(app=main.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        res = await client.post(
+            "/attachments",
+            files={"file": ("notes.txt", b"alpha beta gamma", "text/plain")},
+            headers=auth,
+        )
+        assert res.status_code == 200, res.text
+        attachment_id = res.json()["attachment_id"]
+
+        meta: dict = {}
+        for _ in range(60):
+            await asyncio.sleep(0.05)
+            meta = (await client.get(f"/artifacts/{attachment_id}", headers=auth)).json()
+            if meta.get("parse_status") != "pending":
+                break
+        assert meta.get("parse_status") == "parsed"
 
 
 @pytest.mark.asyncio

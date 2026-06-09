@@ -30,11 +30,13 @@ CHAT_MODEL_OPTIONS: tuple[dict[str, Any], ...] = (
         "fallback_for": [],
         "policy": "Default selection; Chronos routes to the best configured model.",
     },
+    # Task-oriented labels (Auto/Best/Fast/...) per the product UX standard; the
+    # concrete vendor model stays in "model"/"description" for tooltips and admin.
     {
         "id": "gpt-5.4-mini",
-        "label": "GPT-5.4 Mini",
+        "label": "Best",
         "model": "openrouter/openai/gpt-5.4-mini",
-        "description": "OpenAI GPT-5.4 Mini through OpenRouter.",
+        "description": "Strongest writing and analysis (OpenAI GPT-5.4 Mini via OpenRouter).",
         "capabilities": ["chat", "tool_use", "agent_loop", "structured_json", "vision"],
         "tool_use": True,
         "fallback_for": [],
@@ -42,9 +44,9 @@ CHAT_MODEL_OPTIONS: tuple[dict[str, Any], ...] = (
     },
     {
         "id": "gpt-5.4-nano",
-        "label": "GPT-5.4 Nano",
+        "label": "Fast",
         "model": "openrouter/openai/gpt-5.4-nano",
-        "description": "OpenAI GPT-5.4 Nano through OpenRouter.",
+        "description": "Quicker, lighter responses (OpenAI GPT-5.4 Nano via OpenRouter).",
         "capabilities": ["chat", "tool_use", "agent_loop", "structured_json", "vision"],
         "tool_use": True,
         "fallback_for": [],
@@ -52,9 +54,9 @@ CHAT_MODEL_OPTIONS: tuple[dict[str, Any], ...] = (
     },
     {
         "id": "deepseek-v4-pro",
-        "label": "DeepSeek V4 Pro",
+        "label": "Reasoning",
         "model": "openrouter/deepseek/deepseek-v4-pro",
-        "description": "DeepSeek V4 Pro through OpenRouter.",
+        "description": "Deeper multi-step reasoning (DeepSeek V4 Pro via OpenRouter).",
         "capabilities": ["chat", "tool_use", "agent_loop", "structured_json"],
         "tool_use": True,
         "fallback_for": [],
@@ -62,9 +64,9 @@ CHAT_MODEL_OPTIONS: tuple[dict[str, Any], ...] = (
     },
     {
         "id": "deepseek-v4-flash",
-        "label": "DeepSeek V4 Flash",
+        "label": "Lite",
         "model": "openrouter/deepseek/deepseek-v4-flash",
-        "description": "DeepSeek V4 Flash through OpenRouter.",
+        "description": "Fastest and most economical (DeepSeek V4 Flash via OpenRouter).",
         "capabilities": ["chat", "tool_use", "agent_loop", "structured_json"],
         "tool_use": True,
         "fallback_for": [],

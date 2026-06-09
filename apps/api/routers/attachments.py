@@ -1,7 +1,12 @@
-"""Attachment upload — stores raw bytes as an artifact. Parsing happens on first use."""
+"""Attachment upload — stores raw bytes as an artifact.
+
+Documents are parsed eagerly in the background after upload so the UI can show
+honest ready/unreadable states up front; the chat path reuses the cached parse.
+"""
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, Form
 from sqlalchemy import insert, select
@@ -15,7 +20,64 @@ from core.models import Member
 
 router = APIRouter(prefix="/attachments", tags=["attachments"])
 
+logger = logging.getLogger(__name__)
+
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB
+
+# Strong references so eager-parse tasks aren't garbage-collected mid-flight.
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
+
+
+async def _parse_eagerly(attachment_id: str, conversation_id: str | None, org_id: str) -> None:
+    """Parse a freshly uploaded document and record its parse status.
+
+    Mirrors the lazy parse in the chat path (which reuses this result via the
+    parse_status="parsed" cache check). Images/audio/video are skipped — they go
+    through the vision/voice paths at use time, not the document parser.
+    """
+    from core.artifacts import get_artifact, read_artifact_content, set_parse_status
+    from parsing.engine import UNPARSEABLE_NOTE, parse_document
+
+    try:
+        meta = await get_artifact(attachment_id)
+        if not meta:
+            return
+        mime = str(meta.get("mime_type") or "")
+        if mime.startswith(("image/", "audio/", "video/")):
+            return
+        raw = await read_artifact_content(attachment_id) or b""
+        doc = await parse_document(raw, mime, str(meta.get("title") or "file"))
+        if doc.parser_used != "none":
+            status = "parsed"
+        elif doc.note == UNPARSEABLE_NOTE:
+            status = "unparseable"
+        else:
+            status = "failed"
+        if doc.full_text:
+            await save_artifact(
+                doc.full_text, kind="parsed_text", title=f"{meta.get('title')} (text)",
+                conversation_id=conversation_id, parent_artifact_id=attachment_id,
+                parse_status="parsed", org_id=org_id, mime_type="text/plain",
+            )
+        await set_parse_status(attachment_id, status)
+        await audit.log(
+            "attachment_parsed", "system", "attachments.parse",
+            organization_id=org_id,
+            resource_type="artifacts", resource_id=attachment_id,
+            payload={"parse_status": status, "parser_used": doc.parser_used, "eager": True},
+        )
+    except Exception:
+        logger.exception("Eager parse failed for attachment %s", attachment_id)
+        try:
+            await set_parse_status(attachment_id, "failed")
+        except Exception:
+            pass
+
+
+def _spawn_eager_parse(attachment_id: str, conversation_id: str | None, org_id: str) -> None:
+    task = asyncio.create_task(_parse_eagerly(attachment_id, conversation_id, org_id))
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
 
 
 async def _require_conversation_member(member: Member, conversation_id: str) -> None:
@@ -134,6 +196,7 @@ async def upload_attachment(
         organization_id=member.organization_id,
         resource_type="artifacts", resource_id=attachment_id,
     )
+    _spawn_eager_parse(attachment_id, conversation_id, member.organization_id)
 
     source_id = None
     if project_id:
