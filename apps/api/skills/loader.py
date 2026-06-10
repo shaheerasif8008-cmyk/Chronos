@@ -84,10 +84,20 @@ async def load_skill_content(skill_id: str, *, progressive: bool = True) -> str:
 
     if progressive and aux_files:
         # Progressive disclosure: list available files so the agent can fetch them on demand.
-        file_list = "\n".join(f"- {p.name}" for p in aux_files)
-        parts.append(
-            f"\n## Additional skill files (use fs.read to load when needed)\n{file_list}"
-        )
+        text_files = [p for p in aux_files if p.suffix not in {".py", ".sh"}]
+        exec_files = [p for p in aux_files if p.suffix in {".py", ".sh"}]
+
+        sections: list[str] = []
+        if text_files:
+            file_list = "\n".join(f"- {p.name}" for p in text_files)
+            sections.append(f"## Additional skill files (use fs.read to load when needed)\n{file_list}")
+        if exec_files:
+            script_list = "\n".join(f"- {p.name}" for p in exec_files)
+            sections.append(
+                f"## Executable scripts (invoke via `skill.run_script`)\n{script_list}"
+            )
+        if sections:
+            parts.append("\n" + "\n\n".join(sections))
     else:
         # Inline all aux .md files; skip binary files.
         for path in aux_files:
