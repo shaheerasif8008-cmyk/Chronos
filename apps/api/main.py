@@ -122,9 +122,15 @@ async def start_schedulers() -> None:
         if not scheduler.running:
             scheduler.start()
     task_runner.start_runner()
-    await recover_incomplete_tasks()
-    await recover_incomplete_workflows()
-    await recover_incomplete_research()
+    try:
+        await recover_incomplete_tasks()
+        await recover_incomplete_workflows()
+        await recover_incomplete_research()
+    except Exception as exc:
+        # DB may be briefly unavailable on first deploy; recovery runs again
+        # on next restart. Do not crash the entire app.
+        import logging
+        logging.getLogger(__name__).warning("Startup recovery skipped (DB unavailable): %s", exc)
 
 
 async def _bootstrap_authz() -> None:
