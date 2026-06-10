@@ -6,6 +6,7 @@ import ArtifactsScreen from "../../components/artifacts/ArtifactsScreen";
 import AgentsScreen from "../../components/agents/AgentsScreen";
 import BrowserOperatorScreen from "../../components/browser/BrowserOperatorScreen";
 import ComputerScreen from "../../components/computer/ComputerScreen";
+import DataScreen from "../../components/data/DataScreen";
 import InChatArtifactPanel from "../../components/artifacts/InChatArtifactPanel";
 import ResearchScreen from "../../components/research/ResearchScreen";
 import SkillsScreen from "../../components/skills/SkillsScreen";
@@ -40,7 +41,7 @@ function formatSearchResultTime(value?: string) {
 }
 
 // ─── Types ───────────────────────────────────────────────────────────────────
-type Route = "chat" | "activity" | "approvals" | "memory" | "connectors" | "assistants" | "settings" | "projects" | "research" | "browser" | "computer" | "tasks" | "artifacts" | "agents" | "workflows" | "skills" | "audit";
+type Route = "chat" | "activity" | "approvals" | "memory" | "connectors" | "assistants" | "settings" | "projects" | "research" | "browser" | "computer" | "tasks" | "artifacts" | "agents" | "workflows" | "skills" | "audit" | "data";
 type SettingsTab = "general" | "profile" | "organization" | "members" | "permissions" | "employees" | "runtime" | "memory-settings" | "tools-settings" | "approval-settings" | "notifications" | "security" | "billing" | "audit" | "developer" | "danger";
 type Conversation = { id: string; title: string | null; updated_at?: string; created_at?: string };
 type MessageRole = "user" | "assistant" | "system" | "tool";
@@ -547,6 +548,7 @@ function routeFromPath(pathname: string | null): Route {
   if (pathname === "/workflows") return "workflows";
   if (pathname === "/skills") return "skills";
   if (pathname === "/audit") return "audit";
+  if (pathname === "/data") return "data";
   return "chat";
 }
 
@@ -999,10 +1001,11 @@ function ChronosAppInner() {
         {route === "skills"     && <SkillsScreen />}
         {route === "browser"    && <BrowserOperatorScreen />}
         {route === "computer"   && <ComputerScreen />}
-        {route === "tasks"      && <EmptyPanel label="Tasks" />}
+        {route === "tasks"      && <TasksScreen />}
         {route === "agents"     && <AgentsScreen />}
         {route === "workflows"  && <WorkflowsScreen />}
-        {route === "audit"      && <EmptyPanel label="Audit" />}
+        {route === "audit"      && <AuditScreen />}
+        {route === "data"       && <DataScreen />}
       </main>
       <InChatArtifactPanel />
       {shellNotice && (
@@ -1080,6 +1083,9 @@ function Sidebar({
     { id: "agents"     as Route, icon: <IC.Sparkles size={15}/>,   label: "Agents",     badge: null, badgeKind: undefined },
     { id: "workflows"  as Route, icon: <IC.Refresh size={15}/>,    label: "Workflows",  badge: null, badgeKind: undefined },
     { id: "skills"     as Route, icon: <IC.Sparkles size={15}/>,   label: "Skills",     badge: null, badgeKind: undefined },
+    { id: "tasks"      as Route, icon: <IC.Clock size={15}/>,      label: "Tasks",      badge: null, badgeKind: undefined },
+    { id: "data"       as Route, icon: <IC.Filter size={15}/>,     label: "Data",       badge: null, badgeKind: undefined },
+    { id: "audit"      as Route, icon: <IC.Audit size={15}/>,      label: "Audit",      badge: null, badgeKind: undefined },
   ];
   const advancedActive = advancedNav.some(it => it.id === route);
 
@@ -6344,15 +6350,157 @@ function workflowNameFor(workflows: Phase12Workflow[], id: string) {
   return workflows.find(workflow => workflow.id === id)?.name || id;
 }
 
-function EmptyPanel({ label }: { label: string }) {
+function TasksScreen() {
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
+  const [activeTask, setActiveTask] = useState<Task | null>(null);
+  const [events, setEvents] = useState<ActivityAction[]>([]);
+  const [actionBusy, setActionBusy] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  const loadTasks = useCallback(async () => {
+    setLoading(true);
+    const params = new URLSearchParams({ limit: "100" });
+    if (statusFilter === "dead_letter") params.set("dead_letter", "true");
+    else if (statusFilter !== "all") params.set("status", statusFilter);
+    await apiFetch(`/tasks/?${params.toString()}`)
+      .then(r => r.json())
+      .then((data: Task[]) => setTasks(data))
+      .catch(() => setTasks([]))
+      .finally(() => setLoading(false));
+  }, [statusFilter]);
+
+  useEffect(() => { void loadTasks(); }, [loadTasks]);
+
+  useEffect(() => {
+    if (!activeTaskId) { setActiveTask(null); setEvents([]); return; }
+    apiFetch(`/tasks/${activeTaskId}`)
+      .then(r => r.json())
+      .then((data: Task) => setActiveTask(data))
+      .catch(() => setActiveTask(null));
+    apiFetch(`/tasks/${activeTaskId}/events`)
+      .then(r => r.json())
+      .then((data: ActivityAction[]) => setEvents(data))
+      .catch(() => setEvents([]));
+  }, [activeTaskId]);
+
+  const runTaskAction = useCallback(async (taskId: string, action: "cancel" | "retry") => {
+    setActionBusy(taskId);
+    setActionError(null);
+    try {
+      await apiFetch(`/tasks/${taskId}/${action}`, { method: "POST" });
+      await loadTasks();
+      if (activeTaskId === taskId) setActiveTaskId(null);
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : `Couldn't ${action} task`);
+    } finally {
+      setActionBusy(null);
+    }
+  }, [activeTaskId, loadTasks]);
+
+  const filters = [
+    { id: "all", label: "All" },
+    { id: "running", label: "Working" },
+    { id: "queued", label: "Queued" },
+    { id: "awaiting_approval", label: "Waiting on you" },
+    { id: "complete", label: "Done" },
+    { id: "failed", label: "Stopped" },
+    { id: "cancelled", label: "Cancelled" },
+    { id: "dead_letter", label: "Dead letter" },
+  ];
+  const statusLabel: Record<string, string> = {
+    queued: "Queued", running: "Working", awaiting_approval: "Waiting on you", complete: "Done", failed: "Stopped", pending: "Queued", cancelled: "Cancelled",
+  };
+  const cancellable = (t: Task) => !["complete", "failed", "cancelled"].includes(t.status);
+  const retryable = (t: Task) => ["failed", "cancelled"].includes(t.status);
+
   return (
-    <div className="flex-1 flex flex-col">
-      <PageHeader title={label} />
-      <div className="flex-1 flex items-center justify-center px-10 pb-10">
-        <div className="surface border border-soft rounded-2xl px-10 py-12 flex flex-col items-center gap-3 text-center max-w-sm">
-          <p className="text-[15px] font-medium">{label}</p>
-          <p className="text-[13.5px]" style={{ color: "var(--text-dim)" }}>Nothing here yet.</p>
-        </div>
+    <div className="flex-1 flex flex-col min-w-0 overflow-y-auto">
+      <PageHeader
+        title="Tasks"
+        subtitle="Manage Chronos's background work — cancel running tasks or retry stopped ones."
+        right={<button onClick={() => void loadTasks()} className="btn btn-ghost btn-sm"><IC.Refresh size={13}/> Refresh</button>}
+      />
+      <div className="px-10 pb-4 flex items-center gap-1 flex-wrap">
+        {filters.map(f => (
+          <button key={f.id} onClick={() => setStatusFilter(f.id)}
+                  className="px-3 py-1.5 rounded-md text-[13px] font-medium smooth whitespace-nowrap"
+                  style={{ background: statusFilter === f.id ? "var(--surface-2)" : "transparent", color: statusFilter === f.id ? "var(--text)" : "var(--text-muted)" }}>
+            {f.label}
+          </button>
+        ))}
+      </div>
+      {actionError && (
+        <div className="mx-10 mb-3 text-[12.5px] rounded-md px-3 py-2" style={{ color: "var(--danger)", background: "var(--danger-soft)" }}>{actionError}</div>
+      )}
+      <div className="px-10 pb-10 space-y-2.5">
+        {loading && <p className="text-[13.5px]" style={{ color: "var(--text-dim)" }}>Loading…</p>}
+        {!loading && tasks.length === 0 && (
+          <EmptyState icon={<IC.Clock size={20}/>} title="No tasks here" sub="Tasks appear when you ask Chronos to do something, or pick another filter."/>
+        )}
+        {tasks.map(t => {
+          const sl = statusLabel[t.status] ?? t.status;
+          const statusColor = { running: "var(--accent-text)", awaiting_approval: "var(--warn)", failed: "var(--danger)", complete: "var(--ok)" }[t.status] ?? "var(--text-muted)";
+          return (
+            <div key={t.id} className="surface border border-soft rounded-lg overflow-hidden">
+              <div className="w-full p-4 flex items-center gap-4">
+                <button onClick={() => setActiveTaskId(activeTaskId === t.id ? null : t.id)} className="flex-1 min-w-0 flex items-center gap-4 text-left smooth cursor-pointer">
+                  <div className="flex-shrink-0">
+                    {t.status === "running"             && <Dot color="var(--accent)" size={10} pulse ring/>}
+                    {t.status === "awaiting_approval"   && <Dot color="var(--warn)" size={10}/>}
+                    {t.status === "complete"            && <IC.Check size={16} stroke={2.2} style={{ color: "var(--ok)" }}/>}
+                    {(t.status === "failed" || t.status === "cancelled") && <IC.Info size={16} style={{ color: "var(--danger)" }}/>}
+                    {(t.status === "queued" || t.status === "pending") && <Dot color="var(--text-faint)" size={8}/>}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-[14.5px] font-medium mb-1 truncate">{t.goal}</div>
+                    <div className="flex items-center gap-2 text-[12.5px]" style={{ color: "var(--text-dim)" }}>
+                      <span style={{ color: statusColor }}>{sl}</span>
+                      <span>·</span>
+                      <span>{t.iteration_count ?? 0} iterations</span>
+                      {t.created_at && <><span>·</span><span>{new Date(t.created_at).toLocaleString()}</span></>}
+                    </div>
+                  </div>
+                </button>
+                <div className="flex items-center gap-1.5 flex-shrink-0">
+                  {cancellable(t) && (
+                    <button onClick={() => void runTaskAction(t.id, "cancel")} disabled={actionBusy === t.id} className="btn btn-ghost btn-sm">
+                      <IC.Stop size={13}/> Cancel
+                    </button>
+                  )}
+                  {retryable(t) && (
+                    <button onClick={() => void runTaskAction(t.id, "retry")} disabled={actionBusy === t.id} className="btn btn-ghost btn-sm">
+                      <IC.Refresh size={13}/> Retry
+                    </button>
+                  )}
+                  <button onClick={() => setActiveTaskId(activeTaskId === t.id ? null : t.id)} className="btn btn-ghost btn-icon">
+                    <IC.Chevron size={16} style={{ color: "var(--text-faint)", transform: activeTaskId === t.id ? "rotate(90deg)" : "none" }}/>
+                  </button>
+                </div>
+              </div>
+              {activeTaskId === t.id && (
+                <div className="border-t hairline px-5 py-4 space-y-3">
+                  {activeTask?.error && <div className="text-[12.5px]" style={{ color: "var(--danger)" }}>{activeTask.error}</div>}
+                  <TaskTimeline task={activeTask || t} events={events}/>
+                  <TaskResult task={activeTask || t}/>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function AuditScreen() {
+  return (
+    <div className="flex-1 flex flex-col min-w-0 overflow-y-auto">
+      <PageHeader title="Audit" subtitle="Every governed action Chronos has recorded — searchable and exportable."/>
+      <div className="px-10 pb-10">
+        <AuditSettings/>
       </div>
     </div>
   );
