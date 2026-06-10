@@ -22,6 +22,7 @@ loop state (messages + tool results) rather than a pre-generated JSON plan.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 from datetime import datetime, timedelta, timezone
@@ -554,12 +555,13 @@ async def _llm_step(
     model: str,
     *,
     reasoning_effort: str | None = None,
-) -> tuple[str | None, list[dict[str, Any]]]:
-    """Call the LLM and return (final_text | None, list_of_tool_calls).
+) -> tuple[str | None, list[dict[str, Any]], int]:
+    """Call the LLM and return (final_text | None, tool_calls, token_count).
 
     Returns:
-        final_text: The text response if the LLM is done calling tools.
-        tool_calls: Normalised list of tool call dicts if the LLM wants to act.
+        final_text:   The text response if the LLM is done calling tools.
+        tool_calls:   Normalised list of tool call dicts if the LLM wants to act.
+        token_count:  Total tokens consumed by this step (0 if unavailable).
     """
     kwargs = model_kwargs(model, messages=history, stream=False, reasoning_effort=reasoning_effort)
     kwargs["tools"] = tools
@@ -570,9 +572,12 @@ async def _llm_step(
     raw_calls = _tool_calls(msg)
     text = _message_content(response)
 
+    usage = getattr(response, "usage", None)
+    token_count = int(getattr(usage, "total_tokens", None) or 0) if usage else 0
+
     if raw_calls:
-        return None, _normalise_calls(raw_calls)
-    return (text or ""), []
+        return None, _normalise_calls(raw_calls), token_count
+    return (text or ""), [], token_count
 
 
 def _normalise_calls(raw_calls: list[Any]) -> list[dict[str, Any]]:
@@ -749,6 +754,14 @@ async def _execute_tool(
 
     # All other tools go through the ToolBroker
     broker_name = to_broker_name(tool_name)
+    # Auto-generate a stable idempotency key for external write tools so that
+    # crash/resume mid-step does not double-execute (e.g. double-send an email).
+    # Key is deterministic on (task_id, call_id) — unique per logical step, but
+    # stable across retries of the same step.
+    if _call_is_external_write(call) and "__idempotency_key" not in args:
+        args["__idempotency_key"] = hashlib.sha256(
+            f"{task_id}:{call['id']}".encode()
+        ).hexdigest()[:24]
     created_artifacts: list[dict[str, Any]] = []
     try:
         result = await tool_broker.execute(agent, broker_name, args)
@@ -1703,7 +1716,7 @@ async def run_loop(
             if _guidance:
                 step_history = history + [{"role": "system", "content": "\n\n".join(_guidance)}]
         try:
-            final_text, calls = await _llm_step(
+            final_text, calls, step_tokens = await _llm_step(
                 step_history,
                 effective_tools,
                 effective_model,
@@ -1724,6 +1737,12 @@ async def run_loop(
                 failed_event["message_id"] = failed_msg_id
             await emit_activity(task_id, failed_event)
             return {"error": str(exc)}
+
+        # Record token usage for per-org budget tracking.
+        if step_tokens > 0 and settings.per_org_daily_token_limit > 0:
+            _spawn_background(tool_broker.record_tokens_used(
+                task.get("organization_id", "default"), step_tokens
+            ))
 
         # ── Final answer ────────────────────────────────────────────────────
         if not calls:

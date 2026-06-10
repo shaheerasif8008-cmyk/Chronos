@@ -48,8 +48,9 @@ async def test_native_loop_adds_controller_replan_instruction_after_tool_error(m
         (
             None,
             [{"id": "call-1", "name": "browser__search", "args_str": json.dumps({"query": "bad"})}],
+            0,
         ),
-        ("Recovered after changing strategy.", []),
+        ("Recovered after changing strategy.", [], 0),
     ]
 
     async def fake_save_task(task_id, **values):
