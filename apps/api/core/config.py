@@ -140,6 +140,13 @@ class Settings(BaseSettings):
     # Sub-agent concurrency
     concurrent_sub_agents: int = 5
 
+    # Agent-loop cognition (plan / reflect / dynamic routing). When disabled the
+    # loop falls back to the proven model-native behavior. The planner/critic
+    # also no-op automatically when no model API key is configured.
+    agent_cognition_enabled: bool = True
+    agent_max_reflections: int = 2
+    agent_max_replans: int = 3
+
     # Context budgeting (category 7)
     max_context_tokens: int = 120_000   # conservative for frontier models
     response_reserve_tokens: int = 4_000
