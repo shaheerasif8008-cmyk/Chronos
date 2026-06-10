@@ -5,7 +5,8 @@ services:
     runtime: python
     rootDir: apps/api
     buildCommand: pip install -r requirements.txt
-    startCommand: alembic upgrade head && uvicorn main:app --host 0.0.0.0 --port $PORT
+    preDeployCommand: alembic upgrade head
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
       - key: ORG_ID
@@ -26,9 +27,9 @@ services:
       - key: JWT_SECRET
         generateValue: true
       - key: VAULT_ENCRYPTION_KEY
-        generateValue: true  # must be 64 hex chars — see note below
+        sync: false          # set to 64 hex chars: openssl rand -hex 32
       - key: AUTH_PROVIDER
-        value: dev_otp       # change to sendgrid_otp once SENDGRID_API_KEY is set
+        sync: false          # set to "dev_otp" for testing or "sendgrid_otp" for production
       - key: SENDGRID_API_KEY
         sync: false
       - key: OBJECT_STORAGE_BACKEND
@@ -66,7 +67,7 @@ services:
         value: "1536"
       # ── Misc ─────────────────────────────────────────────────────────────────
       - key: DEMO_MODE
-        value: "true"
+        value: "false"
       - key: ACCESS_TOKEN_EXPIRE_MINUTES
         value: "60"
       - key: TASK_RUNNER_MAX_CONCURRENCY
