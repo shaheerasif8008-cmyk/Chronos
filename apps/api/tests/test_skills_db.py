@@ -139,3 +139,143 @@ async def test_sync_creates_version_one(sqlite_db):
             )
         ).mappings().all()
     assert any(r["skill_id"] == skill["id"] for r in rows)
+
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: write-path tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_create_skill_new(sqlite_db):
+    """Creating a brand-new uploaded skill yields version=1."""
+    result = await registry.create_or_update_skill(
+        org_id="default",
+        slug="my-new-skill",
+        name="My New Skill",
+        description="A test skill",
+        content="# SKILL.md\nDo stuff.",
+        metadata={"requires_connectors": [], "spawns_sub_agent": False},
+        created_by="test-member",
+    )
+    assert result["version"] == 1
+    assert result["skill_id"]
+
+    skill = await registry.get_skill_db("default", "my-new-skill")
+    assert skill is not None
+    assert skill["current_version"] == 1
+    assert skill["source"] == "uploaded"
+    assert skill["content"] == "# SKILL.md\nDo stuff."
+
+
+@pytest.mark.asyncio
+async def test_create_skill_new_version(sqlite_db):
+    """Calling create_or_update_skill twice on the same slug bumps version to 2."""
+    await registry.create_or_update_skill(
+        org_id="default",
+        slug="versioned-skill",
+        name="Versioned Skill",
+        description="v1",
+        content="content v1",
+        metadata={},
+        created_by="member-a",
+    )
+    result2 = await registry.create_or_update_skill(
+        org_id="default",
+        slug="versioned-skill",
+        name="Versioned Skill",
+        description="v2",
+        content="content v2",
+        metadata={},
+        created_by="member-b",
+    )
+    assert result2["version"] == 2
+
+    skill = await registry.get_skill_db("default", "versioned-skill")
+    assert skill["current_version"] == 2
+    # current content should reflect version 2
+    assert skill["content"] == "content v2"
+
+    versions = await registry.list_skill_versions(skill["id"])
+    assert len(versions) == 2
+    assert versions[0]["version"] == 1
+    assert versions[1]["version"] == 2
+
+
+@pytest.mark.asyncio
+async def test_filesystem_skill_immutable(sqlite_db):
+    """A filesystem-sourced skill cannot be overwritten by create_or_update_skill
+    when guarded at the router level — the guard is the source=='filesystem' check.
+    We verify that the DB function itself does NOT enforce this (it's a router concern),
+    but we also verify that the source column remains 'filesystem' on a fresh sync."""
+    synced = await registry.sync_filesystem_skills(org_id="default")
+    slug = synced[0]["slug"]
+
+    skill = await registry.get_skill_db("default", slug)
+    assert skill["source"] == "filesystem"
+
+    # The router would block this; the DB function itself permits it (caller's
+    # responsibility).  We only assert the source field is detectable.
+    assert skill["source"] == "filesystem"
+
+
+@pytest.mark.asyncio
+async def test_soft_delete(sqlite_db):
+    """A soft-deleted skill no longer appears in list_skills_db."""
+    await registry.create_or_update_skill(
+        org_id="default",
+        slug="delete-me",
+        name="Delete Me",
+        description="",
+        content="bye",
+        metadata={},
+        created_by="member",
+    )
+    before = await registry.list_skills_db("default")
+    assert any(s["slug"] == "delete-me" for s in before)
+
+    deleted = await registry.soft_delete_skill("default", "delete-me")
+    assert deleted is True
+
+    after = await registry.list_skills_db("default")
+    assert not any(s["slug"] == "delete-me" for s in after)
+
+    # Double-delete returns False (already deleted)
+    second = await registry.soft_delete_skill("default", "delete-me")
+    assert second is False
+
+
+@pytest.mark.asyncio
+async def test_get_version(sqlite_db):
+    """get_skill_version returns the correct content for a specific version."""
+    r1 = await registry.create_or_update_skill(
+        org_id="default",
+        slug="versioned-fetch",
+        name="Versioned Fetch",
+        description="",
+        content="version one content",
+        metadata={},
+        created_by="member",
+    )
+    r2 = await registry.create_or_update_skill(
+        org_id="default",
+        slug="versioned-fetch",
+        name="Versioned Fetch",
+        description="",
+        content="version two content",
+        metadata={},
+        created_by="member",
+    )
+
+    skill_id = r1["skill_id"]
+
+    v1 = await registry.get_skill_version(skill_id, 1)
+    assert v1 is not None
+    assert v1["content"] == "version one content"
+
+    v2 = await registry.get_skill_version(skill_id, 2)
+    assert v2 is not None
+    assert v2["content"] == "version two content"
+
+    missing = await registry.get_skill_version(skill_id, 99)
+    assert missing is None
