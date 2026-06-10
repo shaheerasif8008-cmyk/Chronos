@@ -35,6 +35,49 @@ def load_skill_index() -> list[dict[str, Any]]:
     return index
 
 
+async def get_candidate_skills(org_id: str) -> list[dict[str, Any]]:
+    """Return the union of filesystem skills and DB skills for ``org_id``.
+
+    Each candidate has a consistent shape:
+        {id, name, description, source, requires_connectors, spawns_sub_agent}
+
+    Dedupe is by slug, with the DB version preferred (an uploaded override may
+    be newer than the filesystem seed). If the DB query fails for any reason
+    (DB unavailable, table missing), degrade gracefully to filesystem-only.
+    """
+    by_slug: dict[str, dict[str, Any]] = {}
+
+    # Filesystem first (seed layer).
+    for skill in load_skill_index():
+        by_slug[skill["id"]] = {
+            "id": skill["id"],
+            "name": skill["name"],
+            "description": skill["description"],
+            "source": "filesystem",
+            "requires_connectors": list(skill["requires_connectors"]),
+            "spawns_sub_agent": bool(skill["spawns_sub_agent"]),
+        }
+
+    # DB skills override by slug; degrade to filesystem-only on error.
+    try:
+        db_skills = await list_skills_db(org_id)
+    except Exception:
+        db_skills = []
+
+    for skill in db_skills:
+        slug = skill["slug"]
+        by_slug[slug] = {
+            "id": slug,
+            "name": skill["name"],
+            "description": skill.get("description") or "",
+            "source": skill.get("source") or "uploaded",
+            "requires_connectors": list(skill.get("requires_connectors") or []),
+            "spawns_sub_agent": bool(skill.get("spawns_sub_agent", False)),
+        }
+
+    return list(by_slug.values())
+
+
 def _read_skill_md(skill_path: str) -> str:
     md = Path(skill_path) / "SKILL.md"
     if md.exists():

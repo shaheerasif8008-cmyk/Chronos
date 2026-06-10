@@ -18,7 +18,7 @@ from memory.source_retrieval import (
     retrieve_source_chunks,
 )
 from skills.loader import find_relevant_skills, load_skill_content, skill_connector_warning
-from skills.registry import load_skill_index
+from skills.registry import get_candidate_skills
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -129,13 +129,15 @@ async def assemble_context(
     requester_context.memory_context = "task" if requester_context.task_id else "chat"
 
     async def _fetch_skills() -> list[tuple[str, str | None, str]]:
-        skill_ids = await find_relevant_skills(message)
-        skill_index = {s["id"]: s for s in load_skill_index()}
+        org_id = requester_context.org_id
+        candidates = await get_candidate_skills(org_id)
+        skill_index = {s["id"]: s for s in candidates}
+        skill_ids = await find_relevant_skills(message, org_id)
         out: list[tuple[str, str | None, str]] = []
         for skill_id in skill_ids:
             skill_meta = skill_index.get(skill_id, {})
             warning = await skill_connector_warning(skill_meta)
-            content = await load_skill_content(skill_id, progressive=True)
+            content = await load_skill_content(skill_id, progressive=True, org_id=org_id)
             out.append((skill_id, warning, content))
         return out
 

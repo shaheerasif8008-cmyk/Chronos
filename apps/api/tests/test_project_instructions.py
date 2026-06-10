@@ -124,7 +124,7 @@ async def test_assemble_context_includes_project_instructions_block(monkeypatch)
     async def fake_org_context(org_id):
         return ""
 
-    async def fake_find_skills(message):
+    async def fake_find_skills(message, *args, **kwargs):
         return []
 
     async def fake_retrieve(message, requester_context):
@@ -170,6 +170,9 @@ async def test_assemble_context_includes_project_instructions_block(monkeypatch)
         def limit(self, *args): return self
 
     monkeypatch.setattr(context, "load_org_context", fake_org_context)
+    async def _fake_candidates(org_id):
+        return []
+    monkeypatch.setattr(context, "get_candidate_skills", _fake_candidates)
     monkeypatch.setattr(context, "find_relevant_skills", fake_find_skills)
     monkeypatch.setattr(context.memory, "retrieve", fake_retrieve)
     monkeypatch.setattr(context, "_load_project_instructions", fake_load_project_instructions)
@@ -198,7 +201,7 @@ async def test_assemble_context_omits_project_instructions_when_no_project_id(mo
     async def fake_org_context(org_id):
         return ""
 
-    async def fake_find_skills(message):
+    async def fake_find_skills(message, *args, **kwargs):
         return []
 
     async def fake_retrieve(message, requester_context):
@@ -243,6 +246,9 @@ async def test_assemble_context_omits_project_instructions_when_no_project_id(mo
         def limit(self, *args): return self
 
     monkeypatch.setattr(context, "load_org_context", fake_org_context)
+    async def _fake_candidates(org_id):
+        return []
+    monkeypatch.setattr(context, "get_candidate_skills", _fake_candidates)
     monkeypatch.setattr(context, "find_relevant_skills", fake_find_skills)
     monkeypatch.setattr(context.memory, "retrieve", fake_retrieve)
     monkeypatch.setattr(context, "_load_project_instructions", fake_load_project_instructions)
@@ -270,7 +276,7 @@ async def test_assemble_context_project_instructions_before_skills(monkeypatch):
     async def fake_org_context(org_id):
         return ""
 
-    async def fake_find_skills(message):
+    async def fake_find_skills(message, *args, **kwargs):
         return ["general"]
 
     async def fake_load_skill(skill_id, **kwargs):
@@ -317,6 +323,9 @@ async def test_assemble_context_project_instructions_before_skills(monkeypatch):
         def limit(self, *args): return self
 
     monkeypatch.setattr(context, "load_org_context", fake_org_context)
+    async def _fake_candidates(org_id):
+        return []
+    monkeypatch.setattr(context, "get_candidate_skills", _fake_candidates)
     monkeypatch.setattr(context, "find_relevant_skills", fake_find_skills)
     monkeypatch.setattr(context, "load_skill_content", fake_load_skill)
     monkeypatch.setattr(context.memory, "retrieve", fake_retrieve)
@@ -348,7 +357,7 @@ async def test_assemble_context_omits_project_block_when_instructions_none(monke
     async def fake_org_context(org_id):
         return ""
 
-    async def fake_find_skills(message):
+    async def fake_find_skills(message, *args, **kwargs):
         return []
 
     async def fake_retrieve(message, requester_context):
@@ -392,6 +401,9 @@ async def test_assemble_context_omits_project_block_when_instructions_none(monke
         def limit(self, *args): return self
 
     monkeypatch.setattr(context, "load_org_context", fake_org_context)
+    async def _fake_candidates(org_id):
+        return []
+    monkeypatch.setattr(context, "get_candidate_skills", _fake_candidates)
     monkeypatch.setattr(context, "find_relevant_skills", fake_find_skills)
     monkeypatch.setattr(context.memory, "retrieve", fake_retrieve)
     monkeypatch.setattr(context, "_load_project_instructions", fake_load_project_instructions)
@@ -556,7 +568,7 @@ async def test_assemble_context_omits_project_block_when_instructions_whitespace
     async def fake_org_context(org_id):
         return ""
 
-    async def fake_find_skills(message):
+    async def fake_find_skills(message, *args, **kwargs):
         return []
 
     async def fake_retrieve(message, requester_context):
@@ -601,6 +613,9 @@ async def test_assemble_context_omits_project_block_when_instructions_whitespace
         def limit(self, *args): return self
 
     monkeypatch.setattr(context, "load_org_context", fake_org_context)
+    async def _fake_candidates(org_id):
+        return []
+    monkeypatch.setattr(context, "get_candidate_skills", _fake_candidates)
     monkeypatch.setattr(context, "find_relevant_skills", fake_find_skills)
     monkeypatch.setattr(context.memory, "retrieve", fake_retrieve)
     monkeypatch.setattr(context, "_load_project_instructions", fake_load_project_instructions)

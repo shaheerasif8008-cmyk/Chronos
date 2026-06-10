@@ -279,3 +279,113 @@ async def test_get_version(sqlite_db):
 
     missing = await registry.get_skill_version(skill_id, 99)
     assert missing is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: runtime discovery of DB-persisted skills
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_get_candidate_skills_union(sqlite_db):
+    """Candidate pool is the union of filesystem skills and DB-only skills."""
+    await registry.create_or_update_skill(
+        org_id="default",
+        slug="db-only-skill",
+        name="DB Only Skill",
+        description="Lives only in the DB",
+        content="# uploaded",
+        metadata={"requires_connectors": [], "spawns_sub_agent": False},
+        created_by="member",
+    )
+
+    candidates = await registry.get_candidate_skills("default")
+    slugs = {c["id"] for c in candidates}
+
+    fs_slugs = {s["id"] for s in registry.load_skill_index()}
+    assert fs_slugs, "expected at least one filesystem skill"
+    assert fs_slugs <= slugs, "filesystem skills should be present"
+    assert "db-only-skill" in slugs, "DB-only skill should be present"
+
+    # Consistent shape on every candidate.
+    for c in candidates:
+        assert set(c) == {
+            "id",
+            "name",
+            "description",
+            "source",
+            "requires_connectors",
+            "spawns_sub_agent",
+        }
+
+
+@pytest.mark.asyncio
+async def test_get_candidate_skills_db_overrides_filesystem(sqlite_db):
+    """When a DB skill shares a slug with a filesystem skill, the DB version wins."""
+    fs_slug = registry.load_skill_index()[0]["id"]
+
+    await registry.create_or_update_skill(
+        org_id="default",
+        slug=fs_slug,
+        name="Overridden Name",
+        description="overridden description",
+        content="# override",
+        metadata={"requires_connectors": ["gmail"], "spawns_sub_agent": True},
+        created_by="member",
+    )
+
+    candidates = await registry.get_candidate_skills("default")
+    matches = [c for c in candidates if c["id"] == fs_slug]
+
+    assert len(matches) == 1, "slug should be deduped"
+    override = matches[0]
+    assert override["name"] == "Overridden Name"
+    assert override["source"] == "uploaded"
+    assert override["requires_connectors"] == ["gmail"]
+    assert override["spawns_sub_agent"] is True
+
+
+@pytest.mark.asyncio
+async def test_get_candidate_skills_db_error_degrades(sqlite_db, monkeypatch):
+    """If the DB query raises, fall back to filesystem-only (no exception)."""
+    async def boom(org_id):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(registry, "list_skills_db", boom)
+
+    candidates = await registry.get_candidate_skills("default")
+    slugs = {c["id"] for c in candidates}
+
+    assert slugs == {s["id"] for s in registry.load_skill_index()}
+    assert all(c["source"] == "filesystem" for c in candidates)
+
+
+@pytest.mark.asyncio
+async def test_load_skill_content_db(sqlite_db):
+    """A DB skill's current version content is loaded over the filesystem."""
+    from skills import loader
+
+    await registry.create_or_update_skill(
+        org_id="default",
+        slug="uploaded-content-skill",
+        name="Uploaded Content",
+        description="",
+        content="# SKILL.md from DB\nUse the uploaded workflow.",
+        metadata={},
+        created_by="member",
+    )
+
+    content = await loader.load_skill_content(
+        "uploaded-content-skill", org_id="default"
+    )
+    assert content == "# SKILL.md from DB\nUse the uploaded workflow."
+
+
+@pytest.mark.asyncio
+async def test_load_skill_content_filesystem_fallback(sqlite_db):
+    """A slug absent from the DB falls back to the filesystem loader."""
+    from skills import loader
+
+    fs_slug = registry.load_skill_index()[0]["id"]
+    # Not inserted into the DB for this org → must come from the filesystem.
+    content = await loader.load_skill_content(fs_slug, org_id="default")
+    assert content, "expected non-empty filesystem SKILL.md content"
