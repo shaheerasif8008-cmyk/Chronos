@@ -367,8 +367,8 @@ async def test_run_loop_gates_write_after_untrusted_prompt_injection(monkeypatch
     updates = []
     approvals = []
     llm_calls = [
-        (None, [{"id": "call-fetch", "name": "browser__fetch", "args_str": "{}"}]),
-        (None, [{"id": "call-draft", "name": "gmail__draft", "args_str": "{}"}]),
+        (None, [{"id": "call-fetch", "name": "browser__fetch", "args_str": "{}"}], 0),
+        (None, [{"id": "call-draft", "name": "gmail__draft", "args_str": "{}"}], 0),
     ]
 
     async def fake_save_task(task_id, **values):

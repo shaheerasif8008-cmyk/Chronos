@@ -181,8 +181,8 @@ async def test_agent_loop_uses_model_decisions_and_broker_checkpoint(monkeypatch
         assert tools
         decision = decisions.pop(0)
         if decision["type"] == "tool_call":
-            return None, [{"id": "call-1", "name": "browser__search", "args_str": json.dumps(decision["args"])}]
-        return decision["result"]["answer"], []
+            return None, [{"id": "call-1", "name": "browser__search", "args_str": json.dumps(decision["args"])}], 0
+        return decision["result"]["answer"], [], 0
 
     async def fake_execute(agent, tool, args):
         calls.append((tool, args))
@@ -246,7 +246,7 @@ async def test_agent_loop_pauses_and_checkpoints_on_approval(monkeypatch):
                 "name": "gmail__send",
                 "args_str": json.dumps({"to": ["a@example.com"], "subject": "Hi", "body": "Hello"}),
             }
-        ]
+        ], 0
 
     async def fake_open_approval(task, pending_calls, history, iteration, model=None):
         approval_calls.append((task["id"], pending_calls[0]["name"], list(history)))
