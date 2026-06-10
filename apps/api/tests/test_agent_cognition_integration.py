@@ -59,9 +59,9 @@ async def test_run_loop_plans_then_reflects_before_finishing(monkeypatch):
 
     # 1) call a tool, 2) shallow answer (rejected), 3) improved answer (accepted)
     steps = [
-        (None, [{"id": "c1", "name": "browser__search", "args_str": json.dumps({"q": "rivals"})}]),
-        ("Draft memo v1.", []),
-        ("Draft memo v2 with cited sources.", []),
+        (None, [{"id": "c1", "name": "browser__search", "args_str": json.dumps({"q": "rivals"})}], 100),
+        ("Draft memo v1.", [], 50),
+        ("Draft memo v2 with cited sources.", [], 75),
     ]
 
     async def fake_llm_step(history, tools, model, *, reasoning_effort=None):
@@ -129,7 +129,7 @@ async def test_run_loop_without_model_key_skips_cognition(monkeypatch):
     async def boom_reflect(goal, answer, summaries):
         raise AssertionError("critic ran without a model key")
 
-    steps = [("Direct answer.", [])]
+    steps = [("Direct answer.", [], 0)]
 
     async def fake_llm_step(history, tools, model, *, reasoning_effort=None):
         return steps.pop(0)
@@ -176,10 +176,10 @@ async def test_run_loop_escalates_model_when_errors_recur(monkeypatch):
     models_seen: list[str] = []
     # Three failing search calls (same error) then a final answer.
     steps = [
-        (None, [{"id": "c1", "name": "browser__search", "args_str": json.dumps({"q": "a"})}]),
-        (None, [{"id": "c2", "name": "browser__search", "args_str": json.dumps({"q": "b"})}]),
-        (None, [{"id": "c3", "name": "browser__search", "args_str": json.dumps({"q": "c"})}]),
-        ("Best effort answer.", []),
+        (None, [{"id": "c1", "name": "browser__search", "args_str": json.dumps({"q": "a"})}], 80),
+        (None, [{"id": "c2", "name": "browser__search", "args_str": json.dumps({"q": "b"})}], 80),
+        (None, [{"id": "c3", "name": "browser__search", "args_str": json.dumps({"q": "c"})}], 80),
+        ("Best effort answer.", [], 60),
     ]
 
     async def fake_llm_step(history, tools, model, *, reasoning_effort=None):
