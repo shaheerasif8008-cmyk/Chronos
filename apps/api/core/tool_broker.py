@@ -231,6 +231,48 @@ async def record_tokens_used(org_id: str, tokens: int) -> None:
         await redis_client.expire(key, 90_000)
 
 
+async def _route_skill_run_script(agent: AgentContext, args: dict, tier: str) -> ToolResult:
+    """Handle skill.run_script — resolve script, guard against path traversal, delegate to data connector."""
+    from pathlib import Path
+    from skills.registry import SKILLS_ROOT
+
+    skill_id = str(args.get("skill_id") or "")
+    script_name = str(args.get("script_name") or "")
+    params = args.get("params") or {}
+
+    if not skill_id or not script_name:
+        raise ValueError("skill.run_script requires skill_id and script_name")
+
+    skill_dir = (SKILLS_ROOT / skill_id).resolve()
+    script_path = (skill_dir / script_name).resolve()
+
+    # Path-traversal guard: script must resolve inside skill_dir
+    try:
+        script_path.relative_to(skill_dir)
+    except ValueError:
+        raise ValueError(
+            f"skill.run_script: path traversal detected — '{script_name}' escapes skill directory"
+        )
+
+    if not script_path.exists():
+        raise FileNotFoundError(f"skill.run_script: script not found: {skill_id}/{script_name}")
+
+    # Per-script permission check (RULE 3 — never inline permission logic).
+    await permissions.check(agent.as_member(), "skill.run_script", f"skill:{skill_id}/{script_name}")
+
+    script_source = script_path.read_text()
+
+    from connectors.data_analysis import data_analysis_connector
+    routed_args = {
+        "__connector_tier": tier,
+        "__org_id": agent.org_id,
+        "__task_id": agent.task_id or agent.id,
+        "code": script_source,
+        "context": params,
+    }
+    return await data_analysis_connector.execute("data.run_script", routed_args)
+
+
 async def _route(agent: AgentContext, tool: str, args: dict, vault_ref: str, tier: str = "live") -> ToolResult:
     """Route to the correct connector after all checks pass."""
     provider = tool.split(".")[0]
@@ -238,6 +280,9 @@ async def _route(agent: AgentContext, tool: str, args: dict, vault_ref: str, tie
     routed_args["__connector_tier"] = tier
     routed_args["__org_id"] = agent.org_id
     routed_args["__task_id"] = agent.task_id or agent.id
+
+    if tool == "skill.run_script":
+        return await _route_skill_run_script(agent, args, tier)
 
     if provider == "gmail":
         from connectors.gmail import gmail_connector
@@ -357,7 +402,7 @@ class ToolBroker:
         # when external OAuth or browser dependencies are not configured.
         provider = tool.split(".")[0]
         tier = await connector_tier(provider)
-        if tier == "live" and provider not in {"browser", "fs", "code", "doc", "image", "voice", "data", "chat_history", "repo", "computer", "local_computer"}:
+        if tier == "live" and provider not in {"browser", "fs", "code", "doc", "image", "voice", "data", "chat_history", "repo", "computer", "local_computer", "skill"}:
             from connectors.registry import get as registry_get
 
             connector = await registry_get(agent, tool)

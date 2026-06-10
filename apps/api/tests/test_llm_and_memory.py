@@ -317,7 +317,10 @@ async def test_skill_selection_uses_fast_model(monkeypatch):
         assert model == loader.settings.fast_model
         return json.dumps({"relevant_skill_ids": ["general"]})
 
-    monkeypatch.setattr(loader, "load_skill_index", lambda: [{"id": "general", "name": "General", "description": "general help"}])
+    async def fake_candidates(org_id):
+        return [{"id": "general", "name": "General", "description": "general help"}]
+
+    monkeypatch.setattr(loader, "get_candidate_skills", fake_candidates)
     monkeypatch.setattr(loader, "complete_json", fake_complete_json)
 
     assert await loader.find_relevant_skills("general help") == ["general"]
@@ -899,7 +902,7 @@ async def test_assemble_context_loads_persona_skills_memories_and_task_state(mon
     async def fake_org_context(org_id):
         return "Org fact."
 
-    async def fake_find_skills(message):
+    async def fake_find_skills(message, *args, **kwargs):
         return ["sdr-outreach"]
 
     async def fake_load_skill(skill_id, **kwargs):
@@ -967,6 +970,9 @@ async def test_assemble_context_loads_persona_skills_memories_and_task_state(mon
             return self
 
     monkeypatch.setattr(context, "load_org_context", fake_org_context)
+    async def _fake_candidates(org_id):
+        return []
+    monkeypatch.setattr(context, "get_candidate_skills", _fake_candidates)
     monkeypatch.setattr(context, "find_relevant_skills", fake_find_skills)
     monkeypatch.setattr(context, "load_skill_content", fake_load_skill)
     monkeypatch.setattr(context.memory, "retrieve", fake_retrieve)
@@ -997,7 +1003,7 @@ async def test_assemble_context_deduplicates_current_saved_user_message(monkeypa
     async def fake_org_context(org_id):
         return ""
 
-    async def fake_find_skills(message):
+    async def fake_find_skills(message, *args, **kwargs):
         return []
 
     async def fake_retrieve(message, requester_context):
@@ -1011,6 +1017,9 @@ async def test_assemble_context_deduplicates_current_saved_user_message(monkeypa
         ]
 
     monkeypatch.setattr(context, "load_org_context", fake_org_context)
+    async def _fake_candidates(org_id):
+        return []
+    monkeypatch.setattr(context, "get_candidate_skills", _fake_candidates)
     monkeypatch.setattr(context, "find_relevant_skills", fake_find_skills)
     monkeypatch.setattr(context.memory, "retrieve", fake_retrieve)
     monkeypatch.setattr(context, "_compact_history", fake_compact_history)
@@ -1033,7 +1042,7 @@ async def test_assemble_context_injects_dynamic_tool_manifest(monkeypatch):
     async def fake_org_context(org_id):
         return ""
 
-    async def fake_find_skills(message):
+    async def fake_find_skills(message, *args, **kwargs):
         return []
 
     async def fake_retrieve(message, requester_context):
@@ -1088,6 +1097,9 @@ async def test_assemble_context_injects_dynamic_tool_manifest(monkeypatch):
             return self
 
     monkeypatch.setattr(context, "load_org_context", fake_org_context)
+    async def _fake_candidates(org_id):
+        return []
+    monkeypatch.setattr(context, "get_candidate_skills", _fake_candidates)
     monkeypatch.setattr(context, "find_relevant_skills", fake_find_skills)
     monkeypatch.setattr(context.memory, "retrieve", fake_retrieve)
     monkeypatch.setattr(context, "reflect_table", fake_reflect_table)
