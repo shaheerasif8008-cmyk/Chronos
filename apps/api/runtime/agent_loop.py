@@ -34,8 +34,9 @@ from core import audit, tool_broker
 from core.config import settings
 from core.db import engine, reflect_table
 from core.exceptions import ApprovalRequired
-from core.llm import _message_content, _message, _tool_calls, _with_retry, default_chat_model_id, model_kwargs, resolve_agent_model, stream_step
+from core.llm import _message_content, _message, _tool_calls, _with_retry, complete_json, default_chat_model_id, model_kwargs, resolve_agent_model, stream_step, stronger_agent_model
 from core.models import AgentContext
+from runtime import cognition
 from core.redis import redis_client
 from core.task_envelope import build_task_envelope, envelope_to_agent_prompt
 from core.tool_manifest import generate_tool_manifest
@@ -532,6 +533,7 @@ async def _checkpoint(
     *,
     model: str | None = None,
     orchestration_state: dict[str, Any] | None = None,
+    cognition_state: dict[str, Any] | None = None,
     **extra: Any,
 ) -> None:
     state: dict[str, Any] = {"agent_history": history, "iteration_count": iteration}
@@ -539,6 +541,8 @@ async def _checkpoint(
         state["model"] = model  # preserve the UI-chosen model across resume
     if orchestration_state:
         state["orchestration_state"] = orchestration_state
+    if cognition_state:
+        state["cognition"] = cognition_state  # reflections/replans used, survives resume
     await save_task(task_id, agent_state=state, iteration_count=iteration, **extra)
 
 
@@ -1544,15 +1548,69 @@ async def stream_chat_turn(
 
 # ── Core loop ─────────────────────────────────────────────────────────────────
 
+# ── Cognition wrappers (planner / critic) ──────────────────────────────────────
+#
+# These are the only cognition pieces that call a model. They degrade to a safe
+# default (no plan / accept the answer) whenever cognition is disabled, no model
+# key is configured, or the model call fails or returns junk — so the loop's
+# behavior is identical to the prior model-native loop when cognition is off.
+
+
+def _cognition_enabled(is_sub_agent: bool) -> bool:
+    """Cognition runs for top-level tasks when enabled and a model is configured."""
+    if not settings.agent_cognition_enabled or is_sub_agent:
+        return False
+    return bool(settings.openrouter_api_key or settings.backup_api_key)
+
+
+async def _build_plan(goal: str) -> list[dict[str, Any]] | None:
+    """Draft a short plan for the goal via a fast model, or None on any failure."""
+    try:
+        raw = await complete_json(cognition.build_plan_prompt(goal), model=settings.fast_model)
+        return cognition.parse_plan(raw)
+    except Exception as exc:  # noqa: BLE001 — degrade to no-plan on any error
+        logger.info("Planner unavailable, continuing without a plan: %s", exc)
+        return None
+
+
+async def _reflect(goal: str, answer: str, tool_summaries: list[str]) -> cognition.Verdict | None:
+    """Critique the proposed answer, or None (accept) on any failure."""
+    try:
+        raw = await complete_json(
+            cognition.build_reflection_prompt(goal, answer, tool_summaries),
+            model=settings.fast_model,
+        )
+        return cognition.parse_verdict(raw)
+    except Exception as exc:  # noqa: BLE001 — degrade to accept on any error
+        logger.info("Critic unavailable, accepting answer: %s", exc)
+        return None
+
+
+def _persist_plan_shape(steps: list[dict[str, Any]]) -> dict[str, Any]:
+    return {"steps": steps}
+
+
 async def run_loop(
     task: dict[str, Any],
     *,
     tools: list[dict[str, Any]] | None = None,
     model: str | None = None,
 ) -> dict[str, Any]:
-    """
-    Native agent loop.  Runs until the LLM delivers a final text answer
-    or MAX_ITERATIONS is exceeded.  Returns the final result dict.
+    """Plan-execute-reflect agent loop over model-native tool calling.
+
+    Runs until the model delivers a final text answer (no tool calls) or
+    MAX_ITERATIONS is exceeded, returning the final result dict. On top of the
+    proven tool-calling spine it layers four cognitive behaviors, each of which
+    degrades to the plain loop when unavailable:
+
+    - Planner: drafts a short plan into ``tasks.plan`` and surfaces live steps.
+    - Budget: tells the model how many steps remain so it triages.
+    - Progress/loop detection: spots repeated calls, recurring errors, and
+      stalls, injects a change-strategy directive, and wraps up gracefully
+      instead of grinding to the iteration cap.
+    - Reflection: critiques the answer against the goal before finishing, and
+      keeps working if it's incomplete.
+    - Dynamic routing: steps up to a stronger model when the loop is stuck.
 
     - tools: defaults to ALL_TOOLS (sub-agents pass SUBAGENT_TOOLS)
     - model: defaults to settings.agent_model
@@ -1571,6 +1629,42 @@ async def run_loop(
 
     await save_task(task_id, status="running",
                     started_at=task.get("started_at") or datetime.now(timezone.utc))
+
+    # ── Cognition setup (plan · budget · progress) ─────────────────────────────
+    # All cognition degrades to the prior model-native behavior: light cognition
+    # (budget/plan/progress directives) only fires under its own conditions, and
+    # model cognition (planner/critic) needs a configured model.
+    is_sub_agent = effective_tools is SUBAGENT_TOOLS or int(task.get("depth") or 0) > 0
+    light_cognition = settings.agent_cognition_enabled and not is_sub_agent
+    model_cognition = _cognition_enabled(is_sub_agent)
+    goal = str(task.get("goal") or "")
+    budget = cognition.LoopBudget(
+        max_iterations=MAX_ITERATIONS,
+        used=iteration,
+        max_reflections=settings.agent_max_reflections,
+        max_replans=settings.agent_max_replans,
+    )
+    _cog_state = (task.get("agent_state") or {}).get("cognition") if isinstance(task.get("agent_state"), dict) else None
+    if isinstance(_cog_state, dict):
+        budget.reflections_used = int(_cog_state.get("reflections_used") or 0)
+        budget.replans_used = int(_cog_state.get("replans_used") or 0)
+    tracker = cognition.ProgressTracker()
+    escalated = False  # model is upgraded at most once, when the loop struggles
+
+    # Plan: build fresh on first entry, restore from the task row on resume.
+    plan_steps: list[dict[str, Any]] = []
+    _existing_plan = task.get("plan")
+    if isinstance(_existing_plan, dict) and isinstance(_existing_plan.get("steps"), list):
+        plan_steps = list(_existing_plan["steps"])
+    elif isinstance(_existing_plan, list):
+        plan_steps = list(_existing_plan)
+    current_plan_step = int(task.get("current_step") or 0)
+    if model_cognition and not plan_steps and iteration == 0:
+        _built = await _build_plan(goal)
+        if _built:
+            plan_steps = _built
+            await save_task(task_id, plan=_persist_plan_shape(plan_steps), current_step=0)
+            await emit_activity(task_id, {"type": "step_start", "step": plan_steps[0], "step_index": 0})
 
     while iteration < MAX_ITERATIONS:
         if await is_task_cancelled(task_id):
@@ -1594,9 +1688,23 @@ async def run_loop(
             "summary": "Assembling context and deciding the next action.",
         })
         await publish_activity(task_id, {"type": "thinking"})
+        # Transient per-step guidance (budget + plan position). Built as a fresh
+        # list so persistent history is never bloated with repeated directives.
+        budget.used = iteration
+        step_history = history
+        if light_cognition:
+            _guidance: list[str] = []
+            _bd = budget.directive()
+            if _bd:
+                _guidance.append(_bd)
+            _pd = cognition.plan_directive(plan_steps, current_plan_step) if plan_steps else None
+            if _pd:
+                _guidance.append(_pd)
+            if _guidance:
+                step_history = history + [{"role": "system", "content": "\n\n".join(_guidance)}]
         try:
             final_text, calls = await _llm_step(
-                history,
+                step_history,
                 effective_tools,
                 effective_model,
                 reasoning_effort=stored_reasoning_effort,
@@ -1619,15 +1727,68 @@ async def run_loop(
 
         # ── Final answer ────────────────────────────────────────────────────
         if not calls:
+            answer = final_text or ""
+            # Reflection / self-verify: before accepting, critique the answer
+            # against the goal. If it's incomplete and budget remains, inject a
+            # concrete directive and keep working instead of finishing shallow.
+            if (
+                model_cognition
+                and budget.can_reflect
+                and answer.strip()
+                and any(m.get("role") == "tool" for m in history)
+            ):
+                budget.reflections_used += 1
+                await publish_activity(task_id, {
+                    "type": "model_step",
+                    "iteration": iteration + 1,
+                    "summary": "Reviewing the answer against the goal.",
+                })
+                verdict = await _reflect(goal, answer, collect_tool_summaries(history))
+                if verdict and not verdict.complete and budget.can_replan and not budget.exhausted:
+                    budget.replans_used += 1
+                    history.append({"role": "assistant", "content": answer})
+                    _missing = "; ".join(verdict.missing) if verdict.missing else "see directive"
+                    history.append({
+                        "role": "system",
+                        "content": (
+                            "Controller self-check: the answer is not yet complete. "
+                            f"{verdict.directive} Missing: {_missing}. "
+                            "Continue working to close the gap, then give an improved final answer."
+                        ),
+                    })
+                    await emit_activity(task_id, {
+                        "type": "step_retry",
+                        "summary": "Answer needs more work; continuing.",
+                        "attempt": budget.replans_used,
+                    })
+                    iteration += 1
+                    await _checkpoint(
+                        task_id, history, iteration,
+                        model=effective_model,
+                        current_step=current_plan_step if plan_steps else iteration,
+                        cognition_state={
+                            "reflections_used": budget.reflections_used,
+                            "replans_used": budget.replans_used,
+                        },
+                    )
+                    continue
+
             await publish_activity(task_id, {
                 "type": "model_result",
                 "iteration": iteration + 1,
                 "summary": "No tool call needed; preparing final answer.",
             })
-            result = {"answer": final_text or ""}
-            history.append({"role": "assistant", "content": final_text or ""})
+            result = {"answer": answer}
+            if plan_steps:
+                await emit_activity(task_id, {
+                    "type": "step_done",
+                    "step": plan_steps[min(current_plan_step, len(plan_steps) - 1)],
+                    "step_index": min(current_plan_step, len(plan_steps) - 1),
+                })
+            history.append({"role": "assistant", "content": answer})
             await _checkpoint(task_id, history, iteration + 1, model=effective_model,
                               status="complete", result=result,
+                              current_step=len(plan_steps) if plan_steps else iteration + 1,
                               completed_at=datetime.now(timezone.utc))
             # Build the structured response envelope from runtime facts + prose composer.
             # Failures are silently suppressed so the loop never breaks on this path.
@@ -1742,6 +1903,56 @@ async def run_loop(
         state = _orchestration_state(calls, tool_messages, iteration)
         _append_replan_instruction(history, state)
 
+        # ── Progress / loop detection + visible plan advancement ───────────────
+        if light_cognition:
+            signal = tracker.record(
+                calls, tool_messages,
+                args_for=lambda c: _parse_args(c.get("args_str", "{}")),
+            )
+            if signal != cognition.ProgressSignal.OK:
+                _pdir = tracker.directive(signal)
+                if _pdir:
+                    history.append({"role": "system", "content": _pdir})
+                    await publish_activity(task_id, {
+                        "type": "model_step",
+                        "iteration": iteration,
+                        "summary": "Adjusting strategy after limited progress.",
+                    })
+                # Difficulty-aware routing: a recurring error or a stall means the
+                # current model is stuck — step up to a stronger one (once).
+                if signal in (cognition.ProgressSignal.REPEAT_ERROR, cognition.ProgressSignal.STALLED) and not escalated:
+                    _stronger = stronger_agent_model(effective_model)
+                    if _stronger and _stronger != effective_model:
+                        effective_model = _stronger
+                        escalated = True
+                        await publish_activity(task_id, {
+                            "type": "model_step",
+                            "iteration": iteration,
+                            "summary": "Switching to a stronger model to get unstuck.",
+                        })
+            if tracker.should_force_finish:
+                history.append({
+                    "role": "system",
+                    "content": (
+                        "Controller: stop using tools now and deliver your best final answer "
+                        "from the evidence gathered so far."
+                    ),
+                })
+            # Advance the user-visible plan on a productive (error-free) step.
+            _productive = bool(tool_messages) and not state.get("last_tool_errors")
+            if plan_steps and _productive and current_plan_step < len(plan_steps) - 1:
+                await emit_activity(task_id, {
+                    "type": "step_done",
+                    "step": plan_steps[current_plan_step],
+                    "step_index": current_plan_step,
+                })
+                current_plan_step += 1
+                await emit_activity(task_id, {
+                    "type": "step_start",
+                    "step": plan_steps[current_plan_step],
+                    "step_index": current_plan_step,
+                })
+
         # Persist after every iteration
         await _checkpoint(
             task_id,
@@ -1749,7 +1960,11 @@ async def run_loop(
             iteration,
             model=effective_model,
             orchestration_state=state,
-            current_step=iteration,
+            current_step=current_plan_step if plan_steps else iteration,
+            cognition_state={
+                "reflections_used": budget.reflections_used,
+                "replans_used": budget.replans_used,
+            },
         )
 
     # Max iterations exceeded

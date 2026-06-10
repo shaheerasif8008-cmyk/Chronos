@@ -155,6 +155,39 @@ def resolve_agent_model(model_id: str | None) -> str:
     return chat_model_string(normalize_chat_model(model_id))
 
 
+# Weak → strong ordering of agent-capable models, used for difficulty-aware
+# escalation: when the loop is struggling it can step up to a stronger model.
+_AGENT_STRENGTH_ORDER: tuple[str, ...] = (
+    "openrouter/deepseek/deepseek-v4-flash",
+    "openrouter/openai/gpt-5.4-nano",
+    "openrouter/deepseek/deepseek-v4-pro",
+    "openrouter/openai/gpt-5.4-mini",
+)
+
+
+def _strength_index(model: str) -> int:
+    """Rank a (possibly suffixed, e.g. ':free') model string; -1 if unknown."""
+    base = (model or "").split(":", 1)[0]
+    for i, known in enumerate(_AGENT_STRENGTH_ORDER):
+        if base == known:
+            return i
+    return -1
+
+
+def stronger_agent_model(current: str | None) -> str | None:
+    """Return a stronger agent model than *current*, or None if already strongest.
+
+    Unknown models escalate to the strongest known tier (so a misconfigured or
+    free-tier base can still be upgraded when the loop struggles).
+    """
+    idx = _strength_index(current or "")
+    if idx < 0:
+        return _AGENT_STRENGTH_ORDER[-1]
+    if idx >= len(_AGENT_STRENGTH_ORDER) - 1:
+        return None
+    return _AGENT_STRENGTH_ORDER[idx + 1]
+
+
 def normalize_reasoning_effort(reasoning_effort: str | None) -> str | None:
     if reasoning_effort is None:
         return None
