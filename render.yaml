@@ -1,0 +1,117 @@
+services:
+  # ── FastAPI backend ──────────────────────────────────────────────────────────
+  - type: web
+    name: chronos-api
+    runtime: python
+    rootDir: apps/api
+    buildCommand: pip install -r requirements.txt
+    preDeployCommand: alembic upgrade head
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: ORG_ID
+        value: default
+      - key: REGION
+        value: us
+      - key: ADMIN_EMAIL
+        sync: false          # set in Render dashboard
+      - key: DATABASE_URL
+        fromDatabase:
+          name: chronos-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          name: chronos-redis
+          type: redis
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: VAULT_ENCRYPTION_KEY
+        sync: false          # set to 64 hex chars: openssl rand -hex 32
+      - key: AUTH_PROVIDER
+        sync: false          # set to "dev_otp" for testing or "sendgrid_otp" for production
+      - key: SENDGRID_API_KEY
+        sync: false
+      - key: OBJECT_STORAGE_BACKEND
+        value: s3
+      - key: AWS_S3_BUCKET
+        sync: false
+      - key: AWS_S3_REGION
+        value: us-east-1
+      - key: AWS_S3_ENDPOINT
+        value: ""            # leave empty to use real S3 (not MinIO)
+      - key: AWS_ACCESS_KEY_ID
+        sync: false
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false
+      # ── LLM ─────────────────────────────────────────────────────────────────
+      - key: LOCAL_LLM_BASE_URL
+        value: ""            # leave empty — Render can't run Ollama
+      - key: BACKUP_API_KEY
+        sync: false          # your Anthropic or OpenAI key
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: OPENROUTER_MODEL
+        value: openrouter/deepseek/deepseek-v4-flash:free
+      - key: AGENT_MODEL
+        value: openrouter/deepseek/deepseek-v4-flash:free
+      - key: FAST_MODEL
+        value: openrouter/nvidia/nemotron-3-super-120b-a12b:free
+      - key: BACKUP_MODEL
+        value: openrouter/minimax/minimax-m2.5:free
+      - key: OPENROUTER_API_BASE
+        value: https://openrouter.ai/api/v1
+      - key: EMBEDDING_MODEL
+        value: google/gemini-embedding-2
+      - key: EMBEDDING_DIMENSIONS
+        value: "1536"
+      # ── Misc ─────────────────────────────────────────────────────────────────
+      - key: DEMO_MODE
+        value: "false"
+      - key: ACCESS_TOKEN_EXPIRE_MINUTES
+        value: "60"
+      - key: TASK_RUNNER_MAX_CONCURRENCY
+        value: "4"
+      - key: TASK_RUNNER_MAX_ATTEMPTS
+        value: "2"
+      - key: TASK_RUNNER_TIMEOUT_SECONDS
+        value: "1800"
+      - key: TAVILY_API_KEY
+        sync: false
+      - key: LANGFUSE_PUBLIC_KEY
+        sync: false
+      - key: LANGFUSE_SECRET_KEY
+        sync: false
+      - key: SENTRY_DSN
+        sync: false
+
+  # ── Next.js frontend ─────────────────────────────────────────────────────────
+  - type: web
+    name: chronos-web
+    runtime: node
+    rootDir: apps/web
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NEXT_PUBLIC_API_BASE_URL
+        fromService:
+          name: chronos-api
+          type: web
+          property: host
+          transform: "https://{value}"
+      - key: NODE_ENV
+        value: production
+
+  # ── Redis ────────────────────────────────────────────────────────────────────
+  - type: redis
+    name: chronos-redis
+    plan: free
+    maxmemoryPolicy: allkeys-lru
+
+databases:
+  # ── Postgres + pgvector ──────────────────────────────────────────────────────
+  - name: chronos-db
+    plan: free              # upgrade to starter ($7/mo) for pgvector support
+    databaseName: chronos
+    user: chronos
+    postgresMajorVersion: "15"
