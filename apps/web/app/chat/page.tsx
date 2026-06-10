@@ -8,6 +8,7 @@ import BrowserOperatorScreen from "../../components/browser/BrowserOperatorScree
 import ComputerScreen from "../../components/computer/ComputerScreen";
 import InChatArtifactPanel from "../../components/artifacts/InChatArtifactPanel";
 import ResearchScreen from "../../components/research/ResearchScreen";
+import SkillsScreen from "../../components/skills/SkillsScreen";
 import Markdown from "../../components/Markdown";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -39,7 +40,7 @@ function formatSearchResultTime(value?: string) {
 }
 
 // ─── Types ───────────────────────────────────────────────────────────────────
-type Route = "chat" | "activity" | "approvals" | "memory" | "connectors" | "assistants" | "settings" | "projects" | "research" | "browser" | "computer" | "tasks" | "artifacts" | "agents" | "workflows" | "audit";
+type Route = "chat" | "activity" | "approvals" | "memory" | "connectors" | "assistants" | "settings" | "projects" | "research" | "browser" | "computer" | "tasks" | "artifacts" | "agents" | "workflows" | "skills" | "audit";
 type SettingsTab = "general" | "profile" | "organization" | "members" | "permissions" | "employees" | "runtime" | "memory-settings" | "tools-settings" | "approval-settings" | "notifications" | "security" | "billing" | "audit" | "developer" | "danger";
 type Conversation = { id: string; title: string | null; updated_at?: string; created_at?: string };
 type MessageRole = "user" | "assistant" | "system" | "tool";
@@ -544,6 +545,7 @@ function routeFromPath(pathname: string | null): Route {
   if (pathname === "/tasks") return "tasks";
   if (pathname === "/agents") return "agents";
   if (pathname === "/workflows") return "workflows";
+  if (pathname === "/skills") return "skills";
   if (pathname === "/audit") return "audit";
   return "chat";
 }
@@ -994,6 +996,7 @@ function ChronosAppInner() {
         {route === "settings"   && <SettingsScreen tab={settingsTab} setTab={setSettingsTab} theme={theme} setTheme={setTheme} accent={accent} setAccent={setAccent} signOut={signOut} />}
         {route === "projects"   && <ProjectsScreen />}
         {route === "research"   && <ResearchScreen />}
+        {route === "skills"     && <SkillsScreen />}
         {route === "browser"    && <BrowserOperatorScreen />}
         {route === "computer"   && <ComputerScreen />}
         {route === "tasks"      && <EmptyPanel label="Tasks" />}
@@ -1076,6 +1079,7 @@ function Sidebar({
     { id: "computer"   as Route, icon: <IC.Briefcase size={15}/>,  label: "Computer",   badge: null, badgeKind: undefined },
     { id: "agents"     as Route, icon: <IC.Sparkles size={15}/>,   label: "Agents",     badge: null, badgeKind: undefined },
     { id: "workflows"  as Route, icon: <IC.Refresh size={15}/>,    label: "Workflows",  badge: null, badgeKind: undefined },
+    { id: "skills"     as Route, icon: <IC.Sparkles size={15}/>,   label: "Skills",     badge: null, badgeKind: undefined },
   ];
   const advancedActive = advancedNav.some(it => it.id === route);
 

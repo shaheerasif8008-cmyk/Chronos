@@ -117,6 +117,7 @@ async def _permission_denied_handler(_request: Request, exc: PermissionDenied) -
 @app.on_event("startup")
 async def start_schedulers() -> None:
     await _bootstrap_authz()
+    await _bootstrap_skills()
     for scheduler in (profile_synthesis.scheduler, context_update.scheduler, scheduled_tasks.scheduler):
         if not scheduler.running:
             scheduler.start()
@@ -137,6 +138,17 @@ async def _bootstrap_authz() -> None:
     except Exception:
         # Startup must not crash if OpenFGA is briefly unavailable; checks fail
         # closed at request time until the server is reachable.
+        pass
+
+
+async def _bootstrap_skills() -> None:
+    """Seed built-in filesystem skills into the DB so they appear in the API/UI."""
+    from skills.registry import sync_filesystem_skills
+
+    try:
+        await sync_filesystem_skills()
+    except Exception:
+        # Startup must not crash if the DB is not yet migrated/available.
         pass
 
 
