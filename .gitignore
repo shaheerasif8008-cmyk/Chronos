@@ -14,3 +14,11 @@ playwright-report/
 
 .DS_Store
 dump.rdb
+
+# Terraform
+infra/.terraform/
+infra/.terraform.lock.hcl
+infra/terraform.tfvars
+infra/tfplan
+infra/*.tfstate
+infra/*.tfstate.backup
