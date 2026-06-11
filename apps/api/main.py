@@ -1,4 +1,5 @@
 import importlib.util
+import logging
 import os
 import ssl
 
@@ -122,9 +123,19 @@ async def start_schedulers() -> None:
         if not scheduler.running:
             scheduler.start()
     task_runner.start_runner()
-    await recover_incomplete_tasks()
-    await recover_incomplete_workflows()
-    await recover_incomplete_research()
+    _log = logging.getLogger(__name__)
+    try:
+        await recover_incomplete_tasks()
+    except Exception as exc:
+        _log.warning("Task recovery skipped: %s", exc)
+    try:
+        await recover_incomplete_workflows()
+    except Exception as exc:
+        _log.warning("Workflow recovery skipped: %s", exc)
+    try:
+        await recover_incomplete_research()
+    except Exception as exc:
+        _log.warning("Research recovery skipped: %s", exc)
 
 
 async def _bootstrap_authz() -> None:
