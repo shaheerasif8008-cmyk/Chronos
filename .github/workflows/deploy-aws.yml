@@ -1,5 +1,12 @@
 name: Deploy to AWS
 
+# Prerequisites (one-time, configured outside this file):
+#   1. Repo secret AWS_DEPLOY_ROLE_ARN = the OIDC deploy role ARN. Without it the
+#      "Configure AWS credentials" step fails with "Could not load credentials".
+#      The role is created by Terraform when `github_org`/`github_repo` are set;
+#      its ARN is the `github_deploy_role_arn` output.
+#   2. (Optional) Repo variable AWS_REGION if your stack is not in us-east-2.
+
 on:
   push:
     branches: [main]
@@ -15,7 +22,9 @@ concurrency:
   cancel-in-progress: false   # never cancel a running deploy mid-flight
 
 env:
-  AWS_REGION: us-east-1
+  # Must match the region your Terraform stack is deployed in. Override per-repo
+  # with an AWS_REGION Actions *variable* without editing this file.
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-2' }}
   ECR_API_REPO: chronos-prod-api
   ECR_WEB_REPO: chronos-prod-web
   ECS_CLUSTER: chronos-prod-cluster

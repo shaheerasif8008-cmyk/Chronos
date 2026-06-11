@@ -1,26 +1,36 @@
 # Copy to terraform.tfvars and fill in values.
 # NEVER commit terraform.tfvars — it contains secrets.
 
-aws_region  = "us-east-1"
-environment = "prod"
-app_name    = "chronos"
+aws_region         = "us-east-2"
+availability_zones = ["us-east-2a", "us-east-2b"]
+environment        = "prod"
+app_name           = "chronos"
 
-# ── Domain (optional but recommended) ────────────────────────────────────────
+# ── Domain (REQUIRED for Cognito) ────────────────────────────────────────────
+# Cognito only accepts https:// callback URLs (except localhost), so the web app
+# must be served over HTTPS — i.e. domain_name + an ACM cert in us-east-2.
 # After applying, create CNAME records:
 #   api.cognisiatech.com  → <api_alb_dns output>
 #   app.cognisiatech.com  → <web_alb_dns output>
 domain_name         = "cognisiatech.com"
-acm_certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/..."
+acm_certificate_arn = "arn:aws:acm:us-east-2:544294779377:certificate/REPLACE_ME"
+
+# ── Authentication: Amazon Cognito ───────────────────────────────────────────
+auth_provider             = "cognito"             # or "both" to keep OTP fallback
+cognito_user_pool_id      = "us-east-2_Q8sCGVkk9"
+cognito_app_client_id     = "3mlgdb31a2ecri90mk4ld2oebs"
+cognito_domain            = "us-east-2q8scgvkk9"  # hosted-UI prefix
+cognito_app_client_secret = ""                    # from Cognito app client; "" if none
 
 # ── GitHub OIDC deploy role ───────────────────────────────────────────────────
 github_org  = "shaheerasif8008-cmyk"
 github_repo = "Chronos"
 
-# ── Secrets ───────────────────────────────────────────────────────────────────
-# openssl rand -hex 32
+# ── Secrets — REQUIRED (reuse the values you already deployed with) ───────────
+# Generate fresh ones with: openssl rand -hex 32
 jwt_secret           = ""
 vault_encryption_key = ""
-admin_email          = "admin@cognisiatech.com"
+admin_email          = "shaheer8092@gmail.com"
 sendgrid_api_key     = ""
 openrouter_api_key   = ""
 backup_api_key       = ""
