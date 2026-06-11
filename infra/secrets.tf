@@ -14,6 +14,7 @@ locals {
     langfuse_public_key  = var.langfuse_public_key
     langfuse_secret_key  = var.langfuse_secret_key
     sentry_dsn           = var.sentry_dsn
+    cognito_app_client_secret = var.cognito_app_client_secret
   }
 }
 

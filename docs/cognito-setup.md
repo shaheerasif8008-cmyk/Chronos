@@ -62,6 +62,37 @@ Restart the API after changing env vars.
 3. Complete hosted UI login
 4. You are redirected to `/login/callback` and then `/chat`
 
+## AWS deployment (Terraform / ECS)
+
+The ECS task reads the same env vars, but on AWS they come from Terraform —
+**not** a local `.env`. Set these in `infra/` (e.g. `terraform.tfvars`):
+
+```hcl
+auth_provider             = "cognito"          # or "both" to keep dev-OTP fallback
+cognito_user_pool_id      = "us-east-1_XXXXXXXXX"
+cognito_app_client_id     = "xxxxxxxxxxxxxxxxxxxxxxxxxx"
+cognito_app_client_secret = "xxxxxxxxxxxxxxxxxxxxxxxx"   # omit if the client has no secret
+cognito_domain            = "chronos-prod"     # hosted-UI prefix
+```
+
+Terraform derives the rest automatically:
+- `COGNITO_REGION` ← `aws_region`
+- `COGNITO_CALLBACK_URL` ← `https://<domain_name>/login/callback` (or the web ALB
+  DNS name when `domain_name` is empty). Add this exact URL to the Cognito app
+  client's **Allowed callback URLs**.
+
+Apply, then force a new deployment so the API picks up the task definition:
+
+```bash
+terraform apply
+aws ecs update-service --cluster chronos-prod-cluster --service chronos-prod-api --force-new-deployment
+```
+
+> **Why login fell back to OTP:** the task definition previously hardcoded
+> `AUTH_PROVIDER=sendgrid_otp`, which is not a valid provider — `cognito_enabled()`
+> only activates for `cognito`/`both`, so the Cognito button never rendered. It is
+> now driven by the `auth_provider` variable (default `cognito`).
+
 ## Member access
 
 By default, Cognito users must already exist in the `members` table (run `python seed.py` for the admin email).
