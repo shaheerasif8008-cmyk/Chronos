@@ -9,6 +9,15 @@ class Settings(BaseSettings):
     region: str = "us"
     admin_email: str = "admin@example.com"
     database_url: str = "postgresql+asyncpg://chronos:chronos@localhost:55432/chronos"
+    # Connection pool sizing for the async engine. Defaults are tuned for a
+    # multi-worker Fargate deployment against RDS; raise for higher concurrency.
+    db_pool_size: int = 20
+    db_max_overflow: int = 10
+    db_pool_recycle: int = 1800   # recycle connections every 30 min (RDS idle timeout)
+    # asyncpg SSL mode for the DB connection. Empty disables explicit SSL (local
+    # dev). Set to "require" for RDS, or "verify-full" with a CA bundle for strict
+    # cert validation. Accepts any asyncpg sslmode string.
+    db_ssl_mode: str = ""
     redis_url: str = "redis://localhost:6379"
     local_llm_base_url: str = "http://localhost:11434"
     local_llm_model: str = "llama3"

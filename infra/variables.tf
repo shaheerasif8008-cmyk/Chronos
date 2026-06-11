@@ -145,6 +145,43 @@ variable "web_image_tag" {
   default     = "latest"
 }
 
+# ── Authentication ────────────────────────────────────────────────────────────
+variable "auth_provider" {
+  description = "Auth mode: 'cognito' (Cognito only), 'both' (Cognito + dev OTP fallback), or 'dev_otp'. Must be 'cognito' or 'both' for the Cognito login button to appear."
+  type        = string
+  default     = "cognito"
+
+  validation {
+    condition     = contains(["cognito", "both", "dev_otp"], var.auth_provider)
+    error_message = "auth_provider must be one of: cognito, both, dev_otp."
+  }
+}
+
+variable "cognito_user_pool_id" {
+  description = "Cognito User Pool ID (e.g. us-east-1_xxxxxxxxx). Required when auth_provider is cognito/both."
+  type        = string
+  default     = ""
+}
+
+variable "cognito_app_client_id" {
+  description = "Cognito app client ID. Required when auth_provider is cognito/both."
+  type        = string
+  default     = ""
+}
+
+variable "cognito_app_client_secret" {
+  description = "Cognito app client secret. Leave empty if the app client has no secret."
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "cognito_domain" {
+  description = "Cognito hosted-UI domain prefix (e.g. chronos-prod) or full domain URL. Required when auth_provider is cognito/both."
+  type        = string
+  default     = ""
+}
+
 # ── App secrets (injected as Secrets Manager secrets) ─────────────────────────
 variable "jwt_secret" {
   description = "JWT signing secret (min 32 chars)"
