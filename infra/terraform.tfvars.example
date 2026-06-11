@@ -1,0 +1,43 @@
+# Copy to terraform.tfvars and fill in values.
+# NEVER commit terraform.tfvars — it contains secrets.
+
+aws_region  = "us-east-1"
+environment = "prod"
+app_name    = "chronos"
+
+# ── Domain (optional but recommended) ────────────────────────────────────────
+# After applying, create CNAME records:
+#   api.cognisiatech.com  → <api_alb_dns output>
+#   app.cognisiatech.com  → <web_alb_dns output>
+domain_name         = "cognisiatech.com"
+acm_certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/..."
+
+# ── GitHub OIDC deploy role ───────────────────────────────────────────────────
+github_org  = "shaheerasif8008-cmyk"
+github_repo = "Chronos"
+
+# ── Secrets ───────────────────────────────────────────────────────────────────
+# openssl rand -hex 32
+jwt_secret           = ""
+vault_encryption_key = ""
+admin_email          = "admin@cognisiatech.com"
+sendgrid_api_key     = ""
+openrouter_api_key   = ""
+backup_api_key       = ""
+tavily_api_key       = ""
+langfuse_public_key  = ""
+langfuse_secret_key  = ""
+sentry_dsn           = ""
+
+# ── Scale (defaults are fine for prod; adjust as needed) ─────────────────────
+api_cpu    = 1024
+api_memory = 2048
+api_desired_count = 2
+api_min_count     = 1
+api_max_count     = 10
+
+db_instance_class = "db.t3.medium"
+db_multi_az       = true
+
+redis_node_type          = "cache.t3.medium"
+redis_num_cache_clusters = 2

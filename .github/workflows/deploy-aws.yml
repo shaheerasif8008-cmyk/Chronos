@@ -1,0 +1,257 @@
+name: Deploy to AWS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_migrations:
+        description: "Run Alembic migrations before deploying"
+        type: boolean
+        default: true
+
+concurrency:
+  group: deploy-aws
+  cancel-in-progress: false   # never cancel a running deploy mid-flight
+
+env:
+  AWS_REGION: us-east-1
+  ECR_API_REPO: chronos-prod-api
+  ECR_WEB_REPO: chronos-prod-web
+  ECS_CLUSTER: chronos-prod-cluster
+  ECS_API_SERVICE: chronos-prod-api
+  ECS_WEB_SERVICE: chronos-prod-web
+  MIGRATE_TASK_FAMILY: chronos-prod-migrate
+
+jobs:
+  # ── 1. Build and push images ────────────────────────────────────────────────
+  build:
+    name: Build & push images
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write   # needed for OIDC
+      contents: read
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+      api_image: ${{ steps.push.outputs.api_image }}
+      web_image: ${{ steps.push.outputs.web_image }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Compute image tag
+        id: meta
+        run: echo "tag=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & push API image
+        uses: docker/build-push-action@v5
+        with:
+          context: apps/api
+          file: apps/api/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_API_REPO }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_API_REPO }}:latest
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+          build-args: |
+            INSTALL_PLAYWRIGHT=0
+
+      - name: Build & push web image
+        uses: docker/build-push-action@v5
+        with:
+          context: apps/web
+          file: apps/web/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_WEB_REPO }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_WEB_REPO }}:latest
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,mode=max,scope=web
+
+      - name: Set image output
+        id: push
+        run: |
+          REGISTRY=${{ steps.ecr-login.outputs.registry }}
+          echo "api_image=${REGISTRY}/${{ env.ECR_API_REPO }}:${{ steps.meta.outputs.tag }}" >> "$GITHUB_OUTPUT"
+          echo "web_image=${REGISTRY}/${{ env.ECR_WEB_REPO }}:${{ steps.meta.outputs.tag }}" >> "$GITHUB_OUTPUT"
+
+  # ── 2. Run database migrations ──────────────────────────────────────────────
+  migrate:
+    name: Run migrations
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event.inputs.run_migrations != 'false'
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get latest migrate task definition ARN
+        id: task-def
+        run: |
+          ARN=$(aws ecs describe-task-definition \
+            --task-definition "${{ env.MIGRATE_TASK_FAMILY }}" \
+            --query "taskDefinition.taskDefinitionArn" \
+            --output text)
+          echo "arn=$ARN" >> "$GITHUB_OUTPUT"
+
+          # Patch the image tag to match the freshly-built image.
+          NEW_DEF=$(aws ecs describe-task-definition \
+            --task-definition "${{ env.MIGRATE_TASK_FAMILY }}" \
+            --query "taskDefinition" | \
+            jq --arg img "${{ needs.build.outputs.api_image }}" \
+               '.containerDefinitions[0].image = $img |
+                del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)')
+          UPDATED_ARN=$(echo "$NEW_DEF" | aws ecs register-task-definition \
+            --cli-input-json /dev/stdin \
+            --query "taskDefinition.taskDefinitionArn" --output text)
+          echo "updated_arn=$UPDATED_ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Get VPC subnets and security groups
+        id: network
+        run: |
+          SUBNETS=$(aws ec2 describe-subnets \
+            --filters "Name=tag:Application,Values=chronos" "Name=tag:Name,Values=*private*" \
+            --query "Subnets[*].SubnetId" --output text | tr '\t' ',')
+          SG=$(aws ec2 describe-security-groups \
+            --filters "Name=tag:Application,Values=chronos" "Name=group-name,Values=*api-sg*" \
+            --query "SecurityGroups[0].GroupId" --output text)
+          echo "subnets=$SUBNETS" >> "$GITHUB_OUTPUT"
+          echo "sg=$SG" >> "$GITHUB_OUTPUT"
+
+      - name: Run migration task
+        id: run-task
+        run: |
+          TASK_ARN=$(aws ecs run-task \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --task-definition "${{ steps.task-def.outputs.updated_arn }}" \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ steps.network.outputs.subnets }}],securityGroups=[${{ steps.network.outputs.sg }}],assignPublicIp=DISABLED}" \
+            --query "tasks[0].taskArn" --output text)
+          echo "task_arn=$TASK_ARN" >> "$GITHUB_OUTPUT"
+          echo "Migration task started: $TASK_ARN"
+
+      - name: Wait for migration task to complete
+        run: |
+          echo "Waiting for migration task..."
+          aws ecs wait tasks-stopped \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --tasks "${{ steps.run-task.outputs.task_arn }}"
+
+          EXIT_CODE=$(aws ecs describe-tasks \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --tasks "${{ steps.run-task.outputs.task_arn }}" \
+            --query "tasks[0].containers[0].exitCode" --output text)
+
+          echo "Migration task exit code: $EXIT_CODE"
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "Migration failed — check CloudWatch logs: /ecs/chronos-prod/migrate"
+            exit 1
+          fi
+
+  # ── 3. Deploy services ──────────────────────────────────────────────────────
+  deploy:
+    name: Deploy services
+    needs: [build, migrate]
+    runs-on: ubuntu-latest
+    if: always() && needs.build.result == 'success' && (needs.migrate.result == 'success' || needs.migrate.result == 'skipped')
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update API task definition with new image
+        id: api-task-def
+        run: |
+          NEW_DEF=$(aws ecs describe-task-definition \
+            --task-definition "${{ env.ECS_API_SERVICE }}" \
+            --query "taskDefinition" | \
+            jq --arg img "${{ needs.build.outputs.api_image }}" \
+               '.containerDefinitions[0].image = $img |
+                del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)')
+          NEW_ARN=$(echo "$NEW_DEF" | aws ecs register-task-definition \
+            --cli-input-json /dev/stdin \
+            --query "taskDefinition.taskDefinitionArn" --output text)
+          echo "arn=$NEW_ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Update Web task definition with new image
+        id: web-task-def
+        run: |
+          NEW_DEF=$(aws ecs describe-task-definition \
+            --task-definition "${{ env.ECS_WEB_SERVICE }}" \
+            --query "taskDefinition" | \
+            jq --arg img "${{ needs.build.outputs.web_image }}" \
+               '.containerDefinitions[0].image = $img |
+                del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)')
+          NEW_ARN=$(echo "$NEW_DEF" | aws ecs register-task-definition \
+            --cli-input-json /dev/stdin \
+            --query "taskDefinition.taskDefinitionArn" --output text)
+          echo "arn=$NEW_ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy API service
+        run: |
+          aws ecs update-service \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --service "${{ env.ECS_API_SERVICE }}" \
+            --task-definition "${{ steps.api-task-def.outputs.arn }}" \
+            --force-new-deployment
+
+      - name: Deploy Web service
+        run: |
+          aws ecs update-service \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --service "${{ env.ECS_WEB_SERVICE }}" \
+            --task-definition "${{ steps.web-task-def.outputs.arn }}" \
+            --force-new-deployment
+
+      - name: Wait for API service stability
+        run: |
+          echo "Waiting for API service to stabilize..."
+          aws ecs wait services-stable \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --services "${{ env.ECS_API_SERVICE }}"
+
+      - name: Wait for Web service stability
+        run: |
+          echo "Waiting for Web service to stabilize..."
+          aws ecs wait services-stable \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --services "${{ env.ECS_WEB_SERVICE }}"
+
+      - name: Deploy summary
+        run: |
+          echo "### Deploy complete" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | Image |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| API     | \`${{ needs.build.outputs.api_image }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Web     | \`${{ needs.build.outputs.web_image }}\` |" >> $GITHUB_STEP_SUMMARY
