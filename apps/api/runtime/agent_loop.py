@@ -406,6 +406,12 @@ async def _agent_system_message(tools: list[dict[str, Any]] | None = None) -> di
             "read or write files, draft emails. You may call multiple independent tools in "
             "parallel. Do not narrate tool use you are not doing, and stop calling tools once "
             "you can answer. "
+            "To operate a graphical app or any site/app that needs real GUI interaction, use the "
+            "desktop tools: create a session, launch the app with desktop__open_app (this needs "
+            "human approval), then drive it with a perceive→act loop — take a desktop__screenshot, "
+            "look at the returned image, and decide pixel coordinates for desktop__click / "
+            "desktop__type / desktop__key / desktop__scroll. Always screenshot again after an "
+            "action to confirm the result before the next step. "
             "When the user asks you to create code, an HTML page, a Python script, a document, "
             "or any other substantial file, do not paste the full file into chat. Write the file "
             "with fs__write or code__python so Chronos creates a durable artifact, then summarize "
@@ -668,6 +674,41 @@ def _call_is_external_write(call: dict[str, Any]) -> bool:
     )
 
 
+_VISION_MARKER = "[Desktop/browser screenshot — current screen state]"
+
+
+def _is_injected_vision(message: dict[str, Any]) -> bool:
+    if message.get("role") != "user":
+        return False
+    content = message.get("content")
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(block, dict)
+        and block.get("type") == "text"
+        and str(block.get("text") or "").startswith(_VISION_MARKER)
+        for block in content
+    )
+
+
+def _append_vision_message(history: list[dict[str, Any]], image_url: str) -> None:
+    """Append the latest screenshot as a vision block, keeping only the newest.
+
+    Old injected screenshots are pruned first so history (and the checkpoint
+    row) does not accumulate base64 images across many perceive→act steps.
+    """
+    history[:] = [m for m in history if not _is_injected_vision(m)]
+    history.append(
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": _VISION_MARKER},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ],
+        }
+    )
+
+
 def _orchestration_state(
     calls: list[dict[str, Any]],
     tool_messages: list[dict[str, Any]],
@@ -763,9 +804,17 @@ async def _execute_tool(
             f"{task_id}:{call['id']}".encode()
         ).hexdigest()[:24]
     created_artifacts: list[dict[str, Any]] = []
+    vision_image_url: str | None = None
     try:
         result = await tool_broker.execute(agent, broker_name, args)
-        payload = {"summary": result.summary, "data": result.data}
+        data = result.data
+        # A screenshot (desktop / browser) is delivered to the model as a vision
+        # image block, not as base64 text in the tool message — strip it out of
+        # the serialised content so history stays small and the model can "see".
+        if isinstance(data, dict) and data.get("screenshot_data_url"):
+            vision_image_url = str(data["screenshot_data_url"])
+            data = {k: v for k, v in data.items() if k != "screenshot_data_url"}
+        payload = {"summary": result.summary, "data": data}
         content = json.dumps(payload, default=str)
         await emit_activity(task_id, {
             "type": "tool_result",
@@ -803,6 +852,9 @@ async def _execute_tool(
         # yield each entry as a `{"type": "artifact", "artifact": a}` SSE
         # event so live chats surface artifacts without waiting for refresh.
         "artifacts": created_artifacts,
+        # Non-standard extension: run_loop pops this and appends the screenshot
+        # as a vision image message so the model can see the desktop/page.
+        "vision_image_url": vision_image_url,
     }
 
 
@@ -1539,6 +1591,7 @@ async def stream_chat_turn(
             # Open/Download cards live. Pop the non-standard key before
             # appending the message to LLM history.
             created_artifacts = tool_msg.pop("artifacts", []) or []
+            tool_msg.pop("vision_image_url", None)
             for artifact in created_artifacts:
                 yield {"type": "artifact", "artifact": artifact}
             history.append(tool_msg)
@@ -1890,8 +1943,11 @@ async def run_loop(
             # inside `_execute_tool`; strip the non-standard key before the
             # tool message enters the LLM history.
             tool_msg.pop("artifacts", None)
+            vision_url = tool_msg.pop("vision_image_url", None)
             tool_messages.append(tool_msg)
             history.append(tool_msg)
+            if vision_url:
+                _append_vision_message(history, vision_url)
         else:
             # Parallel execution — gather all results concurrently
             raw_results = await asyncio.gather(
@@ -1916,8 +1972,11 @@ async def run_loop(
                     history.append(tool_msg)
                 else:
                     r.pop("artifacts", None)
+                    vision_url = r.pop("vision_image_url", None)
                     tool_messages.append(r)
                     history.append(r)
+                    if vision_url:
+                        _append_vision_message(history, vision_url)
 
         state = _orchestration_state(calls, tool_messages, iteration)
         _append_replan_instruction(history, state)

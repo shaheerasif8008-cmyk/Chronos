@@ -27,6 +27,7 @@ _ALWAYS_APPROVAL_TOOLS = {
     "gmail.send",   # Phase 1: no approval system yet → always blocked
     "local_computer.exec",
     "local_computer.open_app",
+    "desktop.open_app",  # launching an app into the virtual desktop is risk-tiered
 }
 
 # Hard safety limits enforced regardless of permissions.
@@ -335,6 +336,14 @@ async def _route(agent: AgentContext, tool: str, args: dict, vault_ref: str, tie
         from connectors.computer import computer_connector
         return await computer_connector.execute(tool, routed_args)
 
+    if provider == "desktop":
+        from connectors.desktop import desktop_connector
+        return await desktop_connector.execute(tool, routed_args)
+
+    if provider == "canva":
+        from connectors.canva import canva_connector
+        return await canva_connector.execute(tool, routed_args)
+
     if provider == "mcp":
         from connectors.mcp_client import mcp_connector
         return await mcp_connector.execute(tool, routed_args, agent)
@@ -410,7 +419,7 @@ class ToolBroker:
         # when external OAuth or browser dependencies are not configured.
         provider = tool.split(".")[0]
         tier = await connector_tier(provider)
-        if tier == "live" and provider not in {"browser", "fs", "code", "doc", "image", "voice", "data", "chat_history", "repo", "computer", "local_computer", "skill", "platform"}:
+        if tier == "live" and provider not in {"browser", "fs", "code", "doc", "image", "voice", "data", "chat_history", "repo", "computer", "local_computer", "desktop", "canva", "skill", "platform"}:
             from connectors.registry import get as registry_get
 
             connector = await registry_get(agent, tool)
