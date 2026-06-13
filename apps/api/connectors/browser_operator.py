@@ -14,6 +14,7 @@ from core.config import settings
 from core.db import engine, reflect_table
 from core.exceptions import ApprovalRequired
 from core.models import ToolResult
+from core.tool_installer import ensure_runtime_tool
 from core.untrusted_content import scan_untrusted_content
 
 _TIMEOUT_MS = 20_000
@@ -400,29 +401,75 @@ class BrowserOperator:
         cached = self._pages.get(session["id"])
         if cached:
             return cached[3]
-        try:
-            from playwright.async_api import async_playwright  # type: ignore[import]
-        except ImportError:
+        playwright_api = await self._playwright_api_or_none(session)
+        if playwright_api is None:
             page = _MetadataOnlyPage(session)
             self._pages[session["id"]] = (_NoopRuntime(), _NoopRuntime(), _NoopRuntime(), page)
             session["status"] = "degraded"
             await self._save_session(session)
             return page
 
+        try:
+            return await self._launch_page(session, playwright_api)
+        except Exception as exc:
+            if not _looks_like_missing_chromium(exc):
+                raise
+            install = await ensure_runtime_tool(
+                "playwright.chromium",
+                organization_id=session["organization_id"],
+                reason="browser runtime missing chromium",
+            )
+            await self._record_event(
+                session,
+                "browser_runtime_tool_install",
+                {
+                    "tool": "playwright.chromium",
+                    "status": install.status,
+                    "returncode": install.returncode,
+                    "reason": install.reason,
+                },
+            )
+            if install.status not in {"installed", "already_installed"}:
+                page = _MetadataOnlyPage(session)
+                self._pages[session["id"]] = (_NoopRuntime(), _NoopRuntime(), _NoopRuntime(), page)
+                session["status"] = "degraded"
+                await self._save_session(session)
+                return page
+            return await self._launch_page(session, playwright_api)
+
+    async def _playwright_api_or_none(self, session: dict[str, Any]) -> Any | None:
+        try:
+            from playwright.async_api import async_playwright  # type: ignore[import]
+        except ImportError:
+            await self._record_event(
+                session,
+                "browser_runtime_tool_install",
+                {"tool": "playwright.chromium", "status": "skipped", "reason": "playwright package is not installed"},
+            )
+            return None
+        return async_playwright
+
+    async def _launch_page(self, session: dict[str, Any], async_playwright: Any) -> Any:
         playwright = await async_playwright().start()
-        browser = await playwright.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-        context_args: dict[str, Any] = {
-            "viewport": {"width": 1280, "height": 800},
-            "java_script_enabled": True,
-            "accept_downloads": True,
-        }
-        if session.get("storage_state"):
-            context_args["storage_state"] = session["storage_state"]
-        context = await browser.new_context(**context_args)
-        page = await context.new_page()
-        page.set_default_timeout(_TIMEOUT_MS)
-        self._pages[session["id"]] = (playwright, browser, context, page)
-        return page
+        try:
+            browser = await playwright.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            context_args: dict[str, Any] = {
+                "viewport": {"width": 1280, "height": 800},
+                "java_script_enabled": True,
+                "accept_downloads": True,
+            }
+            if session.get("storage_state"):
+                context_args["storage_state"] = session["storage_state"]
+            context = await browser.new_context(**context_args)
+            page = await context.new_page()
+            page.set_default_timeout(_TIMEOUT_MS)
+            self._pages[session["id"]] = (playwright, browser, context, page)
+            return page
+        except Exception:
+            try:
+                await playwright.stop()
+            finally:
+                raise
 
     async def _capture_state(self, session: dict[str, Any], label: str) -> None:
         cached = self._pages.get(session["id"])
@@ -693,3 +740,12 @@ class _MetadataOnlyPage:
 
 
 browser_operator = BrowserOperator()
+
+
+def _looks_like_missing_chromium(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "executable doesn't exist" in message
+        or "please run the following command" in message and "playwright install" in message
+        or "browsertype.launch" in message and "playwright install" in message
+    )
