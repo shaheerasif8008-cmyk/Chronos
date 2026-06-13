@@ -87,6 +87,8 @@ class BrowserOperator:
             raise ApprovalRequired(tool, "browser session has been revoked")
         if action == "navigate":
             return await self._navigate(session, args)
+        if action == "login_task":
+            return await self._login_task(session, args)
         if action == "click":
             return await self._click(session, args)
         if action == "type":
@@ -245,6 +247,51 @@ class BrowserOperator:
         await self._capture_state(session, "navigate")
         await self._record_action(session, "navigate", {"current_url": url})
         return ToolResult(data={"session": _public_session(session)}, summary=f"Browser navigated to {url}")
+
+    async def _login_task(self, session: dict[str, Any], args: dict[str, Any]) -> ToolResult:
+        login_url = str(args.get("login_url") or args.get("url") or "")
+        task = str(args.get("task") or args.get("goal") or "").strip()
+        if not login_url:
+            raise ValueError("browser.login_task requires 'login_url'")
+        if not task:
+            raise ValueError("browser.login_task requires 'task'")
+
+        consent = session.get("consent") or {}
+        if not consent.get("allowed_domains"):
+            consent = {
+                **consent,
+                "purpose": consent.get("purpose") or f"Log in and complete: {task[:160]}",
+                "allowed_domains": [_domain(login_url)],
+            }
+            session["consent"] = consent
+
+        navigate_result = await self._navigate(session, {"url": login_url})
+        session = await self._load_session(navigate_result.data["session"]["id"], session["organization_id"])
+        reason = (
+            "Login required. Enter credentials, complete MFA or CAPTCHA if present, "
+            "then hand the browser session back so Chronos can continue the requested task."
+        )
+        session.update(
+            {
+                "takeover_state": "requested",
+                "takeover_reason": reason,
+                "updated_at": _now(),
+            }
+        )
+        await self._save_session(session)
+        await self._record_action(session, "login_task", {"login_url": login_url, "task": task[:500], "takeover_reason": reason})
+        return ToolResult(
+            data={
+                "session": _public_session(session),
+                "next_step": "user_takeover_required",
+                "resume_instructions": (
+                    "After the user completes login and hands back the session, continue with "
+                    "browser.get_state, browser.read_dom, browser.click, browser.type, "
+                    "browser.extract, browser.download, or browser.upload as needed."
+                ),
+            },
+            summary="Browser login task started; user takeover requested for credentials/MFA",
+        )
 
     async def _click(self, session: dict[str, Any], args: dict[str, Any]) -> ToolResult:
         selector = str(args.get("selector") or "")

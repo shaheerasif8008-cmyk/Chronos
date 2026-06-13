@@ -9,6 +9,7 @@ def test_browser_operator_tools_are_registered_for_agent_and_inline_use():
 
     expected = {
         "browser__navigate",
+        "browser__login_task",
         "browser__click",
         "browser__type",
         "browser__select",
@@ -26,6 +27,32 @@ def test_browser_operator_tools_are_registered_for_agent_and_inline_use():
 
     assert expected <= all_names
     assert expected <= inline_names
+
+
+@pytest.mark.asyncio
+async def test_browser_login_task_opens_site_and_requests_takeover():
+    from connectors.browser_operator import BrowserOperator
+
+    operator = BrowserOperator()
+    result = await operator.execute(
+        "browser.login_task",
+        {
+            "login_url": "https://app.example.test/login",
+            "task": "Download the latest invoice",
+            "__org_id": "org-1",
+            "__task_id": "task-1",
+            "__member_id": "member-1",
+        },
+    )
+
+    session = result.data["session"]
+    assert session["current_url"] == "https://app.example.test/login"
+    assert session["takeover_state"] == "requested"
+    assert "credentials" in session["takeover_reason"].lower()
+    assert session["consent"]["allowed_domains"] == ["app.example.test"]
+    assert "storage_state" not in session
+    assert result.data["next_step"] == "user_takeover_required"
+    assert "browser.get_state" in result.data["resume_instructions"]
 
 
 @pytest.mark.asyncio

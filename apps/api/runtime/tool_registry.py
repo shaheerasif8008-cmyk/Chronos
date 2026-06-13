@@ -76,6 +76,20 @@ BROWSER_NAVIGATE = _fn(
     ["url"],
 )
 
+BROWSER_LOGIN_TASK = _fn(
+    "browser__login_task",
+    "Start a governed website task that requires login. Opens the login URL in a persistent isolated browser session, "
+    "requests user takeover for credentials/MFA/CAPTCHA, and then the agent should continue with normal browser tools "
+    "after the user hands the session back. Never ask the user to paste passwords into chat.",
+    {
+        "login_url": {"type": "string", "description": "The website login URL to open."},
+        "task": {"type": "string", "description": "The task to perform after login is complete."},
+        "session_id": {"type": "string", "description": "Existing browser session id. Omit to create one.", "default": ""},
+        "consent": {"type": "object", "description": "Session purpose and allowed_domains when creating a session.", "default": {}},
+    },
+    ["login_url", "task"],
+)
+
 BROWSER_CLICK = _fn("browser__click", "Click a selector in a persistent browser session.", {"session_id": {"type": "string"}, "selector": {"type": "string"}}, ["session_id", "selector"])
 BROWSER_TYPE = _fn("browser__type", "Type text into a selector in a persistent browser session.", {"session_id": {"type": "string"}, "selector": {"type": "string"}, "text": {"type": "string"}}, ["session_id", "selector", "text"])
 BROWSER_SELECT = _fn("browser__select", "Select an option in a persistent browser session.", {"session_id": {"type": "string"}, "selector": {"type": "string"}, "value": {"type": "string"}}, ["session_id", "selector", "value"])
@@ -92,6 +106,7 @@ BROWSER_REQUEST_TAKEOVER = _fn("browser__request_takeover", "Pause automation an
 
 BROWSER_OPERATOR_TOOLS = [
     BROWSER_NAVIGATE,
+    BROWSER_LOGIN_TASK,
     BROWSER_CLICK,
     BROWSER_TYPE,
     BROWSER_SELECT,
