@@ -279,6 +279,136 @@ async def test_render_chart_pie(cap):
     assert cap.saved[-1]["bytes"][:4] == b"\x89PNG"
 
 
+# ---------------------------------------------------------------------------
+# doc.detect_fields — vision auto-coordinate detection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_detect_fields_converts_to_points(cap, monkeypatch):
+    src = _source_pdf("Name: ____   Age: ____")
+    cap.add_source("form-1", src, org_id="org1")
+
+    async def fake_vision_json(image_bytes, mime, instruction):
+        # Two normalized boxes (top-left origin), as a vision model would return.
+        return (
+            '{"fields": [{"label": "Name", "field_type": "text", "bbox": [0.2, 0.1, 0.5, 0.15]},'
+            ' {"label": "Age", "field_type": "text", "bbox": [0.6, 0.1, 0.8, 0.15]}]}'
+        )
+
+    import core.llm as llm_mod
+    monkeypatch.setattr(llm_mod, "vision_json", fake_vision_json)
+
+    result = await da.doc_authoring_connector.execute("doc.detect_fields", {
+        "__org_id": "org1", "artifact_id": "form-1",
+    })
+    assert result.data["status"] == "success"
+    fields = result.data["fields"]
+    assert len(fields) == 2
+    f = fields[0]
+    # Page is 612pt wide, 792 tall; x0=0.2 → ~122.4pt, y0=0.1 → ~79.2pt (top-left origin).
+    assert f["page"] == 1
+    assert abs(f["bbox_points"]["x"] - 0.2 * 612) < 1.0
+    assert abs(f["bbox_points"]["y"] - 0.1 * 792) < 1.0
+    # fill_hint is ready to drop into doc.fill_pdf.
+    assert "x" in f["fill_hint"] and "y" in f["fill_hint"] and "size" in f["fill_hint"]
+
+
+@pytest.mark.asyncio
+async def test_detect_fields_no_vision_model_degrades(cap, monkeypatch):
+    src = _source_pdf("Q: ____")
+    cap.add_source("form-2", src, org_id="org1")
+
+    async def empty_vision(image_bytes, mime, instruction):
+        return ""  # no vision model configured
+
+    import core.llm as llm_mod
+    monkeypatch.setattr(llm_mod, "vision_json", empty_vision)
+
+    result = await da.doc_authoring_connector.execute("doc.detect_fields", {
+        "__org_id": "org1", "artifact_id": "form-2",
+    })
+    assert result.data["status"] == "unavailable"
+    assert result.data["fields"] == []
+    assert "fallback_reason" in result.data
+
+
+@pytest.mark.asyncio
+async def test_detect_fields_cross_org_denied(cap, monkeypatch):
+    src = _source_pdf("x")
+    cap.add_source("form-3", src, org_id="orgA")
+    result = await da.doc_authoring_connector.execute("doc.detect_fields", {
+        "__org_id": "orgB", "artifact_id": "form-3",
+    })
+    assert result.data["status"] == "error"
+
+
+# ---------------------------------------------------------------------------
+# doc.verify_fill — re-read the filled PDF and confirm the work
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_verify_fill_detects_present_and_missing(cap):
+    # A "filled" PDF whose text contains one of the two expected answers.
+    filled = _source_pdf("Answer: Water is H2O")
+    cap.add_source("filled-1", filled, org_id="org1")
+
+    result = await da.doc_authoring_connector.execute("doc.verify_fill", {
+        "__org_id": "org1", "artifact_id": "filled-1",
+        "expected": [
+            {"label": "Q1", "answer": "Water is H2O"},
+            {"label": "Q2", "answer": "Sodium Chloride"},
+        ],
+    })
+    assert result.data["status"] == "success"
+    assert result.data["all_present"] is False
+    assert result.data["missing"] == ["Sodium Chloride"]
+    by_label = {it["label"]: it["present"] for it in result.data["items"]}
+    assert by_label["Q1"] is True and by_label["Q2"] is False
+
+
+@pytest.mark.asyncio
+async def test_verify_fill_all_present(cap):
+    filled = _source_pdf("Paris is the capital")
+    cap.add_source("filled-2", filled, org_id="org1")
+    result = await da.doc_authoring_connector.execute("doc.verify_fill", {
+        "__org_id": "org1", "artifact_id": "filled-2",
+        "expected": [{"answer": "Paris"}],
+    })
+    assert result.data["all_present"] is True
+    assert result.data["missing"] == []
+
+
+@pytest.mark.asyncio
+async def test_verify_fill_correctness_recheck(cap, monkeypatch):
+    filled = _source_pdf("Answer: 4")
+    cap.add_source("filled-3", filled, org_id="org1")
+
+    async def fake_complete_json(prompt, **kw):
+        return '{"checks": [{"question": "2+2?", "correct": true, "note": "ok"}]}'
+
+    import core.llm as llm_mod
+    monkeypatch.setattr(llm_mod, "complete_json", fake_complete_json)
+
+    result = await da.doc_authoring_connector.execute("doc.verify_fill", {
+        "__org_id": "org1", "artifact_id": "filled-3",
+        "expected": [{"answer": "4", "question": "2+2?"}],
+        "recheck_correctness": True,
+    })
+    assert result.data["correctness"]["status"] == "checked"
+    assert result.data["correctness"]["checks"][0]["correct"] is True
+
+
+@pytest.mark.asyncio
+async def test_verify_fill_requires_expected(cap):
+    cap.add_source("filled-4", _source_pdf("x"), org_id="org1")
+    result = await da.doc_authoring_connector.execute("doc.verify_fill", {
+        "__org_id": "org1", "artifact_id": "filled-4", "expected": [],
+    })
+    assert result.data["status"] == "error"
+
+
 @pytest.mark.asyncio
 async def test_unknown_tool_raises(cap):
     with pytest.raises(ValueError):

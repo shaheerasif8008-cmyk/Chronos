@@ -581,6 +581,42 @@ DOC_RENDER_CHART = _fn(
 )
 
 
+DOC_DETECT_FIELDS = _fn(
+    "doc__detect_fields",
+    "Analyse a PDF (form, worksheet, application) with vision to locate every fillable "
+    "region — blanks, answer lines, checkboxes — and return their positions as absolute "
+    "PDF points plus a ready-to-use 'fill_hint' {x, y, size}. Use this BEFORE doc__fill_pdf "
+    "so you place answers at exact detected coordinates instead of guessing. Falls back to "
+    "an honest 'unavailable' result when no vision model is configured (use anchor_text "
+    "placement in doc__fill_pdf instead).",
+    {
+        "artifact_id": {"type": "string", "description": "Artifact id of the source PDF to analyse."},
+        "pages": {"type": "array", "items": {"type": "integer"}, "description": "Optional 1-based page numbers to analyse (default: all pages)."},
+    },
+    ["artifact_id"],
+)
+
+DOC_VERIFY_FILL = _fn(
+    "doc__verify_fill",
+    "Re-read a FILLED PDF and verify the work: checks that each expected answer actually "
+    "landed and is legible in the output (text extraction with OCR fallback), and optionally "
+    "re-checks answer correctness with the model. Use this AFTER doc__fill_pdf to confirm "
+    "the document was completed correctly before returning it to the user.",
+    {
+        "artifact_id": {"type": "string", "description": "Artifact id of the filled PDF to verify."},
+        "expected": {
+            "type": "array",
+            "description": "Expected answers to confirm are present. Each item: "
+                           "{answer (string, required), label?, question?}. Provide 'question' "
+                           "to enable the optional correctness re-check.",
+            "items": {"type": "object"},
+        },
+        "recheck_correctness": {"type": "boolean", "description": "If true, run an LLM correctness check on the supplied question/answer pairs.", "default": False},
+    },
+    ["artifact_id", "expected"],
+)
+
+
 # ── Image generation ──────────────────────────────────────────────────────────
 
 IMAGE_GENERATE = _fn(
@@ -810,6 +846,8 @@ ALL_TOOLS: list[dict[str, Any]] = [
     DOC_CREATE_SLIDES,
     DOC_FILL_PDF,
     DOC_RENDER_CHART,
+    DOC_DETECT_FIELDS,
+    DOC_VERIFY_FILL,
     IMAGE_GENERATE,
     IMAGE_EDIT,
     VOICE_TRANSCRIBE,
@@ -840,6 +878,8 @@ SUBAGENT_TOOLS: list[dict[str, Any]] = [
     DOC_CREATE_SLIDES,
     DOC_FILL_PDF,
     DOC_RENDER_CHART,
+    DOC_DETECT_FIELDS,
+    DOC_VERIFY_FILL,
     IMAGE_GENERATE,
     IMAGE_EDIT,
     VOICE_TRANSCRIBE,
@@ -878,6 +918,8 @@ INLINE_CHAT_TOOLS: list[dict[str, Any]] = [
     DOC_CREATE_SLIDES,
     DOC_FILL_PDF,
     DOC_RENDER_CHART,
+    DOC_DETECT_FIELDS,
+    DOC_VERIFY_FILL,
     IMAGE_GENERATE,
     IMAGE_EDIT,
     VOICE_TRANSCRIBE,

@@ -534,6 +534,35 @@ async def vision_ocr(image_bytes: bytes, mime: str) -> str:
         return ""
 
 
+async def vision_json(image_bytes: bytes, mime: str, instruction: str) -> str:
+    """Analyse an image with a custom instruction and return the raw model content.
+
+    Like ``vision_ocr`` but the caller supplies the prompt and is expected to ask
+    for JSON. Returns "" when no vision model is configured or the call fails —
+    vision analysis is best-effort and must never raise into a task step. The
+    caller parses/validates the returned string (it may not be valid JSON).
+    """
+    if not settings.vision_model:
+        return ""
+    data_url = f"data:{mime};base64,{base64.b64encode(image_bytes).decode()}"
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": instruction},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        }
+    ]
+    try:
+        kwargs = model_kwargs(settings.vision_model, messages=messages, stream=False)
+        kwargs["response_format"] = {"type": "json_object"}
+        response = await _with_retry(lambda: litellm.acompletion(**kwargs), max_retries=0)
+        return _message_content(response)
+    except Exception:
+        return ""
+
+
 async def tool_call(messages: list[dict[str, Any]], tools: list[dict[str, Any]], *, model: str | None = None) -> dict[str, Any]:
     """Ask the agent model for the next tool call or final response.
 

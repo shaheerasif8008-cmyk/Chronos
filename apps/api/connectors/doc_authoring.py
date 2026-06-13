@@ -39,6 +39,32 @@ _DEFAULT_OVERLAY_SIZE = 11
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 
+def _normalize_ws(text: str) -> str:
+    """Lowercase and collapse whitespace for tolerant substring matching."""
+    return " ".join(str(text or "").split()).lower()
+
+
+def _json_list_key(raw_json: str, key: str) -> list[dict[str, Any]]:
+    """Parse model JSON and return the list of dict items under ``key`` (else [])."""
+    import json
+
+    try:
+        parsed = json.loads(raw_json)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(parsed, dict):
+        return []
+    value = parsed.get(key)
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _json_fields(raw_json: str) -> list[dict[str, Any]]:
+    """Parse a vision response and return its ``fields`` list of dicts (else [])."""
+    return _json_list_key(raw_json, "fields")
+
+
 def _hex_to_rgb01(value: Any) -> tuple[float, float, float]:
     """Convert a ``#rrggbb`` (or ``rrggbb``) string to a 0..1 RGB triple.
 
@@ -141,6 +167,10 @@ class DocAuthoringConnector:
             return await self._fill_pdf(args, org_id=org_id, task_id=task_id)
         if tool == "doc.render_chart":
             return await self._render_chart(args, org_id=org_id, task_id=task_id)
+        if tool == "doc.detect_fields":
+            return await self._detect_fields(args, org_id=org_id)
+        if tool == "doc.verify_fill":
+            return await self._verify_fill(args, org_id=org_id)
         raise ValueError(f"Unknown doc authoring tool: {tool}")
 
     # ── doc.create ────────────────────────────────────────────────────────────
@@ -590,6 +620,219 @@ class DocAuthoringConnector:
         fig.savefig(buf, format="png", dpi=120)
         plt.close(fig)
         return buf.getvalue()
+
+    # ── doc.detect_fields ─────────────────────────────────────────────────────
+
+    async def _detect_fields(self, args: dict[str, Any], *, org_id: str) -> ToolResult:
+        """Detect fillable regions in a PDF via vision, with absolute coordinates.
+
+        Renders each requested page to an image, asks the vision model for the
+        fillable regions (blanks, answer lines, checkboxes) as normalized boxes,
+        and converts them to PDF points (top-left origin). The returned ``fields``
+        carry a ``fill_hint`` ready to drop straight into ``doc.fill_pdf`` items —
+        so the agent never has to guess coordinates.
+        """
+        from core.llm import vision_json
+        from pypdf import PdfReader
+
+        source_id = str(args.get("artifact_id") or "")
+        if not source_id:
+            return ToolResult(
+                data={"status": "error", "reason": "artifact_id is required"},
+                summary="doc.detect_fields: artifact_id is required",
+            )
+        try:
+            raw = await _resolve_pdf(source_id, org_id)
+        except (FileNotFoundError, PermissionError) as exc:
+            return ToolResult(
+                data={"status": "error", "reason": str(exc)},
+                summary=f"doc.detect_fields: {exc}",
+            )
+        try:
+            reader = PdfReader(io.BytesIO(raw))
+        except Exception as exc:
+            return ToolResult(
+                data={"status": "error", "reason": f"could not read PDF: {exc}"},
+                summary=f"doc.detect_fields: source is not a readable PDF ({exc})",
+            )
+
+        page_count = len(reader.pages)
+        requested = args.get("pages")
+        if isinstance(requested, list) and requested:
+            page_indices = [int(p) - 1 for p in requested if 0 < int(p) <= page_count]
+        else:
+            page_indices = list(range(page_count))
+
+        instruction = (
+            "You are analysing a form/worksheet page to find every place a person "
+            "should write an answer (blank lines, empty boxes, answer fields, "
+            "checkboxes). Return ONLY JSON of this exact shape:\n"
+            '{"fields": [{"label": "the question or field label", '
+            '"field_type": "text"|"checkbox", '
+            '"bbox": [x0, y0, x1, y1]}]}\n'
+            "Coordinates are fractions from 0.0 to 1.0 of the page, with the ORIGIN "
+            "at the TOP-LEFT (x to the right, y downward). bbox is the empty region "
+            "to be filled, NOT the printed label. Return [] if there are no fields."
+        )
+
+        all_fields: list[dict[str, Any]] = []
+        pages_analyzed = 0
+        for pidx in page_indices:
+            page = reader.pages[pidx]
+            width = float(page.mediabox.width)
+            height = float(page.mediabox.height)
+            png = self._render_page_png(raw, pidx)
+            if not png:
+                continue
+            content = await vision_json(png, "image/png", instruction)
+            if not content:
+                continue
+            pages_analyzed += 1
+            for field in _json_fields(content):
+                bbox = field.get("bbox")
+                if not isinstance(bbox, list) or len(bbox) != 4:
+                    continue
+                try:
+                    x0, y0, x1, y1 = (max(0.0, min(1.0, float(v))) for v in bbox)
+                except (TypeError, ValueError):
+                    continue
+                px, py = x0 * width, y0 * height
+                pw, ph = max(0.0, (x1 - x0)) * width, max(0.0, (y1 - y0)) * height
+                all_fields.append({
+                    "page": pidx + 1,
+                    "label": str(field.get("label") or ""),
+                    "field_type": str(field.get("field_type") or "text"),
+                    "bbox_points": {"x": round(px, 1), "y": round(py, 1),
+                                    "width": round(pw, 1), "height": round(ph, 1)},
+                    # Ready to drop into doc.fill_pdf: place text just inside the box.
+                    "fill_hint": {"x": round(px + 2, 1),
+                                  "y": round(py + ph * 0.25, 1),
+                                  "size": round(min(14.0, max(8.0, ph * 0.6)), 1)},
+                })
+
+        if pages_analyzed == 0:
+            return ToolResult(
+                data={"status": "unavailable", "fields": [],
+                      "fallback_reason": "no vision model configured or rendering failed",
+                      "page_count": page_count},
+                summary=("doc.detect_fields: vision analysis unavailable — fall back to "
+                         "anchor_text placement in doc.fill_pdf."),
+            )
+        return ToolResult(
+            data={"status": "success", "fields": all_fields,
+                  "pages_analyzed": pages_analyzed, "page_count": page_count},
+            summary=f"Detected {len(all_fields)} fillable field(s) across {pages_analyzed} page(s).",
+        )
+
+    def _render_page_png(self, raw: bytes, page_index: int) -> bytes | None:
+        """Render one PDF page to PNG bytes via pypdfium2 (no system binary)."""
+        try:
+            import pypdfium2 as pdfium
+
+            pdf = pdfium.PdfDocument(raw)
+            try:
+                pil = pdf[page_index].render(scale=2.0).to_pil()
+            finally:
+                pdf.close()
+            buf = io.BytesIO()
+            pil.save(buf, format="PNG")
+            return buf.getvalue()
+        except Exception:
+            return None
+
+    # ── doc.verify_fill ───────────────────────────────────────────────────────
+
+    async def _verify_fill(self, args: dict[str, Any], *, org_id: str) -> ToolResult:
+        """Re-read a filled PDF and verify each expected answer landed legibly.
+
+        Re-parses the filled PDF (text extraction, OCR fallback) and checks that
+        each expected answer string is present in the rendered output. Optionally
+        runs an LLM correctness re-check against the supplied questions. This is
+        the "recheck its work" step after doc.fill_pdf.
+        """
+        from parsing.engine import parse_document
+
+        source_id = str(args.get("artifact_id") or "")
+        expected = args.get("expected")
+        if not source_id:
+            return ToolResult(
+                data={"status": "error", "reason": "artifact_id is required"},
+                summary="doc.verify_fill: artifact_id is required",
+            )
+        if not isinstance(expected, list) or not expected:
+            return ToolResult(
+                data={"status": "error", "reason": "expected (non-empty list) is required"},
+                summary="doc.verify_fill: expected answers list is required",
+            )
+        try:
+            raw = await _resolve_pdf(source_id, org_id)
+        except (FileNotFoundError, PermissionError) as exc:
+            return ToolResult(
+                data={"status": "error", "reason": str(exc)},
+                summary=f"doc.verify_fill: {exc}",
+            )
+
+        doc = await parse_document(raw, "application/pdf", "filled.pdf")
+        haystack = _normalize_ws(doc.full_text)
+
+        items: list[dict[str, Any]] = []
+        missing: list[str] = []
+        for entry in expected:
+            if isinstance(entry, dict):
+                answer = str(entry.get("answer") or "")
+                label = str(entry.get("label") or "")
+            else:
+                answer, label = str(entry), ""
+            present = bool(answer) and _normalize_ws(answer) in haystack
+            items.append({"label": label, "answer": answer, "present": present})
+            if not present:
+                missing.append(answer or label)
+
+        result: dict[str, Any] = {
+            "status": "success",
+            "all_present": not missing,
+            "items": items,
+            "missing": missing,
+            "parser_used": doc.parser_used,
+        }
+
+        # Optional correctness re-check (the "recheck its work" pass).
+        if args.get("recheck_correctness"):
+            result["correctness"] = await self._recheck_correctness(doc.full_text, expected)
+
+        placed = sum(1 for it in items if it["present"])
+        return ToolResult(
+            data=result,
+            summary=(f"Verified filled PDF: {placed}/{len(items)} expected answer(s) present"
+                     + (f"; missing {len(missing)}" if missing else "")),
+        )
+
+    async def _recheck_correctness(
+        self, filled_text: str, expected: list[Any]
+    ) -> dict[str, Any]:
+        """LLM re-check of answer correctness against the filled content. Degrades honestly."""
+        from core import llm
+
+        qa_lines = []
+        for entry in expected:
+            if isinstance(entry, dict) and entry.get("question"):
+                qa_lines.append(f"Q: {entry.get('question')}\nA: {entry.get('answer')}")
+        if not qa_lines:
+            return {"status": "skipped", "reason": "no questions supplied for correctness check"}
+
+        prompt = (
+            "You are checking a completed worksheet. For each question/answer pair, "
+            "decide if the answer is correct. Return ONLY JSON: "
+            '{"checks": [{"question": "...", "correct": true|false, "note": "..."}]}.\n\n'
+            "Filled document text:\n" + filled_text[:8000] + "\n\n"
+            "Question/answer pairs:\n" + "\n\n".join(qa_lines)
+        )
+        try:
+            content = await llm.complete_json(prompt)
+        except Exception:
+            return {"status": "unavailable", "reason": "model error"}
+        checks = _json_list_key(content, "checks")
+        return {"status": "checked", "checks": checks}
 
 
 doc_authoring_connector = DocAuthoringConnector()
