@@ -29,6 +29,7 @@ python-docx>=1.1.0
 openpyxl>=3.1.0
 python-pptx>=0.6.23
 pypdfium2>=4.30.0
+reportlab>=4.0.0
 Pillow>=10.0.0
 # Data analysis workspace (Phase 7 Task 7)
 pandas>=2.0

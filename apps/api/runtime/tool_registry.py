@@ -655,6 +655,178 @@ DOC_COMPARE = _fn(
     ["artifact_id_a", "artifact_id_b"],
 )
 
+# ── Document authoring ────────────────────────────────────────────────────────
+
+DOC_CREATE = _fn(
+    "doc__create",
+    "Author a NEW document (PDF, DOCX, or Markdown) from structured content blocks. "
+    "Use to produce reports, letters, briefs, or any text document from scratch. "
+    "Returns a downloadable artifact.",
+    {
+        "format": {"type": "string", "enum": ["pdf", "docx", "markdown"], "description": "Output format (default 'pdf')."},
+        "title": {"type": "string", "description": "Document title."},
+        "blocks": {
+            "type": "array",
+            "description": "Ordered content blocks. Each is an object with a 'type': "
+                           "'heading' {text, level:1-3}, 'paragraph' {text}, 'bullet' {text}, "
+                           "'image' {artifact_id, width?, height?}, or 'pagebreak' {}.",
+            "items": {"type": "object"},
+        },
+    },
+    ["title", "blocks"],
+)
+
+DOC_CREATE_SLIDES = _fn(
+    "doc__create_slides",
+    "Author a NEW PowerPoint (PPTX) presentation from a list of slides. "
+    "Each slide may have a title, bullet points, an image, and speaker notes. "
+    "Returns a downloadable artifact.",
+    {
+        "title": {"type": "string", "description": "Presentation title."},
+        "slides": {
+            "type": "array",
+            "description": "Ordered slides. Each is an object: "
+                           "{title?, bullets?: [string], image_artifact_id?, notes?}.",
+            "items": {"type": "object"},
+        },
+    },
+    ["title", "slides"],
+)
+
+DOC_FILL_PDF = _fn(
+    "doc__fill_pdf",
+    "Fill in / annotate an EXISTING PDF in place by overlaying text and images onto the "
+    "original pages (the original layout is preserved exactly). Ideal for completing "
+    "worksheets, forms, and printed documents. Place each item by absolute coordinates "
+    "(PDF points, top-left origin) OR by 'anchor_text' (locate a word on the page and "
+    "offset from it with dx/dy). Parse the PDF first with doc__parse to read its content. "
+    "Returns a new filled-PDF artifact.",
+    {
+        "artifact_id": {"type": "string", "description": "Artifact id of the source PDF to fill."},
+        "title": {"type": "string", "description": "Optional title for the output artifact."},
+        "items": {
+            "type": "array",
+            "description": "Overlay items. Each: {page (1-based), type:'text'|'image', "
+                           "text|artifact_id, x?, y?, anchor_text?, dx?, dy?, size?, color?, "
+                           "width?, height?}. With anchor_text the item is placed at the "
+                           "matched word, offset by dx (right) / dy (down) points.",
+            "items": {"type": "object"},
+        },
+    },
+    ["artifact_id", "items"],
+)
+
+DOC_RENDER_CHART = _fn(
+    "doc__render_chart",
+    "Render a precise, code-generated chart (line, bar, scatter, or pie) via matplotlib "
+    "and return it as an image artifact. Use for accurate data plots and technical "
+    "diagrams (as opposed to image__generate, which is for freeform illustrations).",
+    {
+        "chart_type": {"type": "string", "enum": ["line", "bar", "scatter", "pie"], "description": "Chart type."},
+        "title": {"type": "string", "description": "Chart title."},
+        "labels": {"type": "array", "items": {"type": "string"}, "description": "Category/x-axis labels (or pie slice labels)."},
+        "values": {"type": "array", "items": {"type": "number"}, "description": "Values for a single-series or pie chart."},
+        "series": {
+            "type": "array",
+            "description": "Multi-series data: list of {name, values: [number]}. Use instead of 'values' for multiple lines/bars.",
+            "items": {"type": "object"},
+        },
+        "xlabel": {"type": "string"},
+        "ylabel": {"type": "string"},
+    },
+    ["chart_type"],
+)
+
+
+# ── Platforms (general external-platform capability) ──────────────────────────
+
+PLATFORM_LIST = _fn(
+    "platform__list",
+    "List the external platforms this organization can use right now — connected MCP "
+    "servers (e.g. Google Workspace, Canva), connected REST/OAuth apps, and the web "
+    "browser. Call this first whenever a task needs an outside service, to see what is "
+    "available and each platform's id and kind.",
+    {},
+    [],
+)
+
+PLATFORM_ACTIONS = _fn(
+    "platform__actions",
+    "Discover what a specific platform can do: returns its available actions/tools with "
+    "input schemas. Use the platform_id from platform__list. For MCP platforms this is "
+    "the live tool list; for REST apps it describes the generic HTTP actions.",
+    {
+        "platform_id": {"type": "string", "description": "Platform id from platform__list (e.g. 'mcp:<id>', 'notion', 'browser')."},
+    },
+    ["platform_id"],
+)
+
+PLATFORM_INVOKE = _fn(
+    "platform__invoke",
+    "Perform one action on a platform — the general way to actually DO something on an "
+    "external service. For MCP platforms pass action (the tool name) and action_args. For "
+    "REST apps pass action_args as {method, endpoint, params?, body?}. Discover the right "
+    "action/shape with platform__actions first.",
+    {
+        "platform_id": {"type": "string", "description": "Platform id from platform__list."},
+        "action": {"type": "string", "description": "Action/tool name (required for MCP platforms)."},
+        "action_args": {"type": "object", "description": "Arguments for the action (MCP tool arguments, or {method, endpoint, params, body} for REST)."},
+    },
+    ["platform_id"],
+)
+
+PLATFORM_CONNECT = _fn(
+    "platform__connect",
+    "Connect a NEW platform during a task. kind='mcp' registers a remote MCP server by "
+    "URL (fully autonomous). kind='api' returns the OAuth consent URL for an app from the "
+    "catalog so it can be authorized (the user signs in at the provider). Use when a needed "
+    "platform is not yet in platform__list.",
+    {
+        "kind": {"type": "string", "enum": ["mcp", "api"], "description": "'mcp' to register a server, 'api' to authorize a catalog app."},
+        "name": {"type": "string", "description": "Display name for an MCP server (kind='mcp')."},
+        "server_url": {"type": "string", "description": "Remote MCP server URL (kind='mcp')."},
+        "provider": {"type": "string", "description": "App id from the catalog (kind='api'), e.g. 'notion'."},
+    },
+    ["kind"],
+)
+
+
+DOC_DETECT_FIELDS = _fn(
+    "doc__detect_fields",
+    "Analyse a PDF (form, worksheet, application) with vision to locate every fillable "
+    "region — blanks, answer lines, checkboxes — and return their positions as absolute "
+    "PDF points plus a ready-to-use 'fill_hint' {x, y, size}. Use this BEFORE doc__fill_pdf "
+    "so you place answers at exact detected coordinates instead of guessing. Falls back to "
+    "an honest 'unavailable' result when no vision model is configured (use anchor_text "
+    "placement in doc__fill_pdf instead).",
+    {
+        "artifact_id": {"type": "string", "description": "Artifact id of the source PDF to analyse."},
+        "pages": {"type": "array", "items": {"type": "integer"}, "description": "Optional 1-based page numbers to analyse (default: all pages)."},
+    },
+    ["artifact_id"],
+)
+
+DOC_VERIFY_FILL = _fn(
+    "doc__verify_fill",
+    "Re-read a FILLED PDF and verify the work: checks that each expected answer actually "
+    "landed and is legible in the output (text extraction with OCR fallback), and optionally "
+    "re-checks answer correctness with the model. Use this AFTER doc__fill_pdf to confirm "
+    "the document was completed correctly before returning it to the user.",
+    {
+        "artifact_id": {"type": "string", "description": "Artifact id of the filled PDF to verify."},
+        "expected": {
+            "type": "array",
+            "description": "Expected answers to confirm are present. Each item: "
+                           "{answer (string, required), label?, question?}. Provide 'question' "
+                           "to enable the optional correctness re-check.",
+            "items": {"type": "object"},
+        },
+        "recheck_correctness": {"type": "boolean", "description": "If true, run an LLM correctness check on the supplied question/answer pairs.", "default": False},
+    },
+    ["artifact_id", "expected"],
+)
+
+
 # ── Image generation ──────────────────────────────────────────────────────────
 
 IMAGE_GENERATE = _fn(
@@ -882,6 +1054,16 @@ ALL_TOOLS: list[dict[str, Any]] = [
     DOC_READ,
     DOC_SUMMARIZE,
     DOC_COMPARE,
+    DOC_CREATE,
+    DOC_CREATE_SLIDES,
+    DOC_FILL_PDF,
+    DOC_RENDER_CHART,
+    DOC_DETECT_FIELDS,
+    DOC_VERIFY_FILL,
+    PLATFORM_LIST,
+    PLATFORM_ACTIONS,
+    PLATFORM_INVOKE,
+    PLATFORM_CONNECT,
     IMAGE_GENERATE,
     IMAGE_EDIT,
     VOICE_TRANSCRIBE,
@@ -910,6 +1092,16 @@ SUBAGENT_TOOLS: list[dict[str, Any]] = [
     DOC_READ,
     DOC_SUMMARIZE,
     DOC_COMPARE,
+    DOC_CREATE,
+    DOC_CREATE_SLIDES,
+    DOC_FILL_PDF,
+    DOC_RENDER_CHART,
+    DOC_DETECT_FIELDS,
+    DOC_VERIFY_FILL,
+    PLATFORM_LIST,
+    PLATFORM_ACTIONS,
+    PLATFORM_INVOKE,
+    PLATFORM_CONNECT,
     IMAGE_GENERATE,
     IMAGE_EDIT,
     VOICE_TRANSCRIBE,
@@ -945,6 +1137,16 @@ INLINE_CHAT_TOOLS: list[dict[str, Any]] = [
     DOC_READ,
     DOC_SUMMARIZE,
     DOC_COMPARE,
+    DOC_CREATE,
+    DOC_CREATE_SLIDES,
+    DOC_FILL_PDF,
+    DOC_RENDER_CHART,
+    DOC_DETECT_FIELDS,
+    DOC_VERIFY_FILL,
+    PLATFORM_LIST,
+    PLATFORM_ACTIONS,
+    PLATFORM_INVOKE,
+    PLATFORM_CONNECT,
     IMAGE_GENERATE,
     IMAGE_EDIT,
     VOICE_TRANSCRIBE,
