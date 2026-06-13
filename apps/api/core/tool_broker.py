@@ -339,6 +339,10 @@ async def _route(agent: AgentContext, tool: str, args: dict, vault_ref: str, tie
         from connectors.mcp_client import mcp_connector
         return await mcp_connector.execute(tool, routed_args, agent)
 
+    if provider == "platform":
+        from connectors.platform import platform_connector
+        return await platform_connector.execute(tool, routed_args, agent)
+
     # Generic HTTP connector — handles any OAuth2-connected app (Notion, Slack, GitHub, etc.)
     from connectors.generic_http import generic_http_connector
     return await generic_http_connector.execute(tool, routed_args, vault_ref)
@@ -406,7 +410,7 @@ class ToolBroker:
         # when external OAuth or browser dependencies are not configured.
         provider = tool.split(".")[0]
         tier = await connector_tier(provider)
-        if tier == "live" and provider not in {"browser", "fs", "code", "doc", "image", "voice", "data", "chat_history", "repo", "computer", "local_computer", "skill"}:
+        if tier == "live" and provider not in {"browser", "fs", "code", "doc", "image", "voice", "data", "chat_history", "repo", "computer", "local_computer", "skill", "platform"}:
             from connectors.registry import get as registry_get
 
             connector = await registry_get(agent, tool)

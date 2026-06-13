@@ -581,6 +581,59 @@ DOC_RENDER_CHART = _fn(
 )
 
 
+# ── Platforms (general external-platform capability) ──────────────────────────
+
+PLATFORM_LIST = _fn(
+    "platform__list",
+    "List the external platforms this organization can use right now — connected MCP "
+    "servers (e.g. Google Workspace, Canva), connected REST/OAuth apps, and the web "
+    "browser. Call this first whenever a task needs an outside service, to see what is "
+    "available and each platform's id and kind.",
+    {},
+    [],
+)
+
+PLATFORM_ACTIONS = _fn(
+    "platform__actions",
+    "Discover what a specific platform can do: returns its available actions/tools with "
+    "input schemas. Use the platform_id from platform__list. For MCP platforms this is "
+    "the live tool list; for REST apps it describes the generic HTTP actions.",
+    {
+        "platform_id": {"type": "string", "description": "Platform id from platform__list (e.g. 'mcp:<id>', 'notion', 'browser')."},
+    },
+    ["platform_id"],
+)
+
+PLATFORM_INVOKE = _fn(
+    "platform__invoke",
+    "Perform one action on a platform — the general way to actually DO something on an "
+    "external service. For MCP platforms pass action (the tool name) and action_args. For "
+    "REST apps pass action_args as {method, endpoint, params?, body?}. Discover the right "
+    "action/shape with platform__actions first.",
+    {
+        "platform_id": {"type": "string", "description": "Platform id from platform__list."},
+        "action": {"type": "string", "description": "Action/tool name (required for MCP platforms)."},
+        "action_args": {"type": "object", "description": "Arguments for the action (MCP tool arguments, or {method, endpoint, params, body} for REST)."},
+    },
+    ["platform_id"],
+)
+
+PLATFORM_CONNECT = _fn(
+    "platform__connect",
+    "Connect a NEW platform during a task. kind='mcp' registers a remote MCP server by "
+    "URL (fully autonomous). kind='api' returns the OAuth consent URL for an app from the "
+    "catalog so it can be authorized (the user signs in at the provider). Use when a needed "
+    "platform is not yet in platform__list.",
+    {
+        "kind": {"type": "string", "enum": ["mcp", "api"], "description": "'mcp' to register a server, 'api' to authorize a catalog app."},
+        "name": {"type": "string", "description": "Display name for an MCP server (kind='mcp')."},
+        "server_url": {"type": "string", "description": "Remote MCP server URL (kind='mcp')."},
+        "provider": {"type": "string", "description": "App id from the catalog (kind='api'), e.g. 'notion'."},
+    },
+    ["kind"],
+)
+
+
 DOC_DETECT_FIELDS = _fn(
     "doc__detect_fields",
     "Analyse a PDF (form, worksheet, application) with vision to locate every fillable "
@@ -848,6 +901,10 @@ ALL_TOOLS: list[dict[str, Any]] = [
     DOC_RENDER_CHART,
     DOC_DETECT_FIELDS,
     DOC_VERIFY_FILL,
+    PLATFORM_LIST,
+    PLATFORM_ACTIONS,
+    PLATFORM_INVOKE,
+    PLATFORM_CONNECT,
     IMAGE_GENERATE,
     IMAGE_EDIT,
     VOICE_TRANSCRIBE,
@@ -880,6 +937,10 @@ SUBAGENT_TOOLS: list[dict[str, Any]] = [
     DOC_RENDER_CHART,
     DOC_DETECT_FIELDS,
     DOC_VERIFY_FILL,
+    PLATFORM_LIST,
+    PLATFORM_ACTIONS,
+    PLATFORM_INVOKE,
+    PLATFORM_CONNECT,
     IMAGE_GENERATE,
     IMAGE_EDIT,
     VOICE_TRANSCRIBE,
@@ -920,6 +981,10 @@ INLINE_CHAT_TOOLS: list[dict[str, Any]] = [
     DOC_RENDER_CHART,
     DOC_DETECT_FIELDS,
     DOC_VERIFY_FILL,
+    PLATFORM_LIST,
+    PLATFORM_ACTIONS,
+    PLATFORM_INVOKE,
+    PLATFORM_CONNECT,
     IMAGE_GENERATE,
     IMAGE_EDIT,
     VOICE_TRANSCRIBE,
