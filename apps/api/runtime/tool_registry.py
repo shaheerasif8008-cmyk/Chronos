@@ -498,6 +498,89 @@ DOC_COMPARE = _fn(
     ["artifact_id_a", "artifact_id_b"],
 )
 
+# ── Document authoring ────────────────────────────────────────────────────────
+
+DOC_CREATE = _fn(
+    "doc__create",
+    "Author a NEW document (PDF, DOCX, or Markdown) from structured content blocks. "
+    "Use to produce reports, letters, briefs, or any text document from scratch. "
+    "Returns a downloadable artifact.",
+    {
+        "format": {"type": "string", "enum": ["pdf", "docx", "markdown"], "description": "Output format (default 'pdf')."},
+        "title": {"type": "string", "description": "Document title."},
+        "blocks": {
+            "type": "array",
+            "description": "Ordered content blocks. Each is an object with a 'type': "
+                           "'heading' {text, level:1-3}, 'paragraph' {text}, 'bullet' {text}, "
+                           "'image' {artifact_id, width?, height?}, or 'pagebreak' {}.",
+            "items": {"type": "object"},
+        },
+    },
+    ["title", "blocks"],
+)
+
+DOC_CREATE_SLIDES = _fn(
+    "doc__create_slides",
+    "Author a NEW PowerPoint (PPTX) presentation from a list of slides. "
+    "Each slide may have a title, bullet points, an image, and speaker notes. "
+    "Returns a downloadable artifact.",
+    {
+        "title": {"type": "string", "description": "Presentation title."},
+        "slides": {
+            "type": "array",
+            "description": "Ordered slides. Each is an object: "
+                           "{title?, bullets?: [string], image_artifact_id?, notes?}.",
+            "items": {"type": "object"},
+        },
+    },
+    ["title", "slides"],
+)
+
+DOC_FILL_PDF = _fn(
+    "doc__fill_pdf",
+    "Fill in / annotate an EXISTING PDF in place by overlaying text and images onto the "
+    "original pages (the original layout is preserved exactly). Ideal for completing "
+    "worksheets, forms, and printed documents. Place each item by absolute coordinates "
+    "(PDF points, top-left origin) OR by 'anchor_text' (locate a word on the page and "
+    "offset from it with dx/dy). Parse the PDF first with doc__parse to read its content. "
+    "Returns a new filled-PDF artifact.",
+    {
+        "artifact_id": {"type": "string", "description": "Artifact id of the source PDF to fill."},
+        "title": {"type": "string", "description": "Optional title for the output artifact."},
+        "items": {
+            "type": "array",
+            "description": "Overlay items. Each: {page (1-based), type:'text'|'image', "
+                           "text|artifact_id, x?, y?, anchor_text?, dx?, dy?, size?, color?, "
+                           "width?, height?}. With anchor_text the item is placed at the "
+                           "matched word, offset by dx (right) / dy (down) points.",
+            "items": {"type": "object"},
+        },
+    },
+    ["artifact_id", "items"],
+)
+
+DOC_RENDER_CHART = _fn(
+    "doc__render_chart",
+    "Render a precise, code-generated chart (line, bar, scatter, or pie) via matplotlib "
+    "and return it as an image artifact. Use for accurate data plots and technical "
+    "diagrams (as opposed to image__generate, which is for freeform illustrations).",
+    {
+        "chart_type": {"type": "string", "enum": ["line", "bar", "scatter", "pie"], "description": "Chart type."},
+        "title": {"type": "string", "description": "Chart title."},
+        "labels": {"type": "array", "items": {"type": "string"}, "description": "Category/x-axis labels (or pie slice labels)."},
+        "values": {"type": "array", "items": {"type": "number"}, "description": "Values for a single-series or pie chart."},
+        "series": {
+            "type": "array",
+            "description": "Multi-series data: list of {name, values: [number]}. Use instead of 'values' for multiple lines/bars.",
+            "items": {"type": "object"},
+        },
+        "xlabel": {"type": "string"},
+        "ylabel": {"type": "string"},
+    },
+    ["chart_type"],
+)
+
+
 # ── Image generation ──────────────────────────────────────────────────────────
 
 IMAGE_GENERATE = _fn(
@@ -723,6 +806,10 @@ ALL_TOOLS: list[dict[str, Any]] = [
     DOC_READ,
     DOC_SUMMARIZE,
     DOC_COMPARE,
+    DOC_CREATE,
+    DOC_CREATE_SLIDES,
+    DOC_FILL_PDF,
+    DOC_RENDER_CHART,
     IMAGE_GENERATE,
     IMAGE_EDIT,
     VOICE_TRANSCRIBE,
@@ -749,6 +836,10 @@ SUBAGENT_TOOLS: list[dict[str, Any]] = [
     DOC_READ,
     DOC_SUMMARIZE,
     DOC_COMPARE,
+    DOC_CREATE,
+    DOC_CREATE_SLIDES,
+    DOC_FILL_PDF,
+    DOC_RENDER_CHART,
     IMAGE_GENERATE,
     IMAGE_EDIT,
     VOICE_TRANSCRIBE,
@@ -783,6 +874,10 @@ INLINE_CHAT_TOOLS: list[dict[str, Any]] = [
     DOC_READ,
     DOC_SUMMARIZE,
     DOC_COMPARE,
+    DOC_CREATE,
+    DOC_CREATE_SLIDES,
+    DOC_FILL_PDF,
+    DOC_RENDER_CHART,
     IMAGE_GENERATE,
     IMAGE_EDIT,
     VOICE_TRANSCRIBE,

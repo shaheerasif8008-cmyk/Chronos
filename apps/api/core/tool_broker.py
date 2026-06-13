@@ -308,6 +308,9 @@ async def _route(agent: AgentContext, tool: str, args: dict, vault_ref: str, tie
         return await image_gen_connector.execute(tool, routed_args)
 
     if provider == "doc":
+        if tool in {"doc.create", "doc.create_slides", "doc.fill_pdf", "doc.render_chart"}:
+            from connectors.doc_authoring import doc_authoring_connector
+            return await doc_authoring_connector.execute(tool, routed_args)
         from parsing.tool import doc_connector
         return await doc_connector.execute(tool, routed_args)
 
