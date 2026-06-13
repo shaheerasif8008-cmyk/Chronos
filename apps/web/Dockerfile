@@ -6,13 +6,12 @@ RUN npm ci --omit=dev
 
 FROM node:20-slim AS builder
 WORKDIR /app
+ARG NEXT_PUBLIC_API_BASE_URL
+ENV NEXT_PUBLIC_API_BASE_URL=$NEXT_PUBLIC_API_BASE_URL
 COPY package.json package-lock.json ./
 RUN npm ci
 COPY . .
-# NEXT_PUBLIC_API_BASE_URL is injected at runtime via the container env;
-# baking it in at build time would require a separate image per environment.
-# Next.js 14+ supports runtime env vars via next.config.js serverRuntimeConfig
-# or simply reading process.env at request time in Server Components.
+RUN mkdir -p public
 ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 

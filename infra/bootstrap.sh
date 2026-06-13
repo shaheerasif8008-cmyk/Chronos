@@ -11,7 +11,7 @@ ACCOUNT_ID=$(aws sts get-caller-identity --profile "$PROFILE" --query Account --
 echo "==> AWS Account: $ACCOUNT_ID  Region: $REGION"
 
 # ── Terraform state bucket ────────────────────────────────────────────────────
-BUCKET="chronos-terraform-state"
+BUCKET="chronos-terraform-state-${ACCOUNT_ID}-${REGION}"
 echo "==> Creating S3 state bucket: $BUCKET"
 if aws s3api head-bucket --bucket "$BUCKET" --profile "$PROFILE" 2>/dev/null; then
   echo "    (already exists)"

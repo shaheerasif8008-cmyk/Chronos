@@ -132,6 +132,18 @@ variable "redis_num_cache_clusters" {
   default     = 2
 }
 
+variable "redis_automatic_failover_enabled" {
+  description = "Enable automatic failover for Redis. Some free-plan accounts must keep this disabled even with replicas."
+  type        = bool
+  default     = true
+}
+
+variable "redis_multi_az_enabled" {
+  description = "Enable Redis Multi-AZ. Some free-plan accounts must keep this disabled even with replicas."
+  type        = bool
+  default     = true
+}
+
 # ── ECR images ───────────────────────────────────────────────────────────────
 variable "api_image_tag" {
   description = "Docker image tag for the API service"
@@ -254,4 +266,243 @@ variable "github_repo" {
   description = "GitHub repository name (e.g. Chronos)"
   type        = string
   default     = "Chronos"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Runtime / app configuration (sourced from .env)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+variable "org_id" {
+  description = "Default organization ID"
+  type        = string
+  default     = "default"
+}
+
+variable "auth_region" {
+  description = "Region label for auth/org scoping"
+  type        = string
+  default     = "us"
+}
+
+variable "database_url" {
+  description = "PostgreSQL connection string (overrides auto-built RDS URL when set)"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "redis_url" {
+  description = "Redis connection string (overrides auto-built ElastiCache URL when set)"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "local_llm_base_url" {
+  description = "Base URL for local LLM (Ollama etc.)"
+  type        = string
+  default     = "http://localhost:11434"
+}
+
+variable "local_llm_model" {
+  description = "Default local LLM model name"
+  type        = string
+  default     = "llama3"
+}
+
+variable "local_llm_timeout_seconds" {
+  description = "Timeout for local LLM requests"
+  type        = number
+  default     = 0.1
+}
+
+variable "task_runner_timeout_seconds" {
+  description = "Max duration for a single task run"
+  type        = number
+  default     = 1800
+}
+
+variable "task_runner_max_concurrency" {
+  description = "Max concurrent task executions per runner"
+  type        = number
+  default     = 4
+}
+
+variable "task_runner_max_attempts" {
+  description = "Retry attempts for failed steps"
+  type        = number
+  default     = 2
+}
+
+variable "backup_model" {
+  description = "LLM model to use as API key fallback"
+  type        = string
+  default     = ""
+}
+
+variable "openrouter_model" {
+  description = "Primary OpenRouter model identifier"
+  type        = string
+  default     = ""
+}
+
+variable "agent_model" {
+  description = "Model identifier for autonomous agent calls"
+  type        = string
+  default     = ""
+}
+
+variable "openrouter_api_base" {
+  description = "OpenRouter API base URL"
+  type        = string
+  default     = "https://openrouter.ai/api/v1"
+}
+
+variable "embedding_model" {
+  description = "Model used for generating text embeddings"
+  type        = string
+  default     = "google/gemini-embedding-2"
+}
+
+variable "embedding_dimensions" {
+  description = "Output dimensions for embedding vectors"
+  type        = number
+  default     = 1536
+}
+
+variable "fast_model" {
+  description = "Cheap/fast model for routing and extraction"
+  type        = string
+  default     = ""
+}
+
+variable "vision_model" {
+  description = "Vision-capable model for OCR (empty = disabled)"
+  type        = string
+  default     = ""
+}
+
+variable "image_model" {
+  description = "Image generation model (empty = disabled)"
+  type        = string
+  default     = ""
+}
+
+variable "stt_model" {
+  description = "Speech-to-text model (empty = disabled)"
+  type        = string
+  default     = ""
+}
+
+variable "tts_model" {
+  description = "Text-to-speech model (empty = disabled)"
+  type        = string
+  default     = ""
+}
+
+variable "demo_mode" {
+  description = "Use fixture connector data instead of real OAuth connectors"
+  type        = bool
+  default     = true
+}
+
+variable "access_token_expire_minutes" {
+  description = "JWT access token TTL in minutes"
+  type        = number
+  default     = 60
+}
+
+variable "cognito_region" {
+  description = "AWS region for Cognito user pool"
+  type        = string
+  default     = "us-east-1"
+}
+
+variable "cognito_callback_url" {
+  description = "Cognito OAuth callback URL"
+  type        = string
+  default     = "http://localhost:3000/login/callback"
+}
+
+variable "cognito_auto_provision_members" {
+  description = "Auto-create member records on first Cognito login"
+  type        = bool
+  default     = false
+}
+
+variable "google_client_id" {
+  description = "Google OAuth2 client ID for Gmail/Calendar/Drive connectors"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "google_client_secret" {
+  description = "Google OAuth2 client secret"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "google_redirect_uri" {
+  description = "Google OAuth2 redirect URI"
+  type        = string
+  default     = "http://localhost:8000/connectors/gmail/oauth-callback"
+}
+
+variable "object_storage_backend" {
+  description = "Object storage backend (s3 or local)"
+  type        = string
+  default     = "s3"
+}
+
+variable "aws_s3_bucket" {
+  description = "S3 bucket for object storage"
+  type        = string
+  default     = "chronos-dev"
+}
+
+variable "aws_s3_region" {
+  description = "AWS region for the S3 bucket"
+  type        = string
+  default     = "us-east-1"
+}
+
+variable "aws_s3_endpoint" {
+  description = "Custom S3 endpoint (for MinIO or compatible). Empty = default AWS endpoint."
+  type        = string
+  default     = ""
+}
+
+variable "aws_access_key_id" {
+  description = "AWS access key for S3"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "aws_secret_access_key" {
+  description = "AWS secret key for S3"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "aws_session_token" {
+  description = "AWS session token (for temp credentials)"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "openfga_api_url" {
+  description = "OpenFGA API URL for permission enforcement"
+  type        = string
+  default     = ""
+}
+
+variable "permissions_enforce" {
+  description = "Enable real OpenFGA permission checks (vs allow-all stub)"
+  type        = bool
+  default     = false
 }

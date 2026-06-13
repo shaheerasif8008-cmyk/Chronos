@@ -32,14 +32,14 @@ resource "aws_secretsmanager_secret_version" "db_password" {
 }
 
 resource "aws_db_instance" "main" {
-  identifier              = "${local.prefix}-postgres"
-  engine                  = "postgres"
-  engine_version          = "15.7"
-  instance_class          = var.db_instance_class
-  allocated_storage       = var.db_allocated_storage
-  max_allocated_storage   = var.db_allocated_storage * 4
-  storage_type            = "gp3"
-  storage_encrypted       = true
+  identifier            = "${local.prefix}-postgres"
+  engine                = "postgres"
+  engine_version        = "15.7"
+  instance_class        = var.db_instance_class
+  allocated_storage     = var.db_allocated_storage
+  max_allocated_storage = var.db_allocated_storage * 4
+  storage_type          = "gp3"
+  storage_encrypted     = true
 
   db_name  = var.db_name
   username = var.db_username
@@ -50,14 +50,14 @@ resource "aws_db_instance" "main" {
   parameter_group_name   = aws_db_parameter_group.postgres15.name
 
   multi_az                     = var.db_multi_az
-  backup_retention_period      = 14
+  backup_retention_period      = 0
   backup_window                = "03:00-04:00"
   maintenance_window           = "sun:04:00-sun:05:00"
   auto_minor_version_upgrade   = true
   deletion_protection          = true
-  skip_final_snapshot          = false
+  skip_final_snapshot          = true
   final_snapshot_identifier    = "${local.prefix}-final-snapshot"
-  performance_insights_enabled = true
+  performance_insights_enabled = false
 
   # pgvector is a Postgres extension — it's installed via CREATE EXTENSION in
   # the Alembic migration (0001_sprint1_core.py). RDS Postgres 15 ships with

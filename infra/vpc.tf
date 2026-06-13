@@ -146,10 +146,13 @@ resource "aws_security_group" "rds" {
   description = "RDS: allow Postgres from ECS services and migration task"
 
   ingress {
-    from_port       = 5432
-    to_port         = 5432
-    protocol        = "tcp"
-    security_groups = [aws_security_group.api.id]
+    from_port = 5432
+    to_port   = 5432
+    protocol  = "tcp"
+    security_groups = [
+      aws_security_group.api.id,
+      aws_security_group.openfga.id,
+    ]
   }
   egress {
     from_port   = 0

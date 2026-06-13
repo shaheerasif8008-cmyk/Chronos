@@ -5,25 +5,25 @@ resource "aws_elasticache_subnet_group" "main" {
 
 resource "aws_elasticache_replication_group" "main" {
   replication_group_id = "${local.prefix}-redis"
-  description          = "Chronos Redis — pubsub + cache"
+  description          = "Chronos Redis - pubsub + cache"
 
-  node_type            = var.redis_node_type
-  num_cache_clusters   = var.redis_num_cache_clusters
-  port                 = 6379
+  node_type          = var.redis_node_type
+  num_cache_clusters = var.redis_num_cache_clusters
+  port               = 6379
 
-  subnet_group_name          = aws_elasticache_subnet_group.main.name
-  security_group_ids         = [aws_security_group.redis.id]
+  subnet_group_name  = aws_elasticache_subnet_group.main.name
+  security_group_ids = [aws_security_group.redis.id]
 
   at_rest_encryption_enabled = true
   transit_encryption_enabled = true
   # TLS requires the Redis URL to use rediss:// — the API picks this up
   # automatically when REDIS_URL starts with rediss://.
 
-  automatic_failover_enabled = var.redis_num_cache_clusters > 1
-  multi_az_enabled           = var.redis_num_cache_clusters > 1
+  automatic_failover_enabled = var.redis_automatic_failover_enabled
+  multi_az_enabled           = var.redis_multi_az_enabled
 
-  engine_version           = "7.1"
-  parameter_group_name     = "default.redis7"
+  engine_version       = "7.1"
+  parameter_group_name = "default.redis7"
 
   maintenance_window       = "sun:05:00-sun:06:00"
   snapshot_retention_limit = 3

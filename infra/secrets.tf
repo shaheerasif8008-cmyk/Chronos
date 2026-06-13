@@ -4,16 +4,16 @@
 
 locals {
   app_secrets = {
-    jwt_secret           = var.jwt_secret
-    vault_encryption_key = var.vault_encryption_key
-    admin_email          = var.admin_email
-    sendgrid_api_key     = var.sendgrid_api_key
-    openrouter_api_key   = var.openrouter_api_key
-    backup_api_key       = var.backup_api_key
-    tavily_api_key       = var.tavily_api_key
-    langfuse_public_key  = var.langfuse_public_key
-    langfuse_secret_key  = var.langfuse_secret_key
-    sentry_dsn           = var.sentry_dsn
+    jwt_secret                = var.jwt_secret
+    vault_encryption_key      = var.vault_encryption_key
+    admin_email               = var.admin_email
+    sendgrid_api_key          = var.sendgrid_api_key
+    openrouter_api_key        = var.openrouter_api_key
+    backup_api_key            = var.backup_api_key
+    tavily_api_key            = var.tavily_api_key
+    langfuse_public_key       = var.langfuse_public_key
+    langfuse_secret_key       = var.langfuse_secret_key
+    sentry_dsn                = var.sentry_dsn
     cognito_app_client_secret = var.cognito_app_client_secret
   }
 }
@@ -27,7 +27,7 @@ resource "aws_secretsmanager_secret" "app" {
 resource "aws_secretsmanager_secret_version" "app" {
   for_each      = local.app_secrets
   secret_id     = aws_secretsmanager_secret.app[each.key].id
-  secret_string = each.value
+  secret_string = each.value != "" ? each.value : "not_configured"
 }
 
 # ── Convenience locals for task definition secret injection ───────────────────

@@ -20,7 +20,15 @@ from memory.source_retrieval import (
 from skills.loader import find_relevant_skills, load_skill_content, skill_connector_warning
 from skills.registry import get_candidate_skills
 
-ROOT = Path(__file__).resolve().parents[3]
+def _runtime_root() -> Path:
+    current = Path(__file__).resolve()
+    for parent in current.parents:
+        if (parent / "context").exists() or (parent / "apps" / "api").exists():
+            return parent
+    return current.parents[1]
+
+
+ROOT = _runtime_root()
 
 # Category 7: rough token estimation (4 chars ≈ 1 token for English prose).
 _CHARS_PER_TOKEN = 4

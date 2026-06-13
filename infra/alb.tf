@@ -34,6 +34,7 @@ resource "aws_lb_target_group" "api" {
 }
 
 resource "aws_lb_listener" "api_http" {
+  count             = var.acm_certificate_arn != "" ? 1 : 0
   load_balancer_arn = aws_lb.api.arn
   port              = 80
   protocol          = "HTTP"
@@ -101,6 +102,7 @@ resource "aws_lb_target_group" "web" {
 
   health_check {
     path              = "/"
+    matcher           = "200-399"
     healthy_threshold = 2
     interval          = 30
   }

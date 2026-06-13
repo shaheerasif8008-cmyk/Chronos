@@ -43,6 +43,9 @@ resource "aws_s3_bucket_lifecycle_configuration" "artifacts" {
   rule {
     id     = "archive-old-artifacts"
     status = "Enabled"
+    filter {
+      prefix = ""
+    }
     transition {
       days          = 90
       storage_class = "GLACIER_IR"

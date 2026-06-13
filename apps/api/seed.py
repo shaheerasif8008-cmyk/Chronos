@@ -6,7 +6,7 @@ from sqlalchemy import insert, select, update
 from core.config import settings
 from core.db import engine, reflect_table
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parent
 
 
 async def upsert_seed() -> None:

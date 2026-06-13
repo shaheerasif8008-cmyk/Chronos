@@ -1,5 +1,7 @@
 from __future__ import annotations
-import random
+import hashlib
+import hmac
+import time
 
 from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel, EmailStr
@@ -21,6 +23,7 @@ from core.members import get_member_by_email, get_or_create_member_for_email
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 _otp_store: dict[str, str] = {}
+_DEV_OTP_WINDOW_SECONDS = 10 * 60
 
 
 class OtpRequest(BaseModel):
@@ -43,6 +46,14 @@ class CognitoIdTokenRequest(BaseModel):
 
 def _dev_otp_enabled() -> bool:
     return settings.auth_provider in {"dev_otp", "both"}
+
+
+def _dev_otp_for(email: str, window: int | None = None) -> str:
+    current_window = window if window is not None else int(time.time() // _DEV_OTP_WINDOW_SECONDS)
+    key = settings.jwt_secret.encode("utf-8")
+    message = f"{email.lower()}:{current_window}".encode("utf-8")
+    digest = hmac.new(key, message, hashlib.sha256).hexdigest()
+    return f"{int(digest[:12], 16) % 1_000_000:06d}"
 
 
 @router.get("/config")
@@ -72,14 +83,14 @@ async def auth_config() -> dict:
 async def request_otp(req: OtpRequest) -> dict[str, str]:
     if not _dev_otp_enabled():
         raise HTTPException(status_code=404, detail="Dev OTP auth is disabled")
-    code = f"{random.randint(0, 999999):06d}"
+    code = _dev_otp_for(req.email)
     _otp_store[req.email.lower()] = code
     # Pre-login: no member (and thus no tenant) is resolved yet — the email may
     # not even belong to a seeded member. The process default org is the only
     # org available here, so log it explicitly rather than implying a real tenant.
     await audit.log("otp_requested", req.email.lower(), "auth.request_otp", organization_id=settings.org_id)
     print(f"Chronos dev OTP for {req.email}: {code}", flush=True)
-    return {"status": "otp_sent_dev_console"}
+    return {"status": "otp_sent_dev_console", "dev_code": code}
 
 
 @router.post("/verify-otp")
@@ -87,7 +98,13 @@ async def verify_otp(req: OtpVerify, response: Response) -> dict[str, str]:
     if not _dev_otp_enabled():
         raise HTTPException(status_code=404, detail="Dev OTP auth is disabled")
     email = req.email.lower()
-    if _otp_store.get(email) != req.code:
+    current_window = int(time.time() // _DEV_OTP_WINDOW_SECONDS)
+    valid_codes = {
+        _otp_store.get(email),
+        _dev_otp_for(email, current_window),
+        _dev_otp_for(email, current_window - 1),
+    }
+    if req.code not in valid_codes:
         raise HTTPException(status_code=400, detail="Invalid OTP")
 
     member = await get_member_by_email(email)

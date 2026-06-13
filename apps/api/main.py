@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
+from core.config import settings as app_settings
 from core.exceptions import PermissionDenied
 
 from jobs import context_update, profile_synthesis, scheduled_tasks
@@ -34,8 +35,9 @@ app.add_middleware(
         "http://127.0.0.1:3000",
         "http://localhost:3001",
         "http://127.0.0.1:3001",
+        app_settings.frontend_base_url.rstrip("/"),
     ],
-    allow_origin_regex=r"http://(localhost|127\.0\.0\.1):30\d{2}",
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1):30\d{2}",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

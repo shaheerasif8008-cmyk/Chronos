@@ -12,10 +12,9 @@ terraform {
     }
   }
 
-  # Remote state — replace bucket/key/region to match your AWS account.
-  # Create the bucket first: aws s3 mb s3://chronos-terraform-state --region us-east-1
+  # Remote state.
   backend "s3" {
-    bucket         = "chronos-terraform-state"
+    bucket         = "chronos-terraform-state-544294779377-us-east-1"
     key            = "prod/terraform.tfstate"
     region         = "us-east-1"
     encrypt        = true

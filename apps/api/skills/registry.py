@@ -7,7 +7,17 @@ from pathlib import Path
 from typing import Any
 
 
-ROOT = Path(__file__).resolve().parents[3]
+def _runtime_root() -> Path:
+    current = Path(__file__).resolve()
+    for parent in current.parents:
+        if (parent / "skills").is_dir() and any((parent / "skills").glob("*/metadata.json")):
+            return parent
+        if (parent / "apps" / "api").exists():
+            return parent
+    return current.parents[1]
+
+
+ROOT = _runtime_root()
 SKILLS_ROOT = ROOT / "skills"
 
 

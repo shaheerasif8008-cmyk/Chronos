@@ -36,6 +36,7 @@ export default function LoginPage() {
   const router = useRouter();
   const [email, setEmail] = useState("admin@example.com");
   const [code, setCode] = useState("");
+  const [devCode, setDevCode] = useState("");
   const [requested, setRequested] = useState(false);
   const [error, setError] = useState("");
   const [authConfig, setAuthConfig] = useState<AuthConfig | null>(null);
@@ -63,6 +64,8 @@ export default function LoginPage() {
       setError(await res.text());
       return;
     }
+    const data = await res.json();
+    setDevCode(typeof data.dev_code === "string" ? data.dev_code : "");
     setRequested(true);
   }
 
@@ -146,6 +149,11 @@ export default function LoginPage() {
                   type="email"
                 />
               </label>
+              {devCode ? (
+                <div className="rounded-md border border-[#c9ced6] bg-white px-3 py-2 text-sm text-[#2d333b]">
+                  Dev OTP: <span className="font-mono font-semibold">{devCode}</span>
+                </div>
+              ) : null}
               {requested ? (
                 <label className="block">
                   <span className="text-sm font-medium text-[#2d333b]">OTP</span>

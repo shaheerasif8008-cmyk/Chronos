@@ -57,31 +57,33 @@ resource "aws_ecs_task_definition" "api" {
     portMappings = [{ containerPort = 8000, protocol = "tcp" }]
 
     environment = [
-      { name = "ORG_ID",                  value = "default" },
-      { name = "REGION",                  value = var.aws_region },
-      { name = "AUTH_PROVIDER",           value = var.auth_provider },
-      { name = "COGNITO_REGION",          value = var.aws_region },
-      { name = "COGNITO_USER_POOL_ID",    value = var.cognito_user_pool_id },
-      { name = "COGNITO_APP_CLIENT_ID",   value = var.cognito_app_client_id },
-      { name = "COGNITO_DOMAIN",          value = var.cognito_domain },
-      { name = "COGNITO_CALLBACK_URL",    value = var.domain_name != "" ? "https://${var.domain_name}/login/callback" : "http://${aws_lb.web.dns_name}/login/callback" },
-      { name = "DB_SSL_MODE",             value = "require" },
-      { name = "OBJECT_STORAGE_BACKEND",  value = "s3" },
-      { name = "AWS_S3_BUCKET",           value = aws_s3_bucket.artifacts.bucket },
-      { name = "AWS_S3_REGION",           value = var.aws_region },
-      { name = "AWS_S3_ENDPOINT",         value = "" },
-      { name = "OPENFGA_API_URL",         value = "http://${aws_service_discovery_service.openfga.name}.${aws_service_discovery_private_dns_namespace.main.name}:8080" },
-      { name = "PERMISSIONS_ENFORCE",     value = "true" },
+      { name = "ORG_ID", value = "default" },
+      { name = "REGION", value = var.aws_region },
+      { name = "AUTH_PROVIDER", value = var.auth_provider },
+      { name = "FRONTEND_BASE_URL", value = var.domain_name != "" ? "https://${var.domain_name}" : "http://${aws_lb.web.dns_name}" },
+      { name = "OAUTH_CALLBACK_BASE_URL", value = var.domain_name != "" ? "https://api.${var.domain_name}" : "http://${aws_lb.api.dns_name}" },
+      { name = "COGNITO_REGION", value = var.cognito_region },
+      { name = "COGNITO_USER_POOL_ID", value = var.cognito_user_pool_id },
+      { name = "COGNITO_APP_CLIENT_ID", value = var.cognito_app_client_id },
+      { name = "COGNITO_DOMAIN", value = var.cognito_domain },
+      { name = "COGNITO_CALLBACK_URL", value = var.domain_name != "" ? "https://${var.domain_name}/login/callback" : "http://${aws_lb.web.dns_name}/login/callback" },
+      { name = "DB_SSL_MODE", value = "require" },
+      { name = "OBJECT_STORAGE_BACKEND", value = "s3" },
+      { name = "AWS_S3_BUCKET", value = aws_s3_bucket.artifacts.bucket },
+      { name = "AWS_S3_REGION", value = var.aws_region },
+      { name = "AWS_S3_ENDPOINT", value = "" },
+      { name = "OPENFGA_API_URL", value = "http://${aws_service_discovery_service.openfga.name}.${aws_service_discovery_private_dns_namespace.main.name}:8080" },
+      { name = "PERMISSIONS_ENFORCE", value = "true" },
       { name = "TASK_RUNNER_MAX_CONCURRENCY", value = "4" },
-      { name = "TASK_RUNNER_MAX_ATTEMPTS",    value = "2" },
+      { name = "TASK_RUNNER_MAX_ATTEMPTS", value = "2" },
       { name = "TASK_RUNNER_TIMEOUT_SECONDS", value = "1800" },
-      { name = "OPENROUTER_MODEL",        value = "openrouter/deepseek/deepseek-v4-flash:free" },
-      { name = "AGENT_MODEL",             value = "openrouter/deepseek/deepseek-v4-flash:free" },
-      { name = "FAST_MODEL",              value = "openrouter/nvidia/nemotron-3-super-120b-a12b:free" },
-      { name = "BACKUP_MODEL",            value = "openrouter/minimax/minimax-m2.5:free" },
-      { name = "OPENROUTER_API_BASE",     value = "https://openrouter.ai/api/v1" },
-      { name = "EMBEDDING_MODEL",         value = "google/gemini-embedding-2" },
-      { name = "EMBEDDING_DIMENSIONS",    value = "1536" },
+      { name = "OPENROUTER_MODEL", value = "openrouter/deepseek/deepseek-v4-flash:free" },
+      { name = "AGENT_MODEL", value = "openrouter/deepseek/deepseek-v4-flash:free" },
+      { name = "FAST_MODEL", value = "openrouter/nvidia/nemotron-3-super-120b-a12b:free" },
+      { name = "BACKUP_MODEL", value = "openrouter/minimax/minimax-m2.5:free" },
+      { name = "OPENROUTER_API_BASE", value = "https://openrouter.ai/api/v1" },
+      { name = "EMBEDDING_MODEL", value = "google/gemini-embedding-2" },
+      { name = "EMBEDDING_DIMENSIONS", value = "1536" },
       { name = "ACCESS_TOKEN_EXPIRE_MINUTES", value = "60" },
     ]
 
@@ -89,7 +91,7 @@ resource "aws_ecs_task_definition" "api" {
     # appear in task definition JSON or CloudWatch logs.
     secrets = concat(local.task_secrets, [
       {
-        name      = "DATABASE_URL"
+        name = "DATABASE_URL"
         # Build asyncpg URL from known host + secret password at deploy time.
         # The actual value is set by the deploy workflow which calls
         # `aws secretsmanager create-secret --name chronos-prod/database_url`.
@@ -138,8 +140,8 @@ resource "aws_ecs_task_definition" "web" {
     portMappings = [{ containerPort = 3000, protocol = "tcp" }]
 
     environment = [
-      { name = "NODE_ENV",                  value = "production" },
-      { name = "NEXT_PUBLIC_API_BASE_URL",  value = var.domain_name != "" ? "https://api.${var.domain_name}" : "http://${aws_lb.api.dns_name}" },
+      { name = "NODE_ENV", value = "production" },
+      { name = "NEXT_PUBLIC_API_BASE_URL", value = var.domain_name != "" ? "https://api.${var.domain_name}" : "http://${aws_lb.api.dns_name}" },
     ]
 
     logConfiguration = {
@@ -173,12 +175,12 @@ resource "aws_ecs_task_definition" "openfga" {
 
     environment = [
       { name = "OPENFGA_DATASTORE_ENGINE", value = "postgres" },
-      { name = "OPENFGA_LOG_LEVEL",        value = "warn" },
+      { name = "OPENFGA_LOG_LEVEL", value = "warn" },
     ]
 
     secrets = [{
       name      = "OPENFGA_DATASTORE_URI"
-      valueFrom = aws_secretsmanager_secret.database_url.arn
+      valueFrom = aws_secretsmanager_secret.openfga_database_url.arn
     }]
 
     logConfiguration = {
@@ -209,16 +211,19 @@ resource "aws_ecs_task_definition" "migrate" {
     command   = ["sh", "-c", "alembic upgrade head && python seed.py --skip-if-exists"]
 
     environment = [
-      { name = "ORG_ID",                 value = "default" },
-      { name = "REGION",                 value = var.aws_region },
+      { name = "ORG_ID", value = "default" },
+      { name = "REGION", value = var.aws_region },
       { name = "OBJECT_STORAGE_BACKEND", value = "s3" },
-      { name = "AWS_S3_BUCKET",          value = aws_s3_bucket.artifacts.bucket },
-      { name = "AWS_S3_REGION",          value = var.aws_region },
+      { name = "AWS_S3_BUCKET", value = aws_s3_bucket.artifacts.bucket },
+      { name = "AWS_S3_REGION", value = var.aws_region },
+      { name = "AUTH_PROVIDER", value = "dev_otp" },
+      { name = "FRONTEND_BASE_URL", value = var.domain_name != "" ? "https://${var.domain_name}" : "http://${aws_lb.web.dns_name}" },
+      { name = "OAUTH_CALLBACK_BASE_URL", value = var.domain_name != "" ? "https://api.${var.domain_name}" : "http://${aws_lb.api.dns_name}" },
     ]
 
     secrets = concat(local.task_secrets, [
       { name = "DATABASE_URL", valueFrom = aws_secretsmanager_secret.database_url.arn },
-      { name = "REDIS_URL",    valueFrom = aws_secretsmanager_secret.redis_url.arn },
+      { name = "REDIS_URL", valueFrom = aws_secretsmanager_secret.redis_url.arn },
     ])
 
     logConfiguration = {
@@ -362,7 +367,10 @@ resource "aws_service_discovery_service" "api" {
   dns_config {
     namespace_id   = aws_service_discovery_private_dns_namespace.main.id
     routing_policy = "MULTIVALUE"
-    dns_records { ttl = 10; type = "A" }
+    dns_records {
+      ttl  = 10
+      type = "A"
+    }
   }
   health_check_custom_config { failure_threshold = 1 }
 }
@@ -372,7 +380,10 @@ resource "aws_service_discovery_service" "openfga" {
   dns_config {
     namespace_id   = aws_service_discovery_private_dns_namespace.main.id
     routing_policy = "MULTIVALUE"
-    dns_records { ttl = 10; type = "A" }
+    dns_records {
+      ttl  = 10
+      type = "A"
+    }
   }
   health_check_custom_config { failure_threshold = 1 }
 }
@@ -390,4 +401,14 @@ resource "aws_secretsmanager_secret" "database_url" {
 resource "aws_secretsmanager_secret" "redis_url" {
   name                    = "${local.prefix}/redis_url"
   recovery_window_in_days = 7
+}
+
+resource "aws_secretsmanager_secret" "openfga_database_url" {
+  name                    = "${local.prefix}/openfga_database_url"
+  recovery_window_in_days = 7
+}
+
+resource "aws_secretsmanager_secret_version" "openfga_database_url" {
+  secret_id     = aws_secretsmanager_secret.openfga_database_url.id
+  secret_string = "postgres://chronos:${urlencode(random_password.db.result)}@${aws_db_instance.main.address}:5432/chronos"
 }

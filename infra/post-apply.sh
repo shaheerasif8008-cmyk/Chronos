@@ -14,8 +14,9 @@ DB_PASS=$(aws secretsmanager get-secret-value \
   --secret-id "${PREFIX}/rds/password" \
   --region "$REGION" \
   --query SecretString --output text)
+DB_PASS_ENCODED=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$DB_PASS")
 
-DATABASE_URL="postgresql+asyncpg://chronos:${DB_PASS}@${RDS_HOST}:5432/chronos"
+DATABASE_URL="postgresql+asyncpg://chronos:${DB_PASS_ENCODED}@${RDS_HOST}:5432/chronos"
 REDIS_URL="rediss://${REDIS_HOST}:6379/0"
 
 echo "==> Writing DATABASE_URL secret"
