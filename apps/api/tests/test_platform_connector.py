@@ -116,6 +116,27 @@ async def test_actions_mcp_discovery_failure(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_actions_mcp_emits_injectable_schemas(monkeypatch):
+    async def fake_discover(server_id, org_id):
+        return {"status": "healthy", "tools": [
+            {"name": "create_file", "description": "Create", "inputSchema": {"type": "object"}},
+            {"name": "search", "description": "Search", "inputSchema": {"type": "object"}},
+        ]}
+
+    monkeypatch.setattr(pf, "_discover_mcp", fake_discover)
+    result = await pf.platform_connector.execute(
+        "platform.actions", {"platform_id": "mcp:s1"}, _agent())
+    schemas = result.data["tool_schemas"]
+    routes = result.data["tool_routes"]
+    assert len(schemas) == 2 and len(routes) == 2
+    # Each schema name lines up with a route targeting the right MCP action.
+    names = {s["function"]["name"] for s in schemas}
+    assert names == {r["name"] for r in routes}
+    assert {r["action"] for r in routes} == {"create_file", "search"}
+    assert all(r["platform_id"] == "mcp:s1" and r["kind"] == "mcp" for r in routes)
+
+
+@pytest.mark.asyncio
 async def test_actions_api_app(monkeypatch):
     monkeypatch.setattr(pf, "_app_catalog", lambda: {"notion": _fake_app()})
     result = await pf.platform_connector.execute(
@@ -123,6 +144,11 @@ async def test_actions_api_app(monkeypatch):
     assert result.data["kind"] == "api"
     assert {a["name"] for a in result.data["actions"]} == {"search", "read", "write"}
     assert result.data["api_base"] == "https://api.notion.com"
+    # Generic REST app exposes one injectable tool with a method/endpoint schema.
+    schema = result.data["tool_schemas"][0]
+    props = schema["function"]["parameters"]["properties"]
+    assert "method" in props and "endpoint" in props
+    assert result.data["tool_routes"][0]["kind"] == "api"
 
 
 @pytest.mark.asyncio

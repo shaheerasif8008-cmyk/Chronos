@@ -714,15 +714,32 @@ async def _execute_tool(
     call: dict[str, Any],
     task: dict[str, Any],
     agent: AgentContext,
+    dynamic_routes: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Execute one tool call.  Returns a tool-role message for the history.
 
     Raises ApprovalRequired if the broker gates the call.
+
+    ``dynamic_routes`` maps the names of injected platform-action tools (see
+    runtime.platform expansion) to their {platform_id, action} target. A call to
+    one of those names is transparently rewritten into a governed
+    ``platform.invoke`` so it flows through the broker like any other tool.
     """
     tool_name = call["name"]
     args = _parse_args(call["args_str"])
     task_id = task["id"]
     depth = int(task.get("depth") or 0)
+
+    # Injected platform-action tool → rewrite to the governed platform.invoke path.
+    route = (dynamic_routes or {}).get(tool_name)
+    if route:
+        tool_name = "platform__invoke"
+        args = {
+            "platform_id": route.get("platform_id"),
+            "action": route.get("action") or "",
+            "action_args": args,
+        }
+        call = {**call, "name": tool_name}
 
     await emit_activity(task_id, {
         "type": "tool_call",
@@ -763,10 +780,18 @@ async def _execute_tool(
             f"{task_id}:{call['id']}".encode()
         ).hexdigest()[:24]
     created_artifacts: list[dict[str, Any]] = []
+    pf_tools: list[dict[str, Any]] = []
+    pf_routes: list[dict[str, Any]] = []
     try:
         result = await tool_broker.execute(agent, broker_name, args)
         payload = {"summary": result.summary, "data": result.data}
         content = json.dumps(payload, default=str)
+        # platform.actions returns native tool schemas to inject as first-class
+        # tools for subsequent steps. Carry them out-of-band so run_loop can
+        # extend the live tool set; they are stripped before entering history.
+        if isinstance(result.data, dict) and result.data.get("tool_schemas"):
+            pf_tools = result.data.get("tool_schemas") or []
+            pf_routes = result.data.get("tool_routes") or []
         await emit_activity(task_id, {
             "type": "tool_result",
             "tool": tool_name,
@@ -803,6 +828,10 @@ async def _execute_tool(
         # yield each entry as a `{"type": "artifact", "artifact": a}` SSE
         # event so live chats surface artifacts without waiting for refresh.
         "artifacts": created_artifacts,
+        # Out-of-band: native platform tool schemas/routes to inject for later
+        # steps. run_loop pops these; they never enter the LLM history.
+        "_pf_tools": pf_tools,
+        "_pf_routes": pf_routes,
     }
 
 
@@ -1539,6 +1568,10 @@ async def stream_chat_turn(
             # Open/Download cards live. Pop the non-standard key before
             # appending the message to LLM history.
             created_artifacts = tool_msg.pop("artifacts", []) or []
+            # Strip out-of-band platform tool keys (this streaming path does not
+            # inject dynamic tools); they must never enter the LLM history.
+            tool_msg.pop("_pf_tools", None)
+            tool_msg.pop("_pf_routes", None)
             for artifact in created_artifacts:
                 yield {"type": "artifact", "artifact": artifact}
             history.append(tool_msg)
@@ -1630,6 +1663,23 @@ async def run_loop(
     """
     task_id = task["id"]
     effective_tools = tools if tools is not None else ALL_TOOLS
+    # Dynamically-injected platform tools (from platform.actions). Loop-local: on
+    # resume the agent re-discovers via platform.actions, so nothing is persisted.
+    # ``dynamic_routes`` maps an injected tool name → its platform.invoke target.
+    dynamic_tools: list[dict[str, Any]] = []
+    dynamic_routes: dict[str, dict[str, Any]] = {}
+    _MAX_DYNAMIC_TOOLS = 64
+
+    def _absorb_platform_tools(msg: dict[str, Any]) -> None:
+        """Pull native tool schemas/routes off a tool message into the live set."""
+        for schema in msg.pop("_pf_tools", []) or []:
+            name = schema.get("function", {}).get("name")
+            if name and name not in dynamic_routes and len(dynamic_tools) < _MAX_DYNAMIC_TOOLS:
+                dynamic_tools.append(schema)
+        for r in msg.pop("_pf_routes", []) or []:
+            if r.get("name"):
+                dynamic_routes[r["name"]] = r
+
     # Precedence: explicit arg (sub-agents) > model chosen in the UI (stored in
     # agent_state) > default agent model.
     stored_model = (task.get("agent_state") or {}).get("model") if isinstance(task.get("agent_state"), dict) else None
@@ -1718,7 +1768,7 @@ async def run_loop(
         try:
             final_text, calls, step_tokens = await _llm_step(
                 step_history,
-                effective_tools,
+                effective_tools + dynamic_tools if dynamic_tools else effective_tools,
                 effective_model,
                 reasoning_effort=stored_reasoning_effort,
             )
@@ -1882,20 +1932,22 @@ async def run_loop(
         tool_messages: list[dict[str, Any]] = []
         if len(calls) == 1:
             try:
-                tool_msg = await _execute_tool(calls[0], task, agent)
+                tool_msg = await _execute_tool(calls[0], task, agent, dynamic_routes)
             except ApprovalRequired:
                 await _open_approval_gate(task, calls, history, iteration, model=effective_model)
                 return {"status": "awaiting_approval"}
             # Artifacts from this tool call were already emitted to Redis pub/sub
             # inside `_execute_tool`; strip the non-standard key before the
-            # tool message enters the LLM history.
+            # tool message enters the LLM history. Platform tool schemas are
+            # absorbed into the live tool set, then stripped the same way.
             tool_msg.pop("artifacts", None)
+            _absorb_platform_tools(tool_msg)
             tool_messages.append(tool_msg)
             history.append(tool_msg)
         else:
             # Parallel execution — gather all results concurrently
             raw_results = await asyncio.gather(
-                *[_execute_tool(c, task, agent) for c in calls],
+                *[_execute_tool(c, task, agent, dynamic_routes) for c in calls],
                 return_exceptions=True,
             )
             approval_hit = next(
@@ -1916,6 +1968,7 @@ async def run_loop(
                     history.append(tool_msg)
                 else:
                     r.pop("artifacts", None)
+                    _absorb_platform_tools(r)
                     tool_messages.append(r)
                     history.append(r)
 

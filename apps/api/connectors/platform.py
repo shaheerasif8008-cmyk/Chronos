@@ -102,6 +102,59 @@ def _mcp_server_id(platform_id: str) -> str:
     return platform_id[len("mcp:"):] if _is_mcp_id(platform_id) else platform_id
 
 
+#: Prefix for injected, first-class platform-action tools (see runtime.agent_loop).
+INJECTED_TOOL_PREFIX = "pcall_"
+
+
+def _injected_name(platform_id: str, action: str) -> str:
+    """Deterministic, schema-safe tool name for an injected platform action."""
+    import hashlib
+
+    digest = hashlib.sha1(f"{platform_id}:{action}".encode()).hexdigest()[:10]
+    return f"{INJECTED_TOOL_PREFIX}{digest}"
+
+
+def _mcp_tool_schema(platform_id: str, tool: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build (native_tool_schema, route) for one MCP tool so the LLM can call it directly."""
+    action = str(tool.get("name") or "")
+    name = _injected_name(platform_id, action)
+    params = tool.get("inputSchema") or {"type": "object", "properties": {}}
+    schema = {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": f"[{platform_id}] {tool.get('description') or action}",
+            "parameters": params,
+        },
+    }
+    return schema, {"name": name, "platform_id": platform_id, "action": action, "kind": "mcp"}
+
+
+def _api_tool_schema(platform_id: str, app: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build (native_tool_schema, route) for a generic REST app call."""
+    name = _injected_name(platform_id, "request")
+    schema = {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": f"[{platform_id}] Call the {app.name} REST API. "
+                           f"Choose the HTTP method and endpoint path (base {app.api_base}).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "method": {"type": "string", "description": "GET/POST/PUT/PATCH/DELETE"},
+                    "endpoint": {"type": "string", "description": "Path relative to the API base."},
+                    "params": {"type": "object", "description": "Query parameters."},
+                    "body": {"type": "object", "description": "JSON request body."},
+                },
+                "required": ["method", "endpoint"],
+            },
+        },
+    }
+    return schema, {"name": name, "platform_id": platform_id, "action": "", "kind": "api"}
+
+
+
 # ── connector ────────────────────────────────────────────────────────────────
 
 
@@ -206,16 +259,22 @@ class PlatformConnector:
                             f"{discovery.get('message')}",
                 )
             actions = []
+            tool_schemas: list[dict[str, Any]] = []
+            tool_routes: list[dict[str, Any]] = []
             for t in discovery.get("tools") or []:
                 actions.append({
                     "name": t.get("name"),
                     "description": t.get("description") or "",
                     "parameters": t.get("inputSchema") or {"type": "object"},
                 })
+                schema, route = _mcp_tool_schema(platform_id, t)
+                tool_schemas.append(schema)
+                tool_routes.append(route)
             return ToolResult(
                 data={"platform_id": platform_id, "kind": "mcp", "actions": actions,
+                      "tool_schemas": tool_schemas, "tool_routes": tool_routes,
                       "invoke_with": "platform.invoke(platform_id, action, action_args)"},
-                summary=f"{len(actions)} action(s) on {platform_id}; call with platform.invoke.",
+                summary=f"{len(actions)} action(s) on {platform_id}; now callable directly.",
             )
 
         # REST/OAuth app.
@@ -226,14 +285,16 @@ class PlatformConnector:
                 summary=f"platform.actions: unknown platform {platform_id!r}",
             )
         actions = [{"name": a, "description": f"{a} via {app.name} REST API"} for a in app.actions]
+        schema, route = _api_tool_schema(platform_id, app)
         return ToolResult(
             data={
                 "platform_id": platform_id, "kind": "api", "actions": actions,
                 "api_base": app.api_base,
+                "tool_schemas": [schema], "tool_routes": [route],
                 "invoke_with": "platform.invoke(platform_id, action_args={method, endpoint, params?, body?})",
                 "note": "This is a generic REST app: choose the HTTP method and endpoint path.",
             },
-            summary=f"{app.name}: {len(actions)} action group(s) via generic REST (platform.invoke).",
+            summary=f"{app.name}: {len(actions)} action group(s) via generic REST; now callable directly.",
         )
 
     # ── platform.invoke ───────────────────────────────────────────────────────
