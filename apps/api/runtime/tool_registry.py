@@ -402,6 +402,66 @@ DESKTOP_TOOLS = [
     DESKTOP_CLOSE,
 ]
 
+# ── Canva ─────────────────────────────────────────────────────────────────────
+# Governed Canva Connect API. Note: the API cannot freely lay out arbitrary
+# slides from prose — reliable content fill is via autofill against a brand
+# template; create_design returns an edit URL for a human to finish.
+
+CANVA_CREATE_DESIGN = _fn(
+    "canva__create_design",
+    "Create a new Canva design (e.g. a presentation) in the connected Canva account and return its "
+    "edit/view URLs. Use this to start a deck; the Canva API cannot lay out arbitrary slide content "
+    "from prose, so finish detailed layout via canva__autofill (brand template) or hand the edit URL "
+    "to the user.",
+    {
+        "title": {"type": "string", "description": "Design title."},
+        "design_type": {"type": "string", "description": "Canva preset, e.g. 'presentation', 'doc', 'whiteboard'.", "default": "presentation"},
+        "asset_id": {"type": "string", "description": "Optional uploaded asset id to seed the design.", "default": ""},
+    },
+    ["title"],
+)
+CANVA_LIST_BRAND_TEMPLATES = _fn(
+    "canva__list_brand_templates",
+    "List brand templates available in the connected Canva account. Autofill targets one of these by id. "
+    "Inspect a template's data fields before calling canva__autofill.",
+    {"query": {"type": "string", "description": "Optional title search filter.", "default": ""}},
+    [],
+)
+CANVA_AUTOFILL = _fn(
+    "canva__autofill",
+    "Populate a Canva brand template with content and produce a finished design. This is the reliable way "
+    "to programmatically build a deck: provide the brand_template_id and a 'data' map of the template's "
+    "field names to text/image values. Returns the resulting design's edit URL.",
+    {
+        "brand_template_id": {"type": "string", "description": "Brand template id from canva__list_brand_templates."},
+        "data": {"type": "object", "description": "Map of template data-field name → value (text or asset reference)."},
+    },
+    ["brand_template_id", "data"],
+)
+CANVA_EXPORT = _fn(
+    "canva__export",
+    "Export a Canva design to a downloadable file (pptx, pdf, png, jpg) and return the download URLs.",
+    {
+        "design_id": {"type": "string", "description": "Design id to export."},
+        "format": {"type": "string", "enum": ["pptx", "pdf", "png", "jpg"], "default": "pptx"},
+    },
+    ["design_id"],
+)
+CANVA_GET_DESIGN = _fn(
+    "canva__get_design",
+    "Fetch metadata (title, edit/view URLs) for a Canva design by id.",
+    {"design_id": {"type": "string"}},
+    ["design_id"],
+)
+
+CANVA_TOOLS = [
+    CANVA_CREATE_DESIGN,
+    CANVA_LIST_BRAND_TEMPLATES,
+    CANVA_AUTOFILL,
+    CANVA_EXPORT,
+    CANVA_GET_DESIGN,
+]
+
 # ── Repo workspace ────────────────────────────────────────────────────────────
 
 REPO_CLONE = _fn(
@@ -816,6 +876,7 @@ ALL_TOOLS: list[dict[str, Any]] = [
     CODE_PYTHON,
     *COMPUTER_TOOLS,
     *DESKTOP_TOOLS,
+    *CANVA_TOOLS,
     *REPO_WORKSPACE_TOOLS,
     DOC_PARSE,
     DOC_READ,
@@ -843,6 +904,7 @@ SUBAGENT_TOOLS: list[dict[str, Any]] = [
     CODE_PYTHON,
     *COMPUTER_TOOLS,
     *DESKTOP_TOOLS,
+    *CANVA_TOOLS,
     *REPO_WORKSPACE_TOOLS,
     DOC_PARSE,
     DOC_READ,
@@ -878,6 +940,7 @@ INLINE_CHAT_TOOLS: list[dict[str, Any]] = [
     FS_WRITE,
     CODE_PYTHON,
     *COMPUTER_TOOLS,
+    *CANVA_TOOLS,
     DOC_PARSE,
     DOC_READ,
     DOC_SUMMARIZE,

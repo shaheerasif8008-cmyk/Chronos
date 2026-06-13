@@ -336,6 +336,10 @@ async def _route(agent: AgentContext, tool: str, args: dict, vault_ref: str, tie
         from connectors.desktop import desktop_connector
         return await desktop_connector.execute(tool, routed_args)
 
+    if provider == "canva":
+        from connectors.canva import canva_connector
+        return await canva_connector.execute(tool, routed_args)
+
     if provider == "mcp":
         from connectors.mcp_client import mcp_connector
         return await mcp_connector.execute(tool, routed_args, agent)
@@ -407,7 +411,7 @@ class ToolBroker:
         # when external OAuth or browser dependencies are not configured.
         provider = tool.split(".")[0]
         tier = await connector_tier(provider)
-        if tier == "live" and provider not in {"browser", "fs", "code", "doc", "image", "voice", "data", "chat_history", "repo", "computer", "local_computer", "desktop", "skill"}:
+        if tier == "live" and provider not in {"browser", "fs", "code", "doc", "image", "voice", "data", "chat_history", "repo", "computer", "local_computer", "desktop", "canva", "skill"}:
             from connectors.registry import get as registry_get
 
             connector = await registry_get(agent, tool)
