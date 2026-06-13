@@ -305,6 +305,103 @@ COMPUTER_TOOLS = [
     LOCAL_COMPUTER_REVOKE,
 ]
 
+# ── Desktop GUI operator ──────────────────────────────────────────────────────
+# Vision-driven desktop control over an isolated virtual display. The agent
+# perceives via desktop__screenshot (the image is fed back into the loop) and
+# acts via move/click/type/key/scroll. Launching an app is risk-tiered and
+# requires a human approval record.
+
+DESKTOP_CREATE_SESSION = _fn(
+    "desktop__create_session",
+    "Create an isolated virtual-desktop session for GUI operation. State persists across actions. "
+    "Provide a clear purpose; the session runs apps on a private virtual display.",
+    {
+        "purpose": {"type": "string", "description": "Why this desktop session is needed.", "default": "desktop task"},
+        "consent": {"type": "object", "description": "Optional purpose/scope metadata for the session.", "default": {}},
+    },
+    [],
+)
+DESKTOP_SCREENSHOT = _fn(
+    "desktop__screenshot",
+    "Capture the current virtual-desktop screen. ALWAYS take a screenshot before deciding where to click or type — "
+    "the image is returned to you so you can see the desktop and choose pixel coordinates.",
+    {"session_id": {"type": "string", "description": "Desktop session id. Omit to create one."}},
+    [],
+)
+DESKTOP_MOVE = _fn(
+    "desktop__move",
+    "Move the mouse pointer to absolute pixel coordinates on the virtual desktop.",
+    {"session_id": {"type": "string"}, "x": {"type": "integer"}, "y": {"type": "integer"}},
+    ["session_id", "x", "y"],
+)
+DESKTOP_CLICK = _fn(
+    "desktop__click",
+    "Click the mouse on the virtual desktop. Provide x/y to click at coordinates, or omit to click at the current position. "
+    "Decide coordinates from the most recent desktop__screenshot.",
+    {
+        "session_id": {"type": "string"},
+        "x": {"type": "integer", "description": "Optional x coordinate to move to before clicking."},
+        "y": {"type": "integer", "description": "Optional y coordinate to move to before clicking."},
+        "button": {"type": "string", "enum": ["left", "middle", "right"], "default": "left"},
+        "clicks": {"type": "integer", "description": "1 for single, 2 for double click.", "default": 1},
+    },
+    ["session_id"],
+)
+DESKTOP_TYPE = _fn(
+    "desktop__type",
+    "Type literal text into the focused element on the virtual desktop. Click the target field first.",
+    {"session_id": {"type": "string"}, "text": {"type": "string"}},
+    ["session_id", "text"],
+)
+DESKTOP_KEY = _fn(
+    "desktop__key",
+    "Press a key or key combination on the virtual desktop, e.g. 'Return', 'ctrl+s', 'alt+Tab', 'ctrl+shift+t'.",
+    {"session_id": {"type": "string"}, "keys": {"type": "string"}},
+    ["session_id", "keys"],
+)
+DESKTOP_SCROLL = _fn(
+    "desktop__scroll",
+    "Scroll the virtual desktop up or down at the current pointer position.",
+    {
+        "session_id": {"type": "string"},
+        "direction": {"type": "string", "enum": ["up", "down"], "default": "down"},
+        "amount": {"type": "integer", "description": "Number of scroll steps (1-20).", "default": 3},
+    },
+    ["session_id"],
+)
+DESKTOP_OPEN_APP = _fn(
+    "desktop__open_app",
+    "Launch a GUI application into the virtual desktop by shell command (e.g. 'xterm', 'firefox https://example.com'). "
+    "Risk-tiered: requires a human approval record before the app is launched.",
+    {"session_id": {"type": "string"}, "command": {"type": "string"}},
+    ["session_id", "command"],
+)
+DESKTOP_GET_STATE = _fn(
+    "desktop__get_state",
+    "Return the current virtual-desktop session state (status, display, recent action history).",
+    {"session_id": {"type": "string"}},
+    ["session_id"],
+)
+DESKTOP_CLOSE = _fn(
+    "desktop__close",
+    "Close a virtual-desktop session and tear down its display and apps.",
+    {"session_id": {"type": "string"}},
+    ["session_id"],
+)
+
+DESKTOP_TOOLS = [
+    DESKTOP_CREATE_SESSION,
+    DESKTOP_SCREENSHOT,
+    DESKTOP_MOVE,
+    DESKTOP_CLICK,
+    DESKTOP_TYPE,
+    DESKTOP_KEY,
+    DESKTOP_SCROLL,
+    DESKTOP_OPEN_APP,
+    DESKTOP_GET_STATE,
+    DESKTOP_CLOSE,
+]
+
 # ── Repo workspace ────────────────────────────────────────────────────────────
 
 REPO_CLONE = _fn(
@@ -718,6 +815,7 @@ ALL_TOOLS: list[dict[str, Any]] = [
     FS_WRITE,
     CODE_PYTHON,
     *COMPUTER_TOOLS,
+    *DESKTOP_TOOLS,
     *REPO_WORKSPACE_TOOLS,
     DOC_PARSE,
     DOC_READ,
@@ -744,6 +842,7 @@ SUBAGENT_TOOLS: list[dict[str, Any]] = [
     FS_WRITE,
     CODE_PYTHON,
     *COMPUTER_TOOLS,
+    *DESKTOP_TOOLS,
     *REPO_WORKSPACE_TOOLS,
     DOC_PARSE,
     DOC_READ,
@@ -758,7 +857,7 @@ SUBAGENT_TOOLS: list[dict[str, Any]] = [
 
 #: Names that always need explicit human approval before execution.
 ALWAYS_APPROVAL_TOOL_NAMES: frozenset[str] = frozenset(
-    {"gmail__send", "twitter__post", "linkedin__post", "website__publish", "local_computer__exec", "local_computer__open_app"}
+    {"gmail__send", "twitter__post", "linkedin__post", "website__publish", "local_computer__exec", "local_computer__open_app", "desktop__open_app"}
 )
 
 _SUBAGENT_TOOL_NAME = "spawn__subagent"
