@@ -466,12 +466,21 @@ def _format_inherited_context(inherited: dict[str, Any]) -> str:
 
 def _format_attachments_context(attachments: list[dict[str, Any]]) -> str:
     """Render parsed attachment previews as one immutable seed block."""
-    lines = ["# Attached files", "The user attached these files. Their parsed text follows."]
+    lines = [
+        "# Attached files",
+        "The user attached these files. Their parsed text follows. To act on a file "
+        "(read more, fill in a PDF in place, detect form fields, summarize), use the "
+        "doc__* tools with its source artifact_id.",
+    ]
     for a in attachments:
         name = str(a.get("filename") or "file")
+        # Source file artifact (raw bytes) — what doc__fill_pdf / doc__detect_fields need.
+        source_artifact_id = str(a.get("attachment_id") or "")
         artifact_id = str(a.get("parsed_artifact_id") or a.get("attachment_id") or "")
         note = a.get("note")
         header = f"\n## {name}"
+        if source_artifact_id:
+            header += f"  (source artifact_id={source_artifact_id})"
         if a.get("truncated"):
             header += f"  (truncated — use doc__read with artifact_id={artifact_id} for more)"
         if note:
@@ -812,6 +821,14 @@ async def _execute_tool(
             created_artifacts = await _scan_workspace_for_artifacts(task)
             for artifact in created_artifacts:
                 await emit_activity(task_id, {"type": "artifact", **artifact})
+        # Tools that create artifacts directly (doc.*, image.*) report them as
+        # artifact_id / artifact_ids in result.data. Surface each as a card so a
+        # filled PDF, generated image, or authored deck appears in chat without a
+        # workspace round-trip.
+        if isinstance(result.data, dict):
+            for surfaced in await _surface_result_artifacts(task, result.data):
+                created_artifacts.append(surfaced)
+                await emit_activity(task_id, {"type": "artifact", **surfaced})
     except ApprovalRequired:
         raise  # propagate — caller decides whether to gate
     except Exception as exc:
@@ -920,6 +937,43 @@ async def _maybe_create_artifact(task: dict[str, Any], args: dict[str, Any]) -> 
         "mime_type": mime,
         "size_bytes": len(file_content.encode("utf-8")),
 }
+
+
+async def _surface_result_artifacts(
+    task: dict[str, Any], data: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Build artifact card payloads for artifacts a tool created and returned by id.
+
+    Tools like the doc authoring and image connectors persist their output via
+    save_artifact and return ``artifact_id`` / ``artifact_ids`` in ToolResult.data.
+    This resolves each id's metadata (org-checked) into the standard event shape
+    so the chat/activity stream renders an Open/Download card. Dedups and skips
+    ids that are missing or belong to another org.
+    """
+    from core.artifacts import get_artifact
+
+    ids: list[str] = []
+    single = data.get("artifact_id")
+    if isinstance(single, str) and single:
+        ids.append(single)
+    for x in data.get("artifact_ids") or []:
+        if isinstance(x, str) and x:
+            ids.append(x)
+
+    org_id = str(task.get("organization_id") or "default")
+    out: list[dict[str, Any]] = []
+    for aid in dict.fromkeys(ids):  # dedup, preserve order
+        meta = await get_artifact(aid)
+        if not meta or str(meta.get("organization_id", "")) != org_id:
+            continue
+        out.append({
+            "artifact_id": aid,
+            "title": meta.get("title") or "file",
+            "kind": meta.get("kind") or "file",
+            "mime_type": meta.get("mime_type") or "application/octet-stream",
+            "size_bytes": int(meta.get("size_bytes") or 0),
+        })
+    return out
 
 
 async def _scan_workspace_for_artifacts(task: dict[str, Any]) -> list[dict[str, Any]]:
