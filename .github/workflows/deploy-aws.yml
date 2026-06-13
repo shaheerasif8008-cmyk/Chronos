@@ -79,7 +79,7 @@ jobs:
           cache-from: type=gha,scope=api
           cache-to: type=gha,mode=max,scope=api
           build-args: |
-            INSTALL_PLAYWRIGHT=0
+            INSTALL_PLAYWRIGHT=1
 
       - name: Build & push web image
         uses: docker/build-push-action@v5

@@ -8,9 +8,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# System deps: libpq for asyncpg, gcc for compiled wheels, pandoc/wkhtmltopdf
-# not needed — parsing is pure-Python. Playwright browsers are optional (browser
-# connector); install them only if INSTALL_PLAYWRIGHT=1 is set at build time.
+# System deps: libpq for asyncpg, gcc for compiled wheels, and curl for health
+# checks. Playwright installs its own browser OS dependencies below.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev gcc g++ libffi-dev libssl-dev curl \
     && rm -rf /var/lib/apt/lists/*
@@ -19,9 +18,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
-# Playwright chromium (browser connector). Building without it is fine; the
-# connector will raise a clear error if invoked without the binary.
-ARG INSTALL_PLAYWRIGHT=0
+# Playwright chromium (browser connector). The production API image must include
+# Chromium so broker-routed browser tasks do not start in degraded mode. Local
+# debug builds can opt out with INSTALL_PLAYWRIGHT=0.
+ARG INSTALL_PLAYWRIGHT=1
 RUN if [ "$INSTALL_PLAYWRIGHT" = "1" ]; then \
         playwright install chromium --with-deps; \
     fi
