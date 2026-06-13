@@ -2,18 +2,16 @@ import { test, expect } from "@playwright/test";
 import fs from "node:fs";
 import path from "node:path";
 
-test("tasks screen: static route and management actions", async () => {
+test("tasks page redirects to activity", async () => {
   const pageSrc = fs.readFileSync(path.join(process.cwd(), "app/chat/page.tsx"), "utf8");
-  expect(pageSrc).toContain("<TasksScreen");
-  expect(pageSrc).toContain('route === "tasks"');
-  expect(pageSrc).toContain('pathname === "/tasks"');
-  expect(pageSrc).toContain('label: "Tasks"');
-  expect(pageSrc).toContain("function TasksScreen");
+  expect(pageSrc).not.toContain('route === "tasks"');
+  expect(pageSrc).not.toContain('{ id: "tasks"      as Route');
+  expect(pageSrc).toContain("ActivityScreen");
   expect(pageSrc).toContain("/tasks/${taskId}/${action}");
   expect(pageSrc).toContain('"dead_letter"');
 
   const routeSrc = fs.readFileSync(path.join(process.cwd(), "app/tasks/page.tsx"), "utf8");
-  expect(routeSrc).toContain('export { default } from "../chat/page"');
+  expect(routeSrc).toContain('redirect("/activity")');
 });
 
 test("audit screen: static route reusing the audit log viewer", async () => {
@@ -29,13 +27,14 @@ test("audit screen: static route reusing the audit log viewer", async () => {
   expect(routeSrc).toContain('export { default } from "../chat/page"');
 });
 
-test("data screen: rendered inside the app shell", async () => {
+test("data is managed from settings", async () => {
   const pageSrc = fs.readFileSync(path.join(process.cwd(), "app/chat/page.tsx"), "utf8");
-  expect(pageSrc).toContain("<DataScreen");
-  expect(pageSrc).toContain('route === "data"');
-  expect(pageSrc).toContain('pathname === "/data"');
-  expect(pageSrc).toContain('label: "Data"');
+  expect(pageSrc).toContain("AccountDataSettings");
+  expect(pageSrc).toContain('id: "data", label: "Data"');
+  expect(pageSrc).toContain("Upload documents in chat");
+  expect(pageSrc).not.toContain("<DataScreen");
+  expect(pageSrc).not.toContain('route === "data"');
 
   const routeSrc = fs.readFileSync(path.join(process.cwd(), "app/data/page.tsx"), "utf8");
-  expect(routeSrc).toContain('export { default } from "../chat/page"');
+  expect(routeSrc).toContain('redirect("/settings?tab=data")');
 });

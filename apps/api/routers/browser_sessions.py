@@ -24,6 +24,10 @@ class HandBackRequest(BaseModel):
     summary: str
 
 
+class RequestTakeoverRequest(BaseModel):
+    reason: str = "User requested manual control"
+
+
 class ApproveSensitiveSiteRequest(BaseModel):
     domain: str
     approval_id: str | None = None
@@ -102,6 +106,20 @@ async def hand_back_browser_session(
         organization_id=member.organization_id,
         member_id=member.id,
         summary=req.summary,
+    )
+
+
+@router.post("/{session_id}/request-takeover")
+async def request_browser_takeover(
+    session_id: str,
+    req: RequestTakeoverRequest,
+    member: Member = Depends(get_current_member),
+) -> dict[str, Any]:
+    await permissions.check(member, "request_browser_takeover", session_id)
+    return await browser_operator.request_takeover(
+        session_id,
+        organization_id=member.organization_id,
+        reason=req.reason,
     )
 
 

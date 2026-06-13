@@ -4,11 +4,7 @@ import { Component, ReactNode, useEffect, useRef, useState, useMemo, useCallback
 import { usePathname, useRouter } from "next/navigation";
 import ArtifactsScreen from "../../components/artifacts/ArtifactsScreen";
 import AgentsScreen from "../../components/agents/AgentsScreen";
-import BrowserOperatorScreen from "../../components/browser/BrowserOperatorScreen";
-import ComputerScreen from "../../components/computer/ComputerScreen";
-import DataScreen from "../../components/data/DataScreen";
 import InChatArtifactPanel from "../../components/artifacts/InChatArtifactPanel";
-import ResearchScreen from "../../components/research/ResearchScreen";
 import SkillsScreen from "../../components/skills/SkillsScreen";
 import Markdown from "../../components/Markdown";
 
@@ -41,8 +37,8 @@ function formatSearchResultTime(value?: string) {
 }
 
 // ─── Types ───────────────────────────────────────────────────────────────────
-type Route = "chat" | "activity" | "approvals" | "memory" | "connectors" | "assistants" | "settings" | "projects" | "research" | "browser" | "computer" | "tasks" | "artifacts" | "agents" | "workflows" | "skills" | "audit" | "data";
-type SettingsTab = "general" | "profile" | "organization" | "members" | "permissions" | "employees" | "runtime" | "memory-settings" | "tools-settings" | "approval-settings" | "notifications" | "security" | "billing" | "audit" | "developer" | "danger";
+type Route = "chat" | "activity" | "approvals" | "memory" | "connectors" | "assistants" | "settings" | "projects" | "artifacts" | "agents" | "workflows" | "skills" | "audit";
+type SettingsTab = "general" | "profile" | "organization" | "members" | "permissions" | "employees" | "runtime" | "memory-settings" | "data" | "tools-settings" | "approval-settings" | "notifications" | "security" | "billing" | "audit" | "developer" | "danger";
 type Conversation = { id: string; title: string | null; updated_at?: string; created_at?: string };
 type MessageRole = "user" | "assistant" | "system" | "tool";
 type MessageStatus = "streaming" | "complete" | "paused" | "approval_pending" | "error";
@@ -194,6 +190,25 @@ type TaskStreamEvent = {
   payload?: Record<string, unknown>;
 };
 type Approval = { id: string; task_id: string; step_id: string; action_type: string; action_payload: Record<string, unknown>; requested_at?: string; status: string; summary?: string };
+type BrowserSession = {
+  id: string;
+  status: string;
+  current_url?: string | null;
+  title?: string | null;
+  screenshot_data_url?: string | null;
+  takeover_state?: string | null;
+  takeover_reason?: string | null;
+  updated_at?: string | null;
+  created_at?: string | null;
+};
+type ComputerSession = {
+  id: string;
+  status: string;
+  purpose?: string | null;
+  workspace_path?: string | null;
+  updated_at?: string | null;
+  created_at?: string | null;
+};
 
 // Payload keys that are runtime plumbing, never useful to an approver.
 const INTERNAL_PAYLOAD_KEYS = new Set(["call_id", "agent_loop", "batch_id", "tool", "args", "justification", "step_id", "task_id"]);
@@ -540,15 +555,10 @@ function routeFromPath(pathname: string | null): Route {
   if (pathname === "/artifacts") return "artifacts";
   if (pathname === "/settings") return "settings";
   if (pathname === "/projects") return "projects";
-  if (pathname === "/research") return "research";
-  if (pathname === "/browser") return "browser";
-  if (pathname === "/computer") return "computer";
-  if (pathname === "/tasks") return "tasks";
   if (pathname === "/agents") return "agents";
   if (pathname === "/workflows") return "workflows";
   if (pathname === "/skills") return "skills";
   if (pathname === "/audit") return "audit";
-  if (pathname === "/data") return "data";
   return "chat";
 }
 
@@ -829,6 +839,12 @@ function ChronosAppInner() {
 
   useEffect(() => {
     setRoute(routeFromPath(pathname));
+    if (pathname === "/settings") {
+      const queryTab = new URLSearchParams(window.location.search).get("tab");
+      if (queryTab && SETTING_TABS.some(item => item.id === queryTab)) {
+        setSettingsTab(queryTab as SettingsTab);
+      }
+    }
   }, [pathname]);
 
   useEffect(() => {
@@ -997,15 +1013,10 @@ function ChronosAppInner() {
         }} />}
         {route === "settings"   && <SettingsScreen tab={settingsTab} setTab={setSettingsTab} theme={theme} setTheme={setTheme} accent={accent} setAccent={setAccent} signOut={signOut} />}
         {route === "projects"   && <ProjectsScreen />}
-        {route === "research"   && <ResearchScreen />}
         {route === "skills"     && <SkillsScreen />}
-        {route === "browser"    && <BrowserOperatorScreen />}
-        {route === "computer"   && <ComputerScreen />}
-        {route === "tasks"      && <TasksScreen />}
         {route === "agents"     && <AgentsScreen />}
         {route === "workflows"  && <WorkflowsScreen />}
         {route === "audit"      && <AuditScreen />}
-        {route === "data"       && <DataScreen />}
       </main>
       <InChatArtifactPanel />
       {shellNotice && (
@@ -1077,14 +1088,9 @@ function Sidebar({
   ];
   const advancedNav = [
     { id: "assistants" as Route, icon: <IC.Personas size={15}/>,   label: "Assistants", badge: null, badgeKind: undefined },
-    { id: "research"   as Route, icon: <IC.Search size={15}/>,     label: "Research",   badge: null, badgeKind: undefined },
-    { id: "browser"    as Route, icon: <IC.Globe size={15}/>,      label: "Browser",    badge: null, badgeKind: undefined },
-    { id: "computer"   as Route, icon: <IC.Briefcase size={15}/>,  label: "Computer",   badge: null, badgeKind: undefined },
     { id: "agents"     as Route, icon: <IC.Sparkles size={15}/>,   label: "Agents",     badge: null, badgeKind: undefined },
     { id: "workflows"  as Route, icon: <IC.Refresh size={15}/>,    label: "Workflows",  badge: null, badgeKind: undefined },
     { id: "skills"     as Route, icon: <IC.Sparkles size={15}/>,   label: "Skills",     badge: null, badgeKind: undefined },
-    { id: "tasks"      as Route, icon: <IC.Clock size={15}/>,      label: "Tasks",      badge: null, badgeKind: undefined },
-    { id: "data"       as Route, icon: <IC.Filter size={15}/>,     label: "Data",       badge: null, badgeKind: undefined },
     { id: "audit"      as Route, icon: <IC.Audit size={15}/>,      label: "Audit",      badge: null, badgeKind: undefined },
   ];
   const advancedActive = advancedNav.some(it => it.id === route);
@@ -1398,10 +1404,13 @@ function ChatScreen({
   const [retryBusy, setRetryBusy] = useState(false);
   const [taskStreamRetry, setTaskStreamRetry] = useState(0);
   const [activityOpen, setActivityOpen] = useState(false);
+  const [operationsOpen, setOperationsOpen] = useState(false);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
   const [activeTask, setActiveTask] = useState<Task | null>(null);
   const [activeTaskEvents, setActiveTaskEvents] = useState<TaskStreamEvent[]>([]);
   const [activeTaskStreamError, setActiveTaskStreamError] = useState("");
+  const [browserSessions, setBrowserSessions] = useState<BrowserSession[]>([]);
+  const [computerSessions, setComputerSessions] = useState<ComputerSession[]>([]);
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [personaMenuOpen, setPersonaMenuOpen] = useState(false);
@@ -1435,6 +1444,29 @@ function ChatScreen({
       attachmentPreviewUrlsRef.current.forEach(url => URL.revokeObjectURL(url));
       attachmentPreviewUrlsRef.current.clear();
     };
+  }, []);
+
+  const loadOperations = useCallback(async () => {
+    const [browserRows, computerRows] = await Promise.all([
+      apiFetch("/browser-sessions/").then(r => r.json()).catch(() => []),
+      apiFetch("/computer-sessions/").then(r => r.json()).catch(() => []),
+    ]) as [BrowserSession[], ComputerSession[]];
+    setBrowserSessions(browserRows);
+    setComputerSessions(computerRows);
+  }, []);
+
+  useEffect(() => {
+    void loadOperations();
+    const timer = setInterval(() => void loadOperations(), 5_000);
+    return () => clearInterval(timer);
+  }, [loadOperations]);
+
+  useEffect(() => {
+    const pending = window.localStorage.getItem("chronos.chat.pendingDraft");
+    if (!pending) return;
+    window.localStorage.removeItem("chronos.chat.pendingDraft");
+    setDraft(current => current ? `${current}\n\n${pending}` : pending);
+    requestAnimationFrame(() => composerRef.current?.focus());
   }, []);
 
   // ── Command palette (⌘K) ──────────────────────────────────────────────────
@@ -2443,6 +2475,19 @@ function ChatScreen({
             </div>
           </div>
           <div className="flex items-center gap-1">
+            <button
+              onClick={() => setOperationsOpen(true)}
+              className="flex items-center gap-2 px-2.5 py-1.5 rounded-md smooth hover:bg-[var(--surface-2)]"
+              title="Live browser and computer"
+            >
+              <IC.Eye size={13} style={{ color: "var(--text-dim)" }}/>
+              <span className="text-[12.5px]" style={{ color: "var(--text-muted)" }}>
+                Live
+              </span>
+              {(browserSessions.some(session => session.takeover_state === "requested") || computerSessions.some(session => session.status === "active")) && (
+                <Dot color={browserSessions.some(session => session.takeover_state === "requested") ? "var(--warn)" : "var(--accent)"} size={6} pulse ring/>
+              )}
+            </button>
             {!isEmpty && activeTaskId && !activityOpen && (
               <button onClick={() => setActivityOpen(true)}
                       className="flex items-center gap-2 px-2.5 py-1.5 rounded-md smooth hover:bg-[var(--surface-2)]">
@@ -2693,6 +2738,15 @@ function ChatScreen({
           streamError={activeTaskStreamError}
           onReconnect={() => setTaskStreamRetry(n => n + 1)}
           onClose={() => setActivityOpen(false)}
+        />
+      )}
+
+      {operationsOpen && (
+        <LiveOperationsDrawer
+          browserSessions={browserSessions}
+          computerSessions={computerSessions}
+          onRefresh={() => void loadOperations()}
+          onClose={() => setOperationsOpen(false)}
         />
       )}
 
@@ -3864,6 +3918,137 @@ function EmptyChatState({ persona, onSubmit }: { persona: typeof PERSONAS[0]; on
         </div>
       </div>
     </div>
+  );
+}
+
+function LiveOperationsDrawer({
+  browserSessions,
+  computerSessions,
+  onRefresh,
+  onClose,
+}: {
+  browserSessions: BrowserSession[];
+  computerSessions: ComputerSession[];
+  onRefresh: () => void;
+  onClose: () => void;
+}) {
+  const [activeBrowserId, setActiveBrowserId] = useState<string | null>(browserSessions[0]?.id ?? null);
+  const [handBackSummary, setHandBackSummary] = useState("");
+  const activeBrowser = browserSessions.find(session => session.id === activeBrowserId) ?? browserSessions[0] ?? null;
+  const activeComputer = computerSessions.find(session => session.status === "active") ?? computerSessions[0] ?? null;
+
+  useEffect(() => {
+    setActiveBrowserId(current => current && browserSessions.some(session => session.id === current) ? current : browserSessions[0]?.id ?? null);
+  }, [browserSessions]);
+
+  async function postBrowser(path: string, body?: Record<string, unknown>) {
+    if (!activeBrowser) return;
+    await apiFetch(`/browser-sessions/${activeBrowser.id}/${path}`, {
+      method: "POST",
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    setHandBackSummary("");
+    onRefresh();
+  }
+
+  return (
+    <aside
+      className="w-[430px] max-w-[46vw] border-l hairline surface flex flex-col z-30 fadein"
+      style={{ boxShadow: "-10px 0 28px color-mix(in oklch, var(--text) 8%, transparent)" }}
+      aria-label="Live browser and computer"
+    >
+      <div className="px-4 py-3 border-b hairline flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-[14px] font-semibold">Live work</div>
+          <div className="text-[12px]" style={{ color: "var(--text-dim)" }}>Browser feed, approvals, and takeover stay in chat.</div>
+        </div>
+        <div className="flex items-center gap-1">
+          <button className="btn btn-ghost btn-icon" onClick={onRefresh} title="Refresh live work"><IC.Refresh size={14}/></button>
+          <button className="btn btn-ghost btn-icon" onClick={onClose} title="Close live work"><IC.X size={14}/></button>
+        </div>
+      </div>
+
+      <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-4">
+        <section className="rounded-xl border border-soft overflow-hidden">
+          <div className="px-3 py-2 border-b hairline flex items-center justify-between">
+            <div className="flex items-center gap-2 text-[13px] font-medium"><IC.Globe size={14}/> Browser</div>
+            <Tag variant={activeBrowser?.takeover_state === "requested" ? "warn" : activeBrowser?.status === "active" ? "accent" : "default"}>
+              {activeBrowser?.takeover_state === "requested" ? "Takeover needed" : activeBrowser?.status || "No session"}
+            </Tag>
+          </div>
+          {browserSessions.length > 1 && (
+            <div className="px-3 py-2 border-b hairline">
+              <select className="surface border border-soft rounded-md px-2 py-1.5 text-[12.5px] w-full" value={activeBrowser?.id ?? ""} onChange={event => setActiveBrowserId(event.target.value)}>
+                {browserSessions.map(session => <option key={session.id} value={session.id}>{session.title || session.current_url || session.id}</option>)}
+              </select>
+            </div>
+          )}
+          <div className="p-3">
+            <div className="rounded-lg border border-soft overflow-hidden bg-black" style={{ aspectRatio: "16 / 10" }}>
+              {activeBrowser?.screenshot_data_url ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img src={activeBrowser.screenshot_data_url} alt="Live browser feed" className="w-full h-full object-contain" />
+              ) : (
+                <div className="w-full h-full flex items-center justify-center px-4 text-center text-[13px]" style={{ color: "rgba(255,255,255,.74)" }}>
+                  {activeBrowser ? "Waiting for the next browser frame" : "No browser session is active"}
+                </div>
+              )}
+            </div>
+            {activeBrowser && (
+              <div className="mt-3 text-[12px] space-y-1" style={{ color: "var(--text-dim)" }}>
+                <div className="truncate">{activeBrowser.current_url || "No URL loaded"}</div>
+                <div>Updated {labelTime(activeBrowser.updated_at || activeBrowser.created_at)}</div>
+              </div>
+            )}
+            {activeBrowser?.takeover_state === "requested" && (
+              <div className="mt-3 rounded-lg border px-3 py-3" style={{ borderColor: "var(--warn)", background: "var(--warn-soft)" }}>
+                <div className="text-[13px] font-medium" style={{ color: "var(--warn)" }}>Take over in chat</div>
+                <div className="mt-1 text-[12.5px]" style={{ color: "var(--text-dim)" }}>{activeBrowser.takeover_reason || "Credentials, MFA, CAPTCHA, or another human-only step is needed."}</div>
+                <div className="mt-3 flex gap-2">
+                  <input
+                    value={handBackSummary}
+                    onChange={event => setHandBackSummary(event.target.value)}
+                    placeholder="What did you complete?"
+                    className="flex-1 surface border border-soft rounded-md px-3 py-1.5 text-[12.5px] outline-none"
+                  />
+                  <button className="btn btn-accent btn-sm" onClick={() => void postBrowser("hand-back", { summary: handBackSummary || "User completed takeover in chat" })}>Hand back</button>
+                </div>
+              </div>
+            )}
+            {activeBrowser && activeBrowser.takeover_state !== "requested" && (
+              <div className="mt-3 flex gap-2">
+                <button className="btn btn-secondary btn-sm" onClick={() => void postBrowser("request-takeover", { reason: "User requested manual control from chat" })}>Take over</button>
+                <button className="btn btn-ghost btn-sm" onClick={() => void postBrowser("revoke", { reason: "Stopped from chat live work panel" })}>Stop browser</button>
+              </div>
+            )}
+          </div>
+        </section>
+
+        <section className="rounded-xl border border-soft overflow-hidden">
+          <div className="px-3 py-2 border-b hairline flex items-center justify-between">
+            <div className="flex items-center gap-2 text-[13px] font-medium"><IC.Briefcase size={14}/> Computer</div>
+            <Tag variant={activeComputer?.status === "active" ? "accent" : activeComputer?.status === "degraded" ? "warn" : "default"}>{activeComputer?.status || "No session"}</Tag>
+          </div>
+          <div className="p-3">
+            <div className="rounded-lg border border-soft overflow-hidden bg-black" style={{ aspectRatio: "16 / 10" }}>
+              <div className="h-full flex flex-col justify-center px-4 text-[12.5px]" style={{ color: "rgba(255,255,255,.78)" }}>
+                <div className="text-white text-[14px] font-medium">{activeComputer?.purpose || "Virtual computer"}</div>
+                <div className="mt-2 font-mono break-all">{activeComputer?.workspace_path || "No active workspace"}</div>
+                <div className="mt-4 grid grid-cols-2 gap-2">
+                  <div className="rounded-md border px-2 py-1.5" style={{ borderColor: "rgba(255,255,255,.16)" }}>Terminal audited</div>
+                  <div className="rounded-md border px-2 py-1.5" style={{ borderColor: "rgba(255,255,255,.16)" }}>Files sandboxed</div>
+                  <div className="rounded-md border px-2 py-1.5" style={{ borderColor: "rgba(255,255,255,.16)" }}>Network governed</div>
+                  <div className="rounded-md border px-2 py-1.5" style={{ borderColor: "rgba(255,255,255,.16)" }}>Artifacts exported</div>
+                </div>
+              </div>
+            </div>
+            <div className="mt-3 text-[12px]" style={{ color: "var(--text-dim)" }}>
+              Chronos uses a governed virtual workspace for commands and files. Local machine control should be granted only through explicit one-time authorization.
+            </div>
+          </div>
+        </section>
+      </div>
+    </aside>
   );
 }
 
@@ -5441,6 +5626,7 @@ const SETTING_TABS: Array<{ id: SettingsTab; label: string; icon: ReactNode; key
   { id: "general", label: "General", icon: <IC.Settings size={15}/>, keywords: "workspace name timezone language theme notifications landing appearance", group: "You" },
   { id: "profile", label: "Profile", icon: <IC.Personas size={15}/>, keywords: "name avatar email role response citations interaction", group: "You" },
   { id: "memory-settings", label: "Memory", icon: <IC.Memory size={15}/>, keywords: "retention review auto save sensitive export purge privacy", group: "You" },
+  { id: "data", label: "Data", icon: <IC.Filter size={15}/>, keywords: "documents uploads attachments files data download delete chat", group: "You" },
   { id: "notifications", label: "Notifications", icon: <IC.Bell size={15}/>, keywords: "email in app runtime alerts approval task weekly digest security", group: "You" },
   { id: "organization", label: "Organization", icon: <IC.Briefcase size={15}/>, keywords: "org logo domain plan seats workspace creation", group: "Workspace" },
   { id: "members", label: "Members & roles", icon: <IC.Personas size={15}/>, keywords: "member invite role remove owner admin manager operator viewer", group: "Workspace" },
@@ -6634,7 +6820,7 @@ function SettingsScreen({ tab, setTab, theme, setTheme, accent, setAccent, signO
           <div className="flex items-center gap-2">
             {dirty && <span className="text-[12px]" style={{ color: "var(--text-dim)" }}>Unsaved changes</span>}
             {dirty && <button onClick={() => cancel()} className="btn btn-sm">Cancel</button>}
-            {!["members", "audit", "security", "billing", "danger"].includes(tab) && (
+            {!["members", "data", "audit", "security", "billing", "danger"].includes(tab) && (
               <button onClick={() => void save()} disabled={!dirty || readOnly || saving} className="btn btn-accent btn-sm disabled:opacity-50">
                 {saving ? "Saving..." : readOnly ? "Read only" : "Save"}
               </button>
@@ -6657,6 +6843,7 @@ function SettingsScreen({ tab, setTab, theme, setTheme, accent, setAccent, signO
           {tab === "employees" && <EmployeeSettings data={sectionDraft} patch={v => patch("ai_employee", v)}/>}
           {tab === "runtime" && <RuntimeSettings data={sectionDraft} patch={v => patch("runtime", v)} health={overview.runtime_health}/>}
           {tab === "memory-settings" && <MemorySettings data={sectionDraft} patch={v => patch("memory", v)} stats={overview.memory_stats} setToast={setToast} setConfirm={setConfirm} reload={load}/>}
+          {tab === "data" && <AccountDataSettings setToast={setToast}/>}
           {tab === "tools-settings" && <ToolsSettings data={sectionDraft} patch={v => patch("tool_settings", v)} connectors={overview.connectors} capabilities={overview.capabilities} health={overview.runtime_health.connectors || {}}/>}
           {tab === "approval-settings" && <ApprovalSettings data={sectionDraft} patch={v => patch("approval", v)}/>}
           {tab === "notifications" && <NotificationSettings data={sectionDraft} patch={v => patch("notifications", v)} capabilities={overview.capabilities}/>}
@@ -6678,7 +6865,7 @@ function apiSectionForTab(tab: SettingsTab) {
 
 function canEditTab(tab: SettingsTab, canAdmin: boolean) {
   if (["organization", "members", "permissions", "employees", "runtime", "memory-settings", "tools-settings", "approval-settings", "developer", "danger"].includes(tab)) return canAdmin;
-  return !["audit", "security", "billing"].includes(tab);
+  return !["data", "audit", "security", "billing"].includes(tab);
 }
 
 function val(data: Record<string, unknown>, key: string, fallback = "") {
@@ -6765,6 +6952,127 @@ function MemorySettings({ data, patch, stats, setToast, setConfirm, reload }: { 
     }
   }
   return <><SettingsSection title="Memory policy" note={`${stats.active} active memories, ${stats.deleted} deleted.`}><SettingsField label="Workspace memory"><Toggle label="Workspace memory" checked={Boolean(data.workspace_memory)} onChange={workspace_memory => patch({ workspace_memory })}/></SettingsField><SettingsField label="Employee memory"><Toggle label="Employee memory" checked={Boolean(data.employee_memory)} onChange={employee_memory => patch({ employee_memory })}/></SettingsField><SettingsField label="User memory"><Toggle label="User memory" checked={Boolean(data.user_memory)} onChange={user_memory => patch({ user_memory })}/></SettingsField><SettingsField label="Retention days"><TextInput ariaLabel="Memory retention" value={val(data, "retention_days")} onChange={retention_days => patch({ retention_days: Number(retention_days) || 0 })}/></SettingsField><SettingsField label="Review required"><Toggle label="Memory review required" checked={Boolean(data.review_required)} onChange={review_required => patch({ review_required })}/></SettingsField><SettingsField label="Auto-save memory"><Toggle label="Auto-save memory" checked={Boolean(data.auto_save)} onChange={auto_save => patch({ auto_save })}/></SettingsField><SettingsField label="Sensitive detection"><Toggle label="Sensitive memory detection" checked={Boolean(data.sensitive_detection)} onChange={sensitive_detection => patch({ sensitive_detection })}/></SettingsField></SettingsSection><SettingsSection title="Memory danger zone"><SettingsField label="Export organization memory" hint="Downloads JSON for non-deleted organization memory, including archived entries and excluding superseded entries."><button className="btn btn-sm" onClick={() => void exportMemoryJson()}>Export JSON</button></SettingsField><SettingsField label="Purge all memory" hint="Requires typed confirmation and writes an audit entry."><button className="btn btn-danger-soft btn-sm" onClick={() => setConfirm({ title: "Purge memory", text: "This soft-deletes all active memory entries in this workspace.", required: "PURGE MEMORY", action: async () => purge() })}>Purge memory</button></SettingsField></SettingsSection></>;
+}
+
+type AccountArtifact = {
+  id: string;
+  title: string | null;
+  kind: string;
+  mime_type: string | null;
+  size_bytes: number | null;
+  conversation_id?: string | null;
+  task_id?: string | null;
+  created_at?: string | null;
+};
+
+function AccountDataSettings({ setToast }: { setToast: (t: { kind: "ok" | "danger"; text: string }) => void }) {
+  const [rows, setRows] = useState<AccountArtifact[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [query, setQuery] = useState("");
+  const [busyId, setBusyId] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = (await (await apiFetch("/artifacts")).json()) as AccountArtifact[];
+      setRows(data.filter(item => item.kind !== "parsed_text"));
+    } catch (exc) {
+      setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to load uploaded documents" });
+      setRows([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [setToast]);
+
+  useEffect(() => { void load(); }, [load]);
+
+  const filtered = rows.filter(item => {
+    const haystack = `${item.title ?? ""} ${item.kind} ${item.mime_type ?? ""}`.toLowerCase();
+    return haystack.includes(query.trim().toLowerCase());
+  });
+
+  async function download(item: AccountArtifact) {
+    setBusyId(item.id);
+    try {
+      const blob = await (await apiFetch(`/artifacts/${item.id}/content`)).blob();
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = item.title || `chronos-${item.id}`;
+      anchor.click();
+      URL.revokeObjectURL(url);
+    } catch (exc) {
+      setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to download document" });
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function remove(item: AccountArtifact) {
+    if (!window.confirm(`Delete ${item.title || "this document"}?`)) return;
+    setBusyId(item.id);
+    try {
+      await apiFetch(`/artifacts/${item.id}`, { method: "DELETE" });
+      setRows(prev => prev.filter(row => row.id !== item.id));
+      setToast({ kind: "ok", text: "Document deleted" });
+    } catch (exc) {
+      setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to delete document" });
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  function addToChat(item: AccountArtifact) {
+    const title = item.title || "uploaded document";
+    window.localStorage.setItem("chronos.chat.pendingDraft", `Use the uploaded document "${title}" (artifact ${item.id}) in this chat.`);
+    window.location.href = "/chat";
+  }
+
+  return (
+    <>
+      <Unavailable reason="Upload documents in chat with the attachment button. This page manages account-level uploaded documents only."/>
+      <div className="mb-4 flex items-center justify-between gap-3">
+        <div className="surface border border-soft rounded-lg flex items-center gap-2 px-2.5 py-2 min-w-[280px]">
+          <IC.Search size={14} style={{ color: "var(--text-dim)" }}/>
+          <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search documents" className="bg-transparent outline-none text-[13px] w-full" aria-label="Search documents"/>
+        </div>
+        <button className="btn btn-sm" onClick={() => void load()} disabled={loading}>
+          <IC.Refresh size={13}/> Refresh
+        </button>
+      </div>
+      <div className="surface border border-soft rounded-xl overflow-hidden">
+        <div className="grid px-4 py-2.5 border-b hairline text-[11px] font-semibold uppercase tracking-wider" style={{ gridTemplateColumns: "minmax(0,1.6fr) 130px 100px 150px 260px", color: "var(--text-dim)" }}>
+          <div>Document</div>
+          <div>Type</div>
+          <div>Size</div>
+          <div>Uploaded</div>
+          <div className="text-right">Actions</div>
+        </div>
+        {loading && <div className="px-4 py-8 text-[13px]" style={{ color: "var(--text-dim)" }}>Loading documents...</div>}
+        {!loading && filtered.length === 0 && (
+          <div className="px-4 py-10">
+            <EmptyState icon={<IC.Attach size={20}/>} title="No uploaded documents" sub="Attach files in chat and they will appear here for account-level management."/>
+          </div>
+        )}
+        {filtered.map(item => (
+          <div key={item.id} className="grid items-center gap-3 px-4 py-3 border-b hairline last:border-b-0" style={{ gridTemplateColumns: "minmax(0,1.6fr) 130px 100px 150px 260px" }}>
+            <div className="min-w-0">
+              <div className="text-[13.5px] font-medium truncate">{item.title || "Untitled document"}</div>
+              <div className="text-[11.5px] truncate" style={{ color: "var(--text-dim)" }}>{item.id}</div>
+            </div>
+            <div className="text-[12.5px] truncate" style={{ color: "var(--text-muted)" }}>{item.mime_type || item.kind}</div>
+            <div className="text-[12.5px]" style={{ color: "var(--text-muted)" }}>{formatFileSize(item.size_bytes || 0)}</div>
+            <div className="text-[12.5px]" style={{ color: "var(--text-muted)" }}>{labelTime(item.created_at)}</div>
+            <div className="flex justify-end gap-2">
+              <button className="btn btn-secondary btn-sm" disabled={busyId === item.id} onClick={() => addToChat(item)}>Add to chat</button>
+              <button className="btn btn-ghost btn-sm" disabled={busyId === item.id} onClick={() => void download(item)}>Download</button>
+              <button className="btn btn-danger-soft btn-sm" disabled={busyId === item.id} onClick={() => void remove(item)}>Delete</button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </>
+  );
 }
 
 function ToolsSettings({ data, patch, connectors, capabilities, health }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void; connectors: SettingsOverview["connectors"]; capabilities: SettingsOverview["capabilities"]; health: NonNullable<SettingsOverview["runtime_health"]["connectors"]> }) {
