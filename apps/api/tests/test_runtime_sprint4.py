@@ -389,7 +389,7 @@ async def test_browser_screenshot_creates_missing_s3_bucket(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_browser_search_falls_back_to_fixture_results_on_live_timeout(monkeypatch):
+async def test_browser_search_degrades_truthfully_on_live_timeout(monkeypatch):
     from connectors import browser
 
     class FakePage:
@@ -413,8 +413,9 @@ async def test_browser_search_falls_back_to_fixture_results_on_live_timeout(monk
 
     result = await browser.browser_connector._search({"query": "data observability market", "max_results": 2})
 
-    assert result.summary == "LIVE SEARCH UNAVAILABLE — returning 2 placeholder results. Do not treat these as real data."
-    assert result.data["tier"] == "fixture"
-    assert result.data["is_fallback"] is True
-    assert "placeholder data" in result.data["warning"]
-    assert len(result.data["results"]) == 2
+    # No fabricated rows: a failed live search must return an explicit empty result.
+    assert "UNAVAILABLE" in result.summary
+    assert result.data["tier"] == "unavailable"
+    assert result.data["is_unavailable"] is True
+    assert "could not be completed" in result.data["warning"]
+    assert result.data["results"] == []
