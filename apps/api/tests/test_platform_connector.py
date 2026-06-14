@@ -146,7 +146,7 @@ async def test_actions_requires_platform_id():
 async def test_invoke_mcp_success(monkeypatch):
     monkeypatch.setattr(pf, "_get_repo", lambda: _FakeRepo(server={"id": "s1", "transport": "remote"}))
 
-    async def fake_invoke(server, action, action_args):
+    async def fake_invoke(agent, server, action, action_args):
         return {"content": [{"type": "text", "text": "ok"}], "echo": action_args}
 
     monkeypatch.setattr(pf, "_invoke_mcp", fake_invoke)

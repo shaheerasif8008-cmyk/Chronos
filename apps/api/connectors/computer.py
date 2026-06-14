@@ -124,9 +124,12 @@ async def _run_shell(command: str, *, cwd: Path, timeout_seconds: int) -> dict[s
         "PYTHONNOUSERSITE": "1",
     }
     (cwd / ".tmp").mkdir(exist_ok=True)
+    # Non-login shell (``-c`` not ``-lc``): the environment is set explicitly
+    # above, so sourcing login profiles (/etc/profile, ~/.profile) only risks
+    # polluting command stdout with shell-init noise and non-deterministic output.
     process = await asyncio.create_subprocess_exec(
         "/bin/sh",
-        "-lc",
+        "-c",
         command,
         cwd=str(cwd),
         env=env,
