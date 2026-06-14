@@ -66,23 +66,34 @@ async def _connected_providers(org_id: str) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
-async def _invoke_mcp(server: dict[str, Any], action: str, action_args: dict[str, Any]) -> dict[str, Any]:
-    from connectors.mcp_client import call_mcp
+async def _invoke_mcp(
+    agent: AgentContext, server: dict[str, Any], action: str, action_args: dict[str, Any]
+) -> dict[str, Any]:
+    """Call one MCP tool through the broker so the real action is governed.
 
-    return await call_mcp(server, "tools/call", {"name": action, "arguments": action_args})
+    Routing via ``tool_broker.execute`` (rather than reaching into the MCP client
+    directly) means the underlying ``mcp.<server>.<action>`` call gets its own
+    permission check, audit record, and safety/rate gating — RULE 1.
+    """
+    from core import tool_broker
+
+    server_id = str(server.get("id"))
+    result = await tool_broker.execute(agent, f"mcp.{server_id}.{action}", dict(action_args))
+    return result.data.get("result", result.data)
 
 
 async def _invoke_api(
     agent: AgentContext, provider: str, action_args: dict[str, Any]
 ) -> ToolResult:
-    """Make one authenticated REST call through the generic HTTP connector."""
-    from connectors.generic_http import generic_http_connector
-    from connectors.registry import get as registry_get
+    """Make one authenticated REST call through the broker (governed gateway).
 
-    record = await registry_get(agent, f"{provider}.api")
-    routed = dict(action_args)
-    routed["__org_id"] = agent.org_id
-    return await generic_http_connector.execute(f"{provider}.api", routed, record.vault_ref)
+    The broker resolves the connector's ``vault_ref`` and routes to the generic
+    HTTP connector, so the credential never touches this module and the call is
+    permission-checked and audited like any other tool — RULE 1.
+    """
+    from core import tool_broker
+
+    return await tool_broker.execute(agent, f"{provider}.api", dict(action_args))
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -269,7 +280,7 @@ class PlatformConnector:
                     summary=f"platform.invoke: MCP server {platform_id} not found",
                 )
             try:
-                result = await _invoke_mcp(server, action, action_args)
+                result = await _invoke_mcp(agent, server, action, action_args)
             except Exception as exc:
                 return ToolResult(
                     data={"status": "error", "reason": f"{type(exc).__name__}: {exc}"},
