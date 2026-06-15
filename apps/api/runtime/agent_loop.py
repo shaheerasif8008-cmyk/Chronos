@@ -638,8 +638,25 @@ def _parse_args(args_str: str | dict) -> dict[str, Any]:
 
 
 def _args_preview(args: dict[str, Any]) -> dict[str, Any]:
-    sensitive = {"body", "content", "code", "password", "token", "secret"}
-    return {k: "[omitted]" if k.lower() in sensitive else v for k, v in args.items()}
+    # Credentials are never shown. Large content payloads (email bodies, file
+    # writes) are omitted — they surface as drafts/artifacts. But the code and
+    # shell commands the model improvises ARE shown, truncated, so the user can
+    # watch the work happen in the chat activity stream.
+    secret = {"password", "token", "secret", "api_key", "apikey", "authorization"}
+    omitted = {"body", "content"}
+    visible_truncated = {"code", "command", "script"}
+    preview: dict[str, Any] = {}
+    for k, v in args.items():
+        key = k.lower()
+        if key in secret:
+            preview[k] = "[omitted]"
+        elif key in omitted:
+            preview[k] = "[omitted]"
+        elif key in visible_truncated and isinstance(v, str) and len(v) > 1200:
+            preview[k] = v[:1200] + f"\n… [+{len(v) - 1200} chars]"
+        else:
+            preview[k] = v
+    return preview
 
 
 def _tool_message_error(message: dict[str, Any]) -> str | None:
