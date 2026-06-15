@@ -29,17 +29,19 @@ type SkillVersion = {
 export default function SkillsScreen() {
   const [skills, setSkills] = useState<Skill[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [selectedSlug, setSelectedSlug] = useState<string | null>(null);
   const [composerOpen, setComposerOpen] = useState(false);
 
   const loadSkills = useCallback(async () => {
     setLoading(true);
+    setLoadError(null);
     try {
       const res = await apiFetch("/skills");
       const data: Skill[] = await res.json();
       setSkills(data.sort((a, b) => a.slug.localeCompare(b.slug)));
-    } catch {
-      // silent – list stays empty
+    } catch (e) {
+      setLoadError(e instanceof Error ? e.message : "Failed to load skills.");
     } finally {
       setLoading(false);
     }
@@ -73,7 +75,12 @@ export default function SkillsScreen() {
         </div>
         <div className="flex-1 overflow-auto p-2">
           {loading && <div className="text-[13px] p-3" style={{ color: "var(--text-dim)" }}>Loading…</div>}
-          {!loading && skills.length === 0 && (
+          {!loading && loadError && (
+            <div className="text-[12.5px] p-3 m-2 rounded-lg border" style={{ borderColor: "var(--danger)", color: "var(--danger)" }}>
+              Couldn’t load skills: {loadError}
+            </div>
+          )}
+          {!loading && !loadError && skills.length === 0 && (
             <div className="text-[13px] p-3" style={{ color: "var(--text-dim)" }}>No skills yet.</div>
           )}
           {skills.map(skill => (

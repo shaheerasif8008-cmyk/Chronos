@@ -8,12 +8,14 @@ from pydantic import BaseModel, Field
 from core import permissions
 from core.auth import get_current_member
 from core.models import Member
+from skills.loader import load_skill_content
 from skills.registry import (
     create_or_update_skill,
     get_skill_db,
     get_skill_version,
     list_skill_versions,
     list_skills_db,
+    load_skill_index,
     soft_delete_skill,
 )
 
@@ -28,11 +30,37 @@ class CreateSkillRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+def _filesystem_skill_summary(fs: dict[str, Any]) -> dict[str, Any]:
+    """Shape a filesystem skill index entry like a DB skill row."""
+    return {
+        "id": fs["id"],
+        "slug": fs["id"],
+        "name": fs["name"],
+        "description": fs["description"],
+        "source": "filesystem",
+        "current_version": 1,
+        "requires_connectors": list(fs["requires_connectors"]),
+        "spawns_sub_agent": bool(fs["spawns_sub_agent"]),
+    }
+
+
 @router.get("")
 @router.get("/")
 async def list_skills(member: Member = Depends(get_current_member)) -> list[dict[str, Any]]:
     await permissions.check(member, "list_skills", member.organization_id)
-    return await list_skills_db(member.organization_id)
+    # DB-persisted skills take precedence. Built-in filesystem skills are always
+    # surfaced too, so the menu is populated even if the startup DB sync hasn't
+    # run yet (e.g. migrations not applied). This mirrors how the runtime
+    # resolves candidates via get_candidate_skills.
+    try:
+        db_skills = await list_skills_db(member.organization_id)
+    except Exception:
+        db_skills = []
+    by_slug = {s["slug"]: s for s in db_skills}
+    for fs in load_skill_index():
+        if fs["id"] not in by_slug:
+            by_slug[fs["id"]] = _filesystem_skill_summary(fs)
+    return sorted(by_slug.values(), key=lambda s: s["slug"])
 
 
 @router.post("")
@@ -71,6 +99,9 @@ async def list_versions(
     await permissions.check(member, "view_skill", slug)
     skill = await get_skill_db(member.organization_id, slug)
     if skill is None:
+        # Filesystem skill that hasn't been synced to the DB: synthesize v1.
+        if any(fs["id"] == slug for fs in load_skill_index()):
+            return [{"version": 1, "created_at": None, "created_by": "chronos"}]
         raise HTTPException(status_code=404, detail="Skill not found")
     return await list_skill_versions(str(skill["id"]))
 
@@ -120,7 +151,19 @@ async def delete_skill(
 @router.get("/{slug}")
 async def get_skill(slug: str, member: Member = Depends(get_current_member)) -> dict[str, Any]:
     await permissions.check(member, "view_skill", slug)
-    skill = await get_skill_db(member.organization_id, slug)
-    if skill is None:
+    try:
+        skill = await get_skill_db(member.organization_id, slug)
+    except Exception:
+        skill = None
+    if skill is not None:
+        return skill
+    # Filesystem fallback: built-in skill not yet synced to the DB.
+    fs = next((s for s in load_skill_index() if s["id"] == slug), None)
+    if fs is None:
         raise HTTPException(status_code=404, detail="Skill not found")
-    return skill
+    summary = _filesystem_skill_summary(fs)
+    summary["content"] = await load_skill_content(
+        slug, progressive=False, org_id=member.organization_id
+    )
+    summary["version_metadata"] = None
+    return summary
