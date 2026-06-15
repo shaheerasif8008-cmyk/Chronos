@@ -164,7 +164,6 @@ type ConnectorApproval = {
 type Task = { id: string; status: string; goal: string; current_step: number; plan?: TaskStep[] | { steps?: TaskStep[] }; agent_state?: Record<string, unknown>; result?: Record<string, unknown>; error?: string | null; created_at?: string; parent_task_id?: string | null; depth?: number; iteration_count?: number };
 type TaskStep = { id: string; action: string; description: string; tool?: string | null };
 type ChatModel = { id: string; label: string; model: string; description?: string; capabilities?: string[]; status?: string; tool_use?: boolean; fallback_for?: string[]; policy?: string };
-type ChatMode = { id: string; label: string; description?: string; capabilities?: string[]; status?: string; creates_task?: boolean };
 type TaskStreamEvent = {
   type: string;
   task_id?: string;
@@ -253,7 +252,6 @@ type ActivityAction = {
 
 const MODEL_STORAGE_KEY = "chronos.chat.selectedModel";
 const DEFAULT_MODEL_ID = "auto";
-const MODE_STORAGE_KEY = "chronos.chat.selectedMode";
 const REASONING_STORAGE_KEY = "chronos.chat.reasoningEffort";
 const REASONING_OPTIONS = [
   { id: "low", label: "Low", title: "Use lighter reasoning for faster replies." },
@@ -277,11 +275,6 @@ function modelOptionTitle(model: ChatModel) {
   return `${model.description || model.model}.${capabilities}${policy}`.trim();
 }
 
-function modeOptionTitle(mode: ChatMode) {
-  const capabilities = mode.capabilities?.length ? ` Capabilities: ${mode.capabilities.join(", ")}.` : "";
-  const task = mode.creates_task ? " Creates a durable task when selected." : " Runs in the chat turn unless routing escalates it.";
-  return `${mode.description || mode.label}.${capabilities}${task}`.trim();
-}
 
 function taskSteps(task: Task | null | undefined): TaskStep[] {
   if (!task?.plan) return [];
@@ -584,18 +577,6 @@ const PALETTE_TYPE_LABELS: Record<string, string> = {
   memory: "Memory",
   sources: "Sources",
 };
-
-const DEFAULT_CHAT_MODES: ChatMode[] = [
-  { id: "default",  label: "Default" },
-  { id: "research", label: "Research" },
-  { id: "agent",    label: "Agent" },
-  { id: "browser",  label: "Browser" },
-  { id: "computer", label: "Computer" },
-  { id: "data",     label: "Data" },
-  { id: "image",    label: "Image" },
-  { id: "voice",    label: "Voice" },
-  { id: "coding",   label: "Coding" },
-];
 
 // ─── Auth helpers ─────────────────────────────────────────────────────────────
 function getToken() {
@@ -1392,11 +1373,11 @@ function ChatScreen({
   const [draft, setDraft] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
   const [chatModels, setChatModels] = useState<ChatModel[]>([]);
-  const [chatModes, setChatModes] = useState<ChatMode[]>(DEFAULT_CHAT_MODES);
   const [selectedModel, setSelectedModel] = useState(DEFAULT_MODEL_ID);
   const [modelsLoadError, setModelsLoadError] = useState("");
-  const [selectedMode, setSelectedMode] = useState<string>("default");
-  const [modesLoadError, setModesLoadError] = useState("");
+  // Chronos is chat-first: the model self-routes within a single default mode,
+  // so there is no mode picker. The value is kept for the request body shape.
+  const selectedMode = "default";
   const [selectedReasoningEffort, setSelectedReasoningEffort] = useState<ReasoningEffort>(DEFAULT_REASONING_EFFORT);
   const [streaming, setStreaming] = useState(false);
   const [memoryNotice, setMemoryNotice] = useState<{ id: string; content: string; undone?: boolean; error?: string } | null>(null);
@@ -1704,27 +1685,6 @@ function ChatScreen({
       .catch((err) => {
         setModelsLoadError(err instanceof Error ? err.message : "Unable to load models");
         setChatModels([]);
-      });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  useEffect(() => {
-    apiFetch("/chat/modes")
-      .then(r => r.json())
-      .then((data: ChatMode[]) => {
-        const modes = Array.isArray(data) && data.length ? data : DEFAULT_CHAT_MODES;
-        setModesLoadError("");
-        setChatModes(modes);
-        const stored = window.localStorage.getItem(MODE_STORAGE_KEY) || selectedMode;
-        const nextMode = modes.some(mode => mode.id === stored) ? stored : "default";
-        if (nextMode !== selectedMode) {
-          setSelectedMode(nextMode);
-        }
-        window.localStorage.setItem(MODE_STORAGE_KEY, nextMode);
-      })
-      .catch((err) => {
-        setModesLoadError(err instanceof Error ? err.message : "Unable to load modes");
-        setChatModes(DEFAULT_CHAT_MODES);
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -2687,25 +2647,6 @@ function ChatScreen({
                       : [{ id: selectedModel, label: "Loading models", model: selectedModel }]
                     ).map(model => (
                       <option key={model.id} value={model.id}>{modelOptionText(model)}</option>
-                    ))}
-                  </select>
-                  <label className="sr-only" htmlFor="chat-mode-select">Mode</label>
-                  <select
-                    id="chat-mode-select"
-                    aria-label="Mode"
-                    value={selectedMode}
-                    onChange={event => {
-                      setSelectedMode(event.target.value);
-                      window.localStorage.setItem(MODE_STORAGE_KEY, event.target.value);
-                    }}
-                    disabled={streaming || !!modesLoadError || chatModes.length === 0}
-                    className="surface border border-soft rounded-md px-2 py-1.5 text-[12.5px] outline-none disabled:opacity-60"
-                    data-selected-mode-status={chatModes.find(mode => mode.id === selectedMode)?.status ?? "unknown"}
-                    title={modesLoadError || modeOptionTitle(chatModes.find(mode => mode.id === selectedMode) ?? { id: selectedMode, label: selectedMode })}
-                    style={{ color: "var(--text)" }}
-                  >
-                    {(modesLoadError ? [{ id: "default", label: "Modes unavailable", status: "unavailable" }] : chatModes).map(m => (
-                      <option key={m.id} value={m.id}>{m.status && m.status !== "available" ? `${m.label} (${m.status})` : m.label}</option>
                     ))}
                   </select>
                 </div>
@@ -7081,9 +7022,51 @@ function ToolsSettings({ data, patch, connectors, capabilities, health }: { data
   return <><SettingsSection title="Connector readiness" note="Chronos can run tools in fixture, demo, or live mode per connector.">{providers.length === 0 ? <div className="p-5"><EmptyState title="No connector checks available" sub="Startup health has not reported tool readiness yet."/></div> : providers.map(([provider, item]) => <div key={provider} className="px-5 py-4 border-b hairline last:border-b-0"><div className="flex items-start justify-between gap-4"><div><div className="font-medium capitalize">{provider}</div><div className="text-[12px] mt-1" style={{ color: "var(--text-dim)" }}>{item.reason || "Ready"}</div>{item.setup && <div className="text-[12px] mt-1 font-mono" style={{ color: "var(--text-muted)" }}>{item.setup}</div>}</div><Tag variant={item.tier === "live" ? "accent" : item.tier === "demo" ? "info" : "warn"}>{item.tier || item.status || "unknown"}</Tag></div></div>)}</SettingsSection><SettingsSection title="Connected tools" note="Enable/disable and approval-required states are enforced by the tool broker.">{connectors.length === 0 ? <div className="p-5"><EmptyState title="No tools connected" sub="Connectors appear here after OAuth or local enablement."/></div> : connectors.map(c => { const policy = ((data[c.provider] || c.policy || {}) as Record<string, unknown>); return <div key={c.id} className="px-5 py-4 border-b hairline last:border-b-0"><div className="flex justify-between gap-4"><div><div className="font-medium capitalize">{c.provider}</div><div className="text-[12px]" style={{ color: "var(--text-dim)" }}>{c.account_handle || "Org-level connector"} · {c.status} · last used {c.last_used_at || "never"}</div><div className="mt-2 flex flex-wrap gap-1">{(c.scopes || []).map(scope => <Tag key={scope}>{scope}</Tag>)}<Tag variant={String(policy.risk) === "high" ? "danger" : "info"}>{String(policy.risk || "unknown")} risk</Tag></div></div><div className="flex items-center gap-4"><Toggle label={`${c.provider} enabled`} checked={policy.enabled !== false} onChange={enabled => update(c.provider, { enabled })}/><Toggle label={`${c.provider} approval required`} checked={Boolean(policy.approval_required)} onChange={approval_required => update(c.provider, { approval_required })}/><button className="btn btn-danger-soft btn-sm" disabled title="Disconnect is managed from Connectors until scoped confirmation is added.">Disconnect</button></div></div></div>; })}</SettingsSection><Unavailable reason={capabilities.notification_email_dispatch.reason}/></>;
 }
 
+const AUTONOMY_LABELS: Record<string, string> = { supervised: "Supervised", full_auto: "Full auto" };
+
+function WorkspaceAutonomySection() {
+  const [level, setLevel] = useState<string>("supervised");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    apiFetch("/settings/autonomy?workspace_id=default")
+      .then(r => r.json())
+      .then((data: { level?: string }) => setLevel(data.level || "supervised"))
+      .catch(() => {});
+  }, []);
+
+  async function save(next: string) {
+    setSaving(true);
+    setError("");
+    const prev = level;
+    setLevel(next);
+    try {
+      await apiFetch("/settings/autonomy", {
+        method: "PATCH",
+        body: JSON.stringify({ workspace_id: "default", level: next }),
+      });
+    } catch (exc) {
+      setLevel(prev);
+      setError(exc instanceof Error ? exc.message : "Unable to save autonomy");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <SettingsSection title="Workspace autonomy" note="Full auto lets Chronos take governed actions without pausing for per-tool approval. The hard floor — external publishing, payments, sending email, and local-machine commands — always requires approval and can never be bypassed.">
+      <SettingsField label="Autonomy level" hint={level === "full_auto" ? "Full auto: governed actions run without approval, except the hard floor." : "Supervised: tools flagged for approval pause for a human."}>
+        <SelectInput ariaLabel="Workspace autonomy level" value={AUTONOMY_LABELS[level] || level} onChange={pretty => { const next = Object.keys(AUTONOMY_LABELS).find(k => AUTONOMY_LABELS[k] === pretty) || "supervised"; if (!saving) void save(next); }} options={Object.values(AUTONOMY_LABELS)} disabled={saving}/>
+      </SettingsField>
+      {error && <SettingsField label=""><span className="text-[12px]" style={{ color: "var(--danger)" }}>{error}</span></SettingsField>}
+    </SettingsSection>
+  );
+}
+
 function ApprovalSettings({ data, patch }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void }) {
   const thresholds = (data.thresholds || {}) as Record<string, string>;
-  return <SettingsSection title="Approval policy"><SettingsField label="Mode"><SelectInput ariaLabel="Approval mode" value={val(data, "mode")} onChange={mode => patch({ mode })} options={["off", "low-risk auto", "manual", "strict"]}/></SettingsField>{["low", "medium", "high"].map(level => <SettingsField key={level} label={`${level} risk threshold`}><SelectInput ariaLabel={`${level} risk threshold`} value={thresholds[level] || "manual"} onChange={value => patch({ thresholds: { ...thresholds, [level]: value } })} options={["auto", "manual", "strict", "blocked"]}/></SettingsField>)}<SettingsField label="Rule builder"><pre className="text-[12px] overflow-auto max-w-md" style={{ color: "var(--text-muted)" }}>{JSON.stringify(data.rules || [], null, 2)}</pre></SettingsField></SettingsSection>;
+  return <><WorkspaceAutonomySection/><SettingsSection title="Approval policy"><SettingsField label="Mode"><SelectInput ariaLabel="Approval mode" value={val(data, "mode")} onChange={mode => patch({ mode })} options={["off", "low-risk auto", "manual", "strict"]}/></SettingsField>{["low", "medium", "high"].map(level => <SettingsField key={level} label={`${level} risk threshold`}><SelectInput ariaLabel={`${level} risk threshold`} value={thresholds[level] || "manual"} onChange={value => patch({ thresholds: { ...thresholds, [level]: value } })} options={["auto", "manual", "strict", "blocked"]}/></SettingsField>)}<SettingsField label="Rule builder"><pre className="text-[12px] overflow-auto max-w-md" style={{ color: "var(--text-muted)" }}>{JSON.stringify(data.rules || [], null, 2)}</pre></SettingsField></SettingsSection></>;
 }
 
 function NotificationSettings({ data, patch, capabilities }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void; capabilities: SettingsOverview["capabilities"] }) {

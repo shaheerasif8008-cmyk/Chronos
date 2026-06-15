@@ -16,10 +16,13 @@ from core.config import settings
 from core.exceptions import ApprovalRequired, LoopDetected, RateLimitExceeded, SafetyLimitViolation
 from core.models import AgentContext, ToolResult
 from core.redis import redis_client
-from core.settings_store import tool_policy
+from core.settings_store import tool_policy, workspace_autonomy
 from core.untrusted_content import scan_untrusted_content
 
-# Tools that always require a human approval record — regardless of autonomy level.
+# The hard floor: tools that always require a human approval record — regardless
+# of autonomy level, including ``full_auto``. External publish, payments, mass
+# email (gmail.send — see RULE 8), and local-machine shell/app launches can never
+# be bypassed by a workspace running in full-auto.
 _ALWAYS_APPROVAL_TOOLS = {
     "twitter.post",
     "linkedin.post",
@@ -381,13 +384,20 @@ class ToolBroker:
         # 4. Hard safety limits (no override possible)
         _check_safety_limits(tool, args)
 
-        # 5. Approval gate — check always-approval set first
+        # 5. Approval gate — the hard floor is absolute, even under full_auto.
         if tool in _ALWAYS_APPROVAL_TOOLS and not approved_by_gate:
-            raise ApprovalRequired(tool, "tool requires an approval record (none exists in Phase 1)")
+            raise ApprovalRequired(tool, "tool requires an approval record (hard floor — never bypassable)")
         policy = await tool_policy(agent.org_id, tool.split(".")[0])
         if policy.get("enabled") is False:
             raise ApprovalRequired(tool, "tool is disabled in settings")
-        if policy.get("approval_required") is True and not approved_by_gate:
+        # full_auto workspaces collapse the settings-policy approval gate. The hard
+        # floor above and the safety limits below still apply.
+        autonomy = await workspace_autonomy(agent.org_id, agent.workspace_id)
+        if (
+            policy.get("approval_required") is True
+            and not approved_by_gate
+            and autonomy != "full_auto"
+        ):
             raise ApprovalRequired(tool, "tool requires approval by settings policy")
 
         if _is_external_write_tool(tool):

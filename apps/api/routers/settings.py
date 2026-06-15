@@ -16,7 +16,16 @@ from core.config import settings
 from core.db import engine, reflect_table
 from core.models import Member
 from core.memory_control import export_memories
-from core.settings_store import ADMIN_ROLES, DEFAULTS, ROLE_ORDER, get_settings_doc, require_admin, save_settings_doc
+from core.settings_store import (
+    ADMIN_ROLES,
+    AUTONOMY_LEVELS,
+    DEFAULTS,
+    ROLE_ORDER,
+    get_settings_doc,
+    require_admin,
+    save_settings_doc,
+    workspace_autonomy,
+)
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 
@@ -40,6 +49,11 @@ class SettingsPatch(BaseModel):
 
 class MemberRolePatch(BaseModel):
     role: str
+
+
+class AutonomyPatch(BaseModel):
+    workspace_id: str = "default"
+    level: str
 
 
 class InvitationCreate(BaseModel):
@@ -229,6 +243,40 @@ async def update_section(section: str, req: SettingsPatch, member: Member = Depe
     _validate_section(section, req.values)
     saved = await save_settings_doc(member, section, req.values)
     return {"section": section, "values": saved}
+
+
+@router.get("/autonomy")
+async def get_workspace_autonomy(
+    workspace_id: str = Query("default"),
+    member: Member = Depends(get_current_member),
+) -> dict[str, Any]:
+    """Return the autonomy level for a workspace (default 'supervised')."""
+    await permissions.check(member, "get_autonomy", settings.org_id)
+    level = await workspace_autonomy(member.organization_id, workspace_id)
+    return {"workspace_id": workspace_id, "level": level, "levels": sorted(AUTONOMY_LEVELS)}
+
+
+@router.patch("/autonomy")
+async def set_workspace_autonomy(
+    req: AutonomyPatch, member: Member = Depends(get_current_member)
+) -> dict[str, Any]:
+    """Set a workspace's autonomy level. Admin-only.
+
+    ``full_auto`` collapses settings-policy approval gates for that workspace.
+    The hard floor (external publish, payments, gmail.send, local shell) and all
+    safety limits in the tool broker remain absolute regardless of this setting.
+    """
+    require_admin(member)
+    if req.level not in AUTONOMY_LEVELS:
+        raise HTTPException(status_code=400, detail="Invalid autonomy level")
+    await save_settings_doc(
+        member,
+        "autonomy",
+        {"level": req.level},
+        scope="workspace",
+        scope_id=req.workspace_id,
+    )
+    return {"workspace_id": req.workspace_id, "level": req.level}
 
 
 @router.patch("/members/{member_id}/role")

@@ -67,7 +67,9 @@ def _patch_broker_deps(tmp_path, monkeypatch):
 
     # --- core.settings_store ---
     async def _policy(*a, **kw): return {}
-    monkeypatch.setitem(sys.modules, "core.settings_store", _make_stub_module("core.settings_store", tool_policy=_policy))
+    async def _autonomy(*a, **kw): return "supervised"
+    monkeypatch.setitem(sys.modules, "core.settings_store", _make_stub_module(
+        "core.settings_store", tool_policy=_policy, workspace_autonomy=_autonomy))
 
     # --- core.untrusted_content ---
     monkeypatch.setitem(sys.modules, "core.untrusted_content", _make_stub_module(

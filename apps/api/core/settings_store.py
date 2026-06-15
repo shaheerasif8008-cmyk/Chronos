@@ -215,3 +215,23 @@ async def tool_policy(org_id: str, provider: str) -> dict[str, Any]:
     member = Member(id="system", organization_id=org_id, region=settings.region, email="system@local", role="admin")
     policies = await get_settings_doc(member, "tool_settings", scope="org", scope_id=org_id)
     return dict(policies.get(provider, {"enabled": True, "approval_required": False, "risk": "unknown"}))
+
+
+# Autonomy levels a workspace can run at. ``full_auto`` collapses settings-policy
+# approval gates (never the hard floor in tool_broker). Default is ``supervised``.
+AUTONOMY_LEVELS: frozenset[str] = frozenset({"supervised", "full_auto"})
+
+
+async def workspace_autonomy(org_id: str, workspace_id: str | None) -> str:
+    """Return the autonomy level for a workspace, defaulting to ``supervised``.
+
+    Stored as a settings document (section ``autonomy``, scope ``workspace``) so
+    it honors the per-workspace requirement without a dedicated table. When no
+    workspace is supplied the ``default`` workspace document is used.
+    """
+    member = Member(id="system", organization_id=org_id, region=settings.region, email="system@local", role="admin")
+    doc = await get_settings_doc(
+        member, "autonomy", scope="workspace", scope_id=str(workspace_id or "default")
+    )
+    level = str(doc.get("level") or "supervised")
+    return level if level in AUTONOMY_LEVELS else "supervised"

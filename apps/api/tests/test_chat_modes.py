@@ -48,25 +48,23 @@ def test_normalize_mode_trims_whitespace():
     assert normalize_mode(" agent ") == "agent"
 
 
-def test_available_modes_expose_productized_metadata():
+def test_available_modes_expose_only_default():
+    """Chronos is chat-first: only the default self-routing mode is advertised.
+
+    The historical modes remain valid inputs to normalize_mode (backward compat),
+    but they are no longer surfaced as a user-facing composer choice.
+    """
     from core.modes import available_modes
 
     modes = available_modes()
 
-    assert [mode["id"] for mode in modes] == [
-        "default", "research", "agent", "browser", "computer",
-        "data", "image", "voice", "coding",
-    ]
-    for mode in modes:
-        assert mode["status"] in {"available", "foundation", "unavailable"}
-        assert isinstance(mode["capabilities"], list)
-        assert mode["label"]
-        assert mode["description"]
-        assert "creates_task" in mode
-
-    by_id = {mode["id"]: mode for mode in modes}
-    assert by_id["research"]["creates_task"] is True
-    assert by_id["voice"]["status"] == "unavailable"
+    assert [mode["id"] for mode in modes] == ["default"]
+    only = modes[0]
+    assert only["status"] in {"available", "foundation", "unavailable"}
+    assert isinstance(only["capabilities"], list)
+    assert only["label"]
+    assert only["description"]
+    assert "creates_task" in only
 
 
 def test_model_kwargs_threads_reasoning_effort_for_supported_providers():
