@@ -1652,10 +1652,47 @@ def _cognition_enabled(is_sub_agent: bool) -> bool:
     return bool(settings.openrouter_api_key or settings.backup_api_key)
 
 
-async def _build_plan(goal: str) -> list[dict[str, Any]] | None:
-    """Draft a short plan for the goal via a fast model, or None on any failure."""
+async def _connector_availability_note(tools: list[dict[str, Any]] | None) -> str | None:
+    """Per-family degradation notes for the planner, or None when all are live."""
+    if not tools:
+        return None
+    from core.connector_health import degraded_note
+
+    families: set[str] = set()
+    for tool in tools:
+        name = str(((tool or {}).get("function") or {}).get("name") or "")
+        family = name.partition("__")[0]
+        if family:
+            families.add(family)
+    notes: list[str] = []
+    for family in sorted(families):
+        try:
+            note = await degraded_note(family)
+        except Exception:  # noqa: BLE001 — availability is advisory, never fatal
+            note = None
+        if note:
+            notes.append(f"- {family}: {note}")
+    return "\n".join(notes) if notes else None
+
+
+async def _build_plan(
+    goal: str, tools: list[dict[str, Any]] | None = None
+) -> list[dict[str, Any]] | None:
+    """Draft a short plan for the goal, grounded in the agent's actual tools.
+
+    Runs on the primary agent model (not the fast model) so the plan is well
+    reasoned, and feeds it the available tool families plus any degraded-connector
+    notes so it plans only for what the agent can really do. Returns None on any
+    failure so the loop degrades to its prior model-native behavior."""
     try:
-        raw = await complete_json(cognition.build_plan_prompt(goal), model=settings.fast_model)
+        tools_summary = cognition.summarize_tools(tools)
+        availability_note = await _connector_availability_note(tools)
+        raw = await complete_json(
+            cognition.build_plan_prompt(
+                goal, tools_summary=tools_summary, availability_note=availability_note
+            ),
+            model=settings.agent_model,
+        )
         return cognition.parse_plan(raw)
     except Exception as exc:  # noqa: BLE001 — degrade to no-plan on any error
         logger.info("Planner unavailable, continuing without a plan: %s", exc)
@@ -1749,7 +1786,7 @@ async def run_loop(
         plan_steps = list(_existing_plan)
     current_plan_step = int(task.get("current_step") or 0)
     if model_cognition and not plan_steps and iteration == 0:
-        _built = await _build_plan(goal)
+        _built = await _build_plan(goal, effective_tools)
         if _built:
             plan_steps = _built
             await save_task(task_id, plan=_persist_plan_shape(plan_steps), current_step=0)
@@ -2019,9 +2056,14 @@ async def run_loop(
                         "iteration": iteration,
                         "summary": "Adjusting strategy after limited progress.",
                     })
-                # Difficulty-aware routing: a recurring error or a stall means the
-                # current model is stuck — step up to a stronger one (once).
-                if signal in (cognition.ProgressSignal.REPEAT_ERROR, cognition.ProgressSignal.STALLED) and not escalated:
+                # Difficulty-aware routing: a recurring error, a repeated identical
+                # call, or a stall means the current model is stuck — step up to a
+                # stronger one (once).
+                if signal in (
+                    cognition.ProgressSignal.REPEAT_ERROR,
+                    cognition.ProgressSignal.REPEAT_CALL,
+                    cognition.ProgressSignal.STALLED,
+                ) and not escalated:
                     _stronger = stronger_agent_model(effective_model)
                     if _stronger and _stronger != effective_model:
                         effective_model = _stronger

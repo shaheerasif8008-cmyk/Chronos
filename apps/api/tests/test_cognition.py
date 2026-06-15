@@ -14,6 +14,7 @@ from runtime.cognition import (
     parse_plan,
     parse_verdict,
     plan_directive,
+    summarize_tools,
 )
 
 
@@ -151,6 +152,33 @@ def test_plan_directive_marks_current_step():
 
 def test_build_plan_prompt_includes_goal():
     assert "Summarize the report" in build_plan_prompt("Summarize the report")
+
+
+def test_summarize_tools_groups_by_family():
+    tools = [
+        {"type": "function", "function": {"name": "browser__search"}},
+        {"type": "function", "function": {"name": "browser__fetch"}},
+        {"type": "function", "function": {"name": "gmail__draft"}},
+    ]
+    text = summarize_tools(tools)
+    assert "browser: search, fetch" in text
+    assert "gmail: draft" in text
+    # Empty / missing input degrades to an empty summary (no crash).
+    assert summarize_tools(None) == ""
+    assert summarize_tools([]) == ""
+
+
+def test_build_plan_prompt_embeds_tools_and_availability():
+    prompt = build_plan_prompt(
+        "Find leads",
+        tools_summary="- browser: search",
+        availability_note="- gmail: demo storage, not real",
+    )
+    assert "Find leads" in prompt
+    assert "browser: search" in prompt
+    assert "demo storage, not real" in prompt
+    # Without the kwargs the prompt stays clean (backward compatible).
+    assert "Tools available" not in build_plan_prompt("Find leads")
 
 
 # ── Reflection ───────────────────────────────────────────────────────────────

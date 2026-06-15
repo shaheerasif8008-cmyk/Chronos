@@ -99,3 +99,20 @@ async def connector_tier(provider: str) -> str:
         return "demo"
     health = await check_connectors()
     return str(health.get(provider, {}).get("tier") or "fixture")
+
+
+async def degraded_note(provider: str) -> str | None:
+    """Return a note when *provider* serves placeholder (non-real) data, else None.
+
+    Keyed off the connector health table so only genuinely degraded providers are
+    flagged — e.g. gmail running on local demo storage or browser tools returning
+    fixtures. Fully live providers, and providers with no health entry, return
+    None. Surfaced to the model so it never treats stub output as real."""
+    health = await check_connectors()
+    entry = health.get(provider)
+    if not entry or str(entry.get("status")) in {"live", "available"}:
+        return None
+    return str(
+        entry.get("reason")
+        or f"{provider} is not fully configured and returns placeholder (non-real) results."
+    )

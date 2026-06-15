@@ -42,7 +42,7 @@ async def test_run_loop_plans_then_reflects_before_finishing(monkeypatch):
     monkeypatch.setattr(agent_loop.settings, "openrouter_api_key", "test-key")
     monkeypatch.setattr(agent_loop.settings, "agent_cognition_enabled", True)
 
-    async def fake_build_plan(goal):
+    async def fake_build_plan(goal, tools=None):
         return [
             {"id": "step-1", "action": "think", "description": "Research competitors", "tool": "browser"},
             {"id": "step-2", "action": "think", "description": "Write the memo", "tool": None},
@@ -123,7 +123,7 @@ async def test_run_loop_without_model_key_skips_cognition(monkeypatch):
     monkeypatch.setattr(agent_loop.settings, "openrouter_api_key", "")
     monkeypatch.setattr(agent_loop.settings, "backup_api_key", "")
 
-    async def boom_plan(goal):  # must never be called
+    async def boom_plan(goal, tools=None):  # must never be called
         raise AssertionError("planner ran without a model key")
 
     async def boom_reflect(goal, answer, summaries):

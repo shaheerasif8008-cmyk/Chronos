@@ -11,7 +11,7 @@ import time
 from typing import Any
 
 from core import audit, permissions
-from core.connector_health import connector_tier
+from core.connector_health import connector_tier, degraded_note
 from core.config import settings
 from core.exceptions import ApprovalRequired, LoopDetected, RateLimitExceeded, SafetyLimitViolation
 from core.models import AgentContext, ToolResult
@@ -132,6 +132,21 @@ def _extract_text_fragments(value: Any, fragments: list[str], limit: int = 10) -
             _extract_text_fragments(nested, fragments, limit)
             if len(fragments) >= limit:
                 return
+
+
+def _annotate_degraded_result(result: ToolResult, note: str) -> ToolResult:
+    """Flag a result as placeholder data so the model doesn't treat it as real.
+
+    The note rides on both the summary (which the model reads inline) and the
+    structured ``data`` so downstream code can detect the degraded state."""
+    if result.data.get("degraded_connector"):
+        return result
+    data = dict(result.data)
+    data["degraded_connector"] = note
+    return ToolResult(
+        summary=f"[DEGRADED — placeholder data, not real] {note} :: {result.summary}",
+        data=data,
+    )
 
 
 def _mark_untrusted_connector_result(tool: str, result: ToolResult) -> ToolResult:
@@ -441,6 +456,11 @@ class ToolBroker:
         # 8. Execute via connector
         result = await _route(agent, tool, args, vault_ref, tier)
         result = _mark_untrusted_connector_result(tool, result)
+        # Tell the model when it's looking at placeholder data (e.g. gmail demo
+        # storage, browser fixtures) so it doesn't act on stub results as if real.
+        _degraded = await degraded_note(provider)
+        if _degraded:
+            result = _annotate_degraded_result(result, _degraded)
 
         # 9. Audit: result summary (never log result.data — may contain sensitive content)
         await audit.log(

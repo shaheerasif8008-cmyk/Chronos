@@ -24,12 +24,19 @@ class Settings(BaseSettings):
     backup_api_key: str = ""
     backup_model: str = "openrouter/minimax/minimax-m2.5:free"
     openrouter_api_key: str = ""
-    openrouter_model: str = "openrouter/deepseek/deepseek-v4-flash:free"
-    agent_model: str = "openrouter/deepseek/deepseek-v4-flash:free"
+    # Fallback for the agent model — keep it a real (non-free) tier so a fallback
+    # turn isn't noticeably weaker than the primary.
+    openrouter_model: str = "openrouter/openai/gpt-5.4-nano"
+    # Primary model for task execution / the agent loop. A strong reasoning model
+    # by default so plans and tool use are reliable; the loop can still escalate to
+    # the strongest tier (gpt-5.4-mini) when it gets stuck.
+    agent_model: str = "openrouter/deepseek/deepseek-v4-pro"
     openrouter_api_base: str = "https://openrouter.ai/api/v1"
     embedding_model: str = "google/gemini-embedding-2"
     embedding_dimensions: int = 1536
-    fast_model: str = "openrouter/minimax/minimax-m2.5:free"
+    # Fast/cheap model for routing, intent, memory extraction, and planning helpers.
+    # A real lightweight model (not a free tier) so these steps are dependable.
+    fast_model: str = "openrouter/openai/gpt-5.4-nano"
     vision_model: str = ""   # vision-capable model for OCR; empty disables OCR
     image_model: str = ""   # image generation model; empty disables image generation
     stt_model: str = ""    # speech-to-text model; empty disables STT

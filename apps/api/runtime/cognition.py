@@ -225,8 +225,12 @@ Break the user's goal into 2-6 concrete, ordered steps a tool-using agent will \
 execute. Each step is one meaningful unit of work (research, analyze, draft, \
 review, etc.) — not a single tool call, and not low-level mechanics.
 
+Plan only for what the available tools can actually do — do not invent \
+capabilities the agent does not have. If a tool you would need is unavailable or \
+degraded (see notes), plan around it and say so in the relevant step.
+{tools_block}{availability_block}
 Return ONLY JSON:
-{{"steps": [{{"description": "<short imperative step>", "tool_hint": "<optional tool family or null>"}}]}}
+{{"steps": [{{"description": "<short imperative step>", "tool_hint": "<one of the tool families above, or null>"}}]}}
 
 Keep it tight. If the goal is simple enough to answer in one step, return a \
 single step. Do not include sign-off or "respond to user" steps.
@@ -236,8 +240,49 @@ Goal:
 """
 
 
-def build_plan_prompt(goal: str) -> str:
-    return _PLAN_PROMPT.format(goal=goal[:2000])
+def summarize_tools(tools: list[dict[str, Any]] | None) -> str:
+    """Compact 'family: example actions' view of available tools, for the planner.
+
+    Groups OpenAI-format tool schemas by their ``family__action`` name prefix so
+    the planner sees what the agent can actually do without the full schemas."""
+    if not tools:
+        return ""
+    families: dict[str, list[str]] = {}
+    for tool in tools:
+        fn = tool.get("function") if isinstance(tool, dict) else None
+        name = str((fn or {}).get("name") or "")
+        if not name:
+            continue
+        family, _, action = name.partition("__")
+        actions = families.setdefault(family, [])
+        if action and action not in actions and len(actions) < 5:
+            actions.append(action)
+    lines = []
+    for family in sorted(families):
+        actions = ", ".join(families[family]) or "(actions)"
+        lines.append(f"- {family}: {actions}")
+    return "\n".join(lines)
+
+
+def build_plan_prompt(
+    goal: str,
+    *,
+    tools_summary: str | None = None,
+    availability_note: str | None = None,
+) -> str:
+    tools_block = (
+        f"\nTools available to the agent (family: example actions):\n{tools_summary}\n"
+        if tools_summary
+        else ""
+    )
+    availability_block = (
+        f"\nConnector availability notes:\n{availability_note}\n"
+        if availability_note
+        else ""
+    )
+    return _PLAN_PROMPT.format(
+        goal=goal[:2000], tools_block=tools_block, availability_block=availability_block
+    )
 
 
 def parse_plan(raw: str, *, max_steps: int = 6) -> list[dict[str, Any]] | None:
