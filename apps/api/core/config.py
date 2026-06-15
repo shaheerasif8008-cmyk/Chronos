@@ -59,6 +59,12 @@ class Settings(BaseSettings):
     composio_api_key: str = ""       # kept for backward compat; not actively used
     composio_callback_base_url: str = "http://localhost:8000"
     tavily_api_key: str = ""
+
+    # E2B isolated runtime (the real sandbox backing computer.* tools).
+    # When empty, computer.* returns a clear "not configured" degraded result
+    # instead of silently running shell on the API host.
+    e2b_api_key: str = ""
+    e2b_sandbox_timeout_seconds: int = 1800  # sandbox lifetime per session
     # Google OAuth2 — covers Gmail, Calendar, Drive
     google_client_id: str = ""
     google_client_secret: str = ""

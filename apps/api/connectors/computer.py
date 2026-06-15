@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+import posixpath
 import resource
+import shlex
 import shutil
 import subprocess
 import uuid
@@ -18,8 +20,14 @@ from core.config import settings
 from core.db import engine, reflect_table
 from core.models import ToolResult
 from core.workspace import jailed_path
+from connectors.e2b_runtime import (
+    SANDBOX_ROOT,
+    SandboxExpired,
+    SandboxRuntime,
+    default_runtime,
+    remote_path,
+)
 
-CLOUD_ROOT = Path("/tmp/chronos_computers")
 MAX_READ_BYTES = 512_000
 MAX_WRITE_BYTES = 512_000
 MAX_OUTPUT_BYTES = 128_000
@@ -50,12 +58,6 @@ def _uuid_or_none(value: Any) -> str | None:
         return str(uuid.UUID(str(value)))
     except (TypeError, ValueError):
         return None
-
-
-def _cloud_workspace(org_id: str, session_id: str) -> Path:
-    root = (CLOUD_ROOT / str(org_id or "default") / session_id).resolve()
-    root.mkdir(parents=True, exist_ok=True)
-    return root
 
 
 def _public_session(session: dict[str, Any]) -> dict[str, Any]:
@@ -115,6 +117,20 @@ def _timeout(value: Any) -> int:
     return max(1, min(parsed, MAX_TIMEOUT_SECONDS))
 
 
+# The isolated cloud sandbox can run real, slower workloads (builds, servers),
+# so its per-command ceiling is higher than the local grant runner's 30s.
+CLOUD_MAX_TIMEOUT_SECONDS = 600
+CLOUD_DEFAULT_TIMEOUT_SECONDS = 60
+
+
+def _cloud_timeout(value: Any) -> int:
+    try:
+        parsed = int(value or CLOUD_DEFAULT_TIMEOUT_SECONDS)
+    except (TypeError, ValueError):
+        parsed = CLOUD_DEFAULT_TIMEOUT_SECONDS
+    return max(1, min(parsed, CLOUD_MAX_TIMEOUT_SECONDS))
+
+
 async def _run_shell(command: str, *, cwd: Path, timeout_seconds: int) -> dict[str, Any]:
     _validate_command(command)
     env = {
@@ -163,6 +179,24 @@ class ComputerConnector:
         self._events: dict[str, list[dict[str, Any]]] = {}
         self._grants: dict[str, dict[str, Any]] = {}
         self._local_events: dict[str, list[dict[str, Any]]] = {}
+        # Injectable isolated runtime. Tests set this to an in-memory fake; in
+        # production it resolves to the E2B-backed runtime when configured.
+        self._runtime: SandboxRuntime | None = None
+
+    def _get_runtime(self) -> SandboxRuntime | None:
+        return self._runtime if self._runtime is not None else default_runtime()
+
+    @staticmethod
+    def _sandbox_id(session: dict[str, Any]) -> str:
+        sandbox_id = (session.get("environment") or {}).get("sandbox_id")
+        if not sandbox_id:
+            raise SandboxExpired(str(session.get("id") or ""))
+        return str(sandbox_id)
+
+    @staticmethod
+    def _rel(full: str) -> str:
+        rel = full[len(SANDBOX_ROOT):].lstrip("/")
+        return rel or "."
 
     async def execute(self, tool: str, args: dict[str, Any]) -> ToolResult:
         args.pop("__connector_tier", None)
@@ -178,8 +212,22 @@ class ComputerConnector:
     async def _execute_cloud(
         self, action: str, args: dict[str, Any], *, organization_id: str, task_id: str | None
     ) -> ToolResult:
+        runtime = self._get_runtime()
+        if runtime is None:
+            return ToolResult(
+                data={
+                    "status": "unavailable",
+                    "reason": (
+                        "No isolated runtime is configured, so a real cloud computer "
+                        "cannot be started. Set E2B_API_KEY to enable computer sessions."
+                    ),
+                },
+                summary="Cloud computer runtime not configured",
+            )
+
         if action == "create_session":
             session = await self.create_session(
+                runtime=runtime,
                 organization_id=organization_id,
                 member_id=str(args.get("member_id") or "chronos"),
                 task_id=task_id,
@@ -187,24 +235,46 @@ class ComputerConnector:
             )
             return ToolResult(data={"session": session}, summary="Cloud computer session created")
 
-        session = await self._load_or_create_session(args, organization_id=organization_id, task_id=task_id)
-        workspace = _cloud_workspace(organization_id, session["id"])
-        if action == "list_files":
-            return await self._cloud_list(session, workspace, args)
-        if action == "read_file":
-            return await self._cloud_read(session, workspace, args)
-        if action == "write_file":
-            return await self._cloud_write(session, workspace, args)
-        if action == "exec":
-            return await self._cloud_exec(session, workspace, args)
-        if action == "install_package":
-            command = self._package_install_command(args)
-            return await self._cloud_exec(session, workspace, {"command": command, "timeout_seconds": args.get("timeout_seconds", 30)}, event_type="computer_package_install")
-        if action == "screenshot":
-            return await self._cloud_screenshot(session)
-        if action == "export_artifact":
-            return await self._cloud_export(session, workspace, args)
+        session = await self._load_or_create_session(
+            args, runtime=runtime, organization_id=organization_id, task_id=task_id
+        )
+        try:
+            if action == "list_files":
+                return await self._cloud_list(runtime, session, args)
+            if action == "read_file":
+                return await self._cloud_read(runtime, session, args)
+            if action == "write_file":
+                return await self._cloud_write(runtime, session, args)
+            if action == "exec":
+                return await self._cloud_exec(runtime, session, args)
+            if action == "install_package":
+                command = self._package_install_command(args)
+                return await self._cloud_exec(
+                    runtime,
+                    session,
+                    {"command": command, "timeout_seconds": args.get("timeout_seconds", 120)},
+                    event_type="computer_package_install",
+                )
+            if action == "screenshot":
+                return await self._cloud_screenshot(session)
+            if action == "export_artifact":
+                return await self._cloud_export(runtime, session, args)
+        except SandboxExpired:
+            await self._mark_session_expired(session)
+            return ToolResult(
+                data={
+                    "status": "expired",
+                    "reason": "This cloud computer session has expired. Create a new session and re-copy any files you need.",
+                    "session": _public_session(session),
+                },
+                summary="Cloud computer session expired",
+            )
         raise ValueError(f"Unknown computer tool: computer.{action}")
+
+    async def _mark_session_expired(self, session: dict[str, Any]) -> None:
+        session["status"] = "expired"
+        session["closed_at"] = _now()
+        await self._save_session(session)
 
     async def _execute_local(
         self, action: str, args: dict[str, Any], *, organization_id: str, task_id: str | None
@@ -234,10 +304,13 @@ class ComputerConnector:
         raise ValueError(f"Unknown local computer tool: local_computer.{action}")
 
     async def create_session(
-        self, *, organization_id: str, member_id: str, task_id: str | None, purpose: str
+        self, *, runtime: SandboxRuntime, organization_id: str, member_id: str, task_id: str | None, purpose: str
     ) -> dict[str, Any]:
         session_id = str(uuid.uuid4())
-        workspace = _cloud_workspace(organization_id, session_id)
+        sandbox_id = await runtime.create(
+            timeout_seconds=settings.e2b_sandbox_timeout_seconds,
+            metadata={"org": organization_id, "session": session_id, "task": task_id},
+        )
         session = {
             "id": session_id,
             "organization_id": organization_id,
@@ -246,90 +319,99 @@ class ComputerConnector:
             "member_id": member_id,
             "status": "active",
             "purpose": purpose,
-            "workspace_path": str(workspace),
+            "workspace_path": SANDBOX_ROOT,
             "browser_session_id": None,
             "editor_state": {},
-            "network_policy": {"mode": "restricted", "allowed": ["package_index"]},
-            "resource_limits": {"timeout_seconds": MAX_TIMEOUT_SECONDS, "output_bytes": MAX_OUTPUT_BYTES},
-            "environment": {},
+            "network_policy": {"mode": "isolated_sandbox"},
+            "resource_limits": {
+                "command_timeout_seconds": CLOUD_MAX_TIMEOUT_SECONDS,
+                "sandbox_timeout_seconds": settings.e2b_sandbox_timeout_seconds,
+            },
+            # sandbox_id is held server-side identity; _public_session strips it.
+            "environment": {"sandbox_id": sandbox_id, "runtime": "e2b"},
             "history": [],
             "created_at": _now(),
             "updated_at": _now(),
             "closed_at": None,
         }
         await self._save_session(session)
-        await self._record_event(session, "computer_session_created", {"purpose": purpose})
+        await self._record_event(session, "computer_session_created", {"purpose": purpose, "runtime": "e2b"})
         return _public_session(session)
 
     async def _load_or_create_session(
-        self, args: dict[str, Any], *, organization_id: str, task_id: str | None
+        self, args: dict[str, Any], *, runtime: SandboxRuntime, organization_id: str, task_id: str | None
     ) -> dict[str, Any]:
         session_id = str(args.get("session_id") or "")
         if session_id:
             return await self._load_session(session_id, organization_id)
         return await self.create_session(
+            runtime=runtime,
             organization_id=organization_id,
             member_id=str(args.get("member_id") or "chronos"),
             task_id=task_id,
             purpose=str(args.get("purpose") or "computer task"),
         )
 
-    async def _cloud_list(self, session: dict[str, Any], root: Path, args: dict[str, Any]) -> ToolResult:
-        path = jailed_path(root, str(args.get("path") or "."))
-        if not path.exists():
-            raise FileNotFoundError(str(args.get("path") or "."))
-        children = [path] if path.is_file() else sorted(path.iterdir(), key=lambda item: item.name)[:200]
+    async def _cloud_list(self, runtime: SandboxRuntime, session: dict[str, Any], args: dict[str, Any]) -> ToolResult:
+        parent = remote_path(str(args.get("path") or "."))
+        children = await runtime.list(self._sandbox_id(session), parent)
         entries = [
             {
-                "path": str(child.relative_to(root)),
-                "type": "directory" if child.is_dir() else "file",
-                "size": None if child.is_dir() else child.stat().st_size,
+                "path": self._rel(f"{parent.rstrip('/')}/{child['name']}"),
+                "type": child["type"],
+                "size": None,
             }
-            for child in children
+            for child in children[:200]
         ]
-        await self._record_event(session, "computer_files_listed", {"path": str(path.relative_to(root)), "count": len(entries)})
+        await self._record_event(session, "computer_files_listed", {"path": self._rel(parent), "count": len(entries)})
         return ToolResult(data={"session": _public_session(session), "entries": entries}, summary=f"Listed {len(entries)} computer files")
 
-    async def _cloud_read(self, session: dict[str, Any], root: Path, args: dict[str, Any]) -> ToolResult:
-        path = jailed_path(root, str(args.get("path") or ""))
-        if not path.is_file():
-            raise FileNotFoundError(str(args.get("path") or ""))
-        raw = path.read_bytes()
-        await self._record_event(session, "computer_file_read", {"path": str(path.relative_to(root)), "bytes": len(raw)})
+    async def _cloud_read(self, runtime: SandboxRuntime, session: dict[str, Any], args: dict[str, Any]) -> ToolResult:
+        path = remote_path(str(args.get("path") or ""))
+        raw = await runtime.read(self._sandbox_id(session), path)
+        await self._record_event(session, "computer_file_read", {"path": self._rel(path), "bytes": len(raw)})
         return ToolResult(
             data={
                 "session": _public_session(session),
-                "path": str(path.relative_to(root)),
+                "path": self._rel(path),
                 "content": raw[:MAX_READ_BYTES].decode("utf-8", errors="replace"),
                 "bytes": len(raw),
                 "truncated": len(raw) > MAX_READ_BYTES,
             },
-            summary=f"Read computer file {path.relative_to(root)}",
+            summary=f"Read computer file {self._rel(path)}",
         )
 
-    async def _cloud_write(self, session: dict[str, Any], root: Path, args: dict[str, Any]) -> ToolResult:
-        path = jailed_path(root, str(args.get("path") or ""))
+    async def _cloud_write(self, runtime: SandboxRuntime, session: dict[str, Any], args: dict[str, Any]) -> ToolResult:
+        path = remote_path(str(args.get("path") or ""))
         raw = str(args.get("content") or "").encode("utf-8")
         if len(raw) > MAX_WRITE_BYTES:
             raise ValueError(f"computer.write_file payload exceeds {MAX_WRITE_BYTES} bytes")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(raw)
-        await self._record_event(session, "computer_file_written", {"path": str(path.relative_to(root)), "bytes": len(raw)})
+        sandbox_id = self._sandbox_id(session)
+        parent = posixpath.dirname(path)
+        if parent and parent != SANDBOX_ROOT:
+            await runtime.run(sandbox_id, f"mkdir -p {shlex.quote(parent)}", cwd=SANDBOX_ROOT, timeout_seconds=15)
+        await runtime.write(sandbox_id, path, raw)
+        await self._record_event(session, "computer_file_written", {"path": self._rel(path), "bytes": len(raw)})
         return ToolResult(
-            data={"session": _public_session(session), "path": str(path.relative_to(root)), "bytes": len(raw)},
-            summary=f"Wrote computer file {path.relative_to(root)}",
+            data={"session": _public_session(session), "path": self._rel(path), "bytes": len(raw)},
+            summary=f"Wrote computer file {self._rel(path)}",
         )
 
     async def _cloud_exec(
         self,
+        runtime: SandboxRuntime,
         session: dict[str, Any],
-        root: Path,
         args: dict[str, Any],
         *,
         event_type: str = "computer_command",
     ) -> ToolResult:
         command = str(args.get("command") or "")
-        result = await _run_shell(command, cwd=root, timeout_seconds=_timeout(args.get("timeout_seconds")))
+        result = await runtime.run(
+            self._sandbox_id(session),
+            command,
+            cwd=SANDBOX_ROOT,
+            timeout_seconds=_cloud_timeout(args.get("timeout_seconds")),
+        )
         payload = {
             "command": command,
             "status": result["status"],
@@ -339,7 +421,7 @@ class ComputerConnector:
         }
         await self._record_event(session, event_type, payload)
         return ToolResult(
-            data={**result, "session": _public_session(session), "workspace": str(root)},
+            data={**result, "session": _public_session(session), "workspace": SANDBOX_ROOT},
             summary=f"Computer command {result['status']}",
         )
 
@@ -361,28 +443,44 @@ class ComputerConnector:
         return ToolResult(
             data={
                 "status": "degraded",
-                "reason": "Cloud desktop screenshot capture is unavailable in this runtime; session metadata is durable.",
+                "reason": "The isolated sandbox is headless (no GUI), so there is no screen to capture. Use exec/read_file to inspect state.",
                 "session": _public_session(session),
             },
-            summary="Computer screenshot unavailable in metadata-only runtime",
+            summary="Computer screenshot unavailable (headless sandbox)",
         )
 
-    async def _cloud_export(self, session: dict[str, Any], root: Path, args: dict[str, Any]) -> ToolResult:
-        path = jailed_path(root, str(args.get("path") or "."))
-        if not path.exists():
-            raise FileNotFoundError(str(args.get("path") or "."))
-        if path.is_dir():
-            archive_base = root / f"export-{uuid.uuid4()}"
-            archive_path = shutil.make_archive(str(archive_base), "zip", root_dir=path)
-            raw = Path(archive_path).read_bytes()
+    async def _cloud_export(self, runtime: SandboxRuntime, session: dict[str, Any], args: dict[str, Any]) -> ToolResult:
+        sandbox_id = self._sandbox_id(session)
+        path = remote_path(str(args.get("path") or "."))
+        probe = await runtime.run(
+            sandbox_id,
+            f"if [ -d {shlex.quote(path)} ]; then echo dir; elif [ -f {shlex.quote(path)} ]; then echo file; else echo none; fi",
+            cwd=SANDBOX_ROOT,
+            timeout_seconds=15,
+        )
+        kind_fs = (probe.get("stdout") or "").strip()
+        if kind_fs == "none":
+            raise FileNotFoundError(self._rel(path))
+        if kind_fs == "dir":
+            archive = f"/tmp/export-{uuid.uuid4().hex}.zip"
+            rel = self._rel(path)
+            zip_result = await runtime.run(
+                sandbox_id,
+                f"rm -f {shlex.quote(archive)} && cd {shlex.quote(SANDBOX_ROOT)} && zip -rq {shlex.quote(archive)} {shlex.quote(rel)}",
+                cwd=SANDBOX_ROOT,
+                timeout_seconds=CLOUD_MAX_TIMEOUT_SECONDS,
+            )
+            if zip_result.get("status") != "success":
+                raise RuntimeError(f"export archive failed: {zip_result.get('stderr') or zip_result.get('status')}")
+            raw = await runtime.read(sandbox_id, archive)
             kind = "file"
             mime_type = "application/zip"
-            title = str(args.get("title") or f"{path.name or 'computer'} export.zip")
+            title = str(args.get("title") or f"{posixpath.basename(path) or 'computer'} export.zip")
         else:
-            raw = path.read_bytes()
+            raw = await runtime.read(sandbox_id, path)
             kind = str(args.get("kind") or "file")
             mime_type = str(args.get("mime_type") or "application/octet-stream")
-            title = str(args.get("title") or path.name)
+            title = str(args.get("title") or posixpath.basename(path))
         artifact_id = await save_artifact(
             raw,
             kind=kind,
@@ -393,9 +491,9 @@ class ComputerConnector:
             mime_type=mime_type,
             created_by=session.get("member_id"),
         )
-        await self._record_event(session, "computer_artifact_exported", {"path": str(path.relative_to(root)), "artifact_id": artifact_id})
+        await self._record_event(session, "computer_artifact_exported", {"path": self._rel(path), "artifact_id": artifact_id})
         return ToolResult(
-            data={"session": _public_session(session), "artifact_id": artifact_id, "path": str(path.relative_to(root))},
+            data={"session": _public_session(session), "artifact_id": artifact_id, "path": self._rel(path)},
             summary=f"Exported computer file to artifact {artifact_id}",
         )
 

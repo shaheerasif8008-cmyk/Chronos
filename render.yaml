@@ -78,6 +78,8 @@ services:
         value: "1800"
       - key: TAVILY_API_KEY
         sync: false
+      - key: E2B_API_KEY
+        sync: false          # isolated runtime for computer.* tools; without it, computer.* is disabled
       - key: LANGFUSE_PUBLIC_KEY
         sync: false
       - key: LANGFUSE_SECRET_KEY

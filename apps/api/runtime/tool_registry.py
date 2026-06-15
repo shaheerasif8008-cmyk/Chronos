@@ -248,18 +248,18 @@ CODE_PYTHON = _fn(
 
 COMPUTER_CREATE_SESSION = _fn(
     "computer__create_session",
-    "Create a durable cloud computer workspace for a task, with sandboxed filesystem and terminal state.",
+    "Start an isolated Linux sandbox (a real cloud VM-backed container) for a task. The sandbox has its own filesystem and shell, starts EMPTY, and is ephemeral — it expires after a period of inactivity, so treat its files as temporary and export anything you need to keep.",
     {"purpose": {"type": "string", "description": "Why this computer session is needed.", "default": "computer task"}},
     [],
 )
 
 COMPUTER_EXEC = _fn(
     "computer__exec",
-    "Run a shell command inside the sandboxed cloud computer workspace. Commands are audited, timed out, and resource-limited.",
+    "Run a shell command inside the isolated sandbox. Each new session is empty — copy or fetch any files you need into it first. Commands are audited and resource-limited.",
     {
-        "session_id": {"type": "string", "description": "Cloud computer session id. Omit to create one.", "default": ""},
-        "command": {"type": "string", "description": "Shell command to run inside the workspace."},
-        "timeout_seconds": {"type": "integer", "description": "Timeout in seconds, capped at 30.", "default": 10},
+        "session_id": {"type": "string", "description": "Sandbox session id. Omit to create a new (empty) one.", "default": ""},
+        "command": {"type": "string", "description": "Shell command to run inside the sandbox."},
+        "timeout_seconds": {"type": "integer", "description": "Timeout in seconds, capped at 600.", "default": 60},
     },
     ["command"],
 )
