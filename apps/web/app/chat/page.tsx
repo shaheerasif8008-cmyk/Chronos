@@ -7022,9 +7022,51 @@ function ToolsSettings({ data, patch, connectors, capabilities, health }: { data
   return <><SettingsSection title="Connector readiness" note="Chronos can run tools in fixture, demo, or live mode per connector.">{providers.length === 0 ? <div className="p-5"><EmptyState title="No connector checks available" sub="Startup health has not reported tool readiness yet."/></div> : providers.map(([provider, item]) => <div key={provider} className="px-5 py-4 border-b hairline last:border-b-0"><div className="flex items-start justify-between gap-4"><div><div className="font-medium capitalize">{provider}</div><div className="text-[12px] mt-1" style={{ color: "var(--text-dim)" }}>{item.reason || "Ready"}</div>{item.setup && <div className="text-[12px] mt-1 font-mono" style={{ color: "var(--text-muted)" }}>{item.setup}</div>}</div><Tag variant={item.tier === "live" ? "accent" : item.tier === "demo" ? "info" : "warn"}>{item.tier || item.status || "unknown"}</Tag></div></div>)}</SettingsSection><SettingsSection title="Connected tools" note="Enable/disable and approval-required states are enforced by the tool broker.">{connectors.length === 0 ? <div className="p-5"><EmptyState title="No tools connected" sub="Connectors appear here after OAuth or local enablement."/></div> : connectors.map(c => { const policy = ((data[c.provider] || c.policy || {}) as Record<string, unknown>); return <div key={c.id} className="px-5 py-4 border-b hairline last:border-b-0"><div className="flex justify-between gap-4"><div><div className="font-medium capitalize">{c.provider}</div><div className="text-[12px]" style={{ color: "var(--text-dim)" }}>{c.account_handle || "Org-level connector"} · {c.status} · last used {c.last_used_at || "never"}</div><div className="mt-2 flex flex-wrap gap-1">{(c.scopes || []).map(scope => <Tag key={scope}>{scope}</Tag>)}<Tag variant={String(policy.risk) === "high" ? "danger" : "info"}>{String(policy.risk || "unknown")} risk</Tag></div></div><div className="flex items-center gap-4"><Toggle label={`${c.provider} enabled`} checked={policy.enabled !== false} onChange={enabled => update(c.provider, { enabled })}/><Toggle label={`${c.provider} approval required`} checked={Boolean(policy.approval_required)} onChange={approval_required => update(c.provider, { approval_required })}/><button className="btn btn-danger-soft btn-sm" disabled title="Disconnect is managed from Connectors until scoped confirmation is added.">Disconnect</button></div></div></div>; })}</SettingsSection><Unavailable reason={capabilities.notification_email_dispatch.reason}/></>;
 }
 
+const AUTONOMY_LABELS: Record<string, string> = { supervised: "Supervised", full_auto: "Full auto" };
+
+function WorkspaceAutonomySection() {
+  const [level, setLevel] = useState<string>("supervised");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    apiFetch("/settings/autonomy?workspace_id=default")
+      .then(r => r.json())
+      .then((data: { level?: string }) => setLevel(data.level || "supervised"))
+      .catch(() => {});
+  }, []);
+
+  async function save(next: string) {
+    setSaving(true);
+    setError("");
+    const prev = level;
+    setLevel(next);
+    try {
+      await apiFetch("/settings/autonomy", {
+        method: "PATCH",
+        body: JSON.stringify({ workspace_id: "default", level: next }),
+      });
+    } catch (exc) {
+      setLevel(prev);
+      setError(exc instanceof Error ? exc.message : "Unable to save autonomy");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <SettingsSection title="Workspace autonomy" note="Full auto lets Chronos take governed actions without pausing for per-tool approval. The hard floor — external publishing, payments, sending email, and local-machine commands — always requires approval and can never be bypassed.">
+      <SettingsField label="Autonomy level" hint={level === "full_auto" ? "Full auto: governed actions run without approval, except the hard floor." : "Supervised: tools flagged for approval pause for a human."}>
+        <SelectInput ariaLabel="Workspace autonomy level" value={AUTONOMY_LABELS[level] || level} onChange={pretty => { const next = Object.keys(AUTONOMY_LABELS).find(k => AUTONOMY_LABELS[k] === pretty) || "supervised"; if (!saving) void save(next); }} options={Object.values(AUTONOMY_LABELS)} disabled={saving}/>
+      </SettingsField>
+      {error && <SettingsField label=""><span className="text-[12px]" style={{ color: "var(--danger)" }}>{error}</span></SettingsField>}
+    </SettingsSection>
+  );
+}
+
 function ApprovalSettings({ data, patch }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void }) {
   const thresholds = (data.thresholds || {}) as Record<string, string>;
-  return <SettingsSection title="Approval policy"><SettingsField label="Mode"><SelectInput ariaLabel="Approval mode" value={val(data, "mode")} onChange={mode => patch({ mode })} options={["off", "low-risk auto", "manual", "strict"]}/></SettingsField>{["low", "medium", "high"].map(level => <SettingsField key={level} label={`${level} risk threshold`}><SelectInput ariaLabel={`${level} risk threshold`} value={thresholds[level] || "manual"} onChange={value => patch({ thresholds: { ...thresholds, [level]: value } })} options={["auto", "manual", "strict", "blocked"]}/></SettingsField>)}<SettingsField label="Rule builder"><pre className="text-[12px] overflow-auto max-w-md" style={{ color: "var(--text-muted)" }}>{JSON.stringify(data.rules || [], null, 2)}</pre></SettingsField></SettingsSection>;
+  return <><WorkspaceAutonomySection/><SettingsSection title="Approval policy"><SettingsField label="Mode"><SelectInput ariaLabel="Approval mode" value={val(data, "mode")} onChange={mode => patch({ mode })} options={["off", "low-risk auto", "manual", "strict"]}/></SettingsField>{["low", "medium", "high"].map(level => <SettingsField key={level} label={`${level} risk threshold`}><SelectInput ariaLabel={`${level} risk threshold`} value={thresholds[level] || "manual"} onChange={value => patch({ thresholds: { ...thresholds, [level]: value } })} options={["auto", "manual", "strict", "blocked"]}/></SettingsField>)}<SettingsField label="Rule builder"><pre className="text-[12px] overflow-auto max-w-md" style={{ color: "var(--text-muted)" }}>{JSON.stringify(data.rules || [], null, 2)}</pre></SettingsField></SettingsSection></>;
 }
 
 function NotificationSettings({ data, patch, capabilities }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void; capabilities: SettingsOverview["capabilities"] }) {
