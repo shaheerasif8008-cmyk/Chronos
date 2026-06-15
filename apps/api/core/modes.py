@@ -93,8 +93,15 @@ _MODE_METADATA: tuple[dict, ...] = (
 
 
 def available_modes() -> list[dict]:
-    """Return product-facing metadata for all composer modes."""
-    return [dict(mode) for mode in _MODE_METADATA]
+    """Return product-facing composer modes.
+
+    Chronos is chat-first: the model self-routes within a single default mode
+    (running code, driving a browser, kicking off research/tasks on its own),
+    so only ``default`` is advertised to the UI. The other historical modes
+    remain valid inputs to :func:`normalize_mode` for backward compatibility
+    with stored records, but they are no longer surfaced as a user choice.
+    """
+    return [dict(mode) for mode in _MODE_METADATA if mode["id"] == "default"]
 
 
 def normalize_mode(value: str | None) -> str:

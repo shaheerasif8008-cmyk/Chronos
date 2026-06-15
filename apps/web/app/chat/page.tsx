@@ -164,7 +164,6 @@ type ConnectorApproval = {
 type Task = { id: string; status: string; goal: string; current_step: number; plan?: TaskStep[] | { steps?: TaskStep[] }; agent_state?: Record<string, unknown>; result?: Record<string, unknown>; error?: string | null; created_at?: string; parent_task_id?: string | null; depth?: number; iteration_count?: number };
 type TaskStep = { id: string; action: string; description: string; tool?: string | null };
 type ChatModel = { id: string; label: string; model: string; description?: string; capabilities?: string[]; status?: string; tool_use?: boolean; fallback_for?: string[]; policy?: string };
-type ChatMode = { id: string; label: string; description?: string; capabilities?: string[]; status?: string; creates_task?: boolean };
 type TaskStreamEvent = {
   type: string;
   task_id?: string;
@@ -253,7 +252,6 @@ type ActivityAction = {
 
 const MODEL_STORAGE_KEY = "chronos.chat.selectedModel";
 const DEFAULT_MODEL_ID = "auto";
-const MODE_STORAGE_KEY = "chronos.chat.selectedMode";
 const REASONING_STORAGE_KEY = "chronos.chat.reasoningEffort";
 const REASONING_OPTIONS = [
   { id: "low", label: "Low", title: "Use lighter reasoning for faster replies." },
@@ -277,11 +275,6 @@ function modelOptionTitle(model: ChatModel) {
   return `${model.description || model.model}.${capabilities}${policy}`.trim();
 }
 
-function modeOptionTitle(mode: ChatMode) {
-  const capabilities = mode.capabilities?.length ? ` Capabilities: ${mode.capabilities.join(", ")}.` : "";
-  const task = mode.creates_task ? " Creates a durable task when selected." : " Runs in the chat turn unless routing escalates it.";
-  return `${mode.description || mode.label}.${capabilities}${task}`.trim();
-}
 
 function taskSteps(task: Task | null | undefined): TaskStep[] {
   if (!task?.plan) return [];
@@ -584,18 +577,6 @@ const PALETTE_TYPE_LABELS: Record<string, string> = {
   memory: "Memory",
   sources: "Sources",
 };
-
-const DEFAULT_CHAT_MODES: ChatMode[] = [
-  { id: "default",  label: "Default" },
-  { id: "research", label: "Research" },
-  { id: "agent",    label: "Agent" },
-  { id: "browser",  label: "Browser" },
-  { id: "computer", label: "Computer" },
-  { id: "data",     label: "Data" },
-  { id: "image",    label: "Image" },
-  { id: "voice",    label: "Voice" },
-  { id: "coding",   label: "Coding" },
-];
 
 // ─── Auth helpers ─────────────────────────────────────────────────────────────
 function getToken() {
@@ -1392,11 +1373,11 @@ function ChatScreen({
   const [draft, setDraft] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
   const [chatModels, setChatModels] = useState<ChatModel[]>([]);
-  const [chatModes, setChatModes] = useState<ChatMode[]>(DEFAULT_CHAT_MODES);
   const [selectedModel, setSelectedModel] = useState(DEFAULT_MODEL_ID);
   const [modelsLoadError, setModelsLoadError] = useState("");
-  const [selectedMode, setSelectedMode] = useState<string>("default");
-  const [modesLoadError, setModesLoadError] = useState("");
+  // Chronos is chat-first: the model self-routes within a single default mode,
+  // so there is no mode picker. The value is kept for the request body shape.
+  const selectedMode = "default";
   const [selectedReasoningEffort, setSelectedReasoningEffort] = useState<ReasoningEffort>(DEFAULT_REASONING_EFFORT);
   const [streaming, setStreaming] = useState(false);
   const [memoryNotice, setMemoryNotice] = useState<{ id: string; content: string; undone?: boolean; error?: string } | null>(null);
@@ -1704,27 +1685,6 @@ function ChatScreen({
       .catch((err) => {
         setModelsLoadError(err instanceof Error ? err.message : "Unable to load models");
         setChatModels([]);
-      });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  useEffect(() => {
-    apiFetch("/chat/modes")
-      .then(r => r.json())
-      .then((data: ChatMode[]) => {
-        const modes = Array.isArray(data) && data.length ? data : DEFAULT_CHAT_MODES;
-        setModesLoadError("");
-        setChatModes(modes);
-        const stored = window.localStorage.getItem(MODE_STORAGE_KEY) || selectedMode;
-        const nextMode = modes.some(mode => mode.id === stored) ? stored : "default";
-        if (nextMode !== selectedMode) {
-          setSelectedMode(nextMode);
-        }
-        window.localStorage.setItem(MODE_STORAGE_KEY, nextMode);
-      })
-      .catch((err) => {
-        setModesLoadError(err instanceof Error ? err.message : "Unable to load modes");
-        setChatModes(DEFAULT_CHAT_MODES);
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -2687,25 +2647,6 @@ function ChatScreen({
                       : [{ id: selectedModel, label: "Loading models", model: selectedModel }]
                     ).map(model => (
                       <option key={model.id} value={model.id}>{modelOptionText(model)}</option>
-                    ))}
-                  </select>
-                  <label className="sr-only" htmlFor="chat-mode-select">Mode</label>
-                  <select
-                    id="chat-mode-select"
-                    aria-label="Mode"
-                    value={selectedMode}
-                    onChange={event => {
-                      setSelectedMode(event.target.value);
-                      window.localStorage.setItem(MODE_STORAGE_KEY, event.target.value);
-                    }}
-                    disabled={streaming || !!modesLoadError || chatModes.length === 0}
-                    className="surface border border-soft rounded-md px-2 py-1.5 text-[12.5px] outline-none disabled:opacity-60"
-                    data-selected-mode-status={chatModes.find(mode => mode.id === selectedMode)?.status ?? "unknown"}
-                    title={modesLoadError || modeOptionTitle(chatModes.find(mode => mode.id === selectedMode) ?? { id: selectedMode, label: selectedMode })}
-                    style={{ color: "var(--text)" }}
-                  >
-                    {(modesLoadError ? [{ id: "default", label: "Modes unavailable", status: "unavailable" }] : chatModes).map(m => (
-                      <option key={m.id} value={m.id}>{m.status && m.status !== "available" ? `${m.label} (${m.status})` : m.label}</option>
                     ))}
                   </select>
                 </div>
