@@ -7,7 +7,49 @@ def test_runtime_tool_installer_only_supports_allowlisted_tools():
     from core.tool_installer import supported_runtime_tools
 
     assert "playwright.chromium" in supported_runtime_tools()
+    assert "git" in supported_runtime_tools()
+    assert "ripgrep" in supported_runtime_tools()
     assert "apt.curl" not in supported_runtime_tools()
+
+
+@pytest.mark.asyncio
+async def test_ensure_binary_short_circuits_when_already_present(monkeypatch):
+    import core.tool_installer as installer
+
+    async def must_not_install(*_a, **_k):
+        raise AssertionError("install must not run when the binary is present")
+
+    monkeypatch.setattr(installer.shutil, "which", lambda _b: "/usr/bin/git")
+    monkeypatch.setattr(installer, "ensure_runtime_tool", must_not_install)
+
+    assert await installer.ensure_binary("git", organization_id="org-x") is True
+
+
+@pytest.mark.asyncio
+async def test_ensure_binary_returns_false_for_unallowlisted_binary(monkeypatch):
+    import core.tool_installer as installer
+
+    monkeypatch.setattr(installer.shutil, "which", lambda _b: None)
+    # An unknown binary is never installed and degrades to False.
+    assert await installer.ensure_binary("ffmpeg", organization_id="org-x") is False
+
+
+@pytest.mark.asyncio
+async def test_ensure_binary_installs_missing_then_reports_available(monkeypatch):
+    import core.tool_installer as installer
+    from core.tool_installer import ToolInstallResult
+
+    # Missing before install, present after — mirror an on-demand apt install.
+    states = iter([None, "/usr/bin/git"])
+    monkeypatch.setattr(installer.shutil, "which", lambda _b: next(states, "/usr/bin/git"))
+
+    async def fake_install(tool, *, organization_id, actor_id="chronos", reason=""):
+        assert tool == "git"
+        return ToolInstallResult(tool=tool, status="installed", returncode=0, reason=reason)
+
+    monkeypatch.setattr(installer, "ensure_runtime_tool", fake_install)
+
+    assert await installer.ensure_binary("git", organization_id="org-x") is True
 
 
 @pytest.mark.asyncio

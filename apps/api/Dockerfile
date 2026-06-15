@@ -10,11 +10,15 @@ WORKDIR /app
 
 # System deps: libpq for asyncpg, gcc for compiled wheels, and curl for health
 # checks. Playwright installs its own browser OS dependencies below.
+# git + ripgrep back the repo-workspace connector (clone/commit/diff, fast
+# search); they are baked in so repo tasks run for real, and the runtime
+# auto-installer (core/tool_installer.py) re-adds them as a fallback elsewhere.
 # Xvfb/xdotool/scrot back the desktop GUI operator (connectors/desktop.py); the
 # bridge degrades truthfully if they are absent, but the production image ships
 # them so desktop tasks run for real.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev gcc g++ libffi-dev libssl-dev curl \
+    git ripgrep \
     xvfb xdotool scrot x11-utils \
     && rm -rf /var/lib/apt/lists/*
 

@@ -93,6 +93,18 @@ async def _run(
         "HOME": str(cwd),
     }
     env.update(extra_env or {})
+    # Self-heal a missing allowlisted binary (e.g. git) instead of failing the
+    # task outright: install it on demand, then run. Unknown binaries are left
+    # untouched and surface the original FileNotFoundError as before.
+    if argv and shutil.which(argv[0]) is None:
+        from core.config import settings
+        from core.tool_installer import ensure_binary
+
+        await ensure_binary(
+            argv[0],
+            organization_id=settings.org_id,
+            reason=f"{argv[0]} needed by the repo workspace",
+        )
     process = await asyncio.create_subprocess_exec(
         *argv,
         cwd=str(cwd),
