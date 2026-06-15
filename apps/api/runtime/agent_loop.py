@@ -435,6 +435,15 @@ async def _agent_system_message(tools: list[dict[str, Any]] | None = None) -> di
             "- If a tool result contains `is_fallback: true` or a `warning` field, the live search failed. "
             "Report this honestly. Do not present placeholder/fixture data as real.\n"
             "- If you cannot find real data, say \"I could not find that information\" rather than inventing it.\n\n"
+            "CRITICAL RULE — Verify before you claim done:\n"
+            "- Never say a file, import, install, or change succeeded — or that it landed in a particular "
+            "place — until a tool result confirms it. Verify (list the directory, read it back, re-run a check), "
+            "then report. Do not narrate an assumed outcome as a finished fact.\n"
+            "- 'Workspace' refers to several SEPARATE locations that do not share files: the task/file workspace "
+            "(fs__*, code__python), and the cloud computer sandbox (computer__create_session / computer__exec), "
+            "which starts EMPTY every session. Files you wrote elsewhere are not in a new cloud session. Copy or "
+            "fetch what you need INTO the session, confirm with `computer__exec ls`, then run — and only then "
+            "say it is in the cloud workspace.\n\n"
             f"{manifest}"
         ),
     }
