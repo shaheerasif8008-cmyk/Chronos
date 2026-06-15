@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select, update
 
-from core import audit, permissions
+from core import audit, invitations, permissions
 from core.auth import get_current_member
 from core.connector_health import check_connectors
 from core.config import settings
@@ -40,6 +40,11 @@ class SettingsPatch(BaseModel):
 
 class MemberRolePatch(BaseModel):
     role: str
+
+
+class InvitationCreate(BaseModel):
+    email: str
+    role: str = "viewer"
 
 
 class MemoryPurgeRequest(BaseModel):
@@ -201,7 +206,7 @@ async def overview(member: Member = Depends(get_current_member)) -> dict[str, An
         "capabilities": {
             "email_edit": _unsupported("OTP auth does not support email changes."),
             "profile_photo_upload": _unsupported("No file upload service is configured."),
-            "invitations": _unsupported("Invitation delivery is not implemented."),
+            "invitations": {"supported": True, "delivery": "manual_token"},
             "sessions": _unsupported("JWT sessions are stateless and not persisted."),
             "password": _unsupported("OTP auth has no password credential."),
             "two_factor": _unsupported("OTP login is the configured second factor."),
@@ -253,6 +258,43 @@ async def update_member_role(member_id: str, req: MemberRolePatch, member: Membe
         await conn.execute(update(members).where(members.c.id == member_id).values(role=req.role))
     await audit.log("settings_change", member.id, "settings.members.role_update", organization_id=member.organization_id, resource_type="members", resource_id=member_id, payload={"role": req.role})
     return {"id": member_id, "role": req.role}
+
+
+@router.get("/invitations")
+async def list_member_invitations(member: Member = Depends(get_current_member)) -> dict[str, Any]:
+    require_admin(member)
+    return {"invitations": await invitations.list_invitations(member.organization_id)}
+
+
+@router.post("/invitations")
+async def create_member_invitation(req: InvitationCreate, member: Member = Depends(get_current_member)) -> dict[str, Any]:
+    require_admin(member)
+    email = req.email.strip().lower()
+    if "@" not in email or email.startswith("@") or email.endswith("@"):
+        raise HTTPException(status_code=400, detail="A valid email is required")
+    if req.role not in ROLE_ORDER:
+        raise HTTPException(status_code=400, detail="Invalid role")
+    members = await reflect_table("members")
+    async with engine.begin() as conn:
+        existing = (
+            await conn.execute(
+                select(members.c.id).where(
+                    members.c.organization_id == member.organization_id,
+                    members.c.email == email,
+                )
+            )
+        ).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="That email is already a member")
+    return await invitations.create_invitation(member, email, req.role)
+
+
+@router.post("/invitations/{invitation_id}/revoke")
+async def revoke_member_invitation(invitation_id: str, member: Member = Depends(get_current_member)) -> dict[str, Any]:
+    require_admin(member)
+    if not await invitations.revoke_invitation(member, invitation_id):
+        raise HTTPException(status_code=404, detail="No pending invitation with that id")
+    return {"id": invitation_id, "status": "revoked"}
 
 
 @router.delete("/members/{member_id}")

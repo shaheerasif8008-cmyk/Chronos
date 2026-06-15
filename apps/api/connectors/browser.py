@@ -102,8 +102,9 @@ class BrowserConnector:
             except Exception as exc:
                 log.warning("Tavily search failed; falling back to browser search: %s", exc)
 
-        playwright, browser, context, page = await _new_page()
+        playwright = browser = context = None
         try:
+            playwright, browser, context, page = await _new_page()
             url = f"https://html.duckduckgo.com/html/?q={_url_encode(query)}"
             await page.goto(url, wait_until="domcontentloaded")
             await _save_screenshot(page, "search")
@@ -128,15 +129,33 @@ class BrowserConnector:
                 summary=f"Search '{query}': {len(trimmed)} results",
             )
         except Exception as exc:
-            results = _fixture_search_results(query, max_results)
+            # Truthful degraded mode: never fabricate research data. Whether the
+            # browser failed to launch or the page failed to load, return an
+            # explicit empty/unavailable result so the model reports the outage
+            # instead of treating placeholder rows as real findings.
+            log.warning("Live web search failed for %r: %s", query, exc)
             return ToolResult(
-                data={"query": query, "results": results, "tier": "fixture", "fallback_reason": str(exc), "is_fallback": True, "warning": "Live search was unavailable. The results below are placeholder data — do not use them as real research. Report to the user that web search is currently unavailable."},
-                summary=f"LIVE SEARCH UNAVAILABLE — returning {len(results)} placeholder results. Do not treat these as real data.",
+                data={
+                    "query": query,
+                    "results": [],
+                    "tier": "unavailable",
+                    "error": str(exc),
+                    "is_unavailable": True,
+                    "warning": (
+                        "Live web search is currently unavailable and returned no results. "
+                        "Do not fabricate or guess results — tell the user web search could "
+                        "not be completed."
+                    ),
+                },
+                summary=f"LIVE SEARCH UNAVAILABLE — web search could not be completed ({exc}). No results returned.",
             )
         finally:
-            await context.close()
-            await browser.close()
-            await playwright.stop()
+            if context is not None:
+                await context.close()
+            if browser is not None:
+                await browser.close()
+            if playwright is not None:
+                await playwright.stop()
 
     async def _fetch(self, args: dict) -> ToolResult:
         url = args.get("url", "")
@@ -296,14 +315,3 @@ def _fixture_leads(max_results: int) -> list[dict[str, Any]]:
         }
         for i in range(1, 21)
     ][:max_results]
-
-
-def _fixture_search_results(query: str, max_results: int) -> list[dict[str, Any]]:
-    return [
-        {
-            "title": f"Fixture research result {i}: {query}",
-            "snippet": "Live browser search was unavailable, so Chronos recorded a deterministic fallback result for this research step.",
-            "url": f"https://example.com/research/{i}",
-        }
-        for i in range(1, max_results + 1)
-    ]

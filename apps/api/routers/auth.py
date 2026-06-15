@@ -19,6 +19,7 @@ from core.cognito import (
 )
 from core.config import settings
 from core.db import engine, reflect_table
+from core.invitations import accept_pending_invitation
 from core.members import get_member_by_email, get_or_create_member_for_email
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -108,6 +109,8 @@ async def verify_otp(req: OtpVerify, response: Response) -> dict[str, str]:
         raise HTTPException(status_code=400, detail="Invalid OTP")
 
     member = await get_member_by_email(email)
+    if member is None:
+        member = await accept_pending_invitation(email, org_id=settings.org_id)
     if member is None:
         raise HTTPException(status_code=403, detail="Email is not seeded as a Chronos member")
 

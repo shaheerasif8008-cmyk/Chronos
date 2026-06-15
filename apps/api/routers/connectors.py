@@ -884,7 +884,14 @@ async def install_connector(connector_id: str, req: InstallConnectorRequest, mem
     if not connector:
         raise HTTPException(status_code=404, detail="Connector not found")
     if connector.get("type") == "mcp":
-        raise HTTPException(status_code=501, detail="MCP transport is not implemented for production execution")
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "MCP servers are not installed through this connector path. "
+                "Register the server via POST /connectors/mcp/servers, discover its "
+                "tools, then call them through the broker (mcp.<server>.<tool>)."
+            ),
+        )
 
     installed = await repository.install_connector(
         connector_id,

@@ -459,22 +459,61 @@ class CustomHTTPAdapter(OAuthHTTPAdapter):
 
 
 class MCPAdapter:
-    """Architecture placeholder for MCP connectors.
+    """Adapter for MCP connectors.
 
-    This normalizes discovered MCP tools into Chronos connector actions. Actual
-    MCP transport is intentionally not marked production-ready until a concrete
-    MCP server command/URL can be connected and tested.
+    Normalizes discovered MCP tools into Chronos connector actions and executes
+    them through the real JSON-RPC transport in ``connectors.mcp_client`` (stdio
+    for local servers, HTTP for remote). The server descriptor is read from
+    ``connector.mcp_config`` (keys: ``transport``, ``command``, ``server_url``).
     """
 
     def __init__(self, connector: ConnectorDef):
         self.connector = connector
 
+    @property
+    def _server(self) -> dict[str, Any]:
+        return self.connector.mcp_config or {}
+
     async def list_actions(self) -> list[ConnectorActionDef]:
-        # TODO: discover tools from mcp_server_url or command config.
-        return []
+        from connectors.mcp_client import MCPTransportError, call_mcp
+
+        if not self._server.get("transport"):
+            return []
+        try:
+            discovered = await call_mcp(self._server, "tools/list", {})
+        except (MCPTransportError, OSError, TimeoutError, ValueError):
+            return []
+        actions: list[ConnectorActionDef] = []
+        for tool in discovered.get("tools") or []:
+            name = tool.get("name")
+            if not name:
+                continue
+            actions.append(
+                ConnectorActionDef(
+                    name=name,
+                    description=tool.get("description", "MCP tool"),
+                    parameters_schema=tool.get("inputSchema") or {"type": "object"},
+                    output_schema={"type": "object"},
+                    required_permissions=["mcp.execute"],
+                    risk_level="write",
+                    approval_required=True,
+                )
+            )
+        return actions
 
     async def execute(self, action_name: str, args: dict[str, Any], context: dict[str, Any]) -> ConnectorResult:
-        return ConnectorResult(status="failure", error="MCP transport is not implemented for this connector")
+        from connectors.mcp_client import MCPTransportError, call_mcp
+
+        if not self._server.get("transport"):
+            return ConnectorResult(
+                status="failure",
+                error="MCP server is not configured. Register it via /connectors/mcp/servers before executing tools.",
+            )
+        try:
+            result = await call_mcp(self._server, "tools/call", {"name": action_name, "arguments": args})
+        except (MCPTransportError, OSError, TimeoutError, ValueError) as exc:
+            return ConnectorResult(status="failure", error=str(exc))
+        return ConnectorResult(status="success", output={"result": result})
 
     async def validate_credentials(self, credentials: dict[str, Any]) -> bool:
         return True
