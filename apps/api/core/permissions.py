@@ -139,7 +139,9 @@ async def grant_org_membership(member_id: str, org_id: str, *, admin: bool = Fal
     if not settings_openfga_configured():
         return
     relation = "admin" if admin else "member"
-    await authz.write_tuples([(f"user:{member_id}", relation, f"organization:{org_id}")])
+    await _write_tuples_idempotently(
+        [(f"user:{member_id}", relation, f"organization:{org_id}")]
+    )
 
 
 async def grant_project_role(member_id: str, role: str, project_id: str, org_id: str) -> None:
@@ -150,7 +152,7 @@ async def grant_project_role(member_id: str, role: str, project_id: str, org_id:
     if not settings_openfga_configured():
         return
     relation = "owner" if role == "owner" else "editor"
-    await authz.write_tuples(
+    await _write_tuples_idempotently(
         [
             (f"user:{member_id}", relation, f"project:{project_id}"),
             (f"organization:{org_id}", "org", f"project:{project_id}"),
@@ -170,3 +172,12 @@ def settings_openfga_configured() -> bool:
     from core.config import settings
 
     return bool(settings.openfga_api_url)
+
+
+async def _write_tuples_idempotently(tuples: list[tuple[str, str, str]]) -> None:
+    try:
+        await authz.write_tuples(tuples)
+    except AuthzUnavailable as exc:
+        if "tuple to be written already existed" in str(exc):
+            return
+        raise

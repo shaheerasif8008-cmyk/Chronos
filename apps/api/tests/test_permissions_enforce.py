@@ -95,3 +95,32 @@ async def test_grant_project_role_writes_member_and_org_tuples(monkeypatch):
     tuples = write.await_args.args[0]
     assert ("user:bob", "owner", "project:p1") in tuples
     assert ("organization:default", "org", "project:p1") in tuples
+
+
+@pytest.mark.asyncio
+async def test_grant_org_membership_ignores_existing_tuple(monkeypatch):
+    from core.authz import AuthzUnavailable
+
+    monkeypatch.setattr(permissions, "settings_openfga_configured", lambda: True)
+    monkeypatch.setattr(
+        permissions.authz,
+        "write_tuples",
+        AsyncMock(side_effect=AuthzUnavailable("tuple to be written already existed")),
+    )
+
+    await permissions.grant_org_membership("bob", "default", admin=True)
+
+
+@pytest.mark.asyncio
+async def test_grant_org_membership_reraises_other_authz_errors(monkeypatch):
+    from core.authz import AuthzUnavailable
+
+    monkeypatch.setattr(permissions, "settings_openfga_configured", lambda: True)
+    monkeypatch.setattr(
+        permissions.authz,
+        "write_tuples",
+        AsyncMock(side_effect=AuthzUnavailable("openfga down")),
+    )
+
+    with pytest.raises(AuthzUnavailable):
+        await permissions.grant_org_membership("bob", "default", admin=True)
