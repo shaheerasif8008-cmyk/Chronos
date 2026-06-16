@@ -130,14 +130,16 @@ jobs:
           echo "arn=$ARN" >> "$GITHUB_OUTPUT"
 
           # Patch the image tag to match the freshly-built image.
-          NEW_DEF=$(aws ecs describe-task-definition \
+          aws ecs describe-task-definition \
             --task-definition "${{ env.MIGRATE_TASK_FAMILY }}" \
-            --query "taskDefinition" | \
+            --query "taskDefinition" \
+            --output json | \
             jq --arg img "${{ needs.build.outputs.api_image }}" \
                '.containerDefinitions[0].image = $img |
-                del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)')
-          UPDATED_ARN=$(echo "$NEW_DEF" | aws ecs register-task-definition \
-            --cli-input-json /dev/stdin \
+                del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)' \
+            > task-definition.json
+          UPDATED_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://task-definition.json \
             --query "taskDefinition.taskDefinitionArn" --output text)
           echo "updated_arn=$UPDATED_ARN" >> "$GITHUB_OUTPUT"
 
@@ -204,28 +206,32 @@ jobs:
       - name: Update API task definition with new image
         id: api-task-def
         run: |
-          NEW_DEF=$(aws ecs describe-task-definition \
+          aws ecs describe-task-definition \
             --task-definition "${{ env.ECS_API_SERVICE }}" \
-            --query "taskDefinition" | \
+            --query "taskDefinition" \
+            --output json | \
             jq --arg img "${{ needs.build.outputs.api_image }}" \
                '.containerDefinitions[0].image = $img |
-                del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)')
-          NEW_ARN=$(echo "$NEW_DEF" | aws ecs register-task-definition \
-            --cli-input-json /dev/stdin \
+                del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)' \
+            > task-definition.json
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://task-definition.json \
             --query "taskDefinition.taskDefinitionArn" --output text)
           echo "arn=$NEW_ARN" >> "$GITHUB_OUTPUT"
 
       - name: Update Web task definition with new image
         id: web-task-def
         run: |
-          NEW_DEF=$(aws ecs describe-task-definition \
+          aws ecs describe-task-definition \
             --task-definition "${{ env.ECS_WEB_SERVICE }}" \
-            --query "taskDefinition" | \
+            --query "taskDefinition" \
+            --output json | \
             jq --arg img "${{ needs.build.outputs.web_image }}" \
                '.containerDefinitions[0].image = $img |
-                del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)')
-          NEW_ARN=$(echo "$NEW_DEF" | aws ecs register-task-definition \
-            --cli-input-json /dev/stdin \
+                del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)' \
+            > task-definition.json
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://task-definition.json \
             --query "taskDefinition.taskDefinitionArn" --output text)
           echo "arn=$NEW_ARN" >> "$GITHUB_OUTPUT"
 
