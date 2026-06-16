@@ -10,6 +10,7 @@ test("agent menu and command: static route and API guard", async () => {
   expect(pageSrc).toContain('apiFetch("/agents/command"');
   expect(pageSrc).toContain("Agents");
 
+  // Standalone agents/assistants pages are folded into chat.
   const routeSrc = fs.readFileSync(path.join(process.cwd(), "app/agents/page.tsx"), "utf8");
   expect(routeSrc).toContain('redirect("/chat")');
 

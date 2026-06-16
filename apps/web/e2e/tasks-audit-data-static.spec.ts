@@ -27,14 +27,17 @@ test("audit screen: static route reusing the audit log viewer", async () => {
   expect(routeSrc).toContain('export { default } from "../chat/page"');
 });
 
-test("data is managed from settings", async () => {
+test("datasets live in Projects; chat documents stay in settings", async () => {
   const pageSrc = fs.readFileSync(path.join(process.cwd(), "app/chat/page.tsx"), "utf8");
+  // Dataset management (DataScreen) renders as a tab inside project detail.
+  expect(pageSrc).toContain("<DataScreen");
+  expect(pageSrc).not.toContain('route === "data"');
+  // Chat document uploads remain a settings tab.
   expect(pageSrc).toContain("AccountDataSettings");
   expect(pageSrc).toContain('id: "data", label: "Data"');
   expect(pageSrc).toContain("Upload documents in chat");
-  expect(pageSrc).not.toContain("<DataScreen");
-  expect(pageSrc).not.toContain('route === "data"');
 
+  // The standalone /data route redirects into Projects.
   const routeSrc = fs.readFileSync(path.join(process.cwd(), "app/data/page.tsx"), "utf8");
-  expect(routeSrc).toContain('redirect("/settings?tab=data")');
+  expect(routeSrc).toContain('redirect("/projects")');
 });
