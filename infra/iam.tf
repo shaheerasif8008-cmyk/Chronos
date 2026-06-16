@@ -147,6 +147,15 @@ resource "aws_iam_role_policy" "github_deploy" {
         Resource = "*"
       },
       {
+        Sid    = "EC2Read"
+        Effect = "Allow"
+        Action = [
+          "ec2:DescribeSecurityGroups",
+          "ec2:DescribeSubnets",
+        ]
+        Resource = "*"
+      },
+      {
         Sid      = "PassRole"
         Effect   = "Allow"
         Action   = "iam:PassRole"
