@@ -6,6 +6,10 @@ import ArtifactsScreen from "../../components/artifacts/ArtifactsScreen";
 import AgentsScreen from "../../components/agents/AgentsScreen";
 import InChatArtifactPanel from "../../components/artifacts/InChatArtifactPanel";
 import SkillsScreen from "../../components/skills/SkillsScreen";
+import ResearchScreen from "../../components/research/ResearchScreen";
+import BrowserOperatorScreen from "../../components/browser/BrowserOperatorScreen";
+import ComputerScreen from "../../components/computer/ComputerScreen";
+import DataScreen from "../../components/data/DataScreen";
 import Markdown from "../../components/Markdown";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -37,7 +41,7 @@ function formatSearchResultTime(value?: string) {
 }
 
 // ─── Types ───────────────────────────────────────────────────────────────────
-type Route = "chat" | "activity" | "approvals" | "memory" | "connectors" | "assistants" | "settings" | "projects" | "artifacts" | "agents" | "workflows" | "skills" | "audit";
+type Route = "chat" | "activity" | "approvals" | "memory" | "connectors" | "assistants" | "settings" | "projects" | "artifacts" | "workflows" | "skills" | "audit";
 type SettingsTab = "general" | "profile" | "organization" | "members" | "permissions" | "employees" | "runtime" | "memory-settings" | "data" | "tools-settings" | "approval-settings" | "notifications" | "security" | "billing" | "audit" | "developer" | "danger";
 type Conversation = { id: string; title: string | null; updated_at?: string; created_at?: string };
 type MessageRole = "user" | "assistant" | "system" | "tool";
@@ -548,7 +552,6 @@ function routeFromPath(pathname: string | null): Route {
   if (pathname === "/artifacts") return "artifacts";
   if (pathname === "/settings") return "settings";
   if (pathname === "/projects") return "projects";
-  if (pathname === "/agents") return "agents";
   if (pathname === "/workflows") return "workflows";
   if (pathname === "/skills") return "skills";
   if (pathname === "/audit") return "audit";
@@ -650,6 +653,7 @@ const IC = {
   Refresh:    (p: IcProps) => <Ic {...p}><path d="M3.5 9a6.5 6.5 0 0111-3.5L17 8M16.5 11a6.5 6.5 0 01-11 3.5L3 12M14 4v4h-4M6 16v-4h4"/></Ic>,
   Mic:        (p: IcProps) => <Ic {...p}><rect x="8" y="3" width="4" height="9" rx="2"/><path d="M5 10c0 2.8 2.2 5 5 5s5-2.2 5-5M10 15v2"/></Ic>,
   Folder:     (p: IcProps) => <Ic {...p}><path d="M3 6c0-.6.4-1 1-1h3.5l1.5 1.5H16c.6 0 1 .4 1 1v8c0 .6-.4 1-1 1H4c-.6 0-1-.4-1-1z"/></Ic>,
+  Artifact:   (p: IcProps) => <Ic {...p}><rect x="4.5" y="3" width="11" height="14" rx="1.5"/><path d="M7.5 7h5M7.5 10h5M7.5 13h3"/></Ic>,
   Lightbulb:  (p: IcProps) => <Ic {...p}><path d="M7 13c-.7-1-1.5-2-1.5-4 0-2.5 2-4.5 4.5-4.5s4.5 2 4.5 4.5c0 2-.8 3-1.5 4M8 13h4M8.5 16h3"/></Ic>,
   Eye:        (p: IcProps) => <Ic {...p}><path d="M2 10s2.8-5 8-5 8 5 8 5-2.8 5-8 5-8-5-8-5z"/><circle cx="10" cy="10" r="2.2"/></Ic>,
   Stop:       (p: IcProps) => <Ic {...p}><rect x="5" y="5" width="10" height="10" rx="1"/></Ic>,
@@ -707,13 +711,14 @@ function PageHeader({ title, subtitle, right }: { title: string; subtitle?: stri
   );
 }
 
-function EmptyState({ icon, title, sub }: { icon?: ReactNode; title: string; sub?: string }) {
+function EmptyState({ icon, title, sub, action }: { icon?: ReactNode; title: string; sub?: string; action?: ReactNode }) {
   return (
     <div className="flex flex-col items-center justify-center py-20 px-6 text-center">
       {icon && <div className="w-12 h-12 rounded-full flex items-center justify-center mb-4"
                     style={{ background: "var(--surface-2)", color: "var(--text-dim)" }}>{icon}</div>}
       <div className="text-[16px] font-medium mb-1.5">{title}</div>
       {sub && <div className="text-[13.5px] max-w-[400px]" style={{ color: "var(--text-dim)" }}>{sub}</div>}
+      {action && <div className="mt-5 flex items-center gap-2">{action}</div>}
     </div>
   );
 }
@@ -995,7 +1000,6 @@ function ChronosAppInner() {
         {route === "settings"   && <SettingsScreen tab={settingsTab} setTab={setSettingsTab} theme={theme} setTheme={setTheme} accent={accent} setAccent={setAccent} signOut={signOut} />}
         {route === "projects"   && <ProjectsScreen />}
         {route === "skills"     && <SkillsScreen />}
-        {route === "agents"     && <AgentsScreen />}
         {route === "workflows"  && <WorkflowsScreen />}
         {route === "audit"      && <AuditScreen />}
       </main>
@@ -1045,36 +1049,29 @@ function Sidebar({
   const [convoMenu, setConvoMenu] = useState<string | null>(null);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
-  const [advancedOpen, setAdvancedOpen] = useState(false);
 
-  useEffect(() => {
-    setAdvancedOpen(window.localStorage.getItem("chronos.sidebar.advancedOpen") === "1");
-  }, []);
-
-  function toggleAdvanced() {
-    setAdvancedOpen(open => {
-      window.localStorage.setItem("chronos.sidebar.advancedOpen", open ? "0" : "1");
-      return !open;
-    });
-  }
-
-  // Chat-first navigation: the everyday surfaces stay at the top level; the
-  // agent-platform surfaces live under a collapsed "Advanced" group.
-  const nav = [
-    { id: "activity"   as Route, icon: <IC.Activity size={15}/>,   label: "Activity" },
-    { id: "approvals"  as Route, icon: <IC.Approvals size={15}/>,  label: "Approvals",  badge: pendingApprovals || null, badgeKind: "warn" },
-    { id: "artifacts"  as Route, icon: <IC.Folder size={15}/>,     label: "Artifacts" },
-    { id: "projects"   as Route, icon: <IC.Folder size={15}/>,     label: "Projects" },
-    { id: "connectors" as Route, icon: <IC.Connectors size={15}/>, label: "Connectors" },
+  // Three plainly-labeled groups instead of a "chat-first + Advanced" split:
+  // Work (what's happening), Build (what you configure), System (governance).
+  type NavItem = { id: Route; icon: ReactNode; label: string; badge?: number | null; badgeKind?: "warn" };
+  const navGroups: { label: string; items: NavItem[] }[] = [
+    { label: "Work", items: [
+      { id: "activity",   icon: <IC.Activity size={15}/>,   label: "Activity" },
+      { id: "approvals",  icon: <IC.Approvals size={15}/>,  label: "Approvals", badge: pendingApprovals || null, badgeKind: "warn" },
+      { id: "projects",   icon: <IC.Folder size={15}/>,     label: "Projects" },
+      { id: "artifacts",  icon: <IC.Artifact size={15}/>,   label: "Artifacts" },
+    ]},
+    { label: "Build", items: [
+      { id: "assistants", icon: <IC.Personas size={15}/>,   label: "Assistants" },
+      { id: "skills",     icon: <IC.Sparkles size={15}/>,   label: "Skills" },
+      { id: "workflows",  icon: <IC.Refresh size={15}/>,    label: "Workflows" },
+      { id: "connectors", icon: <IC.Connectors size={15}/>, label: "Connectors" },
+    ]},
+    { label: "System", items: [
+      { id: "memory",     icon: <IC.Memory size={15}/>,     label: "Memory" },
+      { id: "audit",      icon: <IC.Audit size={15}/>,      label: "Audit" },
+    ]},
   ];
-  const advancedNav = [
-    { id: "assistants" as Route, icon: <IC.Personas size={15}/>,   label: "Assistants", badge: null, badgeKind: undefined },
-    { id: "agents"     as Route, icon: <IC.Sparkles size={15}/>,   label: "Agents",     badge: null, badgeKind: undefined },
-    { id: "workflows"  as Route, icon: <IC.Refresh size={15}/>,    label: "Workflows",  badge: null, badgeKind: undefined },
-    { id: "skills"     as Route, icon: <IC.Sparkles size={15}/>,   label: "Skills",     badge: null, badgeKind: undefined },
-    { id: "audit"      as Route, icon: <IC.Audit size={15}/>,      label: "Audit",      badge: null, badgeKind: undefined },
-  ];
-  const advancedActive = advancedNav.some(it => it.id === route);
+  const navItems = navGroups.flatMap(g => g.items);
 
   // Group conversations by recency
   const groups = useMemo(() => {
@@ -1105,7 +1102,7 @@ function Sidebar({
         </button>
         <div className="w-8 h-px" style={{ background: "var(--border-soft)" }}/>
         <div className="flex flex-col items-center gap-2 overflow-y-auto no-scrollbar w-full px-2">
-          {[...nav, ...advancedNav].map(it => (
+          {navItems.map(it => (
             <button key={it.id}
                     onClick={() => onNavigate(it.id)}
                     title={it.label}
@@ -1157,36 +1154,28 @@ function Sidebar({
         </button>
       </div>
 
-      {/* Top nav */}
-      <div className="px-3 pt-2 pb-1 space-y-0.5 overflow-y-auto no-scrollbar">
-        {nav.map(it => (
-          <button key={it.id}
-                  onClick={() => onNavigate(it.id)}
-                  className={`nav-item w-full ${route === it.id ? "active" : ""}`}>
-            <span className="nav-icon flex-shrink-0">{it.icon}</span>
-            <span className="flex-1 text-left">{it.label}</span>
-            {it.badge ? (
-              <span className="min-w-[18px] h-[18px] px-1.5 rounded-full text-[10.5px] font-semibold tabular flex items-center justify-center"
-                    style={{ background: it.badgeKind === "warn" ? "var(--warn)" : "var(--accent)", color: "white" }}>
-                {it.badge}
-              </span>
-            ) : null}
-          </button>
-        ))}
-        <button onClick={toggleAdvanced}
-                className={`nav-item w-full ${advancedActive && !advancedOpen ? "active" : ""}`}
-                aria-expanded={advancedOpen || advancedActive}>
-          <span className="nav-icon flex-shrink-0"><IC.Settings size={15}/></span>
-          <span className="flex-1 text-left">Advanced</span>
-          <IC.ChevronDown size={13} style={{ color: "var(--text-dim)", transform: advancedOpen || advancedActive ? "rotate(180deg)" : undefined, transition: "transform .15s" }}/>
-        </button>
-        {(advancedOpen || advancedActive) && advancedNav.map(it => (
-          <button key={it.id}
-                  onClick={() => onNavigate(it.id)}
-                  className={`nav-item w-full pl-7 ${route === it.id ? "active" : ""}`}>
-            <span className="nav-icon flex-shrink-0">{it.icon}</span>
-            <span className="flex-1 text-left">{it.label}</span>
-          </button>
+      {/* Grouped nav */}
+      <div className="px-3 pt-2 pb-1 overflow-y-auto no-scrollbar">
+        {navGroups.map((group, gi) => (
+          <div key={group.label} className={gi === 0 ? "space-y-0.5" : "mt-4 space-y-0.5"}>
+            <div className="px-2.5 pb-1 text-[11px] font-medium uppercase tracking-wider" style={{ color: "var(--text-faint)" }}>
+              {group.label}
+            </div>
+            {group.items.map(it => (
+              <button key={it.id}
+                      onClick={() => onNavigate(it.id)}
+                      className={`nav-item w-full ${route === it.id ? "active" : ""}`}>
+                <span className="nav-icon flex-shrink-0">{it.icon}</span>
+                <span className="flex-1 text-left">{it.label}</span>
+                {it.badge ? (
+                  <span className="min-w-[18px] h-[18px] px-1.5 rounded-full text-[10.5px] font-semibold tabular flex items-center justify-center"
+                        style={{ background: it.badgeKind === "warn" ? "var(--warn)" : "var(--accent)", color: "white" }}>
+                    {it.badge}
+                  </span>
+                ) : null}
+              </button>
+            ))}
+          </div>
         ))}
       </div>
 
@@ -4254,7 +4243,49 @@ function eventColor(event: TaskStreamEvent) {
 }
 
 // ─── Activity Screen ──────────────────────────────────────────────────────────
+const OPS_TABS = [
+  { id: "tasks",    label: "Tasks" },
+  { id: "research", label: "Research" },
+  { id: "browser",  label: "Browser" },
+  { id: "computer", label: "Computer" },
+] as const;
+type OpsTab = typeof OPS_TABS[number]["id"];
+
+// Activity is the unified Operations surface: jobs/actions plus the live
+// research, browser, and computer sessions that used to live on dead-end routes.
 function ActivityScreen() {
+  const [tab, setTab] = useState<OpsTab>("tasks");
+  return (
+    <div className="flex-1 flex flex-col min-h-0">
+      <div role="tablist" className="flex gap-0.5 px-10 pt-5 border-b hairline flex-shrink-0">
+        {OPS_TABS.map(t => (
+          <button
+            key={t.id}
+            role="tab"
+            aria-selected={tab === t.id}
+            onClick={() => setTab(t.id)}
+            className="px-4 py-2.5 text-[13.5px] font-medium transition-colors"
+            style={{
+              color: tab === t.id ? "var(--text)" : "var(--text-dim)",
+              borderBottom: tab === t.id ? "2px solid var(--accent)" : "2px solid transparent",
+              marginBottom: -1,
+            }}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+      <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
+        {tab === "tasks"    && <TasksActivityView />}
+        {tab === "research" && <ResearchScreen />}
+        {tab === "browser"  && <BrowserOperatorScreen />}
+        {tab === "computer" && <ComputerScreen />}
+      </div>
+    </div>
+  );
+}
+
+function TasksActivityView() {
   const [mode, setMode] = useState<"jobs" | "actions">("jobs");
   const [tasks, setTasks] = useState<Task[]>([]);
   const [actions, setActions] = useState<ActivityAction[]>([]);
@@ -4322,8 +4353,8 @@ function ActivityScreen() {
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-y-auto">
       <PageHeader
-        title="Activity"
-        subtitle="Everything Chronos has done — your jobs and the individual actions inside them."
+        title="Tasks"
+        subtitle="Jobs Chronos is running and the individual actions inside them."
         right={
           <div className="flex items-center gap-1 surface border border-soft rounded-lg p-1">
             {[{ id: "jobs", label: "Jobs", icon: <IC.Briefcase size={13}/> }, { id: "actions", label: "Every action", icon: <IC.Activity size={13}/> }].map(m => (
@@ -5478,6 +5509,7 @@ function ConnectorsScreen() {
 
 // ─── Assistants Screen ────────────────────────────────────────────────────────
 function AssistantsScreen({ onStartConversation }: { onStartConversation: (personaId: string) => void }) {
+  const [tab, setTab] = useState<"assistants" | "agents">("assistants");
   const [activePersonaId, setActivePersonaId] = useState<string | null>(null);
   const activePersona = PERSONAS.find(p => p.id === activePersonaId);
 
@@ -5535,7 +5567,29 @@ function AssistantsScreen({ onStartConversation }: { onStartConversation: (perso
   }
 
   return (
-    <div className="flex-1 flex flex-col min-w-0 overflow-y-auto">
+    <div className="flex-1 flex flex-col min-w-0 min-h-0 overflow-hidden">
+      <div role="tablist" className="flex gap-0.5 px-10 pt-5 border-b hairline flex-shrink-0">
+        {([{ id: "assistants", label: "Assistants" }, { id: "agents", label: "Agents" }] as const).map(t => (
+          <button
+            key={t.id}
+            role="tab"
+            aria-selected={tab === t.id}
+            onClick={() => setTab(t.id)}
+            className="px-4 py-2.5 text-[13.5px] font-medium transition-colors"
+            style={{
+              color: tab === t.id ? "var(--text)" : "var(--text-dim)",
+              borderBottom: tab === t.id ? "2px solid var(--accent)" : "2px solid transparent",
+              marginBottom: -1,
+            }}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+      {tab === "agents" ? (
+        <div className="flex-1 min-h-0 flex flex-col overflow-hidden"><AgentsScreen /></div>
+      ) : (
+      <div className="flex-1 min-w-0 overflow-y-auto">
       <PageHeader
         title="Assistants"
         subtitle="Saved configurations of Chronos. Each has its own role, skills, and personality."
@@ -5555,6 +5609,8 @@ function AssistantsScreen({ onStartConversation }: { onStartConversation: (perso
           </button>
         ))}
       </div>
+      </div>
+      )}
     </div>
   );
 }
@@ -5596,7 +5652,7 @@ type Project = {
   created_by?: string | null;
 };
 
-type ProjectTab = "chat" | "sources" | "artifacts" | "tasks" | "research";
+type ProjectTab = "chat" | "sources" | "artifacts" | "tasks" | "data" | "research";
 
 function ProjectsScreen() {
   const [projects, setProjects] = useState<Project[]>([]);
@@ -5742,7 +5798,12 @@ function ProjectsScreen() {
         {loading ? (
           <div className="text-[13.5px] mt-6" style={{ color: "var(--text-dim)" }}>Loading projects…</div>
         ) : projects.length === 0 ? (
-          <EmptyState icon={<IC.Folder size={22} />} title="No projects yet" sub="Create a project to organize conversations, tasks, and artifacts." />
+          <EmptyState
+            icon={<IC.Folder size={22} />}
+            title="No projects yet"
+            sub="Create a project to organize conversations, tasks, and artifacts."
+            action={<button className="btn btn-primary btn-sm" onClick={() => setShowCreate(true)}><IC.Plus size={14} /> New project</button>}
+          />
         ) : (
           <div className="grid gap-3 mt-2" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))" }}>
             {projects.map(proj => (
@@ -5776,6 +5837,7 @@ const PROJECT_TABS: { id: ProjectTab; label: string }[] = [
   { id: "sources",  label: "Sources" },
   { id: "artifacts",label: "Artifacts" },
   { id: "tasks",    label: "Tasks" },
+  { id: "data",     label: "Data" },
   { id: "research", label: "Research" },
 ];
 
@@ -5850,6 +5912,9 @@ function ProjectDetailScreen({
           </button>
         ))}
       </div>
+      {tab === "data" ? (
+        <div className="flex-1 min-h-0"><DataScreen /></div>
+      ) : (
       <div className="flex-1 overflow-auto px-10 pb-10">
         {loadError ? (
           <div className="text-[13.5px] mt-4" style={{ color: "var(--danger)" }}>Couldn't load project details.</div>
@@ -5907,6 +5972,7 @@ function ProjectDetailScreen({
           <EmptyState title="Nothing here yet" sub="This feature is coming soon." />
         )}
       </div>
+      )}
     </div>
   );
 }
