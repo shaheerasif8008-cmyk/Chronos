@@ -79,6 +79,16 @@ type PendingAttachment = {
   previewUrl?: string;
   state: AttachmentState;
 };
+type ChatProfile = {
+  id: string;
+  profile_kind?: "assistant" | "agent";
+  name: string;
+  role: string;
+  personality?: string;
+  instructions?: string;
+  tool_grants?: string[];
+  connector_grants?: string[];
+};
 
 const ATTACHMENT_STATE_LABELS: Record<AttachmentState, string> = {
   uploading: "Uploading…",
@@ -804,6 +814,7 @@ function ChronosAppInner() {
   const [theme, setTheme] = useState<"light" | "dark">("dark");
   const [accent, setAccent] = useState("coral");
   const [searchPaletteOpen, setSearchPaletteOpen] = useState(false);
+  const [agentMenuOpen, setAgentMenuOpen] = useState(false);
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark");
@@ -983,7 +994,7 @@ function ChronosAppInner() {
       />
 
       <main className="flex-1 min-w-0 flex flex-col" style={{ background: "var(--bg)" }}>
-        {route === "chat"       && <ChatScreen activeConvoId={activeConvoId} activePersonaId={activePersonaId} onPersonaChange={setActivePersonaId} onConvoCreated={(id) => loadConversations(id)} onConvoSelected={openConversation} onApprovalsChanged={loadPendingApprovals} paletteOpen={searchPaletteOpen} onPaletteOpenChange={setSearchPaletteOpen} />}
+        {route === "chat"       && <ChatScreen activeConvoId={activeConvoId} activePersonaId={activePersonaId} onPersonaChange={setActivePersonaId} onConvoCreated={(id) => loadConversations(id)} onConvoSelected={openConversation} onApprovalsChanged={loadPendingApprovals} paletteOpen={searchPaletteOpen} onPaletteOpenChange={setSearchPaletteOpen} onOpenAgentMenu={() => setAgentMenuOpen(true)} />}
         {route === "activity"   && <ActivityScreen />}
         {route === "approvals"  && <ApprovalsScreen onDecision={loadPendingApprovals} />}
         {route === "memory"     && <MemoryScreen />}
@@ -1004,6 +1015,7 @@ function ChronosAppInner() {
         {route === "audit"      && <AuditScreen />}
       </main>
       <InChatArtifactPanel />
+      {agentMenuOpen && <AgentMenuModal onClose={() => setAgentMenuOpen(false)} />}
       {shellNotice && (
         <div
           className="fixed bottom-5 right-5 z-50 flex items-center gap-3 rounded-xl border px-4 py-3 shadow-lg fadein max-w-[420px]"
@@ -1061,7 +1073,6 @@ function Sidebar({
       { id: "artifacts",  icon: <IC.Artifact size={15}/>,   label: "Artifacts" },
     ]},
     { label: "Build", items: [
-      { id: "assistants", icon: <IC.Personas size={15}/>,   label: "Assistants" },
       { id: "skills",     icon: <IC.Sparkles size={15}/>,   label: "Skills" },
       { id: "workflows",  icon: <IC.Refresh size={15}/>,    label: "Workflows" },
       { id: "connectors", icon: <IC.Connectors size={15}/>, label: "Connectors" },
@@ -1349,6 +1360,7 @@ function ChatScreen({
   onApprovalsChanged,
   paletteOpen,
   onPaletteOpenChange,
+  onOpenAgentMenu,
 }: {
   activeConvoId: string | null;
   activePersonaId: string;
@@ -1358,6 +1370,7 @@ function ChatScreen({
   onApprovalsChanged: () => void;
   paletteOpen: boolean;
   onPaletteOpenChange: (open: boolean) => void;
+  onOpenAgentMenu: () => void;
 }) {
   const [draft, setDraft] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
@@ -1384,6 +1397,7 @@ function ChatScreen({
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [personaMenuOpen, setPersonaMenuOpen] = useState(false);
+  const [chatProfiles, setChatProfiles] = useState<ChatProfile[]>([]);
   const abortRef = useRef<AbortController | null>(null);
   const streamingRef = useRef(false);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -1556,7 +1570,24 @@ function ChatScreen({
   }));
   // ── End command palette ───────────────────────────────────────────────────
 
-  const activePersona = PERSONAS.find(p => p.id === activePersonaId) ?? PERSONAS[0];
+  useEffect(() => {
+    apiFetch("/agents")
+      .then(r => r.json())
+      .then((profiles: ChatProfile[]) => setChatProfiles(profiles))
+      .catch(() => setChatProfiles([]));
+  }, []);
+
+  const dynamicPersonas = useMemo(() => chatProfiles.map(profile => ({
+    id: profile.id,
+    name: profile.name,
+    role: `${profile.profile_kind ?? "agent"} · ${profile.role}`,
+    color: profile.profile_kind === "assistant" ? "var(--info)" : "var(--ok)",
+    prompt: profile.instructions || profile.personality || profile.role,
+    skills: profile.tool_grants?.length ? profile.tool_grants : ["general"],
+    connectors: profile.connector_grants ?? [],
+  })), [chatProfiles]);
+  const allPersonas = useMemo(() => [...PERSONAS, ...dynamicPersonas], [dynamicPersonas]);
+  const activePersona = allPersonas.find(p => p.id === activePersonaId) ?? allPersonas[0] ?? PERSONAS[0];
 
   const loadMessagesFromServer = useCallback(async (
     conversationId: string,
@@ -2022,6 +2053,59 @@ function ChatScreen({
       if (streamingRef.current) return; // abort didn't settle — keep input intact
     }
     const text = source.trim();
+    if (text.toLowerCase().startsWith("/agent")) {
+      setDraft("");
+      clearAttachments();
+      setMessages(prev => [
+        ...prev,
+        { role: "user", content: text, status: "complete" },
+        { role: "assistant", content: "Checking agent configuration...", status: "streaming", thinking: true },
+      ]);
+      try {
+        const body = await apiFetch("/agents/command", {
+          method: "POST",
+          body: JSON.stringify({ command: text.replace(/^\/agent\b/i, "").trim() || "list agents" }),
+        }).then(r => r.json()) as {
+          status: string;
+          action: string;
+          profile_kind?: string;
+          questions?: string[];
+          profiles?: Array<{ name: string; role: string; profile_kind?: string; autonomy_level?: string }>;
+          profile?: { name: string; role: string; profile_kind?: string; autonomy_level?: string; tool_grants?: string[]; workflows?: string[] };
+        };
+        let content = "";
+        if (body.status === "needs_clarification") {
+          content = `I need a little more detail before I ${body.action} this ${body.profile_kind ?? "agent"}:\n\n${(body.questions ?? []).map(q => `- ${q}`).join("\n")}`;
+        } else if (body.status === "created" || body.status === "updated") {
+          const profile = body.profile;
+          apiFetch("/agents")
+            .then(r => r.json())
+            .then((profiles: ChatProfile[]) => setChatProfiles(profiles))
+            .catch(() => {});
+          content = profile
+            ? `${body.status === "created" ? "Created" : "Updated"} ${profile.profile_kind ?? "profile"}: ${profile.name}\n\nRole: ${profile.role}\nAutonomy: ${profile.autonomy_level ?? "supervised"}\nTools: ${(profile.tool_grants ?? []).join(", ") || "none"}\nWorkflows: ${(profile.workflows ?? []).join(", ") || "none"}`
+            : `${body.status}.`;
+        } else {
+          const rows = body.profiles ?? [];
+          content = rows.length
+            ? rows.map(p => `- ${p.name} (${p.profile_kind ?? "agent"}): ${p.role}`).join("\n")
+            : `No ${body.profile_kind ?? "agent"} profiles yet.`;
+        }
+        setMessages(prev => {
+          const last = prev[prev.length - 1];
+          if (last?.role !== "assistant") return prev;
+          return [...prev.slice(0, -1), { ...last, content, status: "complete", thinking: false }];
+        });
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        setMessages(prev => {
+          const last = prev[prev.length - 1];
+          if (last?.role !== "assistant") return prev;
+          return [...prev.slice(0, -1), { ...last, content: "I couldn't update the agent configuration.", status: "error", thinking: false, error_detail: detail }];
+        });
+      }
+      return;
+    }
     setDraft("");
     // Exclude files still uploading (local- ids are not yet server artifacts).
     const pendingAttachmentIds = attachments.filter(a => !a.id.startsWith("local-")).map(a => a.id);
@@ -2394,7 +2478,7 @@ function ChatScreen({
                 role="menu"
                 className="absolute left-0 top-[34px] z-50 w-[280px] surface border border-soft rounded-lg shadow-xl overflow-hidden py-1"
               >
-                {PERSONAS.map(persona => {
+                {allPersonas.map(persona => {
                   const selected = persona.id === activePersona.id;
                   return (
                     <button
@@ -2424,6 +2508,16 @@ function ChatScreen({
             </div>
           </div>
           <div className="flex items-center gap-1">
+            <button
+              onClick={onOpenAgentMenu}
+              className="flex items-center gap-2 px-2.5 py-1.5 rounded-md smooth hover:bg-[var(--surface-2)]"
+              title="Agents and assistants"
+            >
+              <IC.Sparkles size={13} style={{ color: "var(--text-dim)" }}/>
+              <span className="text-[12.5px]" style={{ color: "var(--text-muted)" }}>
+                Agents
+              </span>
+            </button>
             <button
               onClick={() => setOperationsOpen(true)}
               className="flex items-center gap-2 px-2.5 py-1.5 rounded-md smooth hover:bg-[var(--surface-2)]"
@@ -5508,6 +5602,44 @@ function ConnectorsScreen() {
 }
 
 // ─── Assistants Screen ────────────────────────────────────────────────────────
+function AgentMenuModal({ onClose }: { onClose: () => void }) {
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") onClose();
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center px-4 py-6" style={{ background: "color-mix(in oklch, var(--bg) 78%, transparent)" }}>
+      <div
+        ref={ref}
+        className="surface border rounded-xl shadow-xl flex flex-col overflow-hidden w-full max-w-[1120px] max-h-[88vh]"
+        style={{ borderColor: "var(--border)" }}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Agents and assistants"
+      >
+        <div className="h-[52px] flex items-center justify-between px-4 border-b hairline">
+          <div className="flex items-center gap-2 min-w-0">
+            <IC.Sparkles size={15} style={{ color: "var(--accent)" }}/>
+            <div className="text-[14px] font-semibold">Agents and assistants</div>
+          </div>
+          <button type="button" onClick={onClose} className="btn btn-ghost btn-icon" aria-label="Close agent menu">
+            <IC.X size={14}/>
+          </button>
+        </div>
+        <div className="min-h-0 flex-1 overflow-hidden">
+          <AgentsScreen />
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function AssistantsScreen({ onStartConversation }: { onStartConversation: (personaId: string) => void }) {
   const [tab, setTab] = useState<"assistants" | "agents">("assistants");
   const [activePersonaId, setActivePersonaId] = useState<string | null>(null);

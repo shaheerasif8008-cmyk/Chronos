@@ -16,6 +16,7 @@ type AgentTemplate = {
 
 type AgentProfile = {
   id: string;
+  profile_kind?: "assistant" | "agent";
   name: string;
   role: string;
   template_id?: string | null;
@@ -23,6 +24,8 @@ type AgentProfile = {
   model?: string | null;
   tool_grants: string[];
   connector_grants: string[];
+  workflows?: string[];
+  connected_accounts?: string[];
   project_ids: string[];
   memory_scopes: Array<{ scope: string; scope_id?: string }>;
   autonomy_level: string;
@@ -122,12 +125,15 @@ export default function AgentsScreen() {
         method: "POST",
         body: JSON.stringify({
           name: name.trim(),
+          profile_kind: "agent",
           role: selectedTemplate?.role || "workspace agent",
           template_id: selectedTemplateId,
           instructions: instructions.trim(),
           model,
           tool_grants: splitList(tools),
           connector_grants: splitList(connectors),
+          workflows: [selectedTemplateId],
+          connected_accounts: splitList(connectors),
           project_ids: projectIds,
           memory_scopes: [{ scope: memoryScope, scope_id: projectId || "workspace" }],
           autonomy_level: autonomy,
@@ -191,9 +197,9 @@ export default function AgentsScreen() {
     <div className="flex-1 min-w-0 min-h-0 overflow-hidden flex flex-col" data-testid="agents-screen">
       <header className="px-10 pt-9 pb-5 flex items-start justify-between gap-6 flex-shrink-0">
         <div className="min-w-0">
-          <h1 className="h-page tracking-tight">Agents</h1>
+          <h1 className="h-page tracking-tight">Agent menu</h1>
           <p className="mt-1.5 text-[14px]" style={{ color: "var(--text-dim)" }}>
-            Reusable personas with governed tools, projects, memory scopes, approvals, schedules, and publishing.
+            Configure executable agents here. Use /agent in chat to create or edit agents and assistants conversationally.
           </p>
         </div>
         <button className="btn btn-ghost btn-sm" onClick={() => void load()} disabled={busy}>Refresh</button>
@@ -229,6 +235,7 @@ export default function AgentsScreen() {
                 <div className="text-[13px] font-medium truncate">{agent.name}</div>
                 <div className="text-[12px] truncate" style={{ color: "var(--text-dim)" }}>{agent.role}</div>
                 <div className="mt-2 flex items-center gap-2 text-[11px]" style={{ color: "var(--text-faint)" }}>
+                  <span>{agent.profile_kind ?? "agent"}</span>
                   <span>{agent.autonomy_level}</span>
                   <span>{timeLabel(agent.created_at)}</span>
                 </div>

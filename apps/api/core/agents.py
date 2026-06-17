@@ -87,6 +87,7 @@ AGENT_TEMPLATES: tuple[dict[str, Any], ...] = (
 )
 
 PUBLISH_TARGETS = {"slack", "teams", "email", "web", "api"}
+PROFILE_KINDS = {"assistant", "agent"}
 AUTONOMY_LEVELS = {"manual", "supervised", "approval_required", "autonomous"}
 
 
@@ -183,18 +184,25 @@ async def create_profile(member: Member, data: dict[str, Any]) -> dict[str, Any]
     autonomy_level = str(data.get("autonomy_level") or "supervised")
     if autonomy_level not in AUTONOMY_LEVELS:
         raise HTTPException(status_code=422, detail="Invalid autonomy level")
+    profile_kind = str(data.get("profile_kind") or "agent").lower()
+    if profile_kind not in PROFILE_KINDS:
+        raise HTTPException(status_code=422, detail="Invalid profile kind")
 
     profiles = await reflect_table("agent_profiles")
     values = {
         "organization_id": member.organization_id,
         "region": settings.region,
+        "profile_kind": profile_kind,
         "name": str(data["name"]).strip(),
         "role": str(data["role"]).strip(),
         "template_id": data.get("template_id"),
         "instructions": str(data.get("instructions") or "").strip(),
+        "personality": str(data.get("personality") or "").strip(),
         "model": data.get("model"),
         "tool_grants": _json_list(data.get("tool_grants")),
         "connector_grants": _json_list(data.get("connector_grants")),
+        "workflows": _json_list(data.get("workflows")),
+        "connected_accounts": _json_list(data.get("connected_accounts")),
         "project_ids": project_ids,
         "memory_scopes": _json_list(data.get("memory_scopes")),
         "autonomy_level": autonomy_level,
@@ -204,34 +212,40 @@ async def create_profile(member: Member, data: dict[str, Any]) -> dict[str, Any]
         "created_by": member.id,
     }
     if not values["name"] or not values["role"]:
-        raise HTTPException(status_code=422, detail="Agent name and role are required")
+        raise HTTPException(status_code=422, detail="Profile name and role are required")
 
     async with engine.begin() as conn:
         row = (
             await conn.execute(insert(profiles).values(**values).returning(profiles))
         ).mappings().first()
     agent = _row_dict(row)
-    await _event(agent_id=agent["id"], organization_id=member.organization_id, event_type="agent_created", payload={"name": agent["name"]})
+    await _event(agent_id=agent["id"], organization_id=member.organization_id, event_type=f"{profile_kind}_created", payload={"name": agent["name"]})
     await audit.log(
-        "agent_created",
+        f"{profile_kind}_created",
         member.id,
         "agents.create",
         organization_id=member.organization_id,
         resource_type="agent_profile",
         resource_id=agent["id"],
-        payload={"template_id": agent.get("template_id"), "tool_grants": agent.get("tool_grants", [])},
+        payload={"profile_kind": profile_kind, "template_id": agent.get("template_id"), "tool_grants": agent.get("tool_grants", [])},
     )
     return agent
 
 
-async def list_profiles(member: Member) -> list[dict[str, Any]]:
+async def list_profiles(member: Member, profile_kind: str | None = None) -> list[dict[str, Any]]:
     await permissions.check(member, "list_agents", settings.org_id)
     profiles = await reflect_table("agent_profiles")
+    filters = [profiles.c.organization_id == member.organization_id, profiles.c.status != "deleted"]
+    if profile_kind:
+        kind = profile_kind.lower()
+        if kind not in PROFILE_KINDS:
+            raise HTTPException(status_code=422, detail="Invalid profile kind")
+        filters.append(profiles.c.profile_kind == kind)
     async with engine.begin() as conn:
         rows = (
             await conn.execute(
                 select(profiles)
-                .where(profiles.c.organization_id == member.organization_id, profiles.c.status != "deleted")
+                .where(*filters)
                 .order_by(profiles.c.created_at.desc())
             )
         ).mappings().all()
@@ -259,9 +273,16 @@ async def get_profile(member: Member, agent_id: str) -> dict[str, Any]:
 async def patch_profile(member: Member, agent_id: str, data: dict[str, Any]) -> dict[str, Any]:
     await get_profile(member, agent_id)
     patch = {key: value for key, value in data.items() if value is not None}
+    if "profile_kind" in patch:
+        patch["profile_kind"] = str(patch["profile_kind"]).lower()
+        if patch["profile_kind"] not in PROFILE_KINDS:
+            raise HTTPException(status_code=422, detail="Invalid profile kind")
     if "project_ids" in patch:
         patch["project_ids"] = [str(pid) for pid in _json_list(patch["project_ids"])]
         await _require_project_access(member, patch["project_ids"])
+    for list_key in ("tool_grants", "connector_grants", "memory_scopes", "workflows", "connected_accounts"):
+        if list_key in patch:
+            patch[list_key] = _json_list(patch[list_key])
     if "autonomy_level" in patch and patch["autonomy_level"] not in AUTONOMY_LEVELS:
         raise HTTPException(status_code=422, detail="Invalid autonomy level")
     if not patch:

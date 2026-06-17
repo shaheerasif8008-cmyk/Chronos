@@ -1,5 +1,5 @@
 import { redirect } from "next/navigation";
 
-export default function AgentsPage() {
-  redirect("/assistants");
+export default function AgentsRoute() {
+  redirect("/chat");
 }

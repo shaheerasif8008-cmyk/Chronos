@@ -131,6 +131,47 @@ async def test_agent_profile_create_attach_project_tool_run_and_tenant_scope(mon
 
 
 @pytest.mark.asyncio
+async def test_agent_command_creates_distinct_assistant_and_clarifies_agent_requirements():
+    _, _, token = await _make_org_member()
+
+    transport = httpx.ASGITransport(app=main.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        incomplete = await client.post(
+            "/agents/command",
+            json={"command": "make an agent name: Lead Watcher | purpose: find warm leads"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert incomplete.status_code == 200, incomplete.text
+        body = incomplete.json()
+        assert body["status"] == "needs_clarification"
+        assert {"tool_grants", "approval_policy", "workflows"} <= set(body["missing"])
+
+        created = await client.post(
+            "/agents/command",
+            json={
+                "command": (
+                    "make assistant | name: Contract Coach | role: contract reviewer | "
+                    "purpose: review contracts and explain risk in plain language | "
+                    "personality: cautious and concise | memory: workspace"
+                )
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert created.status_code == 200, created.text
+        profile = created.json()["profile"]
+        assert profile["profile_kind"] == "assistant"
+        assert profile["name"] == "Contract Coach"
+        assert profile["personality"] == "cautious and concise"
+
+        assistants = await client.get("/agents?profile_kind=assistant", headers={"Authorization": f"Bearer {token}"})
+        agents = await client.get("/agents?profile_kind=agent", headers={"Authorization": f"Bearer {token}"})
+        assert assistants.status_code == 200, assistants.text
+        assert agents.status_code == 200, agents.text
+        assert [item["name"] for item in assistants.json()] == ["Contract Coach"]
+        assert agents.json() == []
+
+
+@pytest.mark.asyncio
 async def test_agent_publication_external_fixture_creates_audited_chronos_task(monkeypatch):
     org_id, member_id, token = await _make_org_member()
     project_id = await _make_project(org_id, member_id)
