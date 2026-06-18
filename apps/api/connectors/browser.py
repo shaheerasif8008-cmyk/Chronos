@@ -18,6 +18,7 @@ import re
 import secrets
 from datetime import datetime
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -95,6 +96,18 @@ class BrowserConnector:
             try:
                 results = await _tavily_search(query, max_results)
                 trimmed = [_normalize_tavily_result(item) for item in results[:max_results]]
+                if not trimmed:
+                    direct = await _direct_navigation_fallback(query)
+                    if direct:
+                        return ToolResult(
+                            data={
+                                "query": query,
+                                "results": [direct],
+                                "provider": "direct_navigation",
+                                "fallback_reason": "Search provider returned zero results, so Chronos navigated directly.",
+                            },
+                            summary=f"Tavily search '{query}' returned 0 results; direct navigation found {direct['url']}",
+                        )
                 return ToolResult(
                     data={"query": query, "results": trimmed, "provider": "tavily", "tier": "live"},
                     summary=f"Tavily search '{query}': {len(trimmed)} results",
@@ -124,6 +137,18 @@ class BrowserConnector:
             }""")
 
             trimmed = results[:max_results]
+            if not trimmed:
+                direct = await _direct_navigation_fallback(query)
+                if direct:
+                    return ToolResult(
+                        data={
+                            "query": query,
+                            "results": [direct],
+                            "provider": "direct_navigation",
+                            "fallback_reason": "Search indexing returned zero results, so Chronos navigated directly.",
+                        },
+                        summary=f"Search '{query}' returned 0 results; direct navigation found {direct['url']}",
+                    )
             return ToolResult(
                 data={"query": query, "results": trimmed},
                 summary=f"Search '{query}': {len(trimmed)} results",
@@ -257,6 +282,58 @@ _PERSON_RE = re.compile(r"([A-Z][a-z]+(?: [A-Z][a-z]+)+)[,\-–—|]\s*([A-Za-z 
 def _url_encode(s: str) -> str:
     from urllib.parse import quote_plus
     return quote_plus(s)
+
+
+def _direct_url_candidate(query: str) -> str | None:
+    q = query.strip()
+    if not q:
+        return None
+    if q.startswith(("http://", "https://")):
+        return q
+    domain_match = re.search(r"\b([a-z0-9-]+(?:\.[a-z0-9-]+)+)(/[^\s]*)?", q, flags=re.I)
+    if domain_match:
+        return f"https://{domain_match.group(0)}"
+    words = re.findall(r"[a-z0-9]+", q.lower())
+    if "bbc" in words and "news" in words:
+        return "https://www.bbc.com/news"
+    return None
+
+
+async def _direct_navigation_fallback(query: str) -> dict[str, Any] | None:
+    url = _direct_url_candidate(query)
+    if not url:
+        return None
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    playwright = browser = context = None
+    try:
+        playwright, browser, context, page = await _new_page()
+        await page.goto(url, wait_until="domcontentloaded")
+        await _save_screenshot(page, "direct-navigation")
+        title = await page.title()
+        text = await page.evaluate("""() => {
+            ['script', 'style', 'nav', 'footer', 'aside'].forEach(tag => {
+                document.querySelectorAll(tag).forEach(el => el.remove());
+            });
+            return document.body ? document.body.innerText.trim() : '';
+        }""")
+        return {
+            "title": title or parsed.netloc,
+            "snippet": text[:280],
+            "url": page.url,
+            "source": "direct_navigation",
+        }
+    except Exception as exc:
+        log.warning("Direct navigation fallback failed for %r -> %s: %s", query, url, exc)
+        return None
+    finally:
+        if context is not None:
+            await context.close()
+        if browser is not None:
+            await browser.close()
+        if playwright is not None:
+            await playwright.stop()
 
 
 async def _tavily_search(query: str, max_results: int) -> list[dict[str, Any]]:

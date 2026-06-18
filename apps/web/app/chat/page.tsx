@@ -2872,6 +2872,7 @@ type MessageActionMenuProps = {
 };
 
 function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: MessageActionMenuProps) {
+  const router = useRouter();
   const [open, setOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [editMode, setEditMode] = useState(false);
@@ -2973,8 +2974,8 @@ function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: Mes
         method: "POST",
         body: JSON.stringify({ scope: "org" }),
       });
-      showToast("Saved to memory");
-    } catch { showToast("Failed"); }
+      showToast("Saved to Memory");
+    } catch { showToast("Save failed"); }
     finally { endAction("save-memory"); }
     setOpen(false);
   }
@@ -3002,9 +3003,10 @@ function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: Mes
         method: "POST",
         body: JSON.stringify({}),
       });
-      await res.json();
-      showToast("Workflow created — find it under Advanced › Workflows");
-    } catch { showToast("Failed"); }
+      const data = await res.json() as { workflow_id?: string };
+      showToast("Workflow created");
+      router.push(data.workflow_id ? `/workflows?workflow_id=${encodeURIComponent(data.workflow_id)}` : "/workflows");
+    } catch { showToast("Workflow failed"); }
     finally { endAction("convert-workflow"); }
     setOpen(false);
   }
@@ -3086,7 +3088,7 @@ function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: Mes
     // and when keyboard focus moves inside the menu, without needing JS state.
     <div className="relative inline-block" ref={menuRef} onKeyDown={handleKeyDown}>
       {toast && (
-        <div className="absolute -top-8 left-1/2 -translate-x-1/2 text-[12px] px-2.5 py-1 rounded-md whitespace-nowrap z-50"
+        <div className="absolute -top-9 right-0 text-[12px] px-2.5 py-1 rounded-md whitespace-nowrap z-50"
              style={{ background: "var(--surface-2)", color: "var(--text-muted)", border: "1px solid var(--border-soft)" }}>
           {toast}
         </div>
@@ -3793,6 +3795,13 @@ function AssistantMessage({ message, content, status, persona, toolTraces, reaso
 
         {showCards && <StatusBanner sr={sr!} />}
 
+        {/* Artifacts stay directly in the conversation, before the prose that references them. */}
+        {artifacts && artifacts.length > 0 && (
+          <div className="mb-3 space-y-2">
+            {artifacts.map(a => <ArtifactCard key={a.id} artifact={a} />)}
+          </div>
+        )}
+
         {/* Thinking indicator — shown during the (non-streaming) model call */}
         {isStreaming && thinking && !content && (
           <div className="flex items-center gap-2 text-[13px] shimmer-text" style={{ color: "var(--text-dim)" }}>
@@ -3836,13 +3845,6 @@ function AssistantMessage({ message, content, status, persona, toolTraces, reaso
 
         {message.clarification && (
           <ClarificationCard prompt={message.clarification} onReply={onClarificationReply} />
-        )}
-
-        {/* Artifacts — openable / downloadable files Chronos produced */}
-        {artifacts && artifacts.length > 0 && (
-          <div className="mt-3 space-y-2">
-            {artifacts.map(a => <ArtifactCard key={a.id} artifact={a} />)}
-          </div>
         )}
 
         {showCards && <InlineApprovalCard sr={sr!} />}
@@ -6477,6 +6479,7 @@ function WorkflowsScreen() {
   const [workflowName, setWorkflowName] = useState("Source monitor workflow");
   const [monitorName, setMonitorName] = useState("Pricing page monitor");
   const [monitorTarget, setMonitorTarget] = useState("https://example.com/pricing");
+  const [selectedWorkflowId, setSelectedWorkflowId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -6495,6 +6498,13 @@ function WorkflowsScreen() {
       setTriggers(triggerData as Phase12Trigger[]);
       setMonitors(monitorData as Phase12Monitor[]);
       setAlerts(alertData as Phase12Alert[]);
+      const requestedId = new URLSearchParams(window.location.search).get("workflow_id");
+      const workflowRows = workflowData as Phase12Workflow[];
+      setSelectedWorkflowId(current => {
+        if (requestedId && workflowRows.some(workflow => workflow.id === requestedId)) return requestedId;
+        if (current && workflowRows.some(workflow => workflow.id === current)) return current;
+        return workflowRows[0]?.id ?? null;
+      });
     } catch (exc) {
       setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to load workflows" });
     } finally {
@@ -6617,9 +6627,15 @@ function WorkflowsScreen() {
           <div className="flex items-center justify-between mb-3"><h2 className="text-[16px] font-semibold">Workflow definitions</h2><div className="flex gap-2"><TextInput ariaLabel="Workflow name" value={workflowName} onChange={setWorkflowName}/><button className="btn btn-accent btn-sm" onClick={() => void createWorkflow()}><IC.Plus size={14}/> Create</button></div></div>
           <div className="surface border border-soft rounded-xl overflow-hidden">
             {workflows.length === 0 ? <EmptyState title="No workflows" sub="Reusable workflows store connector steps, conditions, approvals, triggers, and run state."/> : workflows.map(workflow => (
-              <div key={workflow.id} className="px-5 py-4 border-b hairline last:border-b-0 flex items-center justify-between gap-4">
-                <div><div className="font-medium text-[14px]">{workflow.name}</div><div className="text-[12px] mt-1" style={{ color: "var(--text-dim)" }}>{workflow.status || "pending"} · {(workflow.definition?.steps || []).length} steps · {(triggers.filter(t => t.workflow_id === workflow.id)).length} triggers</div></div>
-                <button className="btn btn-sm" onClick={() => void runWorkflow(workflow.id)}><IC.ArrowRight size={14}/> Run</button>
+              <div key={workflow.id} className="px-5 py-4 border-b hairline last:border-b-0">
+                <div className="flex items-start justify-between gap-4">
+                  <button type="button" onClick={() => setSelectedWorkflowId(workflow.id)} className="min-w-0 flex-1 text-left">
+                    <div className="font-medium text-[14px]">{workflow.name}</div>
+                    <div className="text-[12px] mt-1" style={{ color: "var(--text-dim)" }}>{workflow.status || "pending"} · {(workflow.definition?.steps || []).length} steps · {(triggers.filter(t => t.workflow_id === workflow.id)).length} triggers</div>
+                  </button>
+                  <button className="btn btn-sm" onClick={() => void runWorkflow(workflow.id)}><IC.ArrowRight size={14}/> Run</button>
+                </div>
+                {selectedWorkflowId === workflow.id && <WorkflowDagPreview workflow={workflow} triggers={triggers.filter(t => t.workflow_id === workflow.id)} />}
               </div>
             ))}
           </div>
@@ -6660,6 +6676,45 @@ function WorkflowsScreen() {
             ))}
           </div>
         </section>
+      </div>
+    </div>
+  );
+}
+
+function WorkflowDagPreview({ workflow, triggers }: { workflow: Phase12Workflow; triggers: Phase12Trigger[] }) {
+  const steps = workflow.definition?.steps ?? [];
+  const nodes = [
+    ...triggers.map(trigger => ({
+      id: trigger.id,
+      title: `${trigger.trigger_type || "trigger"}: ${trigger.source || "manual"}`,
+      sub: trigger.event_type || trigger.status || "ready",
+      kind: "trigger",
+    })),
+    ...steps.map((step, index) => ({
+      id: String(step.id ?? index),
+      title: String(step.id ?? `step_${index + 1}`),
+      sub: String(step.tool_name ?? "unconfigured tool"),
+      kind: "step",
+    })),
+  ];
+  const visible = nodes.length ? nodes : [{ id: "manual", title: "Manual start", sub: "No steps stored yet", kind: "trigger" }];
+
+  return (
+    <div className="mt-4 rounded-lg border border-soft p-3" style={{ background: "var(--surface)" }}>
+      <div className="flex items-center justify-between gap-3 mb-3">
+        <div className="text-[12px] font-semibold uppercase tracking-wide" style={{ color: "var(--text-dim)" }}>Workflow DAG</div>
+        <code className="text-[11px] truncate" style={{ color: "var(--text-faint)" }}>{workflow.id}</code>
+      </div>
+      <div className="flex items-stretch gap-2 overflow-x-auto pb-1">
+        {visible.map((node, index) => (
+          <div key={`${node.kind}-${node.id}`} className="flex items-center gap-2 flex-shrink-0">
+            {index > 0 && <IC.ArrowRight size={14} style={{ color: "var(--text-faint)" }}/>}
+            <div className="min-w-[172px] rounded-md border px-3 py-2" style={{ borderColor: "var(--border-soft)", background: node.kind === "trigger" ? "var(--accent-soft)" : "var(--bg)" }}>
+              <div className="text-[12.5px] font-medium truncate">{node.title}</div>
+              <div className="text-[11.5px] mt-0.5 truncate" style={{ color: "var(--text-dim)" }}>{node.sub}</div>
+            </div>
+          </div>
+        ))}
       </div>
     </div>
   );

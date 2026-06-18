@@ -1,6 +1,15 @@
 import pytest
 
 
+def test_browser_search_direct_navigation_candidates():
+    from connectors import browser
+
+    assert browser._direct_url_candidate("scrape and summarize BBC news") == "https://www.bbc.com/news"
+    assert browser._direct_url_candidate("summarize example.com/pricing") == "https://example.com/pricing"
+    assert browser._direct_url_candidate("https://www.bbc.com/news") == "https://www.bbc.com/news"
+    assert browser._direct_url_candidate("latest funding news") is None
+
+
 @pytest.mark.asyncio
 async def test_browser_search_uses_tavily_when_api_key_is_configured(monkeypatch):
     from connectors import browser

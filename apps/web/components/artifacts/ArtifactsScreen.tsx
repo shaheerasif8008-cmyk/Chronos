@@ -9,7 +9,7 @@ import {
 } from "../../lib/artifacts";
 import { ArtifactRenderer } from "./ArtifactRenderer";
 
-type Tab = "preview" | "edit" | "versions";
+type Tab = "preview" | "edit" | "versions" | "diff";
 
 export default function ArtifactsScreen() {
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
@@ -17,10 +17,13 @@ export default function ArtifactsScreen() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [kindFilter, setKindFilter] = useState<string>("");
   const [query, setQuery] = useState("");
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
+    setLoadError(null);
     try { setArtifacts(await listArtifacts(kindFilter ? { kind: kindFilter } : {})); }
+    catch (err) { setLoadError(err instanceof Error ? err.message : "Unable to load artifacts."); }
     finally { setLoading(false); }
   }, [kindFilter]);
 
@@ -59,7 +62,8 @@ export default function ArtifactsScreen() {
         </div>
         <div className="flex-1 overflow-auto p-2">
           {loading && <div className="text-[13px] p-3" style={{ color: "var(--text-dim)" }}>Loading…</div>}
-          {!loading && filtered.length === 0 && <div className="text-[13px] p-3" style={{ color: "var(--text-dim)" }}>No artifacts yet.</div>}
+          {!loading && loadError && <div className="text-[12.5px] p-3 m-1 rounded-lg border" style={{ borderColor: "var(--danger)", color: "var(--danger)" }}>Couldn’t load artifacts: {loadError}</div>}
+          {!loading && !loadError && filtered.length === 0 && <div className="text-[13px] p-3" style={{ color: "var(--text-dim)" }}>No artifacts yet.</div>}
           {grouped.map(([label, items]) => (
             <div key={label} className="mb-2">
               <div className="px-2 py-1 text-[10.5px] font-semibold uppercase tracking-wide" style={{ color: "var(--text-dim)" }}>{label}</div>
@@ -138,7 +142,7 @@ export function ArtifactDetail({ artifactId, onChanged, onDeleted }: { artifactI
     else setDiff(null);
   }, [artifactId]);
 
-  useEffect(() => { if (tab === "versions") void loadVersions(); }, [tab, loadVersions]);
+  useEffect(() => { if (tab === "versions" || tab === "diff") void loadVersions(); }, [tab, loadVersions]);
 
   async function save() { setBusy(true); try { await editArtifact(artifactId, draft, "manual edit"); await load(); onChanged(); setTab("preview"); } finally { setBusy(false); } }
   async function aiEdit() { if (!aiInstruction.trim()) return; setBusy(true); try { await aiEditArtifact(artifactId, aiInstruction); setAiInstruction(""); await load(); onChanged(); setTab("preview"); } finally { setBusy(false); } }
@@ -184,7 +188,7 @@ export function ArtifactDetail({ artifactId, onChanged, onDeleted }: { artifactI
       )}
 
       <nav className="px-5 pt-2 flex gap-1 border-b" style={{ borderColor: "var(--border)" }}>
-        {(["preview", "edit", "versions"] as Tab[]).map(t => (
+        {(["preview", "edit", "versions", "diff"] as Tab[]).map(t => (
           <button key={t} onClick={() => setTab(t)} disabled={t === "edit" && !isText}
                   className={`px-3 py-1.5 text-[13px] rounded-t-lg ${tab === t ? "font-semibold" : ""}`}
                   style={{ borderBottom: tab === t ? "2px solid var(--accent)" : "2px solid transparent", opacity: t === "edit" && !isText ? 0.4 : 1 }}>
@@ -216,6 +220,10 @@ export function ArtifactDetail({ artifactId, onChanged, onDeleted }: { artifactI
 
         {tab === "versions" && (
           <div className="flex flex-col gap-4">
+            <div className="flex items-center justify-between rounded-lg border px-3 py-2" style={{ borderColor: "var(--border)", background: "var(--surface)" }}>
+              <div className="text-[12.5px]" style={{ color: "var(--text-dim)" }}>Use Diff for a focused audit view of the latest version change.</div>
+              <button className="btn btn-secondary btn-sm" onClick={() => setTab("diff")}>Open diff</button>
+            </div>
             <div className="flex flex-col gap-1">
               {versions.map(v => (
                 <div key={v.id} className="flex items-center gap-3 px-3 py-2 rounded-lg border" style={{ borderColor: "var(--border)" }}>
@@ -227,10 +235,25 @@ export function ArtifactDetail({ artifactId, onChanged, onDeleted }: { artifactI
                 </div>
               ))}
             </div>
-            {diff && !diff.is_binary && (
+          </div>
+        )}
+
+        {tab === "diff" && (
+          <div className="h-full flex flex-col gap-3">
+            <div className="flex items-center justify-between gap-3">
               <div>
-                <div className="text-[13px] font-semibold mb-2">Diff v{diff.from_version} → v{diff.to_version}</div>
-                <pre className="text-[12px] overflow-auto p-3 rounded-lg font-mono" style={{ background: "var(--surface)" }}>{diff.diff || "(no changes)"}</pre>
+                <div className="text-[13px] font-semibold">Latest version diff</div>
+                <div className="text-[12px]" style={{ color: "var(--text-dim)" }}>
+                  {diff ? `Comparing v${diff.from_version} to v${diff.to_version}` : "At least two versions are required."}
+                </div>
+              </div>
+              <button className="btn btn-ghost btn-sm" onClick={() => setTab("versions")}>Version history</button>
+            </div>
+            {diff && !diff.is_binary ? (
+              <pre className="flex-1 min-h-[320px] text-[12px] overflow-auto p-3 rounded-lg font-mono border" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>{diff.diff || "(no changes)"}</pre>
+            ) : (
+              <div className="rounded-lg border p-4 text-[13px]" style={{ borderColor: "var(--border)", color: "var(--text-dim)" }}>
+                {diff?.is_binary ? "Binary artifacts cannot be shown as a text diff." : "No diff is available yet."}
               </div>
             )}
           </div>
