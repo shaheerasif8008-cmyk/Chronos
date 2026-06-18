@@ -7,10 +7,11 @@ test("coding work is handled in chat without a separate coding surface", async (
   expect(pageSrc).not.toContain("CodingAgentScreen");
   expect(pageSrc).not.toContain('route === "coding"');
   expect(pageSrc).not.toContain('pathname === "/coding"');
-  expect(pageSrc).toContain('{ id: "coding",   label: "Coding" }');
-  expect(pageSrc).not.toContain('id: "coding"     as Route');
+  // No coding nav item, tab, or route exists.
+  expect(pageSrc).not.toContain('label: "Coding"');
+  expect(pageSrc).not.toContain('id: "coding"');
 
-  const routeSrc = fs.readFileSync(path.join(process.cwd(), "app/coding/page.tsx"), "utf8");
-  expect(routeSrc).toContain('redirect("/chat")');
+  // The /coding route and its component were removed entirely.
+  expect(fs.existsSync(path.join(process.cwd(), "app/coding/page.tsx"))).toBe(false);
   expect(fs.existsSync(path.join(process.cwd(), "components/coding/CodingAgentScreen.tsx"))).toBe(false);
 });
