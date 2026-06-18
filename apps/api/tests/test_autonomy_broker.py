@@ -20,6 +20,16 @@ def _make_stub_module(name: str, **attrs) -> types.ModuleType:
     return mod
 
 
+def _drop_cached_tool_broker() -> None:
+    import sys
+
+    if "core.tool_broker" in sys.modules:
+        del sys.modules["core.tool_broker"]
+    core_mod = sys.modules.get("core")
+    if core_mod is not None and hasattr(core_mod, "tool_broker"):
+        delattr(core_mod, "tool_broker")
+
+
 @pytest.fixture
 def broker_env(monkeypatch):
     """Patch broker deps. Returns a knobs object to tune policy/autonomy/connector."""
@@ -94,10 +104,11 @@ def broker_env(monkeypatch):
     monkeypatch.setitem(sys.modules, "connectors.data_analysis", _make_stub_module(
         "connectors.data_analysis", data_analysis_connector=types.SimpleNamespace(execute=_data_execute)))
 
-    if "core.tool_broker" in sys.modules:
-        del sys.modules["core.tool_broker"]
+    _drop_cached_tool_broker()
 
-    return knobs
+    yield knobs
+
+    _drop_cached_tool_broker()
 
 
 def _agent():
