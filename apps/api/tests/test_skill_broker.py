@@ -61,8 +61,9 @@ def _patch_broker_deps(tmp_path, monkeypatch):
 
     # --- core.connector_health ---
     async def _tier(provider): return "fixture"
+    async def _degraded_note(provider): return None
     monkeypatch.setitem(sys.modules, "core.connector_health", _make_stub_module(
-        "core.connector_health", connector_tier=_tier, check_connectors=_noop
+        "core.connector_health", connector_tier=_tier, degraded_note=_degraded_note, check_connectors=_noop
     ))
 
     # --- core.settings_store ---

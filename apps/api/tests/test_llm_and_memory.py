@@ -708,11 +708,15 @@ async def test_tool_broker_audits_gmail_draft_without_logging_raw_args(monkeypat
     async def fake_connector_tier(provider):
         return "live"
 
+    async def fake_degraded_note(provider):
+        return None
+
     monkeypatch.setattr(permissions, "check", fake_permission)
     monkeypatch.setattr(tool_broker, "_check_rate_limit", noop_rate_limit)
     monkeypatch.setattr(tool_broker, "_check_loop", noop_loop)
     monkeypatch.setattr(tool_broker, "tool_policy", fake_tool_policy)
     monkeypatch.setattr(tool_broker, "connector_tier", fake_connector_tier)
+    monkeypatch.setattr(tool_broker, "degraded_note", fake_degraded_note)
     monkeypatch.setattr(registry, "get", fake_registry_get)
     monkeypatch.setattr(tool_broker, "_route", fake_route)
     monkeypatch.setattr(tool_broker.audit, "log", fake_audit_log)

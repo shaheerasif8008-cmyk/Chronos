@@ -277,6 +277,9 @@ async def test_tool_broker_reuses_idempotent_external_write_result(monkeypatch):
     async def fake_tier(provider):
         return "fixture"
 
+    async def fake_degraded_note(provider):
+        return None
+
     async def fake_route(agent, tool, args, vault_ref, tier="live"):
         calls.append((tool, args))
         return ToolResult(summary="drafted once", data={"draft_id": "draft-1"})
@@ -296,6 +299,7 @@ async def test_tool_broker_reuses_idempotent_external_write_result(monkeypatch):
     monkeypatch.setattr(tool_broker, "_check_loop", fake_loop)
     monkeypatch.setattr(tool_broker, "tool_policy", fake_policy)
     monkeypatch.setattr(tool_broker, "connector_tier", fake_tier)
+    monkeypatch.setattr(tool_broker, "degraded_note", fake_degraded_note)
     monkeypatch.setattr(tool_broker, "_route", fake_route)
     monkeypatch.setattr(tool_broker.redis_client, "get", fake_get)
     monkeypatch.setattr(tool_broker.redis_client, "set", fake_set)

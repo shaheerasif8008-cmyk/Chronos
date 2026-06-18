@@ -50,8 +50,9 @@ def broker_env(monkeypatch):
     monkeypatch.setitem(sys.modules, "core.permissions", _make_stub_module("core.permissions", check=_allow))
 
     async def _tier(provider): return "fixture"
+    async def _degraded_note(provider): return None
     monkeypatch.setitem(sys.modules, "core.connector_health", _make_stub_module(
-        "core.connector_health", connector_tier=_tier, check_connectors=_noop))
+        "core.connector_health", connector_tier=_tier, degraded_note=_degraded_note, check_connectors=_noop))
 
     async def _policy(*a, **kw): return dict(knobs.policy)
     async def _autonomy(*a, **kw): return knobs.autonomy
