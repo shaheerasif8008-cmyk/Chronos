@@ -8,7 +8,7 @@ test("memory: add, edit, and delete an explicit memory", async ({ page }) => {
   const base = `e2e-memory-${Date.now()}`;
   const edited = `${base} EDITED`;
 
-  await page.goto("/memory");
+  await page.goto("/settings?tab=memory-settings");
 
   // Add (remember).
   await page.getByRole("button", { name: /Add a memory/ }).click();

@@ -16,12 +16,11 @@ test("tasks page redirects to activity", async () => {
 
 test("audit screen: static route reusing the audit log viewer", async () => {
   const pageSrc = fs.readFileSync(path.join(process.cwd(), "app/chat/page.tsx"), "utf8");
-  expect(pageSrc).toContain("<AuditScreen");
-  expect(pageSrc).toContain('route === "audit"');
   expect(pageSrc).toContain('pathname === "/audit"');
-  expect(pageSrc).toContain('label: "Audit"');
-  expect(pageSrc).toContain("function AuditScreen");
-  expect(pageSrc).toContain("<AuditSettings/>");
+  expect(pageSrc).toContain('setSettingsTab("audit")');
+  expect(pageSrc).toContain('id: "audit", label: "Audit logs"');
+  expect(pageSrc).toContain("{tab === \"audit\" && <AuditSettings />}");
+  expect(pageSrc).not.toContain('{ id: "audit",      icon: <IC.Audit');
 
   const routeSrc = fs.readFileSync(path.join(process.cwd(), "app/audit/page.tsx"), "utf8");
   expect(routeSrc).toContain('export { default } from "../chat/page"');

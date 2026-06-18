@@ -556,7 +556,6 @@ type SettingsOverview = {
 function routeFromPath(pathname: string | null): Route {
   if (pathname === "/activity") return "activity";
   if (pathname === "/approvals") return "approvals";
-  if (pathname === "/memory") return "memory";
   if (pathname === "/connectors") return "connectors";
   if (pathname === "/assistants") return "assistants";
   if (pathname === "/artifacts") return "artifacts";
@@ -564,7 +563,7 @@ function routeFromPath(pathname: string | null): Route {
   if (pathname === "/projects") return "projects";
   if (pathname === "/workflows") return "workflows";
   if (pathname === "/skills") return "skills";
-  if (pathname === "/audit") return "audit";
+  if (pathname === "/memory" || pathname === "/audit") return "settings";
   return "chat";
 }
 
@@ -841,6 +840,10 @@ function ChronosAppInner() {
       if (queryTab && SETTING_TABS.some(item => item.id === queryTab)) {
         setSettingsTab(queryTab as SettingsTab);
       }
+    } else if (pathname === "/memory") {
+      setSettingsTab("memory-settings");
+    } else if (pathname === "/audit") {
+      setSettingsTab("audit");
     }
   }, [pathname]);
 
@@ -1076,10 +1079,6 @@ function Sidebar({
       { id: "skills",     icon: <IC.Sparkles size={15}/>,   label: "Skills" },
       { id: "workflows",  icon: <IC.Refresh size={15}/>,    label: "Workflows" },
       { id: "connectors", icon: <IC.Connectors size={15}/>, label: "Connectors" },
-    ]},
-    { label: "System", items: [
-      { id: "memory",     icon: <IC.Memory size={15}/>,     label: "Memory" },
-      { id: "audit",      icon: <IC.Audit size={15}/>,      label: "Audit" },
     ]},
   ];
   const navItems = navGroups.flatMap(g => g.items);
@@ -4982,7 +4981,7 @@ const MEMORY_SCOPES = [
   { id: "personal", label: "Personal", description: "Private to you" },
 ];
 
-function MemoryScreen() {
+function MemoryScreen({ embedded = false }: { embedded?: boolean }) {
   const [memories, setMemories] = useState<MemoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState("all");
@@ -5121,30 +5120,38 @@ function MemoryScreen() {
     }
   }
 
-  return (
-    <div className="flex-1 flex flex-col min-w-0 overflow-y-auto">
-      <PageHeader
-        title="Memory"
-        subtitle="What Chronos remembers about you and your workspace. Save anything important."
-        right={
-          <div className="flex items-center gap-2">
-            <button onClick={() => void reviewConflicts()} className="btn btn-ghost btn-sm" title="Find stale or conflicting memories">
-              <IC.Info size={14}/> Review conflicts
-            </button>
-            <button onClick={() => void exportMemories()} className="btn btn-ghost btn-sm" title="Export memories as JSON">Export</button>
-            <label className="btn btn-ghost btn-sm cursor-pointer" title="Import memories from JSON">
-              Import
-              <input type="file" accept="application/json" className="hidden"
-                     onChange={e => { const f = e.target.files?.[0]; if (f) void importMemories(f); e.target.value = ""; }}/>
-            </label>
-            <button onClick={() => setAdding(true)} className="btn btn-secondary btn-sm">
-              <IC.Plus size={14}/> Add a memory
-            </button>
-          </div>
-        }
-      />
+  const padX = embedded ? "px-0" : "px-10";
 
-      <div className="px-10 pb-4 flex items-center gap-3 flex-wrap">
+  return (
+    <div className={embedded ? "flex flex-col min-w-0" : "flex-1 flex flex-col min-w-0 overflow-y-auto"}>
+      {embedded ? (
+        <div className="mb-5 flex items-start justify-between gap-4">
+          <p className="text-[13px] max-w-[620px]" style={{ color: "var(--text-dim)" }}>
+            What Chronos remembers about you and your workspace. Save anything important.
+          </p>
+          <MemoryPageActions
+            onReviewConflicts={() => void reviewConflicts()}
+            onExport={() => void exportMemories()}
+            onImport={importMemories}
+            onAdd={() => setAdding(true)}
+          />
+        </div>
+      ) : (
+        <PageHeader
+          title="Memory"
+          subtitle="What Chronos remembers about you and your workspace. Save anything important."
+          right={
+            <MemoryPageActions
+              onReviewConflicts={() => void reviewConflicts()}
+              onExport={() => void exportMemories()}
+              onImport={importMemories}
+              onAdd={() => setAdding(true)}
+            />
+          }
+        />
+      )}
+
+      <div className={`${padX} pb-4 flex items-center gap-3 flex-wrap`}>
         <div className="flex items-center gap-1 surface border border-soft rounded-lg p-1">
           {[{ id: "all", label: "All" }, { id: "auto", label: "Saved by Chronos" }, { id: "you", label: "Saved by you" }].map(f => (
             <button key={f.id} onClick={() => setFilter(f.id)}
@@ -5167,7 +5174,7 @@ function MemoryScreen() {
       </div>
 
       {scopes.length > 0 && (
-        <div className="px-10 pb-3 flex items-center gap-1.5 flex-wrap">
+        <div className={`${padX} pb-3 flex items-center gap-1.5 flex-wrap`}>
           {["all", ...scopes].map(s => (
             <button key={s} onClick={() => setScopeFilter(s)}
                     className="px-2.5 py-1 rounded-full text-[12.5px] font-medium smooth"
@@ -5178,7 +5185,7 @@ function MemoryScreen() {
         </div>
       )}
 
-      <div className="px-10 pb-10 space-y-3">
+      <div className={`${padX} pb-10 space-y-3`}>
         {toast && (
           <div className="flex items-center gap-2 px-4 py-2.5 rounded-xl text-[13px] fadeup"
                style={{ background: toast.kind === "ok" ? "var(--ok-soft)" : "var(--danger-soft)", color: toast.kind === "ok" ? "var(--ok)" : "var(--danger)" }}>
@@ -5260,6 +5267,25 @@ function MemoryScreen() {
 
         {filtered.map(m => <MemoryCard key={m.id} m={m} onDelete={deleteMemory} onUpdate={updateMemory} onFlag={flagMemory}/>)}
       </div>
+    </div>
+  );
+}
+
+function MemoryPageActions({ onReviewConflicts, onExport, onImport, onAdd }: { onReviewConflicts: () => void; onExport: () => void; onImport: (file: File) => Promise<void>; onAdd: () => void }) {
+  return (
+    <div className="flex items-center gap-2 flex-wrap justify-end">
+      <button onClick={onReviewConflicts} className="btn btn-ghost btn-sm" title="Find stale or conflicting memories">
+        <IC.Info size={14}/> Review conflicts
+      </button>
+      <button onClick={onExport} className="btn btn-ghost btn-sm" title="Export memories as JSON">Export</button>
+      <label className="btn btn-ghost btn-sm cursor-pointer" title="Import memories from JSON">
+        Import
+        <input type="file" accept="application/json" className="hidden"
+               onChange={e => { const f = e.target.files?.[0]; if (f) void onImport(f); e.target.value = ""; }}/>
+      </label>
+      <button onClick={onAdd} className="btn btn-secondary btn-sm">
+        <IC.Plus size={14}/> Add a memory
+      </button>
     </div>
   );
 }
@@ -7036,7 +7062,7 @@ function SettingsScreen({ tab, setTab, theme, setTheme, accent, setAccent, signO
           {tab === "permissions" && <PermissionsSettings data={sectionDraft} patch={v => patch("permissions", v)}/>}
           {tab === "employees" && <EmployeeSettings data={sectionDraft} patch={v => patch("ai_employee", v)}/>}
           {tab === "runtime" && <RuntimeSettings data={sectionDraft} patch={v => patch("runtime", v)} health={overview.runtime_health}/>}
-          {tab === "memory-settings" && <MemorySettings data={sectionDraft} patch={v => patch("memory", v)} stats={overview.memory_stats} setToast={setToast} setConfirm={setConfirm} reload={load}/>}
+          {tab === "memory-settings" && <MemoryScreen embedded />}
           {tab === "data" && <AccountDataSettings setToast={setToast}/>}
           {tab === "tools-settings" && <ToolsSettings data={sectionDraft} patch={v => patch("tool_settings", v)} connectors={overview.connectors} capabilities={overview.capabilities} health={overview.runtime_health.connectors || {}}/>}
           {tab === "approval-settings" && <ApprovalSettings data={sectionDraft} patch={v => patch("approval", v)}/>}
