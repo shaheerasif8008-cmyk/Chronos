@@ -1389,33 +1389,6 @@ async def create_task_from_history(
         return str(result.scalar_one())
 
 
-def should_emit_fast_ack(message: str) -> bool:
-    """Return true for turns likely to need tools, retrieval, or durable execution."""
-    text = message.lower()
-    long_or_complex = len(text.split()) >= 18
-    triggers = (
-        "research", "analyze", "analyse", "compare", "extract", "contract",
-        "liability", "draft", "presentation", "slide", "deck", "artifact",
-        "file", "document", "sub-agent", "subagent", "agent", "latest",
-        "current", "today", "find", "search", "generate", "build", "create",
-    )
-    return long_or_complex or any(trigger in text for trigger in triggers)
-
-
-def fast_ack_text(message: str) -> str:
-    """Lightweight visible response sent before planning, retrieval, or tools."""
-    text = message.lower()
-    if "contract" in text or "liability" in text:
-        return "I'll start by checking the contract, extracting the key terms, and comparing the relevant changes."
-    if "presentation" in text or "slide" in text or "deck" in text:
-        return "I'll start by scoping the deck, gathering the research threads, and tracking the presentation artifact as it is built."
-    if "research" in text or "latest" in text or "current" in text or "today" in text:
-        return "I'll start by gathering the relevant sources, checking what needs live lookup, and keeping progress visible as I work."
-    if "file" in text or "document" in text or "extract" in text:
-        return "I'll start by reading the material, extracting the important parts, and then turning that into the result you asked for."
-    return "I'll start by checking the request, gathering the needed context, and keeping the work visible as it runs."
-
-
 def requires_mailbox_grounding(message: str) -> bool:
     text = message.lower()
     if not any(marker in text for marker in ("email", "emails", "gmail", "inbox", "mailbox")):
@@ -1474,10 +1447,6 @@ async def stream_chat_turn(
     # only controls what the model receives as the user turn's content field.
     history.append({"role": "user", "content": user_content if user_content is not None else message})
     effective_model = resolve_agent_model(model)
-    ack_prefix = ""
-    if should_emit_fast_ack(message):
-        ack_prefix = f"{fast_ack_text(message)}\n\n"
-        yield {"type": "token", "content": ack_prefix}
     task_id: str | None = None
     task: dict[str, Any] | None = None
     iteration = 0
@@ -1520,7 +1489,7 @@ async def stream_chat_turn(
             return
 
         if not calls:
-            answer = f"{ack_prefix}{final_text or ''}"
+            answer = final_text or ""
             await save_inline_answer(answer)
             _spawn_background(extract_and_save(conversation_id, message, answer, requester_context))
             yield {"type": "done"}

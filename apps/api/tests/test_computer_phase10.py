@@ -68,7 +68,9 @@ async def test_cloud_computer_runs_in_sandbox_enforces_timeout_and_exports_artif
     ran = await tool_broker.execute(
         agent,
         "computer.exec",
-        {"session_id": session_id, "command": "printf ready", "timeout_seconds": 2},
+        # computer.exec is on the approval hard floor — pass the gate flag the way
+        # an approved execution would, mirroring the local_computer.exec coverage.
+        {"session_id": session_id, "command": "printf ready", "timeout_seconds": 2, "__approved_by_gate": True},
     )
     assert ran.data["status"] == "success"
     assert ran.data["stdout"] == "ready"
@@ -77,7 +79,7 @@ async def test_cloud_computer_runs_in_sandbox_enforces_timeout_and_exports_artif
     timed_out = await tool_broker.execute(
         agent,
         "computer.exec",
-        {"session_id": session_id, "command": "sleep 2", "timeout_seconds": 1},
+        {"session_id": session_id, "command": "sleep 2", "timeout_seconds": 1, "__approved_by_gate": True},
     )
     assert timed_out.data["status"] == "timeout"
 

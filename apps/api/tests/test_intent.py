@@ -58,3 +58,57 @@ async def test_classify_intent_empty_message_is_chat():
 
     out = await intent_mod.classify_intent("   ")
     assert out == {"mode": "chat", "goal": None}
+
+
+def test_effort_for_difficulty_mapping():
+    from core.intent import effort_for_difficulty
+
+    assert effort_for_difficulty("trivial") is None
+    assert effort_for_difficulty("simple") == "low"
+    assert effort_for_difficulty("standard") == "medium"
+    assert effort_for_difficulty("hard") == "high"
+    assert effort_for_difficulty("nonsense") is None
+    assert effort_for_difficulty(None) is None
+
+
+@pytest.mark.asyncio
+async def test_classify_request_threads_difficulty_into_effort(monkeypatch):
+    from core import intent as intent_mod
+
+    async def fake_complete_json(prompt, *, model=None):
+        return '{"mode": "task", "difficulty": "hard", "goal": "design the schema"}'
+
+    monkeypatch.setattr(intent_mod, "complete_json", fake_complete_json)
+    out = await intent_mod.classify_request("design a multi-tenant schema with tradeoffs")
+    assert out["mode"] == "task"
+    assert out["difficulty"] == "hard"
+    assert out["reasoning_effort"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_classify_request_recovers_difficulty_when_model_omits_it(monkeypatch):
+    from core import intent as intent_mod
+
+    async def fake_complete_json(prompt, *, model=None):
+        # Model returns a valid mode but no difficulty field.
+        return '{"mode": "chat", "goal": null}'
+
+    monkeypatch.setattr(intent_mod, "complete_json", fake_complete_json)
+    out = await intent_mod.classify_request("compare the tradeoffs between Postgres and DynamoDB for this")
+    # "compare"/"tradeoffs" markers push the heuristic to hard → high effort.
+    assert out["difficulty"] == "hard"
+    assert out["reasoning_effort"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_classify_request_falls_back_on_error(monkeypatch):
+    from core import intent as intent_mod
+
+    async def boom(prompt, *, model=None):
+        raise RuntimeError("llm down")
+
+    monkeypatch.setattr(intent_mod, "complete_json", boom)
+    out = await intent_mod.classify_request("hi")
+    assert out["mode"] == "chat"
+    assert out["difficulty"] == "trivial"
+    assert out["reasoning_effort"] is None
