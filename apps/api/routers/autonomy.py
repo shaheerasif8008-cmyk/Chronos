@@ -12,7 +12,6 @@ from pydantic import BaseModel
 from core import audit, evidence, learned_policy, permissions, risk_registry, trust
 from core.auth import get_current_member
 from core.models import Member
-from core.settings_store import require_admin
 
 router = APIRouter(prefix="/autonomy", tags=["autonomy"])
 
@@ -51,7 +50,7 @@ async def graduation_proposals(member: Member = Depends(get_current_member)) -> 
 
 @router.post("/graduate")
 async def graduate(req: GraduateRequest, member: Member = Depends(get_current_member)) -> dict:
-    require_admin(member)
+    await permissions.check(member, "graduate_autonomy", f"{req.scope}:{req.action_class}")
     ok = await trust.set_graduation(
         member.organization_id, req.scope, req.action_class,
         auto_threshold=req.auto_threshold, graduated_by=member.id,
@@ -69,7 +68,7 @@ async def graduate(req: GraduateRequest, member: Member = Depends(get_current_me
 
 @router.post("/demote")
 async def demote(req: DemoteRequest, member: Member = Depends(get_current_member)) -> dict:
-    require_admin(member)
+    await permissions.check(member, "demote_autonomy", f"{req.scope}:{req.action_class}")
     ok = await trust.demote(member.organization_id, req.scope, req.action_class)
     if not ok:
         raise HTTPException(status_code=404, detail="No trust record for that scope/action_class")
@@ -89,7 +88,7 @@ async def list_learned_policies(member: Member = Depends(get_current_member)) ->
 
 @router.post("/learned-policies/{policy_id}/confirm")
 async def confirm_learned_policy(policy_id: str, member: Member = Depends(get_current_member)) -> dict:
-    require_admin(member)
+    await permissions.check(member, "confirm_learned_policy", policy_id)
     ok = await learned_policy.confirm(member.organization_id, policy_id, ratified_by=member.id)
     if not ok:
         raise HTTPException(status_code=404, detail="Policy not found")
@@ -103,7 +102,7 @@ async def confirm_learned_policy(policy_id: str, member: Member = Depends(get_cu
 
 @router.post("/learned-policies/{policy_id}/disable")
 async def disable_learned_policy(policy_id: str, member: Member = Depends(get_current_member)) -> dict:
-    require_admin(member)
+    await permissions.check(member, "disable_learned_policy", policy_id)
     ok = await learned_policy.disable(member.organization_id, policy_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Policy not found")
@@ -123,7 +122,7 @@ async def list_risk_overrides(member: Member = Depends(get_current_member)) -> l
 
 @router.put("/risk-overrides")
 async def upsert_risk_override(req: RiskOverrideRequest, member: Member = Depends(get_current_member)) -> dict:
-    require_admin(member)
+    await permissions.check(member, "set_risk_override", req.tool)
     await risk_registry.upsert(
         member.organization_id, member.region, req.tool, req.blast_radius, req.irreversibility
     )
@@ -142,7 +141,7 @@ async def evidence_bundle(
     action_class: str = Query(...),
     member: Member = Depends(get_current_member),
 ) -> dict:
-    require_admin(member)
+    await permissions.check(member, "export_evidence", f"{scope}:{action_class}")
     bundle = await evidence.build_bundle(member.organization_id, scope, action_class)
     await audit.log(
         "evidence_export", member.id, "export",

@@ -193,11 +193,13 @@ class Settings(BaseSettings):
     def object_storage_health_name(self) -> str:
         return "s3"
 
-    # Authorization (OpenFGA). Enforcement is OFF by default so the Phase-1 stub
-    # behavior (allow-all) is preserved until an operator opts in. When
-    # permissions_enforce is true AND openfga_api_url is set, permission.check
-    # queries OpenFGA and raises PermissionDenied on a deny.
-    permissions_enforce: bool = False
+    # Authorization (OpenFGA). Enforcement is ON BY DEFAULT: the moment an operator
+    # configures OpenFGA (sets openfga_api_url), permission.check queries it and
+    # raises PermissionDenied on a deny — no separate opt-in flag needed. Setting
+    # permissions_enforce=false is the explicit kill-switch to fall back to the
+    # allow-all stub for FGA-mapped actions. The deterministic role gates (approval
+    # decisions, admin governance mutations) are always enforced regardless.
+    permissions_enforce: bool = True
     openfga_api_url: str = ""          # e.g. http://localhost:8080 — empty disables
     openfga_store_id: str = ""         # resolved/created at bootstrap if empty
     openfga_model_id: str = ""         # resolved/written at bootstrap if empty
