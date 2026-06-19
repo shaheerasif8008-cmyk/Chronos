@@ -203,7 +203,12 @@ async def get_task_detail(task_id: str, member: Member = Depends(get_current_mem
     await permissions.check(member, "view_task", task_id)
     tasks = await reflect_table("tasks")
     async with engine.begin() as conn:
-        row = (await conn.execute(select(tasks).where(tasks.c.id == task_id))).mappings().first()
+        row = (await conn.execute(
+            select(tasks).where(
+                tasks.c.id == task_id,
+                tasks.c.organization_id == member.organization_id,
+            )
+        )).mappings().first()
     if not row:
         raise HTTPException(status_code=404, detail="Task not found")
     return dict(row)

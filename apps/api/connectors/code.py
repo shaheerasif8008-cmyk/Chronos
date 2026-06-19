@@ -13,6 +13,13 @@ from core.workspace import task_workspace_root_from_args
 MAX_CODE_BYTES = 64_000
 MAX_OUTPUT_BYTES = 64_000
 DEFAULT_TIMEOUT_SECONDS = 5
+# NOTE: this is a defence-in-depth denylist, NOT a security boundary. A lexical
+# blocklist cannot fully contain Python (e.g. ``().__class__.__bases__[0]
+# .__subclasses__()`` reaches arbitrary classes without any blocked token). The
+# real isolation is the RLIMITs below plus the per-task workspace cwd; the proper
+# fix is OS-level isolation (container/namespace, no network, read-only FS) —
+# tracked in docs/SECURITY_AUDIT.md. Patterns below close the cheap, common
+# bypasses (dynamic import/exec, builtins reflection, dunder traversal).
 FORBIDDEN_PATTERNS = [
     r"\bimport\s+(socket|requests|httpx|urllib|subprocess|multiprocessing|ctypes|resource)\b",
     r"\bfrom\s+(socket|requests|httpx|urllib|subprocess|multiprocessing|ctypes|resource)\b",
@@ -23,6 +30,16 @@ FORBIDDEN_PATTERNS = [
     r"\bfrom\s+builtins\b",
     r"\bopen\s*\(\s*['\"]/",
     r"\bos\.(system|popen|spawn|exec)",
+    r"\beval\s*\(",
+    r"\bexec\s*\(",
+    r"\bcompile\s*\(",
+    r"\bbreakpoint\s*\(",
+    r"__builtins__",
+    r"__subclasses__",
+    r"__bases__",
+    r"__mro__",
+    r"__globals__",
+    r"\.\./",            # relative path traversal out of the task workspace
 ]
 
 

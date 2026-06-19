@@ -93,7 +93,12 @@ async def get_approval(approval_id: str, member: Member = Depends(get_current_me
     await permissions.check(member, "view_approval", approval_id)
     approvals = await reflect_table("approvals")
     async with engine.begin() as conn:
-        row = (await conn.execute(select(approvals).where(approvals.c.id == approval_id))).mappings().first()
+        row = (await conn.execute(
+            select(approvals).where(
+                approvals.c.id == approval_id,
+                approvals.c.organization_id == member.organization_id,
+            )
+        )).mappings().first()
     if not row:
         raise HTTPException(status_code=404, detail="Approval not found")
     return _with_summary(dict(row))
@@ -112,17 +117,28 @@ async def decide_approval(
     decided_at = datetime.now(timezone.utc)
 
     async with engine.begin() as conn:
-        row = (await conn.execute(select(approvals).where(approvals.c.id == approval_id))).mappings().first()
+        row = (await conn.execute(
+            select(approvals).where(
+                approvals.c.id == approval_id,
+                approvals.c.organization_id == member.organization_id,
+            )
+        )).mappings().first()
         if not row:
             raise HTTPException(status_code=404, detail="Approval not found")
         row_dict = dict(row)
         batch_id = (row_dict.get("action_payload") or {}).get("batch_id")
-        stmt = update(approvals).where(approvals.c.id == approval_id)
+        # Every mutation is scoped to the caller's org so a member can never
+        # decide another tenant's approvals (RULE 9).
+        stmt = update(approvals).where(
+            approvals.c.id == approval_id,
+            approvals.c.organization_id == member.organization_id,
+        )
         if req.batch and batch_id:
             stmt = update(approvals).where(
                 approvals.c.task_id == row_dict["task_id"],
                 approvals.c.step_id == row_dict["step_id"],
                 approvals.c.status == "pending",
+                approvals.c.organization_id == member.organization_id,
             )
         result = await conn.execute(
             stmt.values(
