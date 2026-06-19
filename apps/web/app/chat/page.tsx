@@ -552,6 +552,36 @@ type SettingsOverview = {
   };
   capabilities: Record<string, { supported: boolean; reason: string }>;
 };
+type AutonomyTrustLevel = {
+  id?: string;
+  scope: string;
+  action_class: string;
+  trust_score: number;
+  auto_threshold?: number | null;
+  graduated_by?: string | null;
+  successes: number;
+  rejections: number;
+  incidents: number;
+  updated_at?: string | null;
+};
+type LearnedPolicy = {
+  id: string;
+  action_class: string;
+  matcher?: Record<string, unknown>;
+  decision: string;
+  derived_from_note?: string | null;
+  ratified_by?: string | null;
+  enabled?: boolean;
+  created_at?: string | null;
+};
+type RiskOverride = {
+  id?: string;
+  tool: string;
+  blast_radius: number;
+  irreversibility: number;
+  enabled?: boolean;
+  updated_at?: string | null;
+};
 
 function routeFromPath(pathname: string | null): Route {
   if (pathname === "/activity") return "activity";
@@ -7069,7 +7099,7 @@ function SettingsScreen({ tab, setTab, theme, setTheme, accent, setAccent, signO
           {tab === "memory-settings" && <MemoryScreen embedded />}
           {tab === "data" && <AccountDataSettings setToast={setToast}/>}
           {tab === "tools-settings" && <ToolsSettings data={sectionDraft} patch={v => patch("tool_settings", v)} connectors={overview.connectors} capabilities={overview.capabilities} health={overview.runtime_health.connectors || {}}/>}
-          {tab === "approval-settings" && <ApprovalSettings data={sectionDraft} patch={v => patch("approval", v)}/>}
+          {tab === "approval-settings" && <ApprovalSettings data={sectionDraft} patch={v => patch("approval", v)} canAdmin={canAdmin} setToast={setToast}/>}
           {tab === "notifications" && <NotificationSettings data={sectionDraft} patch={v => patch("notifications", v)} capabilities={overview.capabilities}/>}
           {tab === "security" && <SecuritySettings capabilities={overview.capabilities} signOut={signOut}/>}
           {tab === "billing" && <BillingSettings overview={overview}/>}
@@ -7347,9 +7377,186 @@ function WorkspaceAutonomySection() {
   );
 }
 
-function ApprovalSettings({ data, patch }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void }) {
+function downloadJson(name: string, data: unknown) {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = name;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
+function formatScore(value: unknown) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return "—";
+  return num.toFixed(2);
+}
+
+function AutonomyTrustSettings({ canAdmin, setToast }: { canAdmin: boolean; setToast: (t: { kind: "ok" | "danger"; text: string }) => void }) {
+  const [levels, setLevels] = useState<AutonomyTrustLevel[]>([]);
+  const [proposals, setProposals] = useState<AutonomyTrustLevel[]>([]);
+  const [policies, setPolicies] = useState<LearnedPolicy[]>([]);
+  const [overrides, setOverrides] = useState<RiskOverride[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState("");
+  const [overrideTool, setOverrideTool] = useState("");
+  const [blastRadius, setBlastRadius] = useState("0.5");
+  const [irreversibility, setIrreversibility] = useState("0.5");
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [trustRows, proposalRows, policyRows, overrideRows] = await Promise.all([
+        apiFetch("/autonomy/trust?workspace_id=default").then(r => r.json()),
+        apiFetch("/autonomy/proposals").then(r => r.json()),
+        apiFetch("/autonomy/learned-policies").then(r => r.json()),
+        apiFetch("/autonomy/risk-overrides").then(r => r.json()),
+      ]);
+      setLevels(Array.isArray(trustRows) ? trustRows : []);
+      setProposals(Array.isArray(proposalRows) ? proposalRows : []);
+      setPolicies(Array.isArray(policyRows) ? policyRows : []);
+      setOverrides(Array.isArray(overrideRows) ? overrideRows : []);
+    } catch (exc) {
+      setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to load autonomy controls" });
+      setLevels([]);
+      setProposals([]);
+      setPolicies([]);
+      setOverrides([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [setToast]);
+
+  useEffect(() => { void load(); }, [load]);
+
+  async function mutate(key: string, path: string, init: RequestInit, okText: string) {
+    setBusy(key);
+    try {
+      await apiFetch(path, init);
+      setToast({ kind: "ok", text: okText });
+      await load();
+    } catch (exc) {
+      setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Autonomy update failed" });
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function exportEvidence(row: Pick<AutonomyTrustLevel, "scope" | "action_class">) {
+    setBusy(`evidence:${row.scope}:${row.action_class}`);
+    try {
+      const bundle = await (await apiFetch(`/autonomy/evidence?scope=${encodeURIComponent(row.scope)}&action_class=${encodeURIComponent(row.action_class)}`)).json();
+      downloadJson(`chronos-evidence-${row.action_class.replace(/[^a-z0-9_.-]/gi, "_")}.json`, bundle);
+      setToast({ kind: "ok", text: `Evidence bundle exported with ${bundle.event_count ?? 0} events.` });
+    } catch (exc) {
+      setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to export evidence" });
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function saveOverride() {
+    const tool = overrideTool.trim();
+    if (!tool) return;
+    await mutate("risk:new", "/autonomy/risk-overrides", {
+      method: "PUT",
+      body: JSON.stringify({
+        tool,
+        blast_radius: Number(blastRadius),
+        irreversibility: Number(irreversibility),
+      }),
+    }, "Risk override saved");
+    setOverrideTool("");
+  }
+
+  return (
+    <>
+      <Unavailable reason={canAdmin ? "Graduation, learned-policy enforcement, risk overrides, and evidence exports are admin-only and audited." : "Your role can inspect autonomy state, but admin-only autonomy mutations and evidence export are disabled."}/>
+      <SettingsSection title="Trust levels" note="Current earned autonomy standing by workspace scope and action class. Empty means the trust ledger has no rows or the backend is degraded.">
+        {loading ? <div className="px-5 py-8 text-[13px]" style={{ color: "var(--text-dim)" }}>Loading autonomy ledger...</div> : levels.length === 0 ? <div className="p-5"><EmptyState title="No trust records" sub="Chronos has not recorded graduated-autonomy evidence for this workspace yet."/></div> : levels.map(row => {
+          const graduated = row.auto_threshold != null;
+          return (
+            <div key={`${row.scope}:${row.action_class}`} className="px-5 py-4 border-b hairline last:border-b-0">
+              <div className="flex items-start justify-between gap-4">
+                <div className="min-w-0">
+                  <div className="font-medium text-[14px] truncate">{row.action_class}</div>
+                  <div className="text-[12px] mt-1" style={{ color: "var(--text-dim)" }}>{row.scope} · updated {row.updated_at ? new Date(row.updated_at).toLocaleString() : "never"}</div>
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    <Tag variant={graduated ? "ok" : "warn"}>{graduated ? `auto <= ${formatScore(row.auto_threshold)}` : "approval required"}</Tag>
+                    <Tag>score {formatScore(row.trust_score)}</Tag>
+                    <Tag>{row.successes} successes</Tag>
+                    {(row.rejections > 0 || row.incidents > 0) && <Tag variant="danger">{row.rejections} rejections · {row.incidents} incidents</Tag>}
+                  </div>
+                </div>
+                <div className="flex flex-wrap justify-end gap-2">
+                  <button className="btn btn-sm" disabled={!canAdmin || busy !== ""} onClick={() => void exportEvidence(row)}>Export evidence</button>
+                  <button className="btn btn-secondary btn-sm" disabled={!canAdmin || busy !== ""} onClick={() => void mutate(`graduate:${row.action_class}`, "/autonomy/graduate", { method: "POST", body: JSON.stringify({ scope: row.scope, action_class: row.action_class, auto_threshold: row.auto_threshold ?? 0.5 }) }, "Action class graduated")}>Graduate</button>
+                  <button className="btn btn-danger-soft btn-sm" disabled={!canAdmin || busy !== "" || !graduated} onClick={() => void mutate(`demote:${row.action_class}`, "/autonomy/demote", { method: "POST", body: JSON.stringify({ scope: row.scope, action_class: row.action_class }) }, "Action class demoted")}>Demote</button>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </SettingsSection>
+      <SettingsSection title="Graduation proposals" note="Rows that meet the trust bar but still need a named admin to ratify autonomous execution.">
+        {loading ? <div className="px-5 py-8 text-[13px]" style={{ color: "var(--text-dim)" }}>Loading proposals...</div> : proposals.length === 0 ? <div className="p-5"><EmptyState title="No proposals ready" sub="Medium and high impact actions stay supervised until they earn enough clean evidence and an admin graduates them."/></div> : proposals.map(row => (
+          <div key={`${row.scope}:${row.action_class}`} className="px-5 py-4 border-b hairline last:border-b-0 flex items-center justify-between gap-4">
+            <div className="min-w-0">
+              <div className="font-medium text-[14px] truncate">{row.action_class}</div>
+              <div className="text-[12px] mt-1" style={{ color: "var(--text-dim)" }}>score {formatScore(row.trust_score)} · {row.successes} successes · {row.scope}</div>
+            </div>
+            <button className="btn btn-accent btn-sm" disabled={!canAdmin || busy !== ""} onClick={() => void mutate(`proposal:${row.action_class}`, "/autonomy/graduate", { method: "POST", body: JSON.stringify({ scope: row.scope, action_class: row.action_class, auto_threshold: 0.5 }) }, "Graduation proposal ratified")}>Ratify</button>
+          </div>
+        ))}
+      </SettingsSection>
+      <SettingsSection title="Learned policies" note="Policies synthesized from rejected approvals are proposed only until an admin confirms them. Enabled policies are enforced before earned trust.">
+        {loading ? <div className="px-5 py-8 text-[13px]" style={{ color: "var(--text-dim)" }}>Loading learned policies...</div> : policies.length === 0 ? <div className="p-5"><EmptyState title="No learned policies" sub="Rejected approvals with useful notes can generate policy proposals here."/></div> : policies.map(policy => (
+          <div key={policy.id} className="px-5 py-4 border-b hairline last:border-b-0">
+            <div className="flex items-start justify-between gap-4">
+              <div className="min-w-0">
+                <div className="font-medium text-[14px] truncate">{policy.action_class}</div>
+                <div className="text-[12px] mt-1" style={{ color: "var(--text-dim)" }}>{policy.derived_from_note || "No reviewer note"} · {policy.created_at ? new Date(policy.created_at).toLocaleString() : "undated"}</div>
+                <pre className="mt-2 text-[12px] overflow-auto max-w-[520px]" style={{ color: "var(--text-muted)" }}>{JSON.stringify(policy.matcher || {}, null, 2)}</pre>
+              </div>
+              <div className="flex flex-col items-end gap-2">
+                <Tag variant={policy.enabled ? "ok" : "warn"}>{policy.enabled ? "enabled" : "proposed"}</Tag>
+                <Tag variant={policy.decision === "deny" ? "danger" : "info"}>{policy.decision}</Tag>
+                <div className="flex gap-2">
+                  <button className="btn btn-secondary btn-sm" disabled={!canAdmin || busy !== "" || policy.enabled} onClick={() => void mutate(`policy:confirm:${policy.id}`, `/autonomy/learned-policies/${policy.id}/confirm`, { method: "POST" }, "Learned policy enabled")}>Confirm</button>
+                  <button className="btn btn-danger-soft btn-sm" disabled={!canAdmin || busy !== "" || !policy.enabled} onClick={() => void mutate(`policy:disable:${policy.id}`, `/autonomy/learned-policies/${policy.id}/disable`, { method: "POST" }, "Learned policy disabled")}>Disable</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        ))}
+      </SettingsSection>
+      <SettingsSection title="Risk overrides" note="Per-tool risk factors override inference on the broker hot path. Values are clamped to 0-1 by the API.">
+        <div className="px-5 py-4 border-b hairline">
+          <div className="grid gap-3 items-end" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))" }}>
+            <div><div className="text-[12px] mb-1" style={{ color: "var(--text-dim)" }}>Tool</div><TextInput ariaLabel="Risk override tool" value={overrideTool} onChange={setOverrideTool} disabled={!canAdmin}/></div>
+            <div><div className="text-[12px] mb-1" style={{ color: "var(--text-dim)" }}>Blast radius</div><TextInput ariaLabel="Blast radius" value={blastRadius} onChange={setBlastRadius} disabled={!canAdmin}/></div>
+            <div><div className="text-[12px] mb-1" style={{ color: "var(--text-dim)" }}>Irreversibility</div><TextInput ariaLabel="Irreversibility" value={irreversibility} onChange={setIrreversibility} disabled={!canAdmin}/></div>
+            <button className="btn btn-accent btn-sm" disabled={!canAdmin || !overrideTool.trim() || busy !== ""} onClick={() => void saveOverride()}>Save override</button>
+          </div>
+        </div>
+        {loading ? <div className="px-5 py-8 text-[13px]" style={{ color: "var(--text-dim)" }}>Loading overrides...</div> : overrides.length === 0 ? <div className="p-5"><EmptyState title="No risk overrides" sub="The risk pricer is using inferred defaults for every tool."/></div> : overrides.map(item => (
+          <div key={item.id || item.tool} className="px-5 py-3 border-b hairline last:border-b-0 flex items-center justify-between gap-4">
+            <div>
+              <div className="font-medium text-[14px]">{item.tool}</div>
+              <div className="text-[12px] mt-1" style={{ color: "var(--text-dim)" }}>blast {formatScore(item.blast_radius)} · irreversible {formatScore(item.irreversibility)} · {item.enabled === false ? "disabled" : "enabled"}</div>
+            </div>
+            <button className="btn btn-secondary btn-sm" disabled={!canAdmin || busy !== ""} onClick={() => { setOverrideTool(item.tool); setBlastRadius(String(item.blast_radius)); setIrreversibility(String(item.irreversibility)); }}>Edit</button>
+          </div>
+        ))}
+      </SettingsSection>
+    </>
+  );
+}
+
+function ApprovalSettings({ data, patch, canAdmin, setToast }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void; canAdmin: boolean; setToast: (t: { kind: "ok" | "danger"; text: string }) => void }) {
   const thresholds = (data.thresholds || {}) as Record<string, string>;
-  return <><WorkspaceAutonomySection/><SettingsSection title="Approval policy"><SettingsField label="Mode"><SelectInput ariaLabel="Approval mode" value={val(data, "mode")} onChange={mode => patch({ mode })} options={["off", "low-risk auto", "manual", "strict"]}/></SettingsField>{["low", "medium", "high"].map(level => <SettingsField key={level} label={`${level} risk threshold`}><SelectInput ariaLabel={`${level} risk threshold`} value={thresholds[level] || "manual"} onChange={value => patch({ thresholds: { ...thresholds, [level]: value } })} options={["auto", "manual", "strict", "blocked"]}/></SettingsField>)}<SettingsField label="Rule builder"><pre className="text-[12px] overflow-auto max-w-md" style={{ color: "var(--text-muted)" }}>{JSON.stringify(data.rules || [], null, 2)}</pre></SettingsField></SettingsSection></>;
+  return <><WorkspaceAutonomySection/><AutonomyTrustSettings canAdmin={canAdmin} setToast={setToast}/><SettingsSection title="Approval policy"><SettingsField label="Mode"><SelectInput ariaLabel="Approval mode" value={val(data, "mode")} onChange={mode => patch({ mode })} options={["off", "low-risk auto", "manual", "strict"]}/></SettingsField>{["low", "medium", "high"].map(level => <SettingsField key={level} label={`${level} risk threshold`}><SelectInput ariaLabel={`${level} risk threshold`} value={thresholds[level] || "manual"} onChange={value => patch({ thresholds: { ...thresholds, [level]: value } })} options={["auto", "manual", "strict", "blocked"]}/></SettingsField>)}<SettingsField label="Rule builder"><pre className="text-[12px] overflow-auto max-w-md" style={{ color: "var(--text-muted)" }}>{JSON.stringify(data.rules || [], null, 2)}</pre></SettingsField></SettingsSection></>;
 }
 
 function NotificationSettings({ data, patch, capabilities }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void; capabilities: SettingsOverview["capabilities"] }) {
