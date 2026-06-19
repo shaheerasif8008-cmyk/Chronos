@@ -572,7 +572,7 @@ function pathForRoute(route: Route) {
 }
 
 const ACCENT_PALETTES: Record<string, { accent: string; hover: string; soft: string; text: string }> = {
-  coral:  { accent: "oklch(0.66 0.135 45)",  hover: "oklch(0.60 0.145 45)",  soft: "oklch(0.94 0.04 50)",  text: "oklch(0.40 0.13 45)" },
+  coral:  { accent: "oklch(0.67 0.12 41)",   hover: "oklch(0.615 0.135 40)", soft: "oklch(0.945 0.038 52)", text: "oklch(0.41 0.125 42)" },
   forest: { accent: "oklch(0.55 0.13 155)",  hover: "oklch(0.50 0.14 155)",  soft: "oklch(0.94 0.04 155)", text: "oklch(0.32 0.12 155)" },
   indigo: { accent: "oklch(0.55 0.16 270)",  hover: "oklch(0.50 0.17 270)",  soft: "oklch(0.94 0.04 270)", text: "oklch(0.35 0.15 270)" },
   slate:  { accent: "oklch(0.42 0.025 240)", hover: "oklch(0.36 0.03 240)",  soft: "oklch(0.94 0.01 240)", text: "oklch(0.30 0.025 240)" },
@@ -1137,11 +1137,11 @@ function Sidebar({
       {/* Brand + collapse */}
       <div className="px-3 pt-3 pb-2 flex items-center justify-between">
         <div className="flex items-center gap-2 pl-1">
-          <div className="w-6 h-6 rounded-md flex items-center justify-center"
-               style={{ background: "var(--text)", color: "var(--bg)" }}>
+          <div className="w-6 h-6 rounded-lg flex items-center justify-center"
+               style={{ background: "var(--accent)", color: "white" }}>
             <IC.Logo size={13} stroke={2.2}/>
           </div>
-          <span className="text-[14.5px] font-semibold tracking-tight">Chronos</span>
+          <span className="text-[17px] tracking-tight" style={{ fontFamily: "var(--font-serif), var(--font-geist), Georgia, serif", fontWeight: 500 }}>Chronos</span>
         </div>
         <button onClick={onCollapse} className="btn btn-ghost btn-icon" title="Collapse sidebar">
           <IC.PanelClose size={16}/>
@@ -1341,7 +1341,7 @@ function AccountMenu({ onClose, onSettings, onSignOut }: { onClose: () => void; 
 
       <div className="px-3 py-2 border-t hairline">
         <div className="flex items-center justify-between text-[11px]" style={{ color: "var(--text-dim)" }}>
-        <span>Chronos · Sprint 4</span>
+        <span>Chronos by Cognisia</span>
           <span className="flex items-center gap-1"><Dot color="var(--ok)" size={5}/> Healthy</span>
         </div>
       </div>
@@ -3912,7 +3912,7 @@ function EmptyChatState({ persona, onSubmit }: { persona: typeof PERSONAS[0]; on
             Talking to <span style={{ color: "var(--text)" }}>{persona.name}</span> · {persona.role}
           </div>
         </div>
-        <h1 className="h-display mb-2" style={{ letterSpacing: "-0.03em" }}>What can I help with?</h1>
+        <h1 className="h-display mb-2">What can I help with?</h1>
         <p className="text-[15px] mb-8" style={{ color: "var(--text-dim)" }}>Ask anything, or pick one to get started.</p>
         {showIntro && (
           <div className="mb-6 surface border border-soft rounded-xl p-4 fadein" role="note">

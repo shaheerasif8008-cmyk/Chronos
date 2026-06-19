@@ -98,14 +98,22 @@ export default function LoginPage() {
   const cognitoEnabled = authConfig?.cognito?.enabled;
   const devOtpEnabled = authConfig?.devOtp ?? false;
 
+  const inputClass =
+    "mt-2 w-full rounded-[var(--r-sm)] border px-3 py-2.5 text-[14px] outline-none smooth focus:border-[var(--accent)] focus:shadow-[0_0_0_3px_color-mix(in_oklch,var(--accent)_12%,transparent)]";
+
   return (
-    <main className="min-h-screen bg-[#f6f7f9] px-6 py-10">
+    <main className="min-h-screen px-6 py-10" style={{ background: "var(--bg)", color: "var(--text)", overflow: "auto" }}>
       <section className="mx-auto flex min-h-[calc(100vh-5rem)] max-w-md flex-col justify-center">
-        <h1 className="text-3xl font-semibold tracking-normal text-[#15171a]">Chronos</h1>
-        <p className="mt-2 text-sm leading-6 text-[#525866]">
+        <div className="flex items-center gap-2.5 mb-6">
+          <div className="w-8 h-8 rounded-xl flex items-center justify-center" style={{ background: "var(--accent)", color: "white", fontFamily: "var(--font-serif), serif", fontWeight: 600 }}>
+            C
+          </div>
+          <h1 className="h-display" style={{ fontSize: 28 }}>Chronos</h1>
+        </div>
+        <p className="text-[14px] leading-6" style={{ color: "var(--text-muted)" }}>
           Chronos helps you complete work through chat, files, and durable AI tasks.
         </p>
-        <p className="mt-3 text-sm leading-6 text-[#525866]">
+        <p className="mt-3 text-[13.5px] leading-6" style={{ color: "var(--text-dim)" }}>
           {cognitoEnabled
             ? "Sign in with your organization account."
             : "Sign in with your email to receive a one-time code. (Development mode: the code also appears in the server logs.)"}
@@ -113,7 +121,7 @@ export default function LoginPage() {
 
         {!authConfig && (
           <div className="mt-12 flex justify-center">
-            <div className="h-6 w-6 animate-spin rounded-full border-2 border-[#c9ced6] border-t-[#15171a]" />
+            <div className="h-6 w-6 animate-spin rounded-full border-2" style={{ borderColor: "var(--border)", borderTopColor: "var(--accent)" }} />
           </div>
         )}
 
@@ -122,11 +130,12 @@ export default function LoginPage() {
             <button
               type="button"
               onClick={signInWithCognito}
-              className="w-full rounded-md bg-[#15171a] px-4 py-2.5 text-sm font-medium text-white"
+              className="btn btn-accent w-full justify-center"
+              style={{ padding: "11px 16px" }}
             >
               Sign in with Cognito
             </button>
-            {error ? <p className="text-sm text-[#b42318]">{error}</p> : null}
+            {error ? <p className="text-[13px]" style={{ color: "var(--danger)" }}>{error}</p> : null}
           </div>
         ) : null}
 
@@ -134,39 +143,41 @@ export default function LoginPage() {
           <>
             {cognitoEnabled ? (
               <div className="my-6 flex items-center gap-3">
-                <div className="h-px flex-1 bg-[#c9ced6]" />
-                <span className="text-xs text-[#525866]">or dev OTP</span>
-                <div className="h-px flex-1 bg-[#c9ced6]" />
+                <div className="h-px flex-1" style={{ background: "var(--border)" }} />
+                <span className="text-xs" style={{ color: "var(--text-dim)" }}>or dev OTP</span>
+                <div className="h-px flex-1" style={{ background: "var(--border)" }} />
               </div>
             ) : null}
-            <form onSubmit={requested ? verifyOtp : requestOtp} className="space-y-4">
+            <form onSubmit={requested ? verifyOtp : requestOtp} className="mt-8 space-y-4">
               <label className="block">
-                <span className="text-sm font-medium text-[#2d333b]">Email</span>
+                <span className="text-[13px] font-medium" style={{ color: "var(--text-muted)" }}>Email</span>
                 <input
-                  className="mt-2 w-full rounded-md border border-[#c9ced6] bg-white px-3 py-2 outline-none focus:border-[#1f6feb]"
+                  className={inputClass}
+                  style={{ borderColor: "var(--border)", background: "var(--surface)", color: "var(--text)" }}
                   value={email}
                   onChange={(event) => setEmail(event.target.value)}
                   type="email"
                 />
               </label>
               {devCode ? (
-                <div className="rounded-md border border-[#c9ced6] bg-white px-3 py-2 text-sm text-[#2d333b]">
-                  Dev OTP: <span className="font-mono font-semibold">{devCode}</span>
+                <div className="rounded-[var(--r-sm)] border px-3 py-2 text-[13px]" style={{ borderColor: "var(--border-soft)", background: "var(--surface-2)", color: "var(--text-muted)" }}>
+                  Dev OTP: <span className="font-mono font-semibold" style={{ color: "var(--text)" }}>{devCode}</span>
                 </div>
               ) : null}
               {requested ? (
                 <label className="block">
-                  <span className="text-sm font-medium text-[#2d333b]">OTP</span>
+                  <span className="text-[13px] font-medium" style={{ color: "var(--text-muted)" }}>OTP</span>
                   <input
-                    className="mt-2 w-full rounded-md border border-[#c9ced6] bg-white px-3 py-2 outline-none focus:border-[#1f6feb]"
+                    className={inputClass}
+                    style={{ borderColor: "var(--border)", background: "var(--surface)", color: "var(--text)" }}
                     value={code}
                     onChange={(event) => setCode(event.target.value)}
                     inputMode="numeric"
                   />
                 </label>
               ) : null}
-              {error && !cognitoEnabled ? <p className="text-sm text-[#b42318]">{error}</p> : null}
-              <button className="w-full rounded-md border border-[#c9ced6] bg-white px-4 py-2 text-sm font-medium text-[#15171a]">
+              {error && !cognitoEnabled ? <p className="text-[13px]" style={{ color: "var(--danger)" }}>{error}</p> : null}
+              <button className="btn btn-accent w-full justify-center" style={{ padding: "11px 16px" }}>
                 {requested ? "Verify OTP" : "Request OTP"}
               </button>
             </form>

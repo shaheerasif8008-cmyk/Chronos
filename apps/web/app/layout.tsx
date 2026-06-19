@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
+import { Geist, Geist_Mono, Source_Serif_4 } from "next/font/google";
 import "./globals.css";
 
 const geist = Geist({
@@ -16,6 +16,16 @@ const geistMono = Geist_Mono({
   display: "swap",
 });
 
+// Warm transitional serif for display headings — gives Chronos the
+// approachable, editorial feel of Claude.ai's wordmark and titles.
+const serif = Source_Serif_4({
+  subsets: ["latin"],
+  weight: ["400", "500", "600"],
+  style: ["normal", "italic"],
+  variable: "--font-serif",
+  display: "swap",
+});
+
 export const metadata: Metadata = {
   title: "Chronos",
   description: "Chronos — AI Operations Platform",
@@ -23,7 +33,7 @@ export const metadata: Metadata = {
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en" className={`${geist.variable} ${geistMono.variable}`}>
+    <html lang="en" className={`${geist.variable} ${geistMono.variable} ${serif.variable}`}>
       <body>{children}</body>
     </html>
   );
