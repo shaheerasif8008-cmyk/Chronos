@@ -45,6 +45,15 @@
                0 8px 24px color-mix(in oklch, var(--text) 5%, transparent);
   --shadow-lg: 0 1px 2px color-mix(in oklch, var(--text) 8%, transparent),
                0 16px 40px color-mix(in oklch, var(--text) 11%, transparent);
+  --shadow-xl: 0 2px 4px color-mix(in oklch, var(--text) 9%, transparent),
+               0 28px 64px color-mix(in oklch, var(--text) 16%, transparent);
+
+  /* Motion — Apple-inspired easing curves */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);     /* expo-out: quick start, soft settle */
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --ease-spring: cubic-bezier(0.34, 1.4, 0.5, 1);  /* gentle overshoot */
+  --glass-bg: color-mix(in oklch, var(--bg) 72%, transparent);
+  --glass-surface: color-mix(in oklch, var(--surface) 70%, transparent);
 }
 
 html.dark {
@@ -75,6 +84,9 @@ html.dark {
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35);
   --shadow-md: 0 2px 6px rgba(0, 0, 0, 0.30), 0 12px 32px rgba(0, 0, 0, 0.28);
   --shadow-lg: 0 2px 8px rgba(0, 0, 0, 0.40), 0 20px 48px rgba(0, 0, 0, 0.42);
+  --shadow-xl: 0 3px 10px rgba(0, 0, 0, 0.45), 0 32px 72px rgba(0, 0, 0, 0.55);
+  --glass-bg: color-mix(in oklch, var(--bg) 64%, transparent);
+  --glass-surface: color-mix(in oklch, var(--surface) 62%, transparent);
 }
 
 html, body, #__next {
@@ -153,22 +165,57 @@ textarea {
 .caret { animation: blink 1s step-end infinite; }
 
 @keyframes fadeup {
-  from { opacity: 0; transform: translateY(6px); }
+  from { opacity: 0; transform: translateY(8px); }
   to   { opacity: 1; transform: translateY(0); }
 }
-.fadeup { animation: fadeup 0.32s cubic-bezier(0.2, 0.7, 0.2, 1) both; }
+.fadeup { animation: fadeup 0.42s var(--ease-out) both; }
 
 @keyframes fadein {
   from { opacity: 0; }
   to { opacity: 1; }
 }
-.fadein { animation: fadein 0.4s ease-out both; }
+.fadein { animation: fadein 0.4s var(--ease-out) both; }
 
 @keyframes slidein {
   from { transform: translateX(100%); opacity: 0.2; }
   to { transform: translateX(0); opacity: 1; }
 }
-.slidein { animation: slidein 0.28s cubic-bezier(0.2, 0.7, 0.2, 1) both; }
+.slidein { animation: slidein 0.42s var(--ease-out) both; }
+
+/* Route / view entrance — settle up with a touch of depth */
+@keyframes view-enter {
+  from { opacity: 0; transform: translateY(10px) scale(0.992); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+.view-enter { animation: view-enter 0.4s var(--ease-out) both; }
+
+/* Modal / popover spring pop */
+@keyframes pop-in {
+  from { opacity: 0; transform: scale(0.94) translateY(8px); }
+  to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+.pop-in { animation: pop-in 0.34s var(--ease-spring) both; }
+
+/* Overlay backdrop fade */
+@keyframes overlay-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+.overlay-in { animation: overlay-in 0.24s var(--ease-out) both; }
+
+/* Bottom-sheet slide up */
+@keyframes sheet-up {
+  from { opacity: 0; transform: translateY(24px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.sheet-up { animation: sheet-up 0.42s var(--ease-spring) both; }
+
+/* Soft attention pulse for live/working chips */
+@keyframes soft-breathe {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+.soft-breathe { animation: soft-breathe 2.4s var(--ease-in-out) infinite; }
 
 @keyframes typing-wave {
   0%, 60%, 100% { opacity: 0.45; transform: translateY(0); }
@@ -181,8 +228,41 @@ textarea {
 
 .hairline { border-color: var(--border-hairline); }
 .border-soft { border-color: var(--border-soft); }
-.smooth { transition: all 0.15s ease; }
+.smooth { transition: all 0.2s var(--ease-out); }
 .tabular { font-variant-numeric: tabular-nums; }
+
+/* Frosted glass — layered translucency à la Apple */
+.glass {
+  background: var(--glass-bg);
+  backdrop-filter: saturate(1.6) blur(20px);
+  -webkit-backdrop-filter: saturate(1.6) blur(20px);
+}
+.glass-surface {
+  background: var(--glass-surface);
+  backdrop-filter: saturate(1.8) blur(24px);
+  -webkit-backdrop-filter: saturate(1.8) blur(24px);
+}
+
+/* Hover lift — content floats toward you */
+.lift { transition: transform 0.22s var(--ease-out), box-shadow 0.22s var(--ease-out); will-change: transform; }
+.lift:hover { transform: translateY(-2px); box-shadow: var(--shadow-lg); }
+.lift:active { transform: translateY(0); transition-duration: 0.1s; }
+
+/* Tactile press for interactive elements */
+.btn:active:not(:disabled) { transform: scale(0.97); }
+.btn { transition: background 0.14s var(--ease-out), border-color 0.14s var(--ease-out), color 0.14s var(--ease-out), filter 0.14s var(--ease-out), box-shadow 0.14s var(--ease-out), transform 0.12s var(--ease-out); }
+
+/* Staggered list reveal — children cascade in */
+.stagger > * { animation: fadeup 0.5s var(--ease-out) both; }
+.stagger > *:nth-child(1) { animation-delay: 0.02s; }
+.stagger > *:nth-child(2) { animation-delay: 0.06s; }
+.stagger > *:nth-child(3) { animation-delay: 0.10s; }
+.stagger > *:nth-child(4) { animation-delay: 0.14s; }
+.stagger > *:nth-child(5) { animation-delay: 0.18s; }
+.stagger > *:nth-child(6) { animation-delay: 0.22s; }
+.stagger > *:nth-child(7) { animation-delay: 0.26s; }
+.stagger > *:nth-child(8) { animation-delay: 0.30s; }
+.stagger > *:nth-child(n+9) { animation-delay: 0.34s; }
 
 .no-scrollbar::-webkit-scrollbar { display: none; }
 .no-scrollbar { scrollbar-width: none; }
@@ -398,20 +478,22 @@ textarea {
   padding: 14px 16px;
   text-align: left;
   box-shadow: var(--shadow-sm);
-  transition: background 0.14s, border-color 0.14s, transform 0.1s, box-shadow 0.14s;
+  transition: background 0.2s var(--ease-out), border-color 0.2s var(--ease-out), transform 0.22s var(--ease-out), box-shadow 0.22s var(--ease-out);
+  will-change: transform;
 }
 
-.suggestion:hover { background: var(--surface); border-color: color-mix(in oklch, var(--accent) 40%, var(--border)); box-shadow: var(--shadow-md); }
-.suggestion:active { transform: scale(0.99); }
+.suggestion:hover { background: var(--surface); border-color: color-mix(in oklch, var(--accent) 40%, var(--border)); box-shadow: var(--shadow-md); transform: translateY(-2px); }
+.suggestion:active { transform: translateY(0) scale(0.99); transition-duration: 0.1s; }
 
 .mem-card {
   background: var(--surface);
   border: 1px solid var(--border-soft);
   border-radius: var(--r-md);
-  transition: border-color 0.14s, transform 0.14s, box-shadow 0.14s;
+  transition: border-color 0.2s var(--ease-out), transform 0.22s var(--ease-out), box-shadow 0.22s var(--ease-out);
+  will-change: transform;
 }
 
-.mem-card:hover { border-color: var(--border); box-shadow: var(--shadow-sm); }
+.mem-card:hover { border-color: var(--border); box-shadow: var(--shadow-md); transform: translateY(-2px); }
 
 /* ── Email row (approvals) ── */
 .email-row {
@@ -678,3 +760,14 @@ textarea {
 
 /* Range slider */
 input[type="range"] { accent-color: var(--accent); }
+
+/* ── Reduced motion ── */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+  .lift:hover, .suggestion:hover, .mem-card:hover { transform: none; }
+}
