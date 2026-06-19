@@ -127,3 +127,95 @@ def test_seed_grants_threshold_to_seeded_class():
     assert level.graduated_by == "seed"
     unseeded = trust._seed("data.query")
     assert unseeded.auto_threshold is None
+
+
+# --- Anomaly circuit-breaker ---------------------------------------------
+
+@pytest.mark.asyncio
+async def test_anomalous_burst_regated(monkeypatch):
+    async def graduated(*a, **k):
+        return TrustLevel("doc.create", 0.95, 0.4, "system", 50, 0, 0)
+    recorded = {}
+    async def rec(org, ws, r, outcome, **k):
+        recorded["outcome"] = outcome
+    monkeypatch.setattr(trust, "get_trust_level", graduated)
+    monkeypatch.setattr(trust, "record_outcome", rec)
+    monkeypatch.setattr(trust, "recent_event_count", lambda *a, **k: _async(999))
+    d = await autonomy.evaluate("default", "ws", _risk(0.2, "doc.create"), {},
+                                {"approval_required": True}, "supervised")
+    assert not d.allow
+    assert "anomalous burst" in d.reason
+    assert recorded["outcome"] == "incident"   # breaker tripped
+
+
+@pytest.mark.asyncio
+async def test_no_burst_allows(monkeypatch):
+    async def graduated(*a, **k):
+        return TrustLevel("doc.create", 0.95, 0.4, "system", 50, 0, 0)
+    monkeypatch.setattr(trust, "get_trust_level", graduated)
+    monkeypatch.setattr(trust, "recent_event_count", lambda *a, **k: _async(1))
+    d = await autonomy.evaluate("default", "ws", _risk(0.2, "doc.create"), {},
+                                {"approval_required": True}, "supervised")
+    assert d.allow
+
+
+def _async(value):
+    async def _c():
+        return value
+    return _c()
+
+
+# --- Novelty -------------------------------------------------------------
+
+def test_novelty_from_successes():
+    assert trust.novelty_from_successes(0) == 1.0
+    assert trust.novelty_from_successes(10) == pytest.approx(0.5)
+    assert trust.novelty_from_successes(20) == 0.0
+    assert trust.novelty_from_successes(99) == 0.0
+
+
+# --- Risk registry overrides ---------------------------------------------
+
+def test_override_replaces_inferred_factors():
+    base = risk.price("data.query", {"q": "x"})
+    over = risk.price("data.query", {"q": "x"},
+                      overrides={"data.query": {"blast_radius": 1.0, "irreversibility": 1.0}})
+    assert over.value > base.value
+    assert over.factors["blast_radius"] == 1.0
+
+
+# --- Learned policy matcher ----------------------------------------------
+
+def test_matcher_fits():
+    from core import learned_policy
+    assert learned_policy.matcher_fits({"domain": "competitor.com"},
+                                       {"to": ["x@competitor.com"]})
+    assert not learned_policy.matcher_fits({"domain": "competitor.com"},
+                                           {"to": ["x@partner.com"]})
+    assert not learned_policy.matcher_fits({}, {"to": ["x@competitor.com"]})
+
+
+# --- Evidence bundle -----------------------------------------------------
+
+def test_evidence_chain_and_signature_verify():
+    from core import evidence
+    events = [
+        {"id": "1", "outcome": "approved", "risk_score": 0.4},
+        {"id": "2", "outcome": "auto_success", "risk_score": 0.3},
+    ]
+    chained, head = evidence.chain(events)
+    bundle = {
+        "events": chained,
+        "chain_head": head,
+        "signature": evidence.sign(head),
+    }
+    assert evidence.verify(bundle)
+
+
+def test_evidence_tamper_detected():
+    from core import evidence
+    events = [{"id": "1", "outcome": "approved", "risk_score": 0.4}]
+    chained, head = evidence.chain(events)
+    bundle = {"events": chained, "chain_head": head, "signature": evidence.sign(head)}
+    bundle["events"][0]["outcome"] = "rejected"   # tamper
+    assert not evidence.verify(bundle)

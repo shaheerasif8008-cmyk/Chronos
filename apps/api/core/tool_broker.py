@@ -10,7 +10,7 @@ import json
 import time
 from typing import Any
 
-from core import audit, autonomy, permissions, risk as risk_pricer, trust
+from core import audit, autonomy, permissions, risk as risk_pricer, risk_registry, trust
 from core.connector_health import connector_tier, degraded_note
 from core.config import settings
 from core.exceptions import ApprovalRequired, LoopDetected, RateLimitExceeded, SafetyLimitViolation
@@ -410,7 +410,13 @@ class ToolBroker:
         # inside evaluate); the hard floor above and safety limits below are absolute
         # and run independently. Trust can only loosen governance, never break it.
         autonomy_level = await workspace_autonomy(agent.org_id, agent.workspace_id)
-        risk = risk_pricer.price(tool, args)
+        # Price the call against admin risk overrides and the action_class's track
+        # record (established actions price slightly lower via novelty).
+        overrides = await risk_registry.get_overrides(agent.org_id)
+        provisional_class = risk_pricer.action_class(tool, args)
+        level = await trust.get_trust_level(agent.org_id, agent.workspace_id, provisional_class)
+        novelty = trust.novelty_from_successes(level.successes)
+        risk = risk_pricer.price(tool, args, novelty=novelty, overrides=overrides)
         if not approved_by_gate:
             gate = await autonomy.evaluate(
                 agent.org_id, agent.workspace_id, risk, args, policy, autonomy_level

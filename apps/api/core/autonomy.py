@@ -22,10 +22,16 @@ Order of checks (supervised workspaces):
 import logging
 from dataclasses import dataclass
 
-from core import trust
+from core import learned_policy, trust
 from core.risk import RiskScore
 
 log = logging.getLogger(__name__)
+
+# Anomaly circuit-breaker: a graduated action_class seeing more than this many
+# calls in the trailing window is treated as an anomalous burst — re-gated to
+# human approval and recorded as an incident (which trips the trust breaker).
+_ANOMALY_WINDOW_SECONDS = 300
+_ANOMALY_BURST_THRESHOLD = 30
 
 
 @dataclass(frozen=True)
@@ -59,20 +65,9 @@ async def _matching_learned_policy(org_id: str, action_class: str, args: dict) -
         return None
 
     for row in rows:
-        if _matcher_fits(row["matcher"] or {}, args):
+        if learned_policy.matcher_fits(row["matcher"] or {}, args):
             return {"decision": row["decision"]}
     return None
-
-
-def _matcher_fits(matcher: dict, args: dict) -> bool:
-    """A matcher fits if every key it asserts is found (substring) in the args."""
-    if not matcher:
-        return False
-    blob = repr(args).lower()
-    for value in matcher.values():
-        if str(value).lower() not in blob:
-            return False
-    return True
 
 
 async def evaluate(
@@ -109,6 +104,19 @@ async def evaluate(
         if risk.tier == "medium" and level.graduated_by in (None, "seed"):
             # Medium tier needs a *named human* to ratify graduation.
             return GateDecision(False, "medium-risk graduation needs human ratification", klass)
+
+        # 5b. Anomaly circuit-breaker: a graduated action seeing a sudden burst is
+        #     re-gated to a human and recorded as an incident (trips the breaker so
+        #     the next call is also gated until trust is re-earned).
+        burst = await trust.recent_event_count(
+            org_id, workspace_id, klass, window_seconds=_ANOMALY_WINDOW_SECONDS
+        )
+        if burst >= _ANOMALY_BURST_THRESHOLD:
+            await trust.record_outcome(
+                org_id, workspace_id, risk, "incident", tool=klass.split(":", 1)[0]
+            )
+            return GateDecision(False, f"anomalous burst ({burst} in window) — re-gated", klass)
+
         return GateDecision(
             True,
             f"graduated (trust={level.trust_score:.2f}, by={level.graduated_by})",

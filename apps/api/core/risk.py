@@ -94,7 +94,11 @@ def risk_tier(value: float) -> str:
     return "high"
 
 
-def _base_factors(tool: str) -> tuple[float, float]:
+def _base_factors(tool: str, overrides: dict[str, dict[str, float]] | None = None) -> tuple[float, float]:
+    # An admin override for the exact tool wins outright over inference.
+    if overrides and tool in overrides:
+        o = overrides[tool]
+        return _clamp01(o["blast_radius"]), _clamp01(o["irreversibility"])
     provider = tool.split(".", 1)[0]
     blast, irr = _PROVIDER_BASE.get(provider, (0.5, 0.5))
     if any(m in tool for m in _READ_MARKERS):
@@ -146,14 +150,23 @@ def action_class(tool: str, args: dict) -> str:
     return tool if partition == "default" else f"{tool}:{partition}"
 
 
-def price(tool: str, args: dict, *, novelty: float = 1.0) -> RiskScore:
+def price(
+    tool: str,
+    args: dict,
+    *,
+    novelty: float = 1.0,
+    overrides: dict[str, dict[str, float]] | None = None,
+) -> RiskScore:
     """Compute the risk score for a single tool call.
 
     ``novelty`` is supplied by the trust ledger: 1.0 means never-before-seen
     (cold start), 0.0 means well-established. Callers that don't have ledger
     context get the cautious default of fully novel.
+
+    ``overrides`` are admin-set per-org base factors from the risk registry; when
+    a tool is overridden, inference is bypassed for its blast/irreversibility.
     """
-    blast, irr = _base_factors(tool)
+    blast, irr = _base_factors(tool, overrides)
     data = _data_class(args)
     magnitude, partition = _magnitude(tool, args)
     novelty = _clamp01(novelty)

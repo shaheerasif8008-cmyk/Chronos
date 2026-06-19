@@ -118,23 +118,41 @@ admin confirmation UX are the **next implementation step** (see below).
 
 ---
 
-## What's implemented now (this slice)
+## What's implemented (complete)
 
+**Core engine**
 - Migration `0036_graduated_autonomy` — `trust_levels`, `trust_events`
-  (append-only), `learned_policies`; indexes; grants; single clean head.
-- `core/risk.py`, `core/trust.py`, `core/autonomy.py`.
-- Broker wired: gate decision + outcome recording.
-- `tests/test_graduated_autonomy.py` — pricer + gate (17 cases, green), and the
-  pre-existing `test_autonomy_broker` cases still pass unchanged.
+  (append-only), `learned_policies`. Migration `0037_risk_overrides` —
+  admin-editable risk registry. Single clean alembic head.
+- `core/risk.py` — Risk Pricer; now consumes registry overrides + ledger novelty.
+- `core/trust.py` — ledger (EWMA, demotion, hybrid graduation) + admin ops
+  (`list_levels`, `list_proposals`, `set_graduation`, `demote`),
+  `recent_event_count` + `novelty_from_successes` for anomaly/novelty.
+- `core/autonomy.py` — gate with learned-policy veto and the **anomaly
+  circuit-breaker** (burst of a graduated action → synthetic incident + re-gate).
+- `core/learned_policy.py` — rejection→matcher **synthesis** (LLM, best-effort) +
+  propose/confirm/disable lifecycle. Enforced only after a named human ratifies.
+- `core/risk_registry.py` — TTL-cached per-org override loader + CRUD.
+- `core/evidence.py` — hash-chained, HMAC-signed **evidence bundles** over
+  `trust_events`, with offline `verify()`.
+- `tool_broker.py` — gate step + overrides/novelty pricing + outcome recording.
 
-## Next steps (not in this slice)
+**Admin/approver API** (`routers/autonomy.py`, mounted at `/autonomy`)
+- `GET /trust` — trust dashboard. `GET /proposals` — graduations awaiting a human.
+- `POST /graduate` · `POST /demote` — ratify / revoke (admin, audited).
+- `GET /learned-policies` · `POST /{id}/confirm` · `POST /{id}/disable`.
+- `GET /risk-overrides` · `PUT /risk-overrides`.
+- `GET /evidence?scope=&action_class=` — signed evidence bundle export.
 
-1. Rejection → learned-policy synthesis in `ApprovalService.resolve` + admin
-   confirmation surface.
-2. Admin/approver UX: graduation proposals, a trust dashboard, learned-policy
-   confirmations.
-3. Anomaly circuit-breaker: per-`action_class` distribution → treat volume/novelty
-   spikes as synthetic incidents.
-4. Promote the inferred risk factors into an admin-editable registry table.
-5. Signed evidence-bundle export over `trust_events` (ties into the
-   Provable-Governance pillar).
+**Rejection wiring** — `routers/approvals.py:decide_approval` now feeds the ledger
+(`approved`/`rejected`) and, on rejection, proposes a learned policy from the note.
+
+**Tests** — `tests/test_graduated_autonomy.py` (27 cases: pricer, gate, anomaly,
+novelty, overrides, matcher, evidence chain/sign/verify). Pre-existing
+`test_autonomy_broker` + `test_skill_broker` still green.
+
+## Remaining surface (frontend only)
+
+The backend + APIs for the admin UX are complete. The Next.js pages that consume
+them (trust dashboard, proposal/learned-policy review screens) are the one
+remaining piece and were intentionally left to follow the web app's conventions.

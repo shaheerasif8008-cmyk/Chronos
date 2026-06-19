@@ -121,6 +121,140 @@ async def get_trust_level(org_id: str, workspace_id: str | None, action_class: s
     )
 
 
+def novelty_from_successes(successes: int, *, seen_floor: int = 20) -> float:
+    """Map an action_class's track record to a novelty factor in [0,1].
+
+    1.0 = never seen (cold start), decaying toward 0 as it becomes routine. The
+    pricer weights novelty so unestablished actions price slightly higher.
+    """
+    if successes <= 0:
+        return 1.0
+    return max(0.0, 1.0 - min(1.0, successes / float(seen_floor)))
+
+
+async def recent_event_count(
+    org_id: str, workspace_id: str | None, action_class: str, *, window_seconds: int
+) -> int:
+    """Count ledger events for an action_class in the trailing window.
+
+    Feeds the anomaly circuit-breaker: a sudden burst of a graduated action is
+    treated as anomalous and re-gated to human approval. Degrades to 0 (no
+    anomaly signal) when the ledger is unavailable.
+    """
+    scope = scope_for(workspace_id)
+    try:
+        from datetime import datetime, timedelta, timezone
+
+        from sqlalchemy import func, select
+
+        from core.db import engine, reflect_table
+
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=window_seconds)
+        events = await reflect_table("trust_events")
+        async with engine.begin() as conn:
+            count = (
+                await conn.execute(
+                    select(func.count()).where(
+                        events.c.organization_id == org_id,
+                        events.c.scope == scope,
+                        events.c.action_class == action_class,
+                        events.c.created_at >= cutoff,
+                    )
+                )
+            ).scalar_one()
+        return int(count or 0)
+    except Exception as exc:
+        log.debug("trust recent-count degraded: %s", exc)
+        return 0
+
+
+async def list_levels(org_id: str, workspace_id: str | None = None) -> list[dict]:
+    """Trust dashboard data: current standing per action_class."""
+    try:
+        from sqlalchemy import select
+
+        from core.db import engine, reflect_table
+
+        table = await reflect_table("trust_levels")
+        stmt = select(table).where(table.c.organization_id == org_id)
+        if workspace_id is not None:
+            stmt = stmt.where(table.c.scope == scope_for(workspace_id))
+        async with engine.begin() as conn:
+            rows = (await conn.execute(stmt.order_by(table.c.trust_score.desc()))).mappings().all()
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        log.debug("trust list degraded: %s", exc)
+        return []
+
+
+async def list_proposals(org_id: str) -> list[dict]:
+    """Action_classes whose track record meets the bar but await human graduation.
+
+    These are the MEDIUM/HIGH (or not-yet-graduated) classes an admin can ratify.
+    Annotated with the mean observed risk so the reviewer sees the tier.
+    """
+    levels = await list_levels(org_id)
+    out = []
+    for lvl in levels:
+        ready = (
+            lvl["graduated_by"] in (None, "seed")
+            and lvl["trust_score"] >= _GRADUATE_SCORE_BAR
+            and lvl["successes"] >= _GRADUATE_MIN_SAMPLE
+            and lvl["rejections"] == 0
+        )
+        if ready:
+            out.append(lvl)
+    return out
+
+
+async def set_graduation(
+    org_id: str, scope: str, action_class: str, *, auto_threshold: float, graduated_by: str
+) -> bool:
+    """A named human ratifies graduation for an action_class (MEDIUM/HIGH path)."""
+    from datetime import datetime, timezone
+
+    return await _admin_update(
+        org_id, scope, action_class,
+        auto_threshold=max(0.0, min(1.0, auto_threshold)),
+        graduated_by=graduated_by,
+        graduated_at=datetime.now(timezone.utc),
+        demoted_at=None,
+    )
+
+
+async def demote(org_id: str, scope: str, action_class: str) -> bool:
+    """Manually revoke autonomy for an action_class."""
+    from datetime import datetime, timezone
+
+    return await _admin_update(
+        org_id, scope, action_class,
+        auto_threshold=None, graduated_by=None, demoted_at=datetime.now(timezone.utc),
+    )
+
+
+async def _admin_update(org_id: str, scope: str, action_class: str, **values) -> bool:
+    try:
+        from sqlalchemy import update
+
+        from core.db import engine, reflect_table
+
+        table = await reflect_table("trust_levels")
+        async with engine.begin() as conn:
+            result = await conn.execute(
+                update(table)
+                .where(
+                    table.c.organization_id == org_id,
+                    table.c.scope == scope,
+                    table.c.action_class == action_class,
+                )
+                .values(**values)
+            )
+        return result.rowcount > 0
+    except Exception as exc:
+        log.debug("trust admin update degraded: %s", exc)
+        return False
+
+
 async def record_outcome(
     org_id: str,
     workspace_id: str | None,
