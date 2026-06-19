@@ -30,7 +30,7 @@ depends_on = None
 def upgrade() -> None:
     op.create_table(
         "trust_levels",
-        sa.Column("id", sa.dialects.postgresql.UUID(as_uuid=False), primary_key=True,
+        sa.Column("id", sa.UUID(), primary_key=True,
                   server_default=sa.text("gen_random_uuid()")),
         sa.Column("organization_id", sa.Text(), nullable=False, server_default="default"),
         sa.Column("region", sa.Text(), nullable=False, server_default="us"),
@@ -53,7 +53,7 @@ def upgrade() -> None:
 
     op.create_table(
         "trust_events",
-        sa.Column("id", sa.dialects.postgresql.UUID(as_uuid=False), primary_key=True,
+        sa.Column("id", sa.UUID(), primary_key=True,
                   server_default=sa.text("gen_random_uuid()")),
         sa.Column("organization_id", sa.Text(), nullable=False, server_default="default"),
         sa.Column("region", sa.Text(), nullable=False, server_default="us"),
@@ -62,7 +62,7 @@ def upgrade() -> None:
         sa.Column("tool", sa.Text(), nullable=False),
         sa.Column("risk_score", sa.Float(), nullable=False),
         sa.Column("outcome", sa.Text(), nullable=False),        # auto_success|approved|rejected|incident|reverted
-        sa.Column("approval_id", sa.dialects.postgresql.UUID(as_uuid=False), nullable=True),
+        sa.Column("approval_id", sa.UUID(), nullable=True),
         sa.Column("actor_id", sa.Text(), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("NOW()")),
     )
@@ -71,14 +71,14 @@ def upgrade() -> None:
 
     op.create_table(
         "learned_policies",
-        sa.Column("id", sa.dialects.postgresql.UUID(as_uuid=False), primary_key=True,
+        sa.Column("id", sa.UUID(), primary_key=True,
                   server_default=sa.text("gen_random_uuid()")),
         sa.Column("organization_id", sa.Text(), nullable=False, server_default="default"),
         sa.Column("region", sa.Text(), nullable=False, server_default="us"),
         sa.Column("action_class", sa.Text(), nullable=False),
         sa.Column("matcher", JSONB(), nullable=False, server_default=sa.text("'{}'::jsonb")),
         sa.Column("decision", sa.Text(), nullable=False),       # deny | require_approval
-        sa.Column("source_approval_id", sa.dialects.postgresql.UUID(as_uuid=False), nullable=True),
+        sa.Column("source_approval_id", sa.UUID(), nullable=True),
         sa.Column("derived_from_note", sa.Text(), nullable=True),
         sa.Column("ratified_by", sa.Text(), nullable=True),     # NULL = proposed, not enforced
         sa.Column("enabled", sa.Boolean(), nullable=False, server_default=sa.text("false")),

@@ -21,7 +21,7 @@ depends_on = None
 def upgrade() -> None:
     op.create_table(
         "risk_overrides",
-        sa.Column("id", sa.dialects.postgresql.UUID(as_uuid=False), primary_key=True,
+        sa.Column("id", sa.UUID(), primary_key=True,
                   server_default=sa.text("gen_random_uuid()")),
         sa.Column("organization_id", sa.Text(), nullable=False, server_default="default"),
         sa.Column("region", sa.Text(), nullable=False, server_default="us"),
