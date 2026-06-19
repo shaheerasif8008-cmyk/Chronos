@@ -193,8 +193,22 @@ def test_system_prompt_requires_large_code_outputs_as_artifacts():
     assert "ask_clarification" in prompt
 
 
+def test_system_prompt_sets_substance_and_voice_standard():
+    from core.context import load_base_system_prompt
+
+    prompt = load_base_system_prompt()
+    # The substance contract that lifts answers above generic, hedge-filled output.
+    assert "# Substance & Voice" in prompt
+    assert "Lead with the answer" in prompt
+    assert "No filler" in prompt
+    # And the terse "1-4 sentences" quota is gone from the conversational format.
+    assert "1-4 sentences" not in prompt
+
+
 @pytest.mark.asyncio
-async def test_complex_inline_turn_sends_fast_ack_before_model_tokens(monkeypatch):
+async def test_inline_turn_streams_model_tokens_without_canned_ack(monkeypatch):
+    # The model's own tokens are the response — no robotic templated prefix is
+    # prepended to substantive answers anymore.
     from runtime import agent_loop
 
     async def fake_stream_step(messages, tools, model):
@@ -223,9 +237,9 @@ async def test_complex_inline_turn_sends_fast_ack_before_model_tokens(monkeypatc
     ))
 
     token_events = [e["content"] for e in events if e["type"] == "token"]
-    assert token_events[0].startswith("I'll start by checking the contract")
-    assert "".join(token_events).endswith("The answer")
-    assert saved_msgs == ["".join(token_events)]
+    assert token_events == ["The", " answer"]
+    assert "".join(token_events) == "The answer"
+    assert saved_msgs == ["The answer"]
 
 
 @pytest.mark.asyncio

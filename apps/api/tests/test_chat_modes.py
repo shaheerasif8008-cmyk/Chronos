@@ -79,7 +79,10 @@ def test_model_kwargs_threads_reasoning_effort_for_supported_providers():
     assert kwargs["reasoning_effort"] == "high"
 
 
-def test_model_kwargs_drops_reasoning_effort_for_openrouter():
+def test_model_kwargs_threads_reasoning_effort_for_routed_reasoning_models():
+    # Reasoning models keep their effort even when routed through OpenRouter —
+    # the gate is on the model family, not the provider prefix. (Previously this
+    # was dropped for all openrouter/ models, silently disabling reasoning.)
     from core.llm import model_kwargs
 
     kwargs = model_kwargs(
@@ -88,7 +91,32 @@ def test_model_kwargs_drops_reasoning_effort_for_openrouter():
         reasoning_effort="High",
     )
 
+    assert kwargs["reasoning_effort"] == "high"
+
+
+def test_model_kwargs_drops_reasoning_effort_for_non_reasoning_models():
+    from core.llm import model_kwargs
+
+    kwargs = model_kwargs(
+        "openrouter/meta-llama/llama-3-8b-instruct",
+        messages=[{"role": "user", "content": "hi"}],
+        reasoning_effort="High",
+    )
+
     assert "reasoning_effort" not in kwargs
+
+
+def test_model_accepts_reasoning_effort_gates_on_family_not_provider():
+    from core.llm import model_accepts_reasoning_effort
+
+    # Reasoning families qualify regardless of the provider prefix.
+    assert model_accepts_reasoning_effort("openrouter/openai/gpt-5.4-mini") is True
+    assert model_accepts_reasoning_effort("openai/gpt-5.4-nano") is True
+    assert model_accepts_reasoning_effort("openrouter/deepseek/deepseek-v4-pro") is True
+    # Non-reasoning models do not.
+    assert model_accepts_reasoning_effort("openrouter/meta-llama/llama-3-8b-instruct") is False
+    assert model_accepts_reasoning_effort("openrouter/deepseek/deepseek-v4-flash") is False
+    assert model_accepts_reasoning_effort(None) is False
 
 
 def test_model_kwargs_rejects_unknown_reasoning_effort():
@@ -363,7 +391,7 @@ async def test_nontrivial_chat_uses_history_aware_inline_turn(monkeypatch):
     monkeypatch.setattr(chat, "_save_message", fake_save_message)
     monkeypatch.setattr(chat, "assemble_context", fake_assemble_context)
     monkeypatch.setattr(chat, "extract_explicit_memory_content", lambda msg: None)
-    monkeypatch.setattr(chat, "classify_intent", AsyncMock(return_value={"mode": "chat", "goal": None}))
+    monkeypatch.setattr(chat, "classify_request", AsyncMock(return_value={"mode": "chat", "goal": None, "difficulty": "standard", "reasoning_effort": "medium"}))
     monkeypatch.setattr(chat, "stream_chat_turn", fake_stream_chat_turn)
     monkeypatch.setattr(chat, "_agent_loop_stream", fake_agent_loop_stream)
 
@@ -416,9 +444,11 @@ async def test_task_route_preserves_original_message_for_execution(monkeypatch):
     monkeypatch.setattr(chat, "_save_message", fake_save_message)
     monkeypatch.setattr(chat, "assemble_context", fake_assemble_context)
     monkeypatch.setattr(chat, "extract_explicit_memory_content", lambda msg: None)
-    monkeypatch.setattr(chat, "classify_intent", AsyncMock(return_value={
+    monkeypatch.setattr(chat, "classify_request", AsyncMock(return_value={
         "mode": "task",
         "goal": "Run the provided GitHub repository and analyze its strengths and weaknesses",
+        "difficulty": "hard",
+        "reasoning_effort": "high",
     }))
     monkeypatch.setattr(chat, "_agent_loop_stream", fake_agent_loop_stream)
 

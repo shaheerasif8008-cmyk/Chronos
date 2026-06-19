@@ -199,13 +199,32 @@ def normalize_reasoning_effort(reasoning_effort: str | None) -> str | None:
     return normalized
 
 
+# Model families that natively support the `reasoning_effort` parameter. Matched
+# as substrings against the (possibly provider-prefixed) model string, so e.g.
+# "openrouter/openai/gpt-5.4-mini" qualifies via "gpt-5". litellm.drop_params is
+# enabled, so if a routed provider ignores the param it is dropped before the
+# request rather than erroring — meaning enabling it here is safe even when a
+# specific OpenRouter route happens not to honor it.
+_REASONING_CAPABLE_MARKERS: tuple[str, ...] = (
+    "gpt-5",
+    "o1-", "o1_", "/o1", "o3-", "o3_", "/o3", "o4-", "o4_", "/o4",
+    "deepseek-v4-pro", "deepseek-r1", "deepseek-reasoner",
+)
+
+
 def model_accepts_reasoning_effort(model: str | None) -> bool:
+    """True when the model is a reasoning model that honors `reasoning_effort`.
+
+    Previously this disabled the param for *all* `openrouter/` models, which
+    silently stripped reasoning effort from every configured model (all of which
+    are routed through OpenRouter) — so even an explicit "high" selection was a
+    no-op and strong reasoning models ran at minimal effort. Now it gates on the
+    model family instead of the provider prefix.
+    """
     if not model:
         return False
-    # OpenRouter rejects reasoning_effort for at least some routed models; sending
-    # it breaks otherwise valid chat/task turns. Keep the UI setting as a no-op
-    # for routed providers rather than failing the whole task.
-    return not model.startswith("openrouter/")
+    lowered = model.lower()
+    return any(marker in lowered for marker in _REASONING_CAPABLE_MARKERS)
 
 
 def apply_reasoning_effort(kwargs: dict[str, Any], reasoning_effort: str | None) -> dict[str, Any]:

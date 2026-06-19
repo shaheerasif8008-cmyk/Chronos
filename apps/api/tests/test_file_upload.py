@@ -330,7 +330,7 @@ async def test_send_message_persists_attachment_refs_on_user_message(monkeypatch
     monkeypatch.setattr(chat_router, "assemble_context", fake_assemble_context)
     monkeypatch.setattr(chat_router, "extract_explicit_memory_content", lambda _: None)
     monkeypatch.setattr(chat_router, "normalize_chat_model", lambda m: "fast")
-    monkeypatch.setattr(chat_router, "classify_intent", lambda _: _wrap_coro({"mode": "chat", "goal": None}))
+    monkeypatch.setattr(chat_router, "classify_request", lambda _: _wrap_coro({"mode": "chat", "goal": None, "difficulty": "standard", "reasoning_effort": "medium"}))
     monkeypatch.setattr(chat_router, "stream_chat_turn", fake_stream_chat_turn)
 
     req = chat_router.ChatRequest(
@@ -390,7 +390,7 @@ async def test_send_message_filters_cross_org_attachment(monkeypatch):
     monkeypatch.setattr(chat_router, "assemble_context", fake_assemble_context)
     monkeypatch.setattr(chat_router, "extract_explicit_memory_content", lambda _: None)
     monkeypatch.setattr(chat_router, "normalize_chat_model", lambda m: "fast")
-    monkeypatch.setattr(chat_router, "classify_intent", lambda _: _wrap_coro({"mode": "chat", "goal": None}))
+    monkeypatch.setattr(chat_router, "classify_request", lambda _: _wrap_coro({"mode": "chat", "goal": None, "difficulty": "standard", "reasoning_effort": "medium"}))
     monkeypatch.setattr(chat_router, "stream_chat_turn", fake_stream_chat_turn)
 
     req = chat_router.ChatRequest(
