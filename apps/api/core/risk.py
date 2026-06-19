@@ -31,8 +31,11 @@ TIER_MEDIUM_MAX = 0.70
 # Cold-start: action_classes safe enough to auto-execute on day one (no external
 # effect, trivially reversible). They graduate "by seed" so a fresh org isn't all
 # friction. Everything else must earn graduation. See chronos_graduated_autonomy.md.
+#
+# Note: gmail.draft is intentionally NOT seeded — drafts are deliberately
+# approval-gated by product policy (the draft-before-send control adjacent to
+# RULE 8), so graduating them by seed would bypass an existing governance step.
 SEEDED_AUTO_CLASSES: dict[str, float] = {
-    "gmail.draft": 0.40,
     "doc.create": 0.40,
     "doc.create_slides": 0.40,
     "doc.render_chart": 0.40,

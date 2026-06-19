@@ -490,7 +490,7 @@ class ToolBroker:
             agent.workspace_id,
             risk,
             "approved" if approved_by_gate else "auto_success",
-            region=settings.region,
+            region=getattr(settings, "region", "us"),
             tool=tool,
             actor_id=agent.id,
         )

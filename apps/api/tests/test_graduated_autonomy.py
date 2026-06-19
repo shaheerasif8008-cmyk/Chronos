@@ -87,9 +87,9 @@ async def test_high_risk_never_graduates(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_low_risk_seeded_class_auto_executes():
-    # gmail.draft is seeded -> cold-start auto_threshold; degrades to seed (no DB).
-    r = risk.price("gmail.draft", {"to": ["a@x.com"], "body": "hi"})
-    d = await autonomy.evaluate("default", "ws", r, {"to": ["a@x.com"]},
+    # doc.create is seeded -> cold-start auto_threshold; degrades to seed (no DB).
+    r = risk.price("doc.create", {"title": "Notes"})
+    d = await autonomy.evaluate("default", "ws", r, {"title": "Notes"},
                                 {"approval_required": True}, "supervised")
     assert d.allow
 
@@ -122,11 +122,12 @@ async def test_learned_policy_blocks(monkeypatch):
 
 
 def test_seed_grants_threshold_to_seeded_class():
-    level = trust._seed("gmail.draft")
+    level = trust._seed("doc.create")
     assert level.auto_threshold == 0.40
     assert level.graduated_by == "seed"
-    unseeded = trust._seed("data.query")
-    assert unseeded.auto_threshold is None
+    # gmail.draft is intentionally NOT seeded (stays approval-gated by policy).
+    assert trust._seed("gmail.draft").auto_threshold is None
+    assert trust._seed("data.query").auto_threshold is None
 
 
 # --- Anomaly circuit-breaker ---------------------------------------------

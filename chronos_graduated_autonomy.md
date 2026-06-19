@@ -52,6 +52,9 @@ risk = 0.30·blast_radius + 0.30·irreversibility + 0.20·data_class
   (read ↓, draft ↓↓, destructive ↑). From the registry; admin-overridable later.
 - `data_class` — regulated identifiers (SSN/card) detected in args raise risk.
   Emails are deliberately excluded (ubiquitous, not regulated on their own).
+- Cold-start seed = reversible, no-external-effect classes (`doc.create`,
+  `doc.create_slides`, `doc.render_chart`, `image.generate`). `gmail.draft` is
+  **not** seeded — drafts stay approval-gated by product policy.
 - `magnitude` — recipients / $ amount / record count, normalized.
 - `novelty` — supplied by the ledger; 1.0 = never seen (cold start).
 
