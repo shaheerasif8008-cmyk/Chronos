@@ -72,6 +72,13 @@ _FORBIDDEN_DATA_PATTERNS = [
     r"\beval\s*\(",
     r"\bexec\s*\(",
     r"\bcompile\s*\(",
+    r"\bbreakpoint\s*\(",
+    r"__builtins__",
+    r"__subclasses__",
+    r"__bases__",
+    r"__mro__",
+    r"__globals__",
+    r"\.\./",            # relative path traversal out of the run workspace
 ]
 
 

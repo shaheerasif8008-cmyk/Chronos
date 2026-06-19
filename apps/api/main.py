@@ -28,19 +28,26 @@ from routers import activity, agents, approvals, artifact_share, artifacts, atta
 
 app = FastAPI(title="Chronos API", version="0.1.0")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
+# CORS: in production, pin to the configured frontend origin only. The broad
+# localhost regex is dev-only attack surface (any local app on port 30xx could
+# otherwise drive credentialed requests), so it is not registered in production.
+_cors_origins = [app_settings.frontend_base_url.rstrip("/")]
+_cors_kwargs: dict = {"allow_origins": _cors_origins}
+if not app_settings.is_production:
+    _cors_origins.extend([
         "http://localhost:3000",
         "http://127.0.0.1:3000",
         "http://localhost:3001",
         "http://127.0.0.1:3001",
-        app_settings.frontend_base_url.rstrip("/"),
-    ],
-    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1):30\d{2}",
+    ])
+    _cors_kwargs["allow_origin_regex"] = r"https?://(localhost|127\.0\.0\.1):30\d{2}"
+
+app.add_middleware(
+    CORSMiddleware,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    **_cors_kwargs,
 )
 
 app.include_router(auth.router)
@@ -216,9 +223,16 @@ async def stop_schedulers() -> None:
 
 @app.get("/health")
 async def health() -> dict:
-    """Deep health check — verifies all critical dependencies."""
+    """Deep health check — verifies all critical dependencies.
+
+    Returns only ``ok``/``error``/``degraded`` per dependency. Exception detail
+    (which can leak DSN fragments, internal hostnames, and provider error
+    bodies) is logged server-side, never returned to unauthenticated callers.
+    """
+    import logging
     import time
 
+    log = logging.getLogger("chronos.health")
     checks: dict[str, str] = {}
 
     # Postgres
@@ -226,16 +240,18 @@ async def health() -> dict:
         async with engine.begin() as conn:
             await conn.execute(select(1))  # type: ignore[arg-type]
         checks["postgres"] = "ok"
-    except Exception as exc:
-        checks["postgres"] = f"error: {exc}"
+    except Exception:
+        log.exception("health check: postgres")
+        checks["postgres"] = "error"
 
     # Redis
     try:
         from core.redis import redis_client
         await redis_client.ping()
         checks["redis"] = "ok"
-    except Exception as exc:
-        checks["redis"] = f"error: {exc}"
+    except Exception:
+        log.exception("health check: redis")
+        checks["redis"] = "error"
 
     # Object storage.
     storage_health_name = "object_storage"
@@ -245,8 +261,9 @@ async def health() -> dict:
         storage_health_name = cfg.object_storage_health_name
         await ensure_bucket()
         checks[storage_health_name] = "ok"
-    except Exception as exc:
-        checks[storage_health_name] = f"error: {exc}"
+    except Exception:
+        log.exception("health check: object storage")
+        checks[storage_health_name] = "error"
 
     # Model reachability (quick probe — no retries)
     try:
@@ -258,8 +275,9 @@ async def health() -> dict:
             max_tokens=1,
         )
         checks["model"] = "ok"
-    except Exception as exc:
-        checks["model"] = f"degraded: {exc!r:.120}"
+    except Exception:
+        log.exception("health check: model probe")
+        checks["model"] = "degraded"
 
     overall = "ok" if all(v == "ok" for v in checks.values()) else "degraded"
     return {"status": overall, "checks": checks, "ts": time.time()}

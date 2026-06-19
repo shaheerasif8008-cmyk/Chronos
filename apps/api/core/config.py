@@ -4,7 +4,15 @@ from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+_DEFAULT_JWT_SECRET = "change-me-in-dev"
+_INSECURE_VAULT_KEYS = {"", "0" * 64}
+
+
 class Settings(BaseSettings):
+    # Deployment environment. "development" relaxes secret/auth guards for local
+    # work; anything else ("staging"/"production") is treated as production and
+    # the startup guards below refuse to boot on insecure defaults.
+    environment: str = "development"
     org_id: str = "default"
     region: str = "us"
     admin_email: str = "admin@example.com"
@@ -104,6 +112,35 @@ class Settings(BaseSettings):
             raise ValueError("OBJECT_STORAGE_BACKEND must be 's3'")
         if not self.aws_s3_bucket:
             raise ValueError("AWS_S3_BUCKET is required when OBJECT_STORAGE_BACKEND=s3")
+        return self
+
+    @property
+    def is_production(self) -> bool:
+        return self.environment.strip().lower() not in {"development", "dev", "local", "test"}
+
+    @model_validator(mode="after")
+    def enforce_production_secrets(self) -> "Settings":
+        """Fail closed on insecure defaults outside development.
+
+        A deployment must never run with the shipped JWT secret, a missing/
+        all-zeros vault key, or dev OTP enabled. These are the highest-impact
+        misconfigurations (token forgery, credential disclosure, account
+        takeover), so we refuse to boot rather than start in a vulnerable state.
+        """
+        if not self.is_production:
+            return self
+        problems: list[str] = []
+        if self.jwt_secret == _DEFAULT_JWT_SECRET or not self.jwt_secret:
+            problems.append("JWT_SECRET must be set to a strong random value (not the default)")
+        if self.vault_encryption_key in _INSECURE_VAULT_KEYS:
+            problems.append("VAULT_ENCRYPTION_KEY must be a real 32-byte (64 hex char) key")
+        if self.auth_provider in {"dev_otp", "both"}:
+            problems.append("AUTH_PROVIDER must not enable dev_otp in production")
+        if problems:
+            raise ValueError(
+                "Insecure configuration for ENVIRONMENT="
+                f"{self.environment}: " + "; ".join(problems)
+            )
         return self
 
     @property

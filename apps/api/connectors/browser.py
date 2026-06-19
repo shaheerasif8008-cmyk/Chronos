@@ -29,6 +29,16 @@ from core.untrusted_content import scan_untrusted_content
 
 log = logging.getLogger(__name__)
 
+
+def _assert_fetchable(url: str) -> None:
+    """Block SSRF before navigating: model/untrusted content controls these URLs."""
+    from core.ssrf import assert_safe_url, UnsafeURLError
+    try:
+        assert_safe_url(url)
+    except UnsafeURLError as exc:
+        raise ValueError(f"refusing to fetch unsafe URL: {exc}") from exc
+
+
 _TIMEOUT_MS = 20_000   # 20-second hard page timeout
 _USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -186,6 +196,7 @@ class BrowserConnector:
         url = args.get("url", "")
         if not url:
             raise ValueError("browser.fetch requires 'url'")
+        _assert_fetchable(url)
         tier = args.pop("__connector_tier", "live")
         if settings.demo_mode or tier in {"demo", "fixture"}:
             return ToolResult(
@@ -232,6 +243,7 @@ class BrowserConnector:
         url = args.get("url", "")
         if not url:
             raise ValueError("browser.extract_contacts requires 'url'")
+        _assert_fetchable(url)
         tier = args.pop("__connector_tier", "live")
         if settings.demo_mode or tier in {"demo", "fixture"}:
             return ToolResult(
