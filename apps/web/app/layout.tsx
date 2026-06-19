@@ -31,7 +31,11 @@ export const metadata: Metadata = {
   description: "Chronos — AI Operations Platform",
 };
 
-export default function RootLayout({ children }: { children: React.ReactNode }) {
+interface RootLayoutProps {
+  children: React.ReactNode;
+}
+
+export default function RootLayout({ children }: RootLayoutProps) {
   return (
     <html lang="en" className={`${geist.variable} ${geistMono.variable} ${serif.variable}`}>
       <body>{children}</body>

@@ -114,9 +114,11 @@ export default function LoginPage() {
           Chronos helps you complete work through chat, files, and durable AI tasks.
         </p>
         <p className="mt-3 text-[13.5px] leading-6" style={{ color: "var(--text-dim)" }}>
-          {cognitoEnabled
-            ? "Sign in with your organization account."
-            : "Sign in with your email to receive a one-time code. (Development mode: the code also appears in the server logs.)"}
+          {!authConfig
+            ? "Loading sign-in options…"
+            : cognitoEnabled
+              ? "Sign in with your organization account."
+              : "Sign in with your email to receive a one-time code. (Development mode: the code also appears in the server logs.)"}
         </p>
 
         {!authConfig && (

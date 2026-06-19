@@ -769,5 +769,6 @@ input[type="range"] { accent-color: var(--accent); }
     transition-duration: 0.001ms !important;
     scroll-behavior: auto !important;
   }
-  .lift:hover, .suggestion:hover, .mem-card:hover { transform: none; }
+  .lift:hover, .suggestion:hover, .mem-card:hover,
+  .btn:active:not(:disabled), .suggestion:active, .lift:active { transform: none !important; }
 }
