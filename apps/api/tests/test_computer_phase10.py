@@ -65,10 +65,13 @@ async def test_cloud_computer_runs_in_sandbox_enforces_timeout_and_exports_artif
     listed = await tool_broker.execute(agent, "computer.list_files", {"session_id": session_id, "path": "app"})
     assert {entry["path"] for entry in listed.data["entries"]} == {"app/index.html"}
 
+    # computer.exec is on the broker's approval hard-floor (it runs shell on the
+    # backend host), so a human approval record is required. Pass the gate flag
+    # to exercise the post-approval sandbox path this test is asserting.
     ran = await tool_broker.execute(
         agent,
         "computer.exec",
-        {"session_id": session_id, "command": "printf ready", "timeout_seconds": 2},
+        {"session_id": session_id, "command": "printf ready", "timeout_seconds": 2, "__approved_by_gate": True},
     )
     assert ran.data["status"] == "success"
     assert ran.data["stdout"] == "ready"
@@ -77,7 +80,7 @@ async def test_cloud_computer_runs_in_sandbox_enforces_timeout_and_exports_artif
     timed_out = await tool_broker.execute(
         agent,
         "computer.exec",
-        {"session_id": session_id, "command": "sleep 2", "timeout_seconds": 1},
+        {"session_id": session_id, "command": "sleep 2", "timeout_seconds": 1, "__approved_by_gate": True},
     )
     assert timed_out.data["status"] == "timeout"
 
