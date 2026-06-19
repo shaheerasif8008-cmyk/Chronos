@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import socket
 import uuid
+from types import SimpleNamespace
 
 import pytest
 
@@ -125,6 +126,85 @@ class TestFsWriteBinaryRejection:
         assert result is not None
         assert result["kind"] == "html"
         assert result["title"] == "page.html"
+
+
+# ── Tool-returned artifact ids — no DB ───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_tool_returned_uploaded_document_artifact_surfaces_once(monkeypatch):
+    """A doc workflow that returns a filled PDF artifact id should render in chat."""
+    from runtime.agent_loop import _execute_tool, _surface_result_artifacts
+
+    async def fake_get_artifact(artifact_id: str):
+        rows = {
+            "filled-pdf-1": {
+                "id": "filled-pdf-1",
+                "organization_id": "org-1",
+                "title": "filled-intake.pdf",
+                "kind": "pdf",
+                "mime_type": "application/pdf",
+                "size_bytes": 2048,
+            },
+            "other-tenant": {
+                "id": "other-tenant",
+                "organization_id": "org-2",
+                "title": "private.pdf",
+                "kind": "pdf",
+                "mime_type": "application/pdf",
+                "size_bytes": 4096,
+            },
+        }
+        return rows.get(artifact_id)
+
+    monkeypatch.setattr("core.artifacts.get_artifact", fake_get_artifact)
+    emitted: list[dict] = []
+
+    async def fake_execute(agent, broker_name, args):
+        assert broker_name == "doc.fill_pdf"
+        return SimpleNamespace(
+            summary="Filled PDF",
+            data={
+                "status": "success",
+                "artifact_id": "filled-pdf-1",
+                "artifact_ids": ["filled-pdf-1", "other-tenant", ""],
+            },
+        )
+
+    async def fake_emit_activity(task_id, event, actor_id="chronos"):
+        emitted.append(event)
+
+    monkeypatch.setattr("runtime.agent_loop.tool_broker.execute", fake_execute)
+    monkeypatch.setattr("runtime.agent_loop.emit_activity", fake_emit_activity)
+
+    task = {"id": "task-1", "organization_id": "org-1"}
+    result = await _surface_result_artifacts(
+        task,
+        {
+            "artifact_id": "filled-pdf-1",
+            "artifact_ids": ["filled-pdf-1", "other-tenant", ""],
+        },
+    )
+
+    assert result == [
+        {
+            "artifact_id": "filled-pdf-1",
+            "title": "filled-intake.pdf",
+            "kind": "pdf",
+            "mime_type": "application/pdf",
+            "size_bytes": 2048,
+        }
+    ]
+
+    tool_message = await _execute_tool(
+        {"id": "call-1", "name": "doc__fill_pdf", "args_str": "{}"},
+        task,
+        agent=SimpleNamespace(),
+    )
+
+    assert tool_message["artifacts"] == result
+    artifact_events = [event for event in emitted if event.get("type") == "artifact"]
+    assert artifact_events == [{"type": "artifact", **result[0]}]
 
 
 # ── _scan_workspace_for_artifacts — DB-requiring ──────────────────────────────

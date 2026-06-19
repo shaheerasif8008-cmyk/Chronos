@@ -859,6 +859,15 @@ async def _execute_tool(
             created_artifacts = await _scan_workspace_for_artifacts(task)
             for artifact in created_artifacts:
                 await emit_activity(task_id, {"type": "artifact", **artifact})
+        # Some tools persist artifacts themselves and return only artifact ids
+        # in their result payload. Resolve those ids into normal artifact events
+        # so filled PDFs, generated images, slides, and charts show up inline.
+        if isinstance(result.data, dict):
+            for artifact in await _surface_result_artifacts(task, result.data):
+                if any(existing.get("artifact_id") == artifact["artifact_id"] for existing in created_artifacts):
+                    continue
+                created_artifacts.append(artifact)
+                await emit_activity(task_id, {"type": "artifact", **artifact})
     except ApprovalRequired:
         raise  # propagate — caller decides whether to gate
     except Exception as exc:
@@ -966,6 +975,40 @@ async def _maybe_create_artifact(task: dict[str, Any], args: dict[str, Any]) -> 
         "mime_type": mime,
         "size_bytes": len(file_content.encode("utf-8")),
 }
+
+
+async def _surface_result_artifacts(task: dict[str, Any], data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Resolve tool-returned artifact ids into chat/activity artifact payloads."""
+    from core.artifacts import get_artifact
+
+    artifact_ids: list[str] = []
+    single = data.get("artifact_id")
+    if isinstance(single, str) and single:
+        artifact_ids.append(single)
+    for artifact_id in data.get("artifact_ids") or []:
+        if isinstance(artifact_id, str) and artifact_id:
+            artifact_ids.append(artifact_id)
+
+    org_id = str(task.get("organization_id") or "default")
+    surfaced: list[dict[str, Any]] = []
+    for artifact_id in dict.fromkeys(artifact_ids):
+        try:
+            meta = await get_artifact(artifact_id)
+        except Exception as exc:
+            logger.warning("Artifact surfacing lookup failed for %s: %r", artifact_id, exc)
+            continue
+        if not meta or str(meta.get("organization_id") or "") != org_id:
+            continue
+        surfaced.append(
+            {
+                "artifact_id": artifact_id,
+                "title": meta.get("title") or "artifact",
+                "kind": meta.get("kind") or "file",
+                "mime_type": meta.get("mime_type") or "application/octet-stream",
+                "size_bytes": int(meta.get("size_bytes") or 0),
+            }
+        )
+    return surfaced
 
 
 async def _scan_workspace_for_artifacts(task: dict[str, Any]) -> list[dict[str, Any]]:
