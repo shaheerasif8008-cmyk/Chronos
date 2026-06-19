@@ -41,64 +41,188 @@ def test_computer_tools_are_registered_for_agent_and_inline_use():
     assert expected <= inline_names
 
 
+class _FakeRuntime:
+    def __init__(self):
+        self.fs: dict[str, dict[str, bytes]] = {}
+        self._n = 0
+        self.expired: set[str] = set()
+
+    async def create(self, *, timeout_seconds, metadata):
+        self._n += 1
+        sid = f"sbx-{self._n}"
+        self.fs[sid] = {}
+        return sid
+
+    def _check(self, sandbox_id):
+        if sandbox_id in self.expired:
+            from connectors.e2b_runtime import SandboxExpired
+
+            raise SandboxExpired(sandbox_id)
+
+    async def run(self, sandbox_id, command, *, cwd, timeout_seconds):
+        self._check(sandbox_id)
+        files = self.fs.setdefault(sandbox_id, {})
+
+        def result(status="success", stdout="", stderr="", returncode=0):
+            return {
+                "status": status,
+                "returncode": returncode,
+                "stdout": stdout,
+                "stderr": stderr,
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+            }
+
+        if command.startswith("mkdir -p"):
+            return result()
+        if command.startswith("if [ -d"):
+            for path in files:
+                if path in command:
+                    return result(stdout="file")
+            return result(stdout="none")
+        if command.startswith("printf "):
+            return result(stdout=command[len("printf "):])
+        if command.startswith("sleep "):
+            try:
+                duration = int(command.split()[1])
+            except ValueError:
+                duration = 0
+            if timeout_seconds < duration:
+                return result(status="timeout", returncode=124)
+            return result()
+        return result()
+
+    async def write(self, sandbox_id, path, content):
+        self._check(sandbox_id)
+        self.fs.setdefault(sandbox_id, {})[path] = content
+
+    async def read(self, sandbox_id, path):
+        self._check(sandbox_id)
+        return self.fs.get(sandbox_id, {}).get(path, b"")
+
+    async def list(self, sandbox_id, path):
+        self._check(sandbox_id)
+        out = []
+        prefix = path.rstrip("/") + "/"
+        for full in self.fs.get(sandbox_id, {}):
+            if full.startswith(prefix) and "/" not in full[len(prefix):]:
+                out.append({"name": full[len(prefix):], "type": "file"})
+        return out
+
+    async def kill(self, sandbox_id):
+        self.fs.pop(sandbox_id, None)
+
+
 @pytest.mark.asyncio
-async def test_cloud_computer_runs_in_sandbox_enforces_timeout_and_exports_artifact():
+async def test_cloud_computer_runs_in_isolated_runtime_and_exports_artifact():
     from connectors.computer import computer_connector
+    from connectors.e2b_runtime import SANDBOX_ROOT
     from core import tool_broker
     from core.artifacts import read_artifact_content
 
-    agent = _agent(f"org-cloud-{uuid4()}")
-    created = await tool_broker.execute(
-        agent,
-        "computer.create_session",
-        {"purpose": "phase 10 acceptance"},
-    )
-    session_id = created.data["session"]["id"]
+    computer_connector._runtime = _FakeRuntime()
+    try:
+        agent = _agent(f"org-cloud-{uuid4()}")
+        created = await tool_broker.execute(
+            agent,
+            "computer.create_session",
+            {"purpose": "phase 10 acceptance"},
+        )
+        session_id = created.data["session"]["id"]
+        assert "sandbox_id" not in created.data["session"]
+        assert "environment" not in created.data["session"]
 
-    wrote = await tool_broker.execute(
-        agent,
-        "computer.write_file",
-        {"session_id": session_id, "path": "app/index.html", "content": "<h1>Chronos</h1>"},
-    )
-    assert wrote.data["path"] == "app/index.html"
+        wrote = await tool_broker.execute(
+            agent,
+            "computer.write_file",
+            {"session_id": session_id, "path": "app/index.html", "content": "<h1>Chronos</h1>"},
+        )
+        assert wrote.data["path"] == "app/index.html"
 
-    listed = await tool_broker.execute(agent, "computer.list_files", {"session_id": session_id, "path": "app"})
-    assert {entry["path"] for entry in listed.data["entries"]} == {"app/index.html"}
+        listed = await tool_broker.execute(agent, "computer.list_files", {"session_id": session_id, "path": "app"})
+        assert {entry["path"] for entry in listed.data["entries"]} == {"app/index.html"}
 
-    ran = await tool_broker.execute(
-        agent,
-        "computer.exec",
-        # computer.exec is on the approval hard floor — pass the gate flag the way
-        # an approved execution would, mirroring the local_computer.exec coverage.
-        {"session_id": session_id, "command": "printf ready", "timeout_seconds": 2, "__approved_by_gate": True},
-    )
-    assert ran.data["status"] == "success"
-    assert ran.data["stdout"] == "ready"
-    assert f"/chronos_computers/{agent.org_id}/" in ran.data["workspace"]
+        ran = await tool_broker.execute(
+            agent,
+            "computer.exec",
+            {"session_id": session_id, "command": "printf ready", "timeout_seconds": 2, "__approved_by_gate": True},
+        )
+        assert ran.data["status"] == "success"
+        assert ran.data["stdout"] == "ready"
+        assert ran.data["workspace"] == SANDBOX_ROOT
 
-    timed_out = await tool_broker.execute(
-        agent,
-        "computer.exec",
-        {"session_id": session_id, "command": "sleep 2", "timeout_seconds": 1, "__approved_by_gate": True},
-    )
-    assert timed_out.data["status"] == "timeout"
+        timed_out = await tool_broker.execute(
+            agent,
+            "computer.exec",
+            {"session_id": session_id, "command": "sleep 2", "timeout_seconds": 1, "__approved_by_gate": True},
+        )
+        assert timed_out.data["status"] == "timeout"
 
-    screenshot = await tool_broker.execute(agent, "computer.screenshot", {"session_id": session_id})
-    assert screenshot.data["status"] in {"degraded", "success"}
-    assert screenshot.data["session"]["id"] == session_id
+        screenshot = await tool_broker.execute(agent, "computer.screenshot", {"session_id": session_id})
+        assert screenshot.data["status"] == "degraded"
+        assert "headless" in screenshot.data["reason"]
+        assert screenshot.data["session"]["id"] == session_id
 
-    exported = await tool_broker.execute(
-        agent,
-        "computer.export_artifact",
-        {"session_id": session_id, "path": "app/index.html", "title": "Phase 10 App"},
-    )
-    artifact_id = exported.data["artifact_id"]
-    assert await read_artifact_content(artifact_id) == b"<h1>Chronos</h1>"
+        exported = await tool_broker.execute(
+            agent,
+            "computer.export_artifact",
+            {"session_id": session_id, "path": "app/index.html", "title": "Phase 10 App"},
+        )
+        artifact_id = exported.data["artifact_id"]
+        assert await read_artifact_content(artifact_id) == b"<h1>Chronos</h1>"
 
-    events = await computer_connector.list_events(session_id, organization_id=agent.org_id)
-    event_types = [event["event_type"] for event in events]
-    assert "computer_command" in event_types
-    assert "computer_artifact_exported" in event_types
+        events = await computer_connector.list_events(session_id, organization_id=agent.org_id)
+        event_types = [event["event_type"] for event in events]
+        assert "computer_command" in event_types
+        assert "computer_artifact_exported" in event_types
+    finally:
+        computer_connector._runtime = None
+
+
+@pytest.mark.asyncio
+async def test_cloud_computer_unavailable_without_runtime():
+    from connectors.computer import computer_connector
+    from core import tool_broker
+
+    computer_connector._runtime = None
+    import connectors.computer as comp_mod
+
+    original = comp_mod.default_runtime
+    comp_mod.default_runtime = lambda: None
+    try:
+        agent = _agent(f"org-none-{uuid4()}")
+        result = await tool_broker.execute(agent, "computer.create_session", {"purpose": "x"})
+        assert result.data["status"] == "unavailable"
+        assert "E2B_API_KEY" in result.data["reason"]
+    finally:
+        comp_mod.default_runtime = original
+
+
+@pytest.mark.asyncio
+async def test_cloud_computer_marks_expired_session_truthfully():
+    from connectors.computer import computer_connector
+    from core import tool_broker
+
+    fake = _FakeRuntime()
+    computer_connector._runtime = fake
+    try:
+        agent = _agent(f"org-expired-{uuid4()}")
+        created = await tool_broker.execute(agent, "computer.create_session", {"purpose": "expiry proof"})
+        session_id = created.data["session"]["id"]
+        sandbox_id = computer_connector._sessions[session_id]["environment"]["sandbox_id"]
+        fake.expired.add(sandbox_id)
+
+        result = await tool_broker.execute(
+            agent,
+            "computer.exec",
+            {"session_id": session_id, "command": "printf stale", "__approved_by_gate": True},
+        )
+        assert result.data["status"] == "expired"
+        assert result.data["session"]["status"] == "expired"
+        assert computer_connector._sessions[session_id]["status"] == "expired"
+        assert "Create a new session" in result.data["reason"]
+    finally:
+        computer_connector._runtime = None
 
 
 @pytest.mark.asyncio

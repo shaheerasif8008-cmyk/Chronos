@@ -56,6 +56,8 @@ class Settings(BaseSettings):
     task_runner_timeout_seconds: float = 1800.0
     runtime_auto_install_tools: bool = True
     runtime_tool_install_timeout_seconds: float = 180.0
+    e2b_api_key: str = ""
+    e2b_sandbox_timeout_seconds: int = 1800
     jwt_secret: str = "change-me-in-dev"
     access_token_expire_minutes: int = 60
 
