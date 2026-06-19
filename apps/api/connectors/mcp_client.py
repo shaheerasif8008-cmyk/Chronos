@@ -82,6 +82,13 @@ async def _stdio_request(command: str, method: str, params: dict[str, Any] | Non
 
 
 async def _remote_request(server_url: str, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    # A registered MCP server_url must not be used to reach internal services
+    # (cloud metadata, loopback admin APIs) via the backend.
+    from core.ssrf import assert_safe_url, UnsafeURLError
+    try:
+        assert_safe_url(server_url)
+    except UnsafeURLError as exc:
+        raise MCPTransportError(f"remote MCP server_url blocked: {exc}") from exc
     async with httpx.AsyncClient(timeout=20) as client:
         response = await client.post(
             server_url,

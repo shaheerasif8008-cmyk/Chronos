@@ -90,6 +90,13 @@ async def call(
 
     token, creds = await _get_token(vault_ref)
     url = api_base.rstrip("/") + "/" + endpoint.lstrip("/")
+    # Never send the bearer token to an internal/loopback address — the api_base
+    # (stored) or endpoint (LLM-controlled) could point at metadata/internal hosts.
+    from core.ssrf import assert_safe_url, UnsafeURLError
+    try:
+        assert_safe_url(url)
+    except UnsafeURLError as exc:
+        raise RuntimeError(f"{provider} API blocked unsafe URL: {exc}") from exc
     headers = {"Authorization": f"Bearer {token}"}
 
     # Notion requires a version header

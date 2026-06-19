@@ -1,6 +1,5 @@
 from __future__ import annotations
-import hashlib
-import hmac
+import secrets
 import time
 
 from fastapi import APIRouter, HTTPException, Response
@@ -8,7 +7,7 @@ from pydantic import BaseModel, EmailStr
 from sqlalchemy import select, update
 
 from core import audit
-from core.auth import create_access_token
+from core.auth import create_access_token, set_session_cookie
 from core.cognito import (
     CognitoAuthError,
     build_authorize_url,
@@ -23,8 +22,13 @@ from core.invitations import accept_pending_invitation
 from core.members import get_member_by_email, get_or_create_member_for_email
 
 router = APIRouter(prefix="/auth", tags=["auth"])
-_otp_store: dict[str, str] = {}
-_DEV_OTP_WINDOW_SECONDS = 10 * 60
+# email -> {code, expires_at, attempts}. Codes are random, single-use, and
+# short-lived; the store is locked after too many failed attempts to defeat
+# brute force. Process-local (single-node dev auth); a clustered deployment
+# should use a shared store, but dev OTP is disabled in production anyway.
+_otp_store: dict[str, dict] = {}
+_OTP_TTL_SECONDS = 5 * 60
+_OTP_MAX_ATTEMPTS = 5
 
 
 class OtpRequest(BaseModel):
@@ -46,15 +50,9 @@ class CognitoIdTokenRequest(BaseModel):
 
 
 def _dev_otp_enabled() -> bool:
-    return settings.auth_provider in {"dev_otp", "both"}
-
-
-def _dev_otp_for(email: str, window: int | None = None) -> str:
-    current_window = window if window is not None else int(time.time() // _DEV_OTP_WINDOW_SECONDS)
-    key = settings.jwt_secret.encode("utf-8")
-    message = f"{email.lower()}:{current_window}".encode("utf-8")
-    digest = hmac.new(key, message, hashlib.sha256).hexdigest()
-    return f"{int(digest[:12], 16) % 1_000_000:06d}"
+    # Hard gate: dev OTP is never available in production, regardless of config
+    # (the config guard also refuses to boot with dev_otp in production).
+    return (not settings.is_production) and settings.auth_provider in {"dev_otp", "both"}
 
 
 @router.get("/config")
@@ -84,14 +82,22 @@ async def auth_config() -> dict:
 async def request_otp(req: OtpRequest) -> dict[str, str]:
     if not _dev_otp_enabled():
         raise HTTPException(status_code=404, detail="Dev OTP auth is disabled")
-    code = _dev_otp_for(req.email)
-    _otp_store[req.email.lower()] = code
+    email = req.email.lower()
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    _otp_store[email] = {
+        "code": code,
+        "expires_at": time.time() + _OTP_TTL_SECONDS,
+        "attempts": 0,
+    }
     # Pre-login: no member (and thus no tenant) is resolved yet — the email may
     # not even belong to a seeded member. The process default org is the only
     # org available here, so log it explicitly rather than implying a real tenant.
-    await audit.log("otp_requested", req.email.lower(), "auth.request_otp", organization_id=settings.org_id)
+    await audit.log("otp_requested", email, "auth.request_otp", organization_id=settings.org_id)
+    # Dev only: the code is printed to the API console (see CLAUDE.md). It is
+    # never returned in the HTTP response, so requesting a code for someone
+    # else's email does not disclose it.
     print(f"Chronos dev OTP for {req.email}: {code}", flush=True)
-    return {"status": "otp_sent_dev_console", "dev_code": code}
+    return {"status": "otp_sent_dev_console"}
 
 
 @router.post("/verify-otp")
@@ -99,14 +105,18 @@ async def verify_otp(req: OtpVerify, response: Response) -> dict[str, str]:
     if not _dev_otp_enabled():
         raise HTTPException(status_code=404, detail="Dev OTP auth is disabled")
     email = req.email.lower()
-    current_window = int(time.time() // _DEV_OTP_WINDOW_SECONDS)
-    valid_codes = {
-        _otp_store.get(email),
-        _dev_otp_for(email, current_window),
-        _dev_otp_for(email, current_window - 1),
-    }
-    if req.code not in valid_codes:
-        raise HTTPException(status_code=400, detail="Invalid OTP")
+    entry = _otp_store.get(email)
+    if entry is None or entry["expires_at"] < time.time():
+        _otp_store.pop(email, None)
+        raise HTTPException(status_code=400, detail="Invalid or expired OTP")
+    if entry["attempts"] >= _OTP_MAX_ATTEMPTS:
+        _otp_store.pop(email, None)
+        raise HTTPException(status_code=429, detail="Too many attempts; request a new code")
+    entry["attempts"] += 1
+    if not secrets.compare_digest(req.code, entry["code"]):
+        raise HTTPException(status_code=400, detail="Invalid or expired OTP")
+    # Single-use: consume the code on success so it can't be replayed.
+    _otp_store.pop(email, None)
 
     member = await get_member_by_email(email)
     if member is None:
@@ -121,7 +131,7 @@ async def verify_otp(req: OtpVerify, response: Response) -> dict[str, str]:
             update(members).where(members.c.id == member.id).values(region=settings.region)
         )
     await audit.log("otp_verified", member.id, "auth.verify_otp", organization_id=member.organization_id)
-    response.set_cookie("chronos_session", token, httponly=True, samesite="lax")
+    set_session_cookie(response, token)
     return {"access_token": token, "token_type": "bearer", "member_id": member.id}
 
 
@@ -142,7 +152,7 @@ async def cognito_callback(req: CognitoCallbackRequest, response: Response) -> d
 
     token = create_access_token(member.id)
     await audit.log("cognito_login", member.id, "auth.cognito_callback", organization_id=member.organization_id)
-    response.set_cookie("chronos_session", token, httponly=True, samesite="lax")
+    set_session_cookie(response, token)
     return {"access_token": token, "token_type": "bearer", "member_id": member.id}
 
 
@@ -162,5 +172,5 @@ async def cognito_verify_id_token(req: CognitoIdTokenRequest, response: Response
 
     token = create_access_token(member.id)
     await audit.log("cognito_login", member.id, "auth.cognito_verify", organization_id=member.organization_id)
-    response.set_cookie("chronos_session", token, httponly=True, samesite="lax")
+    set_session_cookie(response, token)
     return {"access_token": token, "token_type": "bearer", "member_id": member.id}

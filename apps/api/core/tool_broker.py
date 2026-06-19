@@ -31,6 +31,11 @@ _ALWAYS_APPROVAL_TOOLS = {
     "local_computer.exec",
     "local_computer.open_app",
     "desktop.open_app",  # launching an app into the virtual desktop is risk-tiered
+    # Cloud computer shell/package operations execute on the backend host. They
+    # must never run unattended (even under full_auto) — arbitrary shell is the
+    # highest-impact action surface, so a human approval record is mandatory.
+    "computer.exec",
+    "computer.install_package",
 }
 
 # Hard safety limits enforced regardless of permissions.
