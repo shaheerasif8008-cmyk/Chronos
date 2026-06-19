@@ -183,9 +183,17 @@ async def recover_incomplete_tasks() -> list[str]:
             )
         ).all()
 
-    task_ids = [str(row[0]) for row in rows]
-    for task_id in task_ids:
+    from runtime import leases
+
+    task_ids: list[str] = []
+    for row in rows:
+        task_id = str(row[0])
+        # Don't re-enqueue a task another live worker already holds a lease on —
+        # that worker is actively running it. Orphans (no live lease) are revived.
+        if await leases.task_lease_held(task_id):
+            continue
         await task_runner.enqueue_task(task_id)
+        task_ids.append(task_id)
     return task_ids
 
 

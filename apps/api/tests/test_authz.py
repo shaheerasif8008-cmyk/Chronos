@@ -18,9 +18,10 @@ def _reset():
 
 def test_model_defines_expected_types():
     types = {t["type"] for t in authz.AUTHORIZATION_MODEL["type_definitions"]}
-    assert {"user", "organization", "project"} <= types
-    project = next(t for t in authz.AUTHORIZATION_MODEL["type_definitions"] if t["type"] == "project")
-    assert {"can_view", "can_edit", "can_manage"} <= set(project["relations"])
+    assert {"user", "organization", "project", "workspace"} <= types
+    for resource in ("project", "workspace"):
+        td = next(t for t in authz.AUTHORIZATION_MODEL["type_definitions"] if t["type"] == resource)
+        assert {"can_view", "can_edit", "can_manage"} <= set(td["relations"])
 
 
 @pytest.mark.asyncio

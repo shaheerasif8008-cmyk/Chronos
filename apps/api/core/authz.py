@@ -39,6 +39,62 @@ class AuthzUnavailable(ChronosError):
     """Raised when the OpenFGA server cannot be reached or returns an error."""
 
 
+def _scoped_resource_type(type_name: str) -> dict:
+    """Type def for an org-scoped resource with owner/editor/viewer roles.
+
+    can_view/can_edit/can_manage compose the direct roles with org-admin
+    inheritance, so an organization admin can act on every resource of this type.
+    Used for both ``project`` and ``workspace`` so the model is consistent.
+    """
+    return {
+        "type": type_name,
+        "relations": {
+            "org": {"this": {}},
+            "owner": {"this": {}},
+            "editor": {"this": {}},
+            "viewer": {"this": {}},
+            "can_view": {
+                "union": {
+                    "child": [
+                        {"computedUserset": {"relation": "owner"}},
+                        {"computedUserset": {"relation": "editor"}},
+                        {"computedUserset": {"relation": "viewer"}},
+                        {"tupleToUserset": {"tupleset": {"relation": "org"},
+                                            "computedUserset": {"relation": "admin"}}},
+                    ]
+                }
+            },
+            "can_edit": {
+                "union": {
+                    "child": [
+                        {"computedUserset": {"relation": "owner"}},
+                        {"computedUserset": {"relation": "editor"}},
+                        {"tupleToUserset": {"tupleset": {"relation": "org"},
+                                            "computedUserset": {"relation": "admin"}}},
+                    ]
+                }
+            },
+            "can_manage": {
+                "union": {
+                    "child": [
+                        {"computedUserset": {"relation": "owner"}},
+                        {"tupleToUserset": {"tupleset": {"relation": "org"},
+                                            "computedUserset": {"relation": "admin"}}},
+                    ]
+                }
+            },
+        },
+        "metadata": {
+            "relations": {
+                "org": {"directly_related_user_types": [{"type": "organization"}]},
+                "owner": {"directly_related_user_types": [{"type": "user"}]},
+                "editor": {"directly_related_user_types": [{"type": "user"}]},
+                "viewer": {"directly_related_user_types": [{"type": "user"}]},
+            }
+        },
+    }
+
+
 AUTHORIZATION_MODEL: dict = {
     "schema_version": "1.1",
     "type_definitions": [
@@ -56,65 +112,8 @@ AUTHORIZATION_MODEL: dict = {
                 }
             },
         },
-        {
-            "type": "project",
-            "relations": {
-                "org": {"this": {}},
-                "owner": {"this": {}},
-                "editor": {"this": {}},
-                "viewer": {"this": {}},
-                "can_view": {
-                    "union": {
-                        "child": [
-                            {"computedUserset": {"relation": "owner"}},
-                            {"computedUserset": {"relation": "editor"}},
-                            {"computedUserset": {"relation": "viewer"}},
-                            {
-                                "tupleToUserset": {
-                                    "tupleset": {"relation": "org"},
-                                    "computedUserset": {"relation": "admin"},
-                                }
-                            },
-                        ]
-                    }
-                },
-                "can_edit": {
-                    "union": {
-                        "child": [
-                            {"computedUserset": {"relation": "owner"}},
-                            {"computedUserset": {"relation": "editor"}},
-                            {
-                                "tupleToUserset": {
-                                    "tupleset": {"relation": "org"},
-                                    "computedUserset": {"relation": "admin"},
-                                }
-                            },
-                        ]
-                    }
-                },
-                "can_manage": {
-                    "union": {
-                        "child": [
-                            {"computedUserset": {"relation": "owner"}},
-                            {
-                                "tupleToUserset": {
-                                    "tupleset": {"relation": "org"},
-                                    "computedUserset": {"relation": "admin"},
-                                }
-                            },
-                        ]
-                    }
-                },
-            },
-            "metadata": {
-                "relations": {
-                    "org": {"directly_related_user_types": [{"type": "organization"}]},
-                    "owner": {"directly_related_user_types": [{"type": "user"}]},
-                    "editor": {"directly_related_user_types": [{"type": "user"}]},
-                    "viewer": {"directly_related_user_types": [{"type": "user"}]},
-                }
-            },
-        },
+        _scoped_resource_type("project"),
+        _scoped_resource_type("workspace"),
     ],
 }
 

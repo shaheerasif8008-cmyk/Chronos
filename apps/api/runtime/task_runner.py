@@ -7,6 +7,8 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any
 
+from runtime import leases
+
 
 RunTask = Callable[[str], Awaitable[Any]]
 MarkCancelled = Callable[[str, str], Awaitable[Any]]
@@ -201,25 +203,50 @@ class TaskRunner:
             self._wake.set()
 
     async def _run_with_policy(self, task_id: str) -> None:
-        last_error = "task_failed"
-        for attempt in range(1, self._max_attempts + 1):
-            self._last_attempts[task_id] = attempt
-            try:
-                if self._task_timeout_seconds is None:
-                    await self._run_task(task_id)
-                else:
-                    await asyncio.wait_for(self._run_task(task_id), timeout=self._task_timeout_seconds)
-                return
-            except asyncio.TimeoutError:
-                last_error = "task_timeout"
-                break
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                last_error = str(exc) or type(exc).__name__
-                if attempt >= self._max_attempts:
+        # Durable lease: claim the task before running. A peer worker (or a
+        # startup/reaper requeue) that already owns it is refused, so a task is
+        # never executed twice concurrently. The lease is renewed on a heartbeat
+        # and released when the task finishes — if this worker dies, the lease
+        # expires and the reaper re-queues the task.
+        if not await leases.acquire_task_lease(task_id):
+            return
+        heartbeat = asyncio.create_task(self._heartbeat(task_id))
+        try:
+            last_error = "task_failed"
+            for attempt in range(1, self._max_attempts + 1):
+                self._last_attempts[task_id] = attempt
+                try:
+                    if self._task_timeout_seconds is None:
+                        await self._run_task(task_id)
+                    else:
+                        await asyncio.wait_for(self._run_task(task_id), timeout=self._task_timeout_seconds)
+                    return
+                except asyncio.TimeoutError:
+                    last_error = "task_timeout"
                     break
-        await self._mark_failed(task_id, last_error)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    last_error = str(exc) or type(exc).__name__
+                    if attempt >= self._max_attempts:
+                        break
+            await self._mark_failed(task_id, last_error)
+        finally:
+            heartbeat.cancel()
+            try:
+                await heartbeat
+            except asyncio.CancelledError:
+                pass
+            await leases.release_task_lease(task_id)
+
+    async def _heartbeat(self, task_id: str) -> None:
+        """Renew the task lease periodically so a live worker keeps ownership."""
+        from core.config import settings
+
+        interval = max(1, int(settings.task_lease_heartbeat_seconds))
+        while True:
+            await asyncio.sleep(interval)
+            await leases.renew_task_lease(task_id)
 
 
 def _configured_runner() -> TaskRunner:
@@ -237,6 +264,42 @@ runner = _configured_runner()
 
 async def enqueue_task(task_id: str, priority: int = 10) -> None:
     await runner.enqueue(task_id, priority=priority)
+
+
+async def _active_task_ids() -> list[str]:
+    from sqlalchemy import select
+
+    from core.db import engine, reflect_table
+
+    tasks_table = await reflect_table("tasks")
+    async with engine.begin() as conn:
+        rows = (
+            await conn.execute(
+                select(tasks_table.c.id).where(tasks_table.c.status.in_(["planning", "running"]))
+            )
+        ).all()
+    return [str(row[0]) for row in rows]
+
+
+async def reap_orphaned_tasks(task_ids: list[str] | None = None) -> list[str]:
+    """Re-queue active tasks whose owning worker died (lease expired).
+
+    A task in ``planning``/``running`` always has a live lease while its worker is
+    alive (claimed before execution). If the lease is gone, the worker crashed —
+    revive the task so another worker resumes it from its last checkpoint. This is
+    crash recovery between restarts, complementing the startup-time recovery scan.
+    """
+    from runtime.agent_loop import save_task
+
+    ids = task_ids if task_ids is not None else await _active_task_ids()
+    reaped: list[str] = []
+    for task_id in ids:
+        if await leases.task_lease_held(task_id):
+            continue  # a live worker still owns it
+        await save_task(task_id, status="queued")
+        await runner.enqueue(task_id, priority=5)  # slightly ahead of fresh work
+        reaped.append(task_id)
+    return reaped
 
 
 def cancel_task(task_id: str, reason: str = "user_cancelled") -> bool:
