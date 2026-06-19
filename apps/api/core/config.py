@@ -54,6 +54,14 @@ class Settings(BaseSettings):
     task_runner_max_concurrency: int = 4
     task_runner_max_attempts: int = 2
     task_runner_timeout_seconds: float = 1800.0
+    # Durable runtime: distributed task leases + scheduler lock so multiple API
+    # workers coordinate safely. A worker holds a lease while executing a task and
+    # renews it on a heartbeat; if the worker dies the lease expires and the reaper
+    # re-queues the task. The scheduler poll runs under a single-holder lock so a
+    # due schedule fires exactly once across the fleet.
+    task_lease_ttl_seconds: int = 120
+    task_lease_heartbeat_seconds: int = 30
+    task_reaper_interval_seconds: int = 60
     runtime_auto_install_tools: bool = True
     runtime_tool_install_timeout_seconds: float = 180.0
     e2b_api_key: str = ""

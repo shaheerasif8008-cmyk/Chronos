@@ -231,7 +231,22 @@ async def run_due_scheduled_tasks(now: datetime | None = None) -> list[str]:
 
     A row is due when enabled and ``next_run_at`` is null (never run) or <= now.
     Returns the list of spawned task ids.
+
+    Guarded by a single-holder lock so that, across a multi-worker fleet, a due
+    schedule fires on exactly one worker per tick (no duplicate spawns).
     """
+    from runtime import leases
+
+    token = await leases.acquire_lock("scheduler_poll", ttl=_POLL_SECONDS)
+    if token is None:
+        return []  # another worker is handling this tick
+    try:
+        return await _run_due_scheduled_tasks(now)
+    finally:
+        await leases.release_lock("scheduler_poll", token)
+
+
+async def _run_due_scheduled_tasks(now: datetime | None = None) -> list[str]:
     now = now or _now()
     scheduled = await reflect_table("scheduled_tasks")
     async with engine.begin() as conn:
@@ -278,4 +293,25 @@ async def run_due_scheduled_tasks(now: datetime | None = None) -> list[str]:
     return spawned
 
 
+async def reap_orphaned_tasks() -> list[str]:
+    """Single-holder wrapper around the runtime orphan reaper.
+
+    Re-queues active tasks whose owning worker died (lease expired). Runs on one
+    worker per tick so the fleet doesn't all requeue at once.
+    """
+    from runtime import leases, task_runner
+
+    interval = settings.task_reaper_interval_seconds
+    token = await leases.acquire_lock("task_reaper", ttl=interval)
+    if token is None:
+        return []
+    try:
+        return await task_runner.reap_orphaned_tasks()
+    finally:
+        await leases.release_lock("task_reaper", token)
+
+
 scheduler.add_job(run_due_scheduled_tasks, "interval", seconds=_POLL_SECONDS)
+scheduler.add_job(
+    reap_orphaned_tasks, "interval", seconds=settings.task_reaper_interval_seconds
+)
