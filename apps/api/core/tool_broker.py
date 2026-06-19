@@ -10,7 +10,7 @@ import json
 import time
 from typing import Any
 
-from core import audit, permissions
+from core import audit, autonomy, permissions, risk as risk_pricer, trust
 from core.connector_health import connector_tier, degraded_note
 from core.config import settings
 from core.exceptions import ApprovalRequired, LoopDetected, RateLimitExceeded, SafetyLimitViolation
@@ -405,15 +405,18 @@ class ToolBroker:
         policy = await tool_policy(agent.org_id, tool.split(".")[0])
         if policy.get("enabled") is False:
             raise ApprovalRequired(tool, "tool is disabled in settings")
-        # full_auto workspaces collapse the settings-policy approval gate. The hard
-        # floor above and the safety limits below still apply.
-        autonomy = await workspace_autonomy(agent.org_id, agent.workspace_id)
-        if (
-            policy.get("approval_required") is True
-            and not approved_by_gate
-            and autonomy != "full_auto"
-        ):
-            raise ApprovalRequired(tool, "tool requires approval by settings policy")
+        # Graduated Autonomy gate. Prices the call, then decides allow vs. approval
+        # against earned trust. full_auto still collapses the settings gate (handled
+        # inside evaluate); the hard floor above and safety limits below are absolute
+        # and run independently. Trust can only loosen governance, never break it.
+        autonomy_level = await workspace_autonomy(agent.org_id, agent.workspace_id)
+        risk = risk_pricer.price(tool, args)
+        if not approved_by_gate:
+            gate = await autonomy.evaluate(
+                agent.org_id, agent.workspace_id, risk, args, policy, autonomy_level
+            )
+            if not gate.allow:
+                raise ApprovalRequired(tool, gate.reason)
 
         if _is_external_write_tool(tool):
             cached = await _load_idempotent_result(agent.org_id, tool, idempotency_key)
@@ -472,6 +475,19 @@ class ToolBroker:
         )
         if _is_external_write_tool(tool):
             await _store_idempotent_result(agent.org_id, tool, idempotency_key, result)
+
+        # Feed the trust ledger: an action that ran unattended is positive evidence
+        # ("auto_success"); one that a human approved is weaker positive evidence
+        # ("approved"). Best-effort — a missing ledger never affects the result.
+        await trust.record_outcome(
+            agent.org_id,
+            agent.workspace_id,
+            risk,
+            "approved" if approved_by_gate else "auto_success",
+            region=settings.region,
+            tool=tool,
+            actor_id=agent.id,
+        )
 
         return result
 
