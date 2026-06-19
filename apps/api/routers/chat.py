@@ -16,7 +16,7 @@ from core.auth import get_current_member
 from core.config import settings
 from core.context import assemble_context
 from core.db import engine, reflect_table
-from core.intent import classify_intent
+from core.intent import classify_request
 from core.context import (
     _IMAGE_MIMES,
     _VISION_UNAVAILABLE_NOTE,
@@ -697,18 +697,22 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
     if _attachment_ids_raw:
         attachments_context = await _parse_attachments(_attachment_ids_raw, conversation_id, member.organization_id)
 
-    # classify_intent and assemble_context are independent, and both the task and
-    # chat branches need the assembled context — so run them concurrently to overlap
-    # their LLM round-trips instead of paying for them in series. Obviously
-    # conversational messages skip the classifier LLM call entirely.
+    # The model-driven router and assemble_context are independent, and both the
+    # task and chat branches need the assembled context — so run them concurrently
+    # to overlap their LLM round-trips instead of paying for them in series.
+    # Obviously conversational messages skip the classifier LLM call entirely.
     if _is_trivial_chat(req.message):
-        intent = {"mode": "chat", "goal": None}
+        intent = {"mode": "chat", "goal": None, "difficulty": "trivial", "reasoning_effort": None}
         context = await assemble_context(conversation_id, req.message, requester_context)
     else:
         intent, context = await asyncio.gather(
-            classify_intent(req.message),
+            classify_request(req.message),
             assemble_context(conversation_id, req.message, requester_context),
         )
+
+    # Adaptive reasoning: an explicit UI selection always wins; otherwise the
+    # router's difficulty-based recommendation drives how hard the model thinks.
+    effective_reasoning_effort = selected_reasoning_effort or intent.get("reasoning_effort")
 
     # Explicit tasks stay durable immediately. Ordinary chat, including non-trivial
     # tool-using chat, goes through stream_chat_turn below so conversation history
@@ -722,7 +726,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
                 persona_id=req.persona_id,
                 workspace_id=req.workspace_id,
                 model=selected_model,
-                reasoning_effort=selected_reasoning_effort,
+                reasoning_effort=effective_reasoning_effort,
                 original_message=req.message,
                 router_decision={
                     "mode": "agent",
@@ -840,7 +844,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
                 model=selected_model,
                 mode=req.mode,
                 user_content=_user_content,
-                reasoning_effort=selected_reasoning_effort,
+                reasoning_effort=effective_reasoning_effort,
             )
         ),
         media_type="text/event-stream",

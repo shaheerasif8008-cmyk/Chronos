@@ -160,5 +160,56 @@ async def decide_approval(
         },
         actor_id=member.id,
     )
+
+    # Feed the trust ledger and, on rejection, propose a learned guardrail from the
+    # reviewer's note. Best-effort — never let it break the decision response.
+    await _record_decision_to_trust(row_dict, req, member, approval_id)
+
     await task_runner.enqueue_task(row_dict["task_id"])
     return {"status": "accepted", "approval_id": approval_id, "decision": req.decision, "resuming": True}
+
+
+async def _record_decision_to_trust(
+    row_dict: dict, req: ApprovalDecision, member: Member, approval_id: str
+) -> None:
+    """Translate an approval decision into Graduated-Autonomy signal.
+
+    approved -> positive trust event; rejected -> negative event (trips the
+    circuit breaker for that action_class) plus a *proposed* learned policy
+    synthesized from the reviewer's note.
+    """
+    try:
+        from core import learned_policy, risk as risk_pricer, trust
+
+        payload = row_dict.get("action_payload") or {}
+        args = payload.get("args") if isinstance(payload.get("args"), dict) else payload
+        tool = str(row_dict.get("action_type") or "").replace("__", ".")
+        if not tool:
+            return
+        risk = risk_pricer.price(tool, args or {})
+
+        # Resolve the workspace the action ran in so trust hits the right scope.
+        workspace_id = None
+        try:
+            tasks = await reflect_table("tasks")
+            async with engine.begin() as conn:
+                task_row = (
+                    await conn.execute(select(tasks.c.workspace_id).where(tasks.c.id == row_dict["task_id"]))
+                ).first()
+            workspace_id = task_row[0] if task_row else None
+        except Exception:
+            pass
+
+        outcome = "approved" if req.decision == "approved" else "rejected"
+        await trust.record_outcome(
+            member.organization_id, workspace_id, risk, outcome,
+            region=member.region, tool=tool, actor_id=member.id, approval_id=approval_id,
+        )
+        if req.decision == "rejected":
+            await learned_policy.synthesize_from_rejection(
+                org_id=member.organization_id, region=member.region,
+                action_class=risk.action_class, args=args or {}, note=req.note,
+                source_approval_id=approval_id,
+            )
+    except Exception:
+        pass
