@@ -27,6 +27,19 @@ function CognitoCallbackInner() {
     if (exchanged.current) return;
     exchanged.current = true;
 
+    // Enterprise SSO (OIDC): the API callback bounces here with the session token
+    // in the URL fragment (#access_token=…), which never reaches a server log.
+    if (typeof window !== "undefined" && window.location.hash.includes("access_token=")) {
+      const frag = new URLSearchParams(window.location.hash.slice(1));
+      const token = frag.get("access_token");
+      if (token) {
+        localStorage.setItem("chronos_token", token);
+        const dest = frag.get("redirect") || "/chat";
+        router.replace(dest.startsWith("/") ? dest : "/chat");
+        return;
+      }
+    }
+
     const code = params.get("code");
     const oauthError = params.get("error_description") || params.get("error");
     if (oauthError) {

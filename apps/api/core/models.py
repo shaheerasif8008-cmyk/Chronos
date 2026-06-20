@@ -11,6 +11,7 @@ class Member(BaseModel):
     email: str
     role: str = "user"
     name: str | None = None
+    status: str = "active"
 
 
 class RequesterContext(BaseModel):

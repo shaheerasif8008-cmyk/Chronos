@@ -65,4 +65,9 @@ async def get_current_member(
         ).mappings().first()
     if row is None:
         raise HTTPException(status_code=401, detail="Member not found")
-    return Member(**dict(row))
+    member = Member(**dict(row))
+    # SCIM deprovisioning (or an admin) can deactivate a member; a deactivated
+    # member's existing tokens must stop working immediately.
+    if getattr(member, "status", "active") != "active":
+        raise HTTPException(status_code=403, detail="Member account is deactivated")
+    return member
