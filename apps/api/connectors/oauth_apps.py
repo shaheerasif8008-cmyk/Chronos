@@ -16,7 +16,12 @@ Each app entry:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import lru_cache
+import os
+from pathlib import Path
 from typing import Any
+
+from dotenv import dotenv_values
 
 
 @dataclass
@@ -335,21 +340,43 @@ def get_app(provider: str) -> OAuthApp | None:
     return APPS.get(provider)
 
 
+@lru_cache(maxsize=1)
+def _dotenv_connector_env() -> dict[str, str]:
+    """Load connector credentials from the same local env files used by the API.
+
+    ``available_apps`` is called before connector-specific OAuth starts, so it
+    cannot rely on pydantic-settings alone: the catalog needs to report keys
+    present in local .env files even when they were not exported into the shell.
+    Real environment variables still win over file values.
+    """
+    repo_root = Path(__file__).resolve().parents[3]
+    env: dict[str, str] = {}
+    for path in (repo_root / ".env", repo_root / "apps" / "api" / ".env"):
+        if not path.exists():
+            continue
+        for key, value in dotenv_values(path).items():
+            clean = (value or "").strip()
+            if clean:
+                env[key] = clean
+    env.update({key: value for key, value in os.environ.items()})
+    return env
+
+
+def _env_value(name: str) -> str:
+    return (_dotenv_connector_env().get(name) or "").strip()
+
+
 def get_client_credentials(app: OAuthApp) -> tuple[str, str]:
-    """Read client_id and client_secret from environment via settings."""
-    import os
-    client_id = os.environ.get(app.client_id_env, "")
-    client_secret = os.environ.get(app.client_secret_env, "")
-    return client_id, client_secret
+    """Read client_id and client_secret from exported env or local .env files."""
+    return _env_value(app.client_id_env), _env_value(app.client_secret_env)
 
 
 def available_apps() -> list[dict]:
     """Return catalog entries — each includes whether credentials are configured."""
-    import os
     result = []
     for app in APPS.values():
-        client_id = os.environ.get(app.client_id_env, "")
-        client_secret = os.environ.get(app.client_secret_env, "")
+        client_id = _env_value(app.client_id_env)
+        client_secret = _env_value(app.client_secret_env)
         result.append({
             "id": app.id,
             "name": app.name,

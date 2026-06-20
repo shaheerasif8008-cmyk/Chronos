@@ -11,7 +11,8 @@ from core.config import settings
 from core.db import engine, reflect_table
 from core.models import RequesterContext
 from core.personas import get_persona_prompt
-from core.tool_manifest import generate_tool_manifest
+from core.token_budget import estimate_tokens, trim_to_token_budget
+from core.tool_manifest import generate_compact_tool_routing
 from memory.source_retrieval import (
     build_knowledge_block,
     citations_payload,
@@ -30,16 +31,9 @@ def _runtime_root() -> Path:
 
 ROOT = _runtime_root()
 
-# Category 7: rough token estimation (4 chars ≈ 1 token for English prose).
-_CHARS_PER_TOKEN = 4
-
-
-def _estimate_tokens(text: str) -> int:
-    return max(1, len(text) // _CHARS_PER_TOKEN)
-
-
-def _estimate_tokens_from_chars(char_count: int) -> int:
-    return max(1, char_count // _CHARS_PER_TOKEN)
+_MIN_HISTORY_TOKENS = 8_000
+_SOURCE_SNIPPET_TOKENS = 120
+_MEMORY_ENTRY_TOKENS = 120
 
 
 def load_base_system_prompt() -> str:
@@ -90,7 +84,7 @@ async def _compact_history(
 
     # If everything fits in budget, return as-is.
     total_chars = sum(len(m["content"]) for m in all_messages)
-    if _estimate_tokens_from_chars(total_chars) <= budget_tokens or not older:
+    if max(1, total_chars // 4) <= budget_tokens or not older:
         return all_messages
 
     # Summarize the older block using the fast model.
@@ -119,9 +113,8 @@ async def assemble_context(
 ) -> list[dict[str, str]]:
     # ── Category 7: establish token budget ──────────────────────────────────
     budget = settings.max_context_tokens - settings.response_reserve_tokens
-    # Reserve half the budget for history; the system layers get the other half.
-    system_budget = budget // 2
-    history_budget = budget - system_budget
+    system_budget = max(_MIN_HISTORY_TOKENS, int(budget * 0.72))
+    history_budget = max(_MIN_HISTORY_TOKENS, budget - system_budget)
 
     # ── Concurrent fetch phase ──────────────────────────────────────────────
     # Every layer's data source is independent, but the string assembly below has
@@ -177,7 +170,7 @@ async def assemble_context(
 
     (
         org_context,
-        tool_manifest,
+        tool_routing,
         persona_prompt,
         project_instructions,
         skills_data,
@@ -186,7 +179,7 @@ async def assemble_context(
         history,
     ) = await asyncio.gather(
         load_org_context(requester_context.org_id),
-        generate_tool_manifest(
+        generate_compact_tool_routing(
             persona_id=requester_context.persona_id,
             org_id=requester_context.org_id,
             sub_agent=is_sub_agent,
@@ -204,36 +197,64 @@ async def assemble_context(
     base = load_base_system_prompt()
 
     # ── Layer 2: org context ────────────────────────────────────────────────
-    if org_context and _estimate_tokens(base + org_context) <= system_budget:
-        base += f"\n\n# Organization Context\n{org_context}"
+    remaining = system_budget - estimate_tokens(base)
+
+    def _append_layer(title: str, content: str, *, cap_tokens: int | None = None) -> bool:
+        nonlocal base, remaining
+        if not content or remaining <= 0:
+            return False
+        layer_content = trim_to_token_budget(content, min(cap_tokens or remaining, remaining))
+        layer = f"\n\n{title}\n{layer_content}"
+        if estimate_tokens(layer) > remaining:
+            return False
+        base += layer
+        remaining -= estimate_tokens(layer)
+        return True
+
+    # High-value grounding layers get first claim on the system budget.
+    if requester_context.project_id is not None and citations:
+        trimmed_citations = []
+        for citation in citations:
+            clone = citation.model_copy()
+            clone.snippet = trim_to_token_budget(clone.snippet, _SOURCE_SNIPPET_TOKENS)
+            trimmed_citations.append(clone)
+        knowledge_block = build_knowledge_block(trimmed_citations)
+        if _append_layer("# Project Knowledge", knowledge_block.removeprefix("# Project Knowledge\n")):
+            requester_context.surfaced_citations = citations_payload(citations)
+        else:
+            requester_context.surfaced_citations = []
+    elif requester_context.project_id is not None:
+        requester_context.surfaced_citations = []
 
     # ── Layer 2b: dynamic tool manifest ────────────────────────────────────
-    if tool_manifest and _estimate_tokens(base + tool_manifest) <= system_budget:
-        base += f"\n\n{tool_manifest}"
+    if tool_routing:
+        _append_layer("# Runtime Tool Routing", tool_routing.removeprefix("# Runtime Tool Routing\n"), cap_tokens=800)
 
     # ── Layer 3: persona ────────────────────────────────────────────────────
-    if persona_prompt and _estimate_tokens(base + persona_prompt) <= system_budget:
-        base += f"\n\n# Your Identity\n{persona_prompt}"
+    if persona_prompt:
+        _append_layer("# Your Identity", persona_prompt, cap_tokens=2_000)
 
     # ── Layer 3b: project instructions ─────────────────────────────────────
-    if project_instructions and _estimate_tokens(base + project_instructions) <= system_budget:
-        base += f"\n\n# Project Instructions\n{project_instructions}"
+    if project_instructions:
+        _append_layer("# Project Instructions", project_instructions, cap_tokens=4_000)
+
+    # ── Layer 2: org context ────────────────────────────────────────────────
+    if org_context:
+        _append_layer("# Organization Context", org_context, cap_tokens=4_000)
 
     # ── Layer 4: skills (Category 6: connector-aware, progressive) ──────────
     for skill_id, warning, content in skills_data:
-        if content and _estimate_tokens(base + content) <= system_budget:
-            base += f"\n\n# Skill: {skill_id}\n{content}"
+        if content and _append_layer(f"# Skill: {skill_id}", content, cap_tokens=4_000):
             if warning:
-                base += f"\n\n{warning}"
+                _append_layer("# Skill Connector Warning", warning, cap_tokens=500)
         elif warning:
             # Even if the skill doesn't fit, show the setup prompt.
-            base += f"\n\n{warning}"
+            _append_layer("# Skill Connector Warning", warning, cap_tokens=500)
 
     # ── Layer 5: memory ─────────────────────────────────────────────────────
     if memories:
-        mem_block = "\n".join(f"- {m.content}" for m in memories)
-        if _estimate_tokens(base + mem_block) <= system_budget:
-            base += "\n\n# What I Remember\n" + mem_block
+        mem_block = "\n".join(f"- {trim_to_token_budget(m.content, _MEMORY_ENTRY_TOKENS)}" for m in memories)
+        if _append_layer("# What I Remember", mem_block):
             requester_context.surfaced_memory_refs = [
                 {
                     "id": getattr(m, "id", None),
@@ -249,25 +270,13 @@ async def assemble_context(
     else:
         requester_context.surfaced_memory_refs = []
 
-    # ── Layer 5b: project knowledge (permission-aware source citations) ─────
-    if requester_context.project_id is not None:
-        if citations:
-            knowledge_block = build_knowledge_block(citations)
-            if knowledge_block and _estimate_tokens(base + knowledge_block) <= system_budget:
-                base += f"\n\n{knowledge_block}"
-                requester_context.surfaced_citations = citations_payload(citations)
-            else:
-                requester_context.surfaced_citations = []
-        else:
-            requester_context.surfaced_citations = []
-
     # ── Layer 6: task state ─────────────────────────────────────────────────
     if requester_context.task_id:
         task_context = await _load_task_context(
             requester_context.task_id, requester_context.org_id
         )
         if task_context:
-            base += f"\n\n# Current Task\n{task_context}"
+            _append_layer("# Current Task", task_context, cap_tokens=600)
 
     # ── Layer 7: conversation history (with compaction) ─────────────────────
     if history and history[-1].get("role") == "user" and history[-1].get("content") == message:
