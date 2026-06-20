@@ -5,9 +5,11 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from connectors.framework.adapters import adapter_registry
 from connectors.framework.queue_factory import connector_execution_queue
 from connectors.framework.repository import DatabaseConnectorRepository
 from connectors.framework.seed import seed_builtin_connectors
+from connectors.framework.worker import ConnectorWorker
 from connectors.framework.workflows import WorkflowRuntime
 from core import permissions
 from core.auth import get_current_member
@@ -67,6 +69,19 @@ def runtime(repo: DatabaseConnectorRepository) -> WorkflowRuntime:
     return WorkflowRuntime(repo, connector_execution_queue())
 
 
+async def _drain_ready_workflow_steps(repo: DatabaseConnectorRepository, run_id: str, tenant_id: str) -> None:
+    """Run immediately-ready connector jobs so manual UI runs visibly advance."""
+    queue = connector_execution_queue()
+    worker = ConnectorWorker(repo, adapter_registry(), queue)
+    for _ in range(10):
+        result = await worker.run_once()
+        if not result:
+            break
+        run = await repo.get_workflow_run(run_id, tenant_id=tenant_id)
+        if not run or run.get("status") in {"completed", "failed", "cancelled", "paused", "waiting_for_approval"}:
+            break
+
+
 @router.get("/")
 async def list_workflows(status: str | None = Query(default=None), member: Member = Depends(get_current_member)) -> list[dict[str, Any]]:
     await permissions.check(member, "list_workflows", member.organization_id)
@@ -111,15 +126,17 @@ async def list_workflow_runs(status: str | None = Query(default=None), member: M
 async def start_workflow_run(req: WorkflowRunRequest, member: Member = Depends(get_current_member)) -> dict[str, Any]:
     await permissions.check(member, "start_workflow_run", req.workflow_id)
     repo = await repository()
-    run = await runtime(repo).start_run(
+    wf_runtime = runtime(repo)
+    run = await wf_runtime.start_run(
         req.workflow_id,
         tenant_id=member.organization_id,
         trigger_source=req.trigger_source,
         trigger_event_type=req.trigger_event_type,
         trigger_payload=req.trigger_payload,
     )
-    await runtime(repo).tick(run["id"], tenant_id=member.organization_id)
-    return run
+    await wf_runtime.tick(run["id"], tenant_id=member.organization_id)
+    await _drain_ready_workflow_steps(repo, run["id"], member.organization_id)
+    return await repo.get_workflow_run(run["id"], tenant_id=member.organization_id) or run
 
 
 @router.get("/triggers")

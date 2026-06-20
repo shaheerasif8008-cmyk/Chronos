@@ -54,6 +54,14 @@ export default function SkillsScreen() {
     void loadSkills().then(() => setSelectedSlug(slug));
   }
 
+  function makeSkillInChat() {
+    window.localStorage.setItem(
+      "chronos.chat.pendingDraft",
+      "Help me create a new Chronos skill. Ask me for the skill name, when it should be used, the exact steps it should follow, required connectors, and any examples. Then create the skill from that specification.",
+    );
+    window.location.href = "/chat";
+  }
+
   return (
     <div className="flex h-full min-h-0">
       {/* ── Left aside ── */}
@@ -61,13 +69,18 @@ export default function SkillsScreen() {
         <div className="p-3 border-b flex flex-col gap-2" style={{ borderColor: "var(--border)" }}>
           <div className="flex items-center justify-between">
             <div className="text-[15px] font-semibold">Skills</div>
-            <button
-              data-testid="skills-new"
-              onClick={() => setComposerOpen(v => !v)}
-              className="btn btn-primary btn-sm"
-            >
-              {composerOpen ? "Cancel" : "Upload / New version"}
-            </button>
+            <div className="flex gap-2">
+              <button data-testid="skills-chat-create" onClick={makeSkillInChat} className="btn btn-ghost btn-sm">
+                Make in chat
+              </button>
+              <button
+                data-testid="skills-new"
+                onClick={() => setComposerOpen(v => !v)}
+                className="btn btn-primary btn-sm"
+              >
+                {composerOpen ? "Cancel" : "New skill"}
+              </button>
+            </div>
           </div>
           {composerOpen && (
             <SkillComposer onSaved={onSaved} onCancel={() => setComposerOpen(false)} />
@@ -81,7 +94,9 @@ export default function SkillsScreen() {
             </div>
           )}
           {!loading && !loadError && skills.length === 0 && (
-            <div className="text-[13px] p-3" style={{ color: "var(--text-dim)" }}>No skills yet.</div>
+            <div className="text-[13px] p-3" style={{ color: "var(--text-dim)" }}>
+              No skills are loaded yet. Create one here, or use chat to draft it from a plain-English description.
+            </div>
           )}
           {skills.map(skill => (
             <button
@@ -106,7 +121,7 @@ export default function SkillsScreen() {
         {selectedSlug
           ? <SkillDetailPane key={selectedSlug} slug={selectedSlug} onDeleted={() => { setSelectedSlug(null); void loadSkills(); }} />
           : <div className="h-full flex items-center justify-center text-[14px]" style={{ color: "var(--text-dim)" }}>
-              Select a skill or upload a new one.
+              Select a skill, create one here, or make one through chat.
             </div>
         }
       </section>
@@ -134,14 +149,16 @@ function SkillComposer({ onSaved, onCancel }: { onSaved: (slug: string) => void;
   const [slug, setSlug] = useState("");
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
-  const [content, setContent] = useState("");
+  const [whenToUse, setWhenToUse] = useState("");
+  const [steps, setSteps] = useState("");
+  const [examples, setExamples] = useState("");
   const [requiresConnectors, setRequiresConnectors] = useState("");
   const [spawnsSubAgent, setSpawnsSubAgent] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   async function submit() {
-    if (!slug.trim() || !name.trim() || !content.trim()) return;
+    if (!slug.trim() || !name.trim() || !description.trim() || !whenToUse.trim() || !steps.trim()) return;
     setBusy(true);
     setError(null);
     try {
@@ -158,7 +175,7 @@ function SkillComposer({ onSaved, onCancel }: { onSaved: (slug: string) => void;
           slug: slug.trim(),
           name: name.trim(),
           description: description.trim(),
-          content,
+          content: buildSkillContent({ name, description, whenToUse, steps, examples, requiresConnectors, spawnsSubAgent }),
           metadata,
         }),
       });
@@ -195,16 +212,32 @@ function SkillComposer({ onSaved, onCancel }: { onSaved: (slug: string) => void;
       <input
         value={description}
         onChange={e => setDescription(e.target.value)}
-        placeholder="Description"
+        placeholder="Brief description"
         className="w-full px-2.5 py-1.5 rounded-lg border text-[13px]"
         style={{ borderColor: "var(--border)", background: "var(--surface)" }}
       />
       <textarea
-        value={content}
-        onChange={e => setContent(e.target.value)}
-        placeholder="SKILL.md content…"
-        rows={6}
-        className="w-full px-2.5 py-1.5 rounded-lg border text-[12.5px] font-mono resize-none"
+        value={whenToUse}
+        onChange={e => setWhenToUse(e.target.value)}
+        placeholder="When should Chronos use this skill?"
+        rows={3}
+        className="w-full px-2.5 py-1.5 rounded-lg border text-[12.5px] resize-none"
+        style={{ borderColor: "var(--border)", background: "var(--surface)" }}
+      />
+      <textarea
+        value={steps}
+        onChange={e => setSteps(e.target.value)}
+        placeholder="Steps Chronos should follow. One per line works well."
+        rows={5}
+        className="w-full px-2.5 py-1.5 rounded-lg border text-[12.5px] resize-none"
+        style={{ borderColor: "var(--border)", background: "var(--surface)" }}
+      />
+      <textarea
+        value={examples}
+        onChange={e => setExamples(e.target.value)}
+        placeholder="Optional examples, constraints, or output format."
+        rows={3}
+        className="w-full px-2.5 py-1.5 rounded-lg border text-[12.5px] resize-none"
         style={{ borderColor: "var(--border)", background: "var(--surface)" }}
       />
       <input
@@ -221,7 +254,7 @@ function SkillComposer({ onSaved, onCancel }: { onSaved: (slug: string) => void;
       <div className="flex gap-2">
         <button
           onClick={submit}
-          disabled={busy || !slug.trim() || !name.trim() || !content.trim()}
+          disabled={busy || !slug.trim() || !name.trim() || !description.trim() || !whenToUse.trim() || !steps.trim()}
           className="btn btn-primary btn-sm flex-1"
         >
           {busy ? "Saving…" : "Save skill"}
@@ -232,6 +265,44 @@ function SkillComposer({ onSaved, onCancel }: { onSaved: (slug: string) => void;
       </div>
     </div>
   );
+}
+
+function buildSkillContent(input: {
+  name: string;
+  description: string;
+  whenToUse: string;
+  steps: string;
+  examples: string;
+  requiresConnectors: string;
+  spawnsSubAgent: boolean;
+}) {
+  const stepLines = input.steps
+    .split("\n")
+    .map(line => line.trim())
+    .filter(Boolean)
+    .map((line, index) => `${index + 1}. ${line}`)
+    .join("\n");
+  const connectorList = input.requiresConnectors
+    .split(",")
+    .map(item => item.trim())
+    .filter(Boolean)
+    .join(", ");
+  return [
+    `# ${input.name.trim()}`,
+    "",
+    input.description.trim(),
+    "",
+    "## When To Use",
+    input.whenToUse.trim(),
+    "",
+    "## Procedure",
+    stepLines,
+    "",
+    "## Requirements",
+    connectorList ? `Connectors: ${connectorList}` : "Connectors: none",
+    `Sub-agent: ${input.spawnsSubAgent ? "yes" : "no"}`,
+    input.examples.trim() ? `\n## Examples\n${input.examples.trim()}` : "",
+  ].filter(Boolean).join("\n");
 }
 
 // ─── Detail pane ──────────────────────────────────────────────────────────────

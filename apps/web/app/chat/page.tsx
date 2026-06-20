@@ -834,6 +834,7 @@ function ChronosAppInner() {
   const [activePersonaId, setActivePersonaId] = useState(() => initialPersonaId());
   const [newConversationOpen, setNewConversationOpen] = useState(() => initialNewConversationOpen());
   const newConversationOpenRef = useRef(newConversationOpen);
+  const [newConversationNonce, setNewConversationNonce] = useState(0);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [conversationsLoading, setConversationsLoading] = useState(false);
   const [pendingApprovals, setPendingApprovals] = useState(0);
@@ -1016,7 +1017,14 @@ function ChronosAppInner() {
         conversationsLoading={conversationsLoading}
         activeConvoId={activeConvoId}
         onSelectConvo={openConversation}
-        onNewConvo={() => { setActiveConvoId(null); setNewConversationOpen(true); newConversationOpenRef.current = true; navigateRoute("chat"); }}
+        onNewConvo={() => {
+          setActiveConvoId(null);
+          setNewConversationOpen(true);
+          newConversationOpenRef.current = true;
+          setNewConversationNonce(n => n + 1);
+          setRoute("chat");
+          router.replace("/chat");
+        }}
         onDeleteConvo={deleteConversation}
         onRenameConvo={renameConversation}
         pendingApprovals={pendingApprovals}
@@ -1027,7 +1035,7 @@ function ChronosAppInner() {
       />
 
       <main className="flex-1 min-w-0 flex flex-col" style={{ background: "var(--bg)" }}>
-        {route === "chat"       && <ChatScreen activeConvoId={activeConvoId} activePersonaId={activePersonaId} onPersonaChange={setActivePersonaId} onConvoCreated={(id) => loadConversations(id)} onConvoSelected={openConversation} onApprovalsChanged={loadPendingApprovals} paletteOpen={searchPaletteOpen} onPaletteOpenChange={setSearchPaletteOpen} onOpenAgentMenu={() => setAgentMenuOpen(true)} />}
+        {route === "chat"       && <ChatScreen key={activeConvoId ?? `new-${newConversationNonce}`} activeConvoId={activeConvoId} activePersonaId={activePersonaId} onPersonaChange={setActivePersonaId} onConvoCreated={(id) => { setNewConversationOpen(false); newConversationOpenRef.current = false; void loadConversations(id); }} onConvoSelected={openConversation} onApprovalsChanged={loadPendingApprovals} paletteOpen={searchPaletteOpen} onPaletteOpenChange={setSearchPaletteOpen} onOpenAgentMenu={() => setAgentMenuOpen(true)} />}
         {route === "activity"   && <ActivityScreen />}
         {route === "approvals"  && <ApprovalsScreen onDecision={loadPendingApprovals} />}
         {route === "memory"     && <MemoryScreen />}
@@ -2723,7 +2731,12 @@ function ChatScreen({
                   >
                     {voiceBusy ? <IC.Refresh size={15} style={{ animation: "spin 1s linear infinite" }}/> : <IC.Mic size={15}/>}
                   </button>
-                  <button className="btn btn-ghost btn-sm">
+                  <button
+                    type="button"
+                    className="btn btn-ghost btn-sm"
+                    onClick={() => router.push("/skills")}
+                    title="Open skills"
+                  >
                     <IC.Sparkles size={14} style={{ color: "var(--accent)" }}/> Skills · 1
                   </button>
                   <button
@@ -5435,6 +5448,16 @@ function AppIcon({ svg, name }: { svg: string; name: string }) {
   );
 }
 
+function connectorSetupLabel(app: CatalogApp) {
+  if (app.connected) return "Connected";
+  if (!app.configured) return "Needs setup";
+  if (app.auth_type === "oauth2") return "Ready to connect";
+  if (app.auth_type === "remote_mcp") return "Register server";
+  if (app.auth_type === "signing_secret") return "Signing secret";
+  if (app.auth_type === "api_key") return "API key ready";
+  return app.auth_type || "Configured";
+}
+
 function ConnectorsScreen() {
   const [apps, setApps] = useState<CatalogApp[]>([]);
   const [loading, setLoading] = useState(true);
@@ -5523,7 +5546,7 @@ function ConnectorsScreen() {
     <div className="flex-1 flex flex-col min-w-0 overflow-y-auto">
       <PageHeader
         title="Integrations"
-        subtitle="Connect apps so Chronos can act on your behalf. Each connection is OAuth2 — you control access."
+        subtitle="Connect apps and custom tools so Chronos can act through governed credentials, policies, and audit logs."
       />
 
       <div className="px-10 pb-10">
@@ -5552,7 +5575,7 @@ function ConnectorsScreen() {
         {!loading && apps.length === 0 && (
           <EmptyState icon={<IC.Connectors size={20}/>}
             title="No integrations available"
-            sub="Configure OAuth credentials in your .env to enable integrations like Gmail, Slack, GitHub, and Notion."/>
+            sub="Configure provider credentials in your .env to enable integrations like Gmail, Slack, GitHub, Notion, custom HTTP, and MCP."/>
         )}
 
         {!loading && apps.length > 0 && (
@@ -5560,64 +5583,32 @@ function ConnectorsScreen() {
             {apps.map(app => (
               <div
                 key={app.id}
-                className="surface border border-soft rounded-2xl p-5 flex flex-col gap-3 transition-shadow hover:shadow-sm"
+                className="surface border border-soft rounded-lg p-5 flex min-h-[170px] flex-col gap-3 transition-shadow hover:shadow-sm"
               >
-                <div className="flex items-start justify-between gap-3">
-                  <div className="flex items-center gap-3 min-w-0">
-                    <AppIcon svg={app.icon_svg} name={app.name} />
-                    <div className="min-w-0">
-                      <div className="font-semibold text-[14.5px] leading-5">{app.name}</div>
-                      {app.connected && app.account_handle && (
-                        <div className="text-[11.5px] truncate" style={{ color: "var(--text-dim)" }}>
-                          {app.account_handle}
-                        </div>
-                      )}
-                    </div>
+                <div className="flex items-center gap-3 min-w-0">
+                  <AppIcon svg={app.icon_svg} name={app.name} />
+                  <div className="min-w-0">
+                    <div className="font-semibold text-[14.5px] leading-5 truncate">{app.name}</div>
+                    {app.connected && app.account_handle && (
+                      <div className="text-[11.5px] truncate" style={{ color: "var(--text-dim)" }}>
+                        {app.account_handle}
+                      </div>
+                    )}
                   </div>
-                  {app.connected && (
-                    <span className="shrink-0 inline-flex items-center gap-1 text-[11.5px] font-medium px-2 py-0.5 rounded-full" style={{ background: "color-mix(in srgb, var(--accent) 12%, transparent)", color: "var(--accent)" }}>
-                      <svg width="8" height="8" viewBox="0 0 8 8" fill="currentColor"><circle cx="4" cy="4" r="4"/></svg>
-                      Connected
-                    </span>
-                  )}
                 </div>
 
-                <p className="text-[12.5px] leading-[1.55]" style={{ color: "var(--text-muted)" }}>
+                <p className="text-[12.5px] leading-[1.55] line-clamp-3" style={{ color: "var(--text-muted)" }}>
                   {app.description}
                 </p>
 
-                <div className="flex flex-wrap gap-1">
-                  {app.auth_type && <Tag>{app.auth_type}</Tag>}
-                  {app.sync_supported && <Tag variant="accent">Sync</Tag>}
-                  {app.health_status && <Tag variant={app.health_status === "healthy" || app.health_status === "connected" ? "ok" : app.health_status === "not_connected" ? "info" : "warn"}>{app.health_status}</Tag>}
-                  {(app.risk_levels || []).slice(0, 3).map(level => (
-                    <Tag key={level} variant={level === "read" ? "info" : level === "financial" || level === "destructive" ? "danger" : "warn"}>
-                      {({ read: "Reads data", write: "Makes changes", external_write: "Acts externally", financial: "Can move money", destructive: "Can delete data" } as Record<string, string>)[level] ?? level.replaceAll("_", " ")}
-                    </Tag>
+                <div className="flex flex-wrap gap-1.5">
+                  <Tag variant={app.connected ? "accent" : app.configured ? "info" : "warn"}>{connectorSetupLabel(app)}</Tag>
+                  <Tag>{app.auth_type || "none"}</Tag>
+                  {app.sync_supported && <Tag>Sync</Tag>}
+                  {(app.risk_levels || []).slice(0, 2).map(risk => (
+                    <Tag key={risk} variant={risk === "financial" || risk === "external_message" ? "danger" : "info"}>{risk}</Tag>
                   ))}
                 </div>
-
-                {(app.actions || []).length > 0 && (
-                  <div className="text-[11.5px] leading-5" style={{ color: "var(--text-dim)" }}>
-                    Actions: {(app.actions || []).join(", ")}
-                  </div>
-                )}
-
-                {(app.scopes || []).length > 0 && (
-                  <div className="text-[11.5px] leading-5 line-clamp-2" style={{ color: "var(--text-dim)" }}>
-                    Scopes: {(app.scopes || []).slice(0, 4).join(", ")}{(app.scopes || []).length > 4 ? "…" : ""}
-                  </div>
-                )}
-
-                <div className="text-[11.5px] leading-5" style={{ color: "var(--text-dim)" }}>
-                  Last used: {app.last_used_at || "never"}
-                </div>
-
-                {app.policy && (
-                  <p className="text-[11.5px] leading-[1.5]" style={{ color: "var(--text-muted)" }}>
-                    {app.policy}
-                  </p>
-                )}
 
                 <div className="mt-auto pt-1 flex gap-2">
                   {!app.connected ? (
@@ -5630,22 +5621,13 @@ function ConnectorsScreen() {
                       {connecting === app.id ? "Redirecting…" : app.auth_type !== "oauth2" ? "Configure" : app.configured ? "Connect" : "Configure first"}
                     </button>
                   ) : (
-                    <>
-                      <button
-                        onClick={() => void connect(app)}
-                        disabled={connecting === app.id}
-                        className="btn btn-secondary btn-sm flex-1 disabled:opacity-50"
-                      >
-                        {connecting === app.id ? "…" : "Reconnect"}
-                      </button>
-                      <button
-                        onClick={() => void disconnect(app)}
-                        disabled={disconnecting === app.id}
-                        className="btn btn-danger-soft btn-sm flex-1 disabled:opacity-50"
-                      >
-                        {disconnecting === app.id ? "…" : "Disconnect"}
-                      </button>
-                    </>
+                    <button
+                      onClick={() => void disconnect(app)}
+                      disabled={disconnecting === app.id}
+                      className="btn btn-danger-soft btn-sm w-full disabled:opacity-50"
+                    >
+                      {disconnecting === app.id ? "Disconnecting…" : "Disconnect"}
+                    </button>
                   )}
                 </div>
               </div>
@@ -5655,7 +5637,7 @@ function ConnectorsScreen() {
 
         {apps.length > 0 && (
           <p className="mt-8 text-[12px]" style={{ color: "var(--text-dim)" }}>
-            More integrations coming soon. Each connection uses OAuth2 — Chronos never sees your password.
+            OAuth apps use provider consent screens; API-key, webhook, custom HTTP, and MCP connectors use explicit setup credentials. Chronos never sees your password.
           </p>
         )}
       </div>
@@ -6662,8 +6644,8 @@ function WorkflowsScreen() {
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-y-auto">
       <PageHeader
-        title="Workflows"
-        subtitle="Scheduled tasks, reusable workflows, event triggers, monitors, alerts, and run history."
+        title="Schedules"
+        subtitle="Create recurring or one-time instructions for Chronos, then run them manually or on a cadence."
         right={<button className="btn btn-secondary btn-sm" onClick={() => void load()}><IC.Refresh size={14}/> Refresh</button>}
       />
       <div className="px-10 pb-10 space-y-7">
@@ -6684,14 +6666,14 @@ function WorkflowsScreen() {
         </section>
 
         <section>
-          <div className="flex items-center justify-between mb-3"><h2 className="text-[16px] font-semibold">Workflow definitions</h2><div className="flex gap-2"><TextInput ariaLabel="Workflow name" value={workflowName} onChange={setWorkflowName}/><button className="btn btn-accent btn-sm" onClick={() => void createWorkflow()}><IC.Plus size={14}/> Create</button></div></div>
+          <div className="flex items-center justify-between mb-3"><h2 className="text-[16px] font-semibold">Reusable workflows</h2><div className="flex gap-2"><TextInput ariaLabel="Workflow name" value={workflowName} onChange={setWorkflowName}/><button className="btn btn-accent btn-sm" onClick={() => void createWorkflow()}><IC.Plus size={14}/> Create</button></div></div>
           <div className="surface border border-soft rounded-xl overflow-hidden">
-            {workflows.length === 0 ? <EmptyState title="No workflows" sub="Reusable workflows store connector steps, conditions, approvals, triggers, and run state."/> : workflows.map(workflow => (
+            {workflows.length === 0 ? <EmptyState title="No workflows" sub="Create a workflow for multi-step scheduled work or run one manually now."/> : workflows.map(workflow => (
               <div key={workflow.id} className="px-5 py-4 border-b hairline last:border-b-0">
                 <div className="flex items-start justify-between gap-4">
                   <button type="button" onClick={() => setSelectedWorkflowId(workflow.id)} className="min-w-0 flex-1 text-left">
                     <div className="font-medium text-[14px]">{workflow.name}</div>
-                    <div className="text-[12px] mt-1" style={{ color: "var(--text-dim)" }}>{workflow.status || "pending"} · {(workflow.definition?.steps || []).length} steps · {(triggers.filter(t => t.workflow_id === workflow.id)).length} triggers</div>
+                    <div className="text-[12px] mt-1" style={{ color: "var(--text-dim)" }}>{workflow.description || `${(workflow.definition?.steps || []).length} step workflow`}</div>
                   </button>
                   <button className="btn btn-sm" onClick={() => void runWorkflow(workflow.id)}><IC.ArrowRight size={14}/> Run</button>
                 </div>
