@@ -2080,9 +2080,29 @@ function ChatScreen({
     requestAnimationFrame(() => composerRef.current?.focus());
   }
 
+  function attachmentsBusy() {
+    return attachments.some(a => a.state === "uploading" || a.id.startsWith("local-"));
+  }
+
+  function readyAttachmentRefs(): ArtifactRef[] {
+    return attachments
+      .filter(a => !a.id.startsWith("local-"))
+      .map(a => ({
+        id: a.id,
+        title: a.name,
+        kind: "attachment",
+        mime_type: a.type,
+        size_bytes: a.size,
+      }));
+  }
+
   async function sendMessage(textOverride?: string) {
     const source = textOverride ?? draft;
     if (!source.trim()) return;
+    if (attachmentsBusy()) {
+      setUploadError("Wait for the file upload to finish before sending.");
+      return;
+    }
     // Interruptibility: sending while Chronos is responding stops the current
     // stream first (durable tasks keep running server-side), then sends.
     if (streaming) {
@@ -2145,13 +2165,13 @@ function ChatScreen({
       return;
     }
     setDraft("");
-    // Exclude files still uploading (local- ids are not yet server artifacts).
-    const pendingAttachmentIds = attachments.filter(a => !a.id.startsWith("local-")).map(a => a.id);
+    const pendingAttachmentRefs = readyAttachmentRefs();
+    const pendingAttachmentIds = pendingAttachmentRefs.map(a => a.id);
     clearAttachments();
     setUploadError(null);
     setMessages(prev => [
       ...prev,
-      { role: "user", content: text, status: "complete" },
+      { role: "user", content: text, status: "complete", artifacts: pendingAttachmentRefs.length ? pendingAttachmentRefs : undefined },
       { role: "assistant", content: "", status: "streaming", thinking: true },
     ]);
     streamingRef.current = true;
@@ -2784,7 +2804,7 @@ function ChatScreen({
                       <IC.Stop size={14}/> Stop
                     </button>
                   ) : (
-                    <button onClick={() => void sendMessage()} disabled={!draft.trim()}
+                    <button onClick={() => void sendMessage()} disabled={!draft.trim() || attachmentsBusy()}
                             className="btn btn-accent btn-sm">
                       <IC.ArrowUp size={14} stroke={2.2}/>
                     </button>
