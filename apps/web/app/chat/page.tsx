@@ -9,6 +9,10 @@ import SkillsScreen from "../../components/skills/SkillsScreen";
 import ResearchScreen from "../../components/research/ResearchScreen";
 import BrowserOperatorScreen from "../../components/browser/BrowserOperatorScreen";
 import ComputerScreen from "../../components/computer/ComputerScreen";
+import DesktopScreen from "../../components/desktop/DesktopScreen";
+import ConnectorGovernanceScreen from "../../components/connectors/ConnectorGovernanceScreen";
+import ContextSuggestionsScreen from "../../components/context/ContextSuggestionsScreen";
+import SSOConnectionsSettings from "../../components/settings/SSOConnectionsSettings";
 import DataScreen from "../../components/data/DataScreen";
 import Markdown from "../../components/Markdown";
 
@@ -42,7 +46,7 @@ function formatSearchResultTime(value?: string) {
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 type Route = "chat" | "activity" | "approvals" | "memory" | "connectors" | "assistants" | "settings" | "projects" | "artifacts" | "workflows" | "skills" | "audit";
-type SettingsTab = "general" | "profile" | "organization" | "members" | "permissions" | "employees" | "runtime" | "memory-settings" | "data" | "tools-settings" | "approval-settings" | "notifications" | "security" | "billing" | "audit" | "developer" | "danger";
+type SettingsTab = "general" | "profile" | "organization" | "members" | "permissions" | "employees" | "runtime" | "memory-settings" | "data" | "tools-settings" | "approval-settings" | "notifications" | "security" | "billing" | "audit" | "context" | "developer" | "danger";
 type Conversation = { id: string; title: string | null; updated_at?: string; created_at?: string };
 type MessageRole = "user" | "assistant" | "system" | "tool";
 type MessageStatus = "streaming" | "complete" | "paused" | "approval_pending" | "error";
@@ -4410,6 +4414,7 @@ const OPS_TABS = [
   { id: "research", label: "Research" },
   { id: "browser",  label: "Browser" },
   { id: "computer", label: "Computer" },
+  { id: "desktop",  label: "Desktop" },
 ] as const;
 type OpsTab = typeof OPS_TABS[number]["id"];
 
@@ -4442,6 +4447,7 @@ function ActivityScreen() {
         {tab === "research" && <ResearchScreen />}
         {tab === "browser"  && <BrowserOperatorScreen />}
         {tab === "computer" && <ComputerScreen />}
+        {tab === "desktop"  && <DesktopScreen />}
       </div>
     </div>
   );
@@ -5188,6 +5194,59 @@ function MemoryScreen({ embedded = false }: { embedded?: boolean }) {
     }
   }
 
+  const [captureEnabled, setCaptureEnabled] = useState(true);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [mergeMode, setMergeMode] = useState(false);
+
+  async function changeScope(id: string, scope: string) {
+    try {
+      const scope_id = scope === "personal" || scope === "restricted" ? "me" : "default";
+      await apiFetch(`/memory/${id}/scope`, { method: "POST", body: JSON.stringify({ scope, scope_id }) });
+      setMemories(prev => prev.map(m => m.id === id ? { ...m, scope } : m));
+      setToast({ kind: "ok", text: `Moved to "${scope}" scope.` });
+    } catch {
+      setToast({ kind: "danger", text: "Could not change scope." });
+    }
+  }
+
+  async function loadUsage(id: string): Promise<Array<Record<string, unknown>>> {
+    return await apiFetch(`/memory/${id}/usage`).then(r => r.json());
+  }
+
+  async function toggleCapture() {
+    const next = !captureEnabled;
+    try {
+      await apiFetch("/memory/policy", { method: "POST", body: JSON.stringify({ scope: "org", scope_id: "default", enabled: next }) });
+      setCaptureEnabled(next);
+      setToast({ kind: "ok", text: next ? "Automatic capture resumed." : "Automatic capture paused." });
+    } catch {
+      setToast({ kind: "danger", text: "Could not update capture policy." });
+    }
+  }
+
+  function toggleSelect(id: string) {
+    setSelected(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+
+  async function mergeSelected() {
+    const ids = [...selected];
+    if (ids.length < 2) return;
+    const [primary_id, ...duplicate_ids] = ids;
+    try {
+      await apiFetch("/memory/merge", { method: "POST", body: JSON.stringify({ primary_id, duplicate_ids }) });
+      setMemories(prev => prev.filter(m => !duplicate_ids.includes(m.id)));
+      setSelected(new Set());
+      setMergeMode(false);
+      setToast({ kind: "ok", text: `Merged ${duplicate_ids.length} into primary.` });
+    } catch {
+      setToast({ kind: "danger", text: "Could not merge memories." });
+    }
+  }
+
   const padX = embedded ? "px-0" : "px-10";
 
   return (
@@ -5236,10 +5295,29 @@ function MemoryScreen({ embedded = false }: { embedded?: boolean }) {
                  className="bg-transparent text-[13.5px] outline-none w-48" style={{ color: "var(--text)" }}/>
         </div>
 
-        <span className="text-[13px] ml-auto" style={{ color: "var(--text-dim)" }}>
-          {filtered.length} {filtered.length === 1 ? "memory" : "memories"}
-        </span>
+        <div className="ml-auto flex items-center gap-2">
+          <button onClick={() => void toggleCapture()} className="btn btn-ghost btn-sm" title="Pause or resume automatic memory capture for the organization">
+            {captureEnabled ? "Pause capture" : "Resume capture"}
+          </button>
+          <button onClick={() => { setMergeMode(m => !m); setSelected(new Set()); }} className="btn btn-ghost btn-sm" title="Select duplicates to merge into one">
+            {mergeMode ? "Cancel merge" : "Merge duplicates"}
+          </button>
+          <span className="text-[13px]" style={{ color: "var(--text-dim)" }}>
+            {filtered.length} {filtered.length === 1 ? "memory" : "memories"}
+          </span>
+        </div>
       </div>
+
+      {mergeMode && (
+        <div className={`${padX} pb-3`}>
+          <div className="flex items-center justify-between gap-3 rounded-lg border px-3 py-2 text-[13px]" style={{ borderColor: "var(--accent)", background: "var(--surface-2)" }}>
+            <span style={{ color: "var(--text-dim)" }}>
+              {selected.size === 0 ? "Select two or more memories. The first selected becomes the primary." : `${selected.size} selected — first is primary, the rest are merged in.`}
+            </span>
+            <button onClick={() => void mergeSelected()} disabled={selected.size < 2} className="btn btn-accent btn-sm disabled:opacity-50">Merge {selected.size > 1 ? selected.size - 1 : 0} into primary</button>
+          </div>
+        </div>
+      )}
 
       {scopes.length > 0 && (
         <div className={`${padX} pb-3 flex items-center gap-1.5 flex-wrap`}>
@@ -5333,7 +5411,7 @@ function MemoryScreen({ embedded = false }: { embedded?: boolean }) {
           </div>
         )}
 
-        {filtered.map(m => <MemoryCard key={m.id} m={m} onDelete={deleteMemory} onUpdate={updateMemory} onFlag={flagMemory}/>)}
+        {filtered.map(m => <MemoryCard key={m.id} m={m} onDelete={deleteMemory} onUpdate={updateMemory} onFlag={flagMemory} onChangeScope={changeScope} onLoadUsage={loadUsage} selectable={mergeMode} selected={selected.has(m.id)} onToggleSelect={toggleSelect}/>)}
       </div>
     </div>
   );
@@ -5358,13 +5436,23 @@ function MemoryPageActions({ onReviewConflicts, onExport, onImport, onAdd }: { o
   );
 }
 
-function MemoryCard({ m, onDelete, onUpdate, onFlag }: { m: MemoryEntry; onDelete: (id: string) => void; onUpdate: (id: string, content: string, importance_score?: number) => Promise<void>; onFlag: (id: string, kind: "archive" | "pin" | "sensitive", value: boolean) => Promise<void> }) {
+function MemoryCard({ m, onDelete, onUpdate, onFlag, onChangeScope, onLoadUsage, selectable = false, selected = false, onToggleSelect }: { m: MemoryEntry; onDelete: (id: string) => void; onUpdate: (id: string, content: string, importance_score?: number) => Promise<void>; onFlag: (id: string, kind: "archive" | "pin" | "sensitive", value: boolean) => Promise<void>; onChangeScope?: (id: string, scope: string) => Promise<void>; onLoadUsage?: (id: string) => Promise<Array<Record<string, unknown>>>; selectable?: boolean; selected?: boolean; onToggleSelect?: (id: string) => void }) {
   const [hover, setHover] = useState(false);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(m.content);
   const [saving, setSaving] = useState(false);
+  const [usage, setUsage] = useState<Array<Record<string, unknown>> | null>(null);
+  const [usageOpen, setUsageOpen] = useState(false);
   const isPrivate = m.scope === "restricted";
   const isAuto = m.source === "autonomous";
+
+  async function toggleUsage() {
+    if (usageOpen) { setUsageOpen(false); return; }
+    setUsageOpen(true);
+    if (usage === null && onLoadUsage) {
+      try { setUsage(await onLoadUsage(m.id)); } catch { setUsage([]); }
+    }
+  }
 
   async function save() {
     const next = draft.trim();
@@ -5379,8 +5467,12 @@ function MemoryCard({ m, onDelete, onUpdate, onFlag }: { m: MemoryEntry; onDelet
   }
 
   return (
-    <div className="mem-card p-4" onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)}>
+    <div className="mem-card p-4" onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)}
+         style={selectable && selected ? { borderColor: "var(--accent)" } : undefined}>
       <div className="flex items-start gap-3">
+        {selectable && (
+          <input type="checkbox" checked={selected} onChange={() => onToggleSelect?.(m.id)} className="mt-2 flex-shrink-0" aria-label="Select memory for merge" />
+        )}
         <div className="w-7 h-7 rounded-md flex items-center justify-center flex-shrink-0 mt-0.5"
              style={{ background: isPrivate ? "var(--danger-soft)" : "var(--surface-2)", color: isPrivate ? "var(--danger)" : "var(--text-dim)" }}>
           {isPrivate ? <IC.Lock size={13}/> : <IC.Memory size={13}/>}
@@ -5403,12 +5495,34 @@ function MemoryCard({ m, onDelete, onUpdate, onFlag }: { m: MemoryEntry; onDelet
             <span className="inline-flex items-center gap-1">
               {isAuto ? <><IC.Sparkles size={11}/> Saved by Chronos</> : <><IC.Pencil size={11}/> Saved by you</>}
             </span>
-            {m.scope && <><span>·</span><span>{m.scope}</span></>}
+            {m.scope && (
+              <><span>·</span>
+              {onChangeScope ? (
+                <select value={m.scope} onChange={e => void onChangeScope(m.id, e.target.value)}
+                        className="bg-transparent outline-none cursor-pointer" style={{ color: "var(--text-dim)" }}
+                        title="Change memory scope" aria-label="Memory scope">
+                  {MEMORY_SCOPES.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}
+                </select>
+              ) : <span>{m.scope}</span>}</>
+            )}
             {typeof m.importance_score === "number" && <><span>·</span><span>{m.importance_score >= 0.75 ? "High" : m.importance_score >= 0.45 ? "Medium" : "Low"} importance</span></>}
             {m.created_by && <><span>·</span><span>by {m.created_by}</span></>}
             {m.is_pinned && <><span>·</span><span style={{ color: "var(--accent)" }}>Pinned</span></>}
             {m.is_sensitive && <><span>·</span><span style={{ color: "var(--danger)" }}>Sensitive</span></>}
           </div>
+          {usageOpen && (
+            <div className="mt-2 rounded-lg border border-soft p-2.5 text-[12.5px]" style={{ background: "var(--surface-2)" }}>
+              <div className="font-medium mb-1" style={{ color: "var(--text-dim)" }}>Usage</div>
+              {usage === null && <div style={{ color: "var(--text-dim)" }}>Loading…</div>}
+              {usage !== null && usage.length === 0 && <div style={{ color: "var(--text-dim)" }}>Not used in any retrieval yet.</div>}
+              {usage !== null && usage.map((u, i) => (
+                <div key={String(u.id ?? i)} className="flex items-center gap-2 py-0.5" style={{ color: "var(--text-muted)" }}>
+                  <span>{String(u.used_in ?? u.context ?? u.source ?? u.conversation_id ?? "retrieval")}</span>
+                  {u.created_at ? <span style={{ color: "var(--text-faint)" }}>· {new Date(String(u.created_at)).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}</span> : null}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
         <div className="flex items-center gap-1 flex-shrink-0" style={{ opacity: hover ? 1 : 0, transition: "opacity 0.15s" }}>
           <button onClick={() => void onFlag(m.id, "pin", !m.is_pinned)} className="btn btn-ghost btn-sm btn-icon" title={m.is_pinned ? "Unpin" : "Pin"}>
@@ -5417,6 +5531,11 @@ function MemoryCard({ m, onDelete, onUpdate, onFlag }: { m: MemoryEntry; onDelet
           <button onClick={() => void onFlag(m.id, "sensitive", !m.is_sensitive)} className="btn btn-ghost btn-sm btn-icon" title={m.is_sensitive ? "Unmark sensitive" : "Mark sensitive"}>
             <IC.Lock size={13}/>
           </button>
+          {onLoadUsage && (
+            <button onClick={() => void toggleUsage()} className="btn btn-ghost btn-sm btn-icon" title="Where this memory has been used">
+              <IC.Info size={13}/>
+            </button>
+          )}
           <button onClick={() => setEditing(true)} className="btn btn-ghost btn-sm btn-icon" title="Edit">
             <IC.Pencil size={13}/>
           </button>
@@ -5480,6 +5599,7 @@ function connectorSetupLabel(app: CatalogApp) {
 }
 
 function ConnectorsScreen() {
+  const [view, setView] = useState<"apps" | "governance">("apps");
   const [apps, setApps] = useState<CatalogApp[]>([]);
   const [loading, setLoading] = useState(true);
   const [connecting, setConnecting] = useState<string | null>(null);
@@ -5570,6 +5690,21 @@ function ConnectorsScreen() {
         subtitle="Connect apps and custom tools so Chronos can act through governed credentials, policies, and audit logs."
       />
 
+      <div className="px-10 pb-3 flex items-center gap-1 surface-0">
+        {([["apps", "Apps"], ["governance", "Governance"]] as const).map(([id, label]) => (
+          <button key={id} onClick={() => setView(id)}
+                  className="px-3 py-1.5 rounded-md text-[13px] font-medium smooth"
+                  style={{ background: view === id ? "var(--surface-2)" : "transparent", color: view === id ? "var(--text)" : "var(--text-muted)" }}>
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {view === "governance" && (
+        <div className="px-10 pb-10"><ConnectorGovernanceScreen /></div>
+      )}
+
+      {view === "apps" && (
       <div className="px-10 pb-10">
         {notice && (
           <div className="mb-5 rounded-xl border border-soft px-4 py-3 text-[13px]" style={{ color: "var(--ok)", background: "var(--surface-2)" }}>
@@ -5662,6 +5797,7 @@ function ConnectorsScreen() {
           </p>
         )}
       </div>
+      )}
     </div>
   );
 }
@@ -5825,6 +5961,7 @@ const SETTING_TABS: Array<{ id: SettingsTab; label: string; icon: ReactNode; key
   { id: "organization", label: "Organization", icon: <IC.Briefcase size={15}/>, keywords: "org logo domain plan seats workspace creation", group: "Workspace" },
   { id: "members", label: "Members & roles", icon: <IC.Personas size={15}/>, keywords: "member invite role remove owner admin manager operator viewer", group: "Workspace" },
   { id: "permissions", label: "Permissions", icon: <IC.Lock size={15}/>, keywords: "rbac matrix workspace employee tools approval memory audit", group: "Workspace" },
+  { id: "context", label: "Org context", icon: <IC.Lightbulb size={15}/>, keywords: "context suggestions org knowledge learn memory institutional apply reject", group: "Workspace" },
   { id: "tools-settings", label: "Tools & integrations", icon: <IC.Connectors size={15}/>, keywords: "connectors oauth disconnect scopes approval required risk enabled", group: "Workspace" },
   { id: "approval-settings", label: "Approvals", icon: <IC.Approvals size={15}/>, keywords: "mode thresholds rules external sub agent runtime memory", group: "Workspace" },
   { id: "security", label: "Security", icon: <IC.Lock size={15}/>, keywords: "sessions password two factor api keys login history revoke privacy", group: "Workspace" },
@@ -7077,7 +7214,7 @@ function SettingsScreen({ tab, setTab, theme, setTheme, accent, setAccent, signO
           <div className="flex items-center gap-2">
             {dirty && <span className="text-[12px]" style={{ color: "var(--text-dim)" }}>Unsaved changes</span>}
             {dirty && <button onClick={() => cancel()} className="btn btn-sm">Cancel</button>}
-            {!["members", "data", "audit", "security", "billing", "danger"].includes(tab) && (
+            {!["members", "data", "audit", "security", "billing", "context", "danger"].includes(tab) && (
               <button onClick={() => void save()} disabled={!dirty || readOnly || saving} className="btn btn-accent btn-sm disabled:opacity-50">
                 {saving ? "Saving..." : readOnly ? "Read only" : "Save"}
               </button>
@@ -7107,6 +7244,7 @@ function SettingsScreen({ tab, setTab, theme, setTheme, accent, setAccent, signO
           {tab === "security" && <SecuritySettings capabilities={overview.capabilities} signOut={signOut}/>}
           {tab === "billing" && <BillingSettings overview={overview}/>}
           {tab === "audit" && <AuditSettings />}
+          {tab === "context" && <ContextSuggestionsScreen />}
           {tab === "developer" && <DeveloperSettings data={sectionDraft} patch={v => patch("developer", v)} capabilities={overview.capabilities}/>}
           {tab === "danger" && <DangerSettings capabilities={overview.capabilities} setToast={setToast}/>}
         </div>
@@ -7567,7 +7705,7 @@ function NotificationSettings({ data, patch, capabilities }: { data: Record<stri
 }
 
 function SecuritySettings({ capabilities, signOut }: { capabilities: SettingsOverview["capabilities"]; signOut: () => void }) {
-  return <><SettingsSection title="Authentication">{["sessions", "password", "two_factor", "api_keys"].map(key => <SettingsField key={key} label={key.replaceAll("_", " ")}><button className="btn btn-sm" disabled>{capabilities[key]?.reason || "Unavailable"}</button></SettingsField>)}<SettingsField label="Current session"><button onClick={signOut} className="btn btn-danger-soft btn-sm">Sign out</button></SettingsField></SettingsSection></>;
+  return <><SettingsSection title="Authentication">{["sessions", "password", "two_factor", "api_keys"].map(key => <SettingsField key={key} label={key.replaceAll("_", " ")}><button className="btn btn-sm" disabled>{capabilities[key]?.reason || "Unavailable"}</button></SettingsField>)}<SettingsField label="Current session"><button onClick={signOut} className="btn btn-danger-soft btn-sm">Sign out</button></SettingsField></SettingsSection><SSOConnectionsSettings /></>;
 }
 
 function BillingSettings({ overview }: { overview: SettingsOverview }) {
