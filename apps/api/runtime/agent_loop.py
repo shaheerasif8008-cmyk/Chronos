@@ -505,6 +505,18 @@ async def _load_history(task: dict[str, Any], tools: list[dict[str, Any]] | None
     # Fresh start. Sub-agents spawned with inherit_keys carry an opt-in snapshot of
     # parent state, injected here as a single context message before the goal.
     seed = [await _agent_system_message(tools)]
+    # Skills (progressive disclosure): always advertise the catalog and inline the
+    # SKILL.md most relevant to the goal, so durable tasks are no longer skill-blind.
+    try:
+        from skills.loader import build_agent_skills_block
+
+        skills_block = await build_agent_skills_block(
+            str(task.get("goal") or ""), str(task.get("organization_id") or "default")
+        )
+        if skills_block.strip():
+            seed.append({"role": "system", "content": skills_block})
+    except Exception:
+        logger.warning("Skill seed assembly failed for task %s", task.get("id"), exc_info=True)
     inherited = state.get("inherited_context") if isinstance(state, dict) else None
     if isinstance(inherited, dict) and (inherited.get("parent_context") or inherited.get("parent_goal")):
         seed.append({"role": "user", "content": _format_inherited_context(inherited)})

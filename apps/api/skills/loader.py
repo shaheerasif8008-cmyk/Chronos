@@ -125,6 +125,48 @@ async def load_skill_content(
     return "\n\n".join(parts)
 
 
+async def build_agent_skills_block(goal: str, org_id: str = "default", top_k: int = 2) -> str:
+    """Assemble a progressive-disclosure skills block for a durable task seed.
+
+    Mirrors how chat assembles skills so the agent loop is no longer skill-blind:
+      - Level 1: the full catalog of available skills (name + description), always
+        cheap, so the agent knows what exists.
+      - Level 2: the SKILL.md body of the skills most relevant to the goal, inlined.
+    Returns an empty string when no skills are available.
+    """
+    candidates = await get_candidate_skills(org_id)
+    if not candidates:
+        return ""
+
+    lines = [
+        "# Skills",
+        "These skills are available. Follow a matching skill's instructions when the "
+        "task fits its description. Run any bundled scripts with the `skill.run_script` tool.",
+        "",
+        "## Available skills",
+    ]
+    for skill in candidates:
+        lines.append(f"- **{skill['name']}** ({skill['id']}): {skill.get('description', '')}")
+
+    relevant_ids = await find_relevant_skills(goal, org_id, top_k=top_k)
+    index = {s["id"]: s for s in candidates}
+    loaded: list[str] = []
+    for skill_id in relevant_ids:
+        content = await load_skill_content(skill_id, progressive=True, org_id=org_id)
+        if not content.strip():
+            continue
+        name = index.get(skill_id, {}).get("name", skill_id)
+        loaded.append(f"## Skill: {name}\n{content}")
+
+    if loaded:
+        lines.append("")
+        lines.append("## Loaded skill instructions (relevant to this task)")
+        lines.append("")
+        lines.append("\n\n".join(loaded))
+
+    return "\n".join(lines)
+
+
 async def skill_connector_warning(skill: dict) -> str | None:
     """Return a human-readable warning if required connectors are missing, else None."""
     required: list[str] = skill.get("requires_connectors") or []
