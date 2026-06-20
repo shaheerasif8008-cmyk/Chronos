@@ -72,6 +72,31 @@ async def list_desktop_session_events(
     return events[:limit]
 
 
+@router.get("/{session_id}/screenshot")
+async def desktop_screenshot(
+    session_id: str, member: Member = Depends(get_current_member)
+) -> dict[str, Any]:
+    """Capture and return a fresh desktop frame as a PNG data URL.
+
+    Polling this drives a true pixel stream of the virtual desktop. When the
+    runtime has no virtual display (headless), the connector returns a degraded
+    result and ``screenshot_data_url`` is null — the caller shows a placeholder.
+    """
+    await permissions.check(member, "view_desktop_session_events", session_id)
+    try:
+        result = await tool_broker.execute(
+            _agent(member), "desktop.screenshot", {"session_id": session_id}
+        )
+    except Exception as exc:  # never 500 a viewer poll
+        return {"status": "unavailable", "screenshot_data_url": None, "reason": str(exc)[:200]}
+    data = result.data or {}
+    return {
+        "status": data.get("status", "active"),
+        "screenshot_data_url": data.get("screenshot_data_url"),
+        "session": data.get("session"),
+    }
+
+
 @router.post("/{session_id}/revoke")
 async def revoke_desktop_session(
     session_id: str,
