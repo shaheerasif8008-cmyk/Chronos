@@ -6,6 +6,7 @@ import ArtifactsScreen from "../../components/artifacts/ArtifactsScreen";
 import AgentsScreen from "../../components/agents/AgentsScreen";
 import InChatArtifactPanel from "../../components/artifacts/InChatArtifactPanel";
 import { classifyRenderer } from "../../components/artifacts/ArtifactRenderer";
+import ComputerLiveView from "../../components/computer/ComputerLiveView";
 import SkillsScreen from "../../components/skills/SkillsScreen";
 import ResearchScreen from "../../components/research/ResearchScreen";
 import BrowserOperatorScreen from "../../components/browser/BrowserOperatorScreen";
@@ -1062,6 +1063,7 @@ function ChronosAppInner() {
         {route === "audit"      && <AuditScreen />}
       </main>
       <InChatArtifactPanel />
+      <ComputerLiveView />
       {agentMenuOpen && <AgentMenuModal onClose={() => setAgentMenuOpen(false)} />}
       {shellNotice && (
         <div
@@ -2329,6 +2331,9 @@ function ChatScreen({
           autoOpenedArtifactsRef.current.add(ref.id);
           window.dispatchEvent(new CustomEvent("chronos:open-artifact", { detail: { id: ref.id } }));
         }
+        // Live versioning: if this artifact is already open in the panel, refresh it
+        // to the new version in place.
+        window.dispatchEvent(new CustomEvent("chronos:artifact-updated", { detail: { id: ref.id } }));
       } else if (ev.type === "structured_response" && ev.structured_response) {
         const sr = ev.structured_response;
         setMessages(prev => {
@@ -4150,9 +4155,12 @@ function LiveOperationsDrawer({
         </section>
 
         <section className="rounded-xl border border-soft overflow-hidden">
-          <div className="px-3 py-2 border-b hairline flex items-center justify-between">
+          <div className="px-3 py-2 border-b hairline flex items-center justify-between gap-2">
             <div className="flex items-center gap-2 text-[13px] font-medium"><IC.Briefcase size={14}/> Computer</div>
-            <Tag variant={activeComputer?.status === "active" ? "accent" : activeComputer?.status === "degraded" ? "warn" : "default"}>{activeComputer?.status || "No session"}</Tag>
+            <div className="flex items-center gap-2">
+              <button className="btn btn-ghost btn-sm" onClick={() => window.dispatchEvent(new CustomEvent("chronos:open-computer", { detail: { id: activeComputer?.id } }))}>Open full view</button>
+              <Tag variant={activeComputer?.status === "active" ? "accent" : activeComputer?.status === "degraded" ? "warn" : "default"}>{activeComputer?.status || "No session"}</Tag>
+            </div>
           </div>
           <div className="p-3">
             <div className="rounded-lg border border-soft overflow-hidden bg-black" style={{ aspectRatio: "16 / 10" }}>
