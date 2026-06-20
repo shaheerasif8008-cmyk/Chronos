@@ -2008,6 +2008,7 @@ async def run_loop(
             if (
                 model_cognition
                 and budget.can_reflect
+                and step_tokens > 0
                 and answer.strip()
                 and any(m.get("role") == "tool" for m in history)
             ):
