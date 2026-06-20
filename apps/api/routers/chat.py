@@ -1336,7 +1336,7 @@ async def retry_message_from_here(
         message_id=message_id,
         req=req,
         member=member,
-        action="retry_message",
+        action="retry_from_message",
     )
 
 
