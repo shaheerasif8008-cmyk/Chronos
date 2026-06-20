@@ -27,6 +27,7 @@ test("agent menu and command: static route and API guard", async () => {
   expect(componentSrc).toContain("data-testid=\"agents-screen\"");
   expect(componentSrc).toContain("data-testid=\"agent-template\"");
   expect(componentSrc).toContain("data-testid=\"agent-publishing-panel\"");
-  expect(componentSrc).toContain("Schedule permission");
+  // The cluttered builder form was replaced by a one-click ready-to-use catalog.
+  expect(componentSrc).toContain("Use agent");
   expect(componentSrc).toContain('profile_kind: "agent"');
 });
