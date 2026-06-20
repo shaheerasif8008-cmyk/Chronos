@@ -72,6 +72,8 @@ _ADMIN_ACTIONS = {
     "disable_learned_policy",
     "set_risk_override",
     "export_evidence",
+    "manage_sso",
+    "manage_scim",
 }
 _ADMIN_ROLES = {"admin", "owner"}
 

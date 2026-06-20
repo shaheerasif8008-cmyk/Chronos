@@ -95,6 +95,26 @@ export default function LoginPage() {
     window.location.href = loginUrl;
   }
 
+  async function signInWithSSO() {
+    setError("");
+    if (!email || !email.includes("@")) {
+      setError("Enter your work email to continue with SSO.");
+      return;
+    }
+    try {
+      const res = await fetch(`${apiBase()}/auth/sso/start?email=${encodeURIComponent(email)}`);
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        setError(body.detail ?? "Single sign-on is not configured for this email domain.");
+        return;
+      }
+      const data = await res.json();
+      window.location.href = data.login_url;
+    } catch {
+      setError("Could not start single sign-on. Please try again.");
+    }
+  }
+
   const cognitoEnabled = authConfig?.cognito?.enabled;
   const devOtpEnabled = authConfig?.devOtp ?? false;
 
@@ -124,6 +144,28 @@ export default function LoginPage() {
         {!authConfig && (
           <div className="mt-12 flex justify-center">
             <div className="h-6 w-6 animate-spin rounded-full border-2" style={{ borderColor: "var(--border)", borderTopColor: "var(--accent)" }} />
+          </div>
+        )}
+
+        {authConfig && (
+          <div className="mt-8 space-y-3">
+            <label className="block">
+              <span className="text-[13px] font-medium" style={{ color: "var(--text-muted)" }}>Work email</span>
+              <input
+                className={inputClass}
+                style={{ borderColor: "var(--border)", background: "var(--surface)", color: "var(--text)" }}
+                value={email}
+                onChange={(event) => setEmail(event.target.value)}
+                type="email"
+                placeholder="you@company.com"
+              />
+            </label>
+            <button type="button" onClick={signInWithSSO} className="btn btn-secondary w-full justify-center" style={{ padding: "11px 16px" }}>
+              Continue with SSO
+            </button>
+            <p className="text-xs" style={{ color: "var(--text-dim)" }}>
+              Uses your organization's single sign-on. We route you to your identity provider by email domain.
+            </p>
           </div>
         )}
 

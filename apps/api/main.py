@@ -19,12 +19,13 @@ from sqlalchemy import select
 
 from core.config import settings as app_settings
 from core.exceptions import PermissionDenied
+from core.scim import SCIMError as _SCIMError
 
 from jobs import context_update, profile_synthesis, scheduled_tasks
 from core.db import engine, reflect_table
 from runtime import task_runner
 from runtime.research_executor import start_research
-from routers import activity, agents, approvals, artifact_share, artifacts, attachments, auth, autonomy, browser_sessions, chat, computer_sessions, connectors, context, data, desktop_sessions, memory, monitors, projects, research, schedules, search, settings, skills, tasks, workflows
+from routers import activity, agents, approvals, artifact_share, artifacts, attachments, auth, autonomy, browser_sessions, chat, computer_sessions, connectors, context, data, desktop_sessions, memory, monitors, projects, research, schedules, scim, search, settings, skills, sso, tasks, workflows
 
 app = FastAPI(title="Chronos API", version="0.1.0")
 
@@ -51,6 +52,8 @@ app.add_middleware(
 )
 
 app.include_router(auth.router)
+app.include_router(sso.router)
+app.include_router(scim.router)
 app.include_router(agents.router)
 app.include_router(browser_sessions.router)
 app.include_router(computer_sessions.router)
@@ -124,6 +127,12 @@ _init_observability()
 async def _permission_denied_handler(_request: Request, exc: PermissionDenied) -> JSONResponse:
     """Map authorization denials to HTTP 403 (enforcement raises rather than returns)."""
     return JSONResponse(status_code=403, content={"detail": str(exc)})
+
+
+@app.exception_handler(_SCIMError)
+async def _scim_error_handler(_request: Request, exc: _SCIMError) -> JSONResponse:
+    """Render SCIM failures in the RFC 7644 Error envelope with scim+json."""
+    return JSONResponse(status_code=exc.status, content=exc.to_dict(), media_type="application/scim+json")
 
 
 @app.on_event("startup")
