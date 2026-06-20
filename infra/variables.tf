@@ -427,7 +427,7 @@ variable "cognito_callback_url" {
 variable "cognito_auto_provision_members" {
   description = "Auto-create member records on first Cognito login"
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "google_client_id" {

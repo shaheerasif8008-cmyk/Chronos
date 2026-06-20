@@ -86,6 +86,7 @@ resource "aws_ecs_task_definition" "api" {
       { name = "EMBEDDING_MODEL", value = "google/gemini-embedding-2" },
       { name = "EMBEDDING_DIMENSIONS", value = "1536" },
       { name = "ACCESS_TOKEN_EXPIRE_MINUTES", value = "60" },
+      { name = "COGNITO_AUTO_PROVISION_MEMBERS", value = "true" },
     ]
 
     # Secrets are fetched from Secrets Manager at task startup — values never
