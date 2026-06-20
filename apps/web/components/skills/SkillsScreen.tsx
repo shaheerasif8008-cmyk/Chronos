@@ -282,12 +282,21 @@ function buildSkillContent(input: {
     .filter(Boolean)
     .map((line, index) => `${index + 1}. ${line}`)
     .join("\n");
-  const connectorList = input.requiresConnectors
+  const connectors = input.requiresConnectors
     .split(",")
     .map(item => item.trim())
-    .filter(Boolean)
-    .join(", ");
-  return [
+    .filter(Boolean);
+  const connectorList = connectors.join(", ");
+  const frontmatter = [
+    "---",
+    `name: ${input.name.trim()}`,
+    `description: ${input.description.trim().replace(/\n/g, " ")}`,
+    `requires_connectors: [${connectors.join(", ")}]`,
+    `spawns_sub_agent: ${input.spawnsSubAgent ? "true" : "false"}`,
+    "---",
+    "",
+  ].join("\n");
+  return frontmatter + [
     `# ${input.name.trim()}`,
     "",
     input.description.trim(),

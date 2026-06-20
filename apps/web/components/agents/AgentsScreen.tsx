@@ -7,7 +7,9 @@ type AgentTemplate = {
   id: string;
   name: string;
   role: string;
+  category?: string;
   description: string;
+  instructions?: string;
   tool_grants: string[];
   connector_grants: string[];
   memory_scopes: string[];
@@ -35,14 +37,7 @@ type AgentProfile = {
   created_at?: string;
 };
 
-type Project = { id: string; name: string };
-
-const MODELS = ["gpt-5.4-mini", "gpt-5.4-nano", "deepseek-v4-pro", "deepseek-v4-flash"];
 const TARGETS = ["slack", "teams", "email", "web", "api"];
-
-function splitList(value: string) {
-  return value.split(",").map(item => item.trim()).filter(Boolean);
-}
 
 function timeLabel(value?: string) {
   if (!value) return "";
@@ -54,22 +49,14 @@ function timeLabel(value?: string) {
 export default function AgentsScreen() {
   const [templates, setTemplates] = useState<AgentTemplate[]>([]);
   const [agents, setAgents] = useState<AgentProfile[]>([]);
-  const [projects, setProjects] = useState<Project[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [selectedTemplateId, setSelectedTemplateId] = useState("research");
-  const [name, setName] = useState("Research Agent");
-  const [instructions, setInstructions] = useState("Prepare concise, cited answers and ask for approval before external replies.");
-  const [model, setModel] = useState("gpt-5.4-mini");
-  const [tools, setTools] = useState("web.search, research.run, artifact.write");
-  const [connectors, setConnectors] = useState("slack, google_drive");
-  const [projectId, setProjectId] = useState("");
-  const [memoryScope, setMemoryScope] = useState("project");
-  const [autonomy, setAutonomy] = useState("supervised");
-  const [scheduleAllowed, setScheduleAllowed] = useState(false);
+  const [query, setQuery] = useState("");
+  const [category, setCategory] = useState("All");
   const [runGoal, setRunGoal] = useState("");
   const [publishTarget, setPublishTarget] = useState("slack");
   const [externalChannel, setExternalChannel] = useState("");
   const [busy, setBusy] = useState(false);
+  const [usingId, setUsingId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -78,76 +65,77 @@ export default function AgentsScreen() {
     () => agents.find(agent => agent.id === selectedId) ?? agents[0] ?? null,
     [agents, selectedId],
   );
-  const selectedTemplate = useMemo(
-    () => templates.find(template => template.id === selectedTemplateId) ?? templates[0] ?? null,
-    [templates, selectedTemplateId],
-  );
+
+  const categories = useMemo(() => {
+    const set = new Set<string>();
+    templates.forEach(t => set.add(t.category || "General"));
+    return ["All", ...Array.from(set).sort()];
+  }, [templates]);
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return templates.filter(t => {
+      if (category !== "All" && (t.category || "General") !== category) return false;
+      if (!q) return true;
+      return (
+        t.name.toLowerCase().includes(q) ||
+        t.role.toLowerCase().includes(q) ||
+        t.description.toLowerCase().includes(q)
+      );
+    });
+  }, [templates, query, category]);
 
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const [templateData, agentData, projectData] = await Promise.all([
+      const [templateData, agentData] = await Promise.all([
         apiFetch("/agents/templates").then(res => res.json()) as Promise<AgentTemplate[]>,
         apiFetch("/agents").then(res => res.json()) as Promise<AgentProfile[]>,
-        apiFetch("/projects/").then(res => res.json()).catch(() => []) as Promise<Project[]>,
       ]);
       setTemplates(templateData);
       setAgents(agentData);
-      setProjects(projectData);
       setSelectedId(current => current && agentData.some(agent => agent.id === current) ? current : agentData[0]?.id ?? null);
-      if (!projectId && projectData[0]?.id) setProjectId(projectData[0].id);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unable to load agents");
       setAgents([]);
     } finally {
       setLoading(false);
     }
-  }, [projectId]);
+  }, []);
 
   useEffect(() => { void load(); }, [load]);
 
-  useEffect(() => {
-    if (!selectedTemplate) return;
-    setName(selectedTemplate.name);
-    setTools(selectedTemplate.tool_grants.join(", "));
-    setConnectors(selectedTemplate.connector_grants.join(", "));
-    setMemoryScope(selectedTemplate.memory_scopes[0] || "workspace");
-  }, [selectedTemplate]);
-
-  async function createAgent() {
-    setBusy(true);
+  async function useTemplate(template: AgentTemplate) {
+    setUsingId(template.id);
     setError(null);
     setNotice(null);
     try {
-      const projectIds = projectId ? [projectId] : [];
       const created = await apiFetch("/agents", {
         method: "POST",
         body: JSON.stringify({
-          name: name.trim(),
+          name: template.name,
           profile_kind: "agent",
-          role: selectedTemplate?.role || "workspace agent",
-          template_id: selectedTemplateId,
-          instructions: instructions.trim(),
-          model,
-          tool_grants: splitList(tools),
-          connector_grants: splitList(connectors),
-          workflows: [selectedTemplateId],
-          connected_accounts: splitList(connectors),
-          project_ids: projectIds,
-          memory_scopes: [{ scope: memoryScope, scope_id: projectId || "workspace" }],
-          autonomy_level: autonomy,
-          approval_policy: { risky_writes: "require_approval", external_replies: "require_approval" },
-          schedule_permissions: { allowed: scheduleAllowed, max_frequency: scheduleAllowed ? "daily" : "disabled" },
+          role: template.role,
+          template_id: template.id,
+          instructions: template.instructions || template.description,
+          tool_grants: template.tool_grants,
+          connector_grants: template.connector_grants,
+          workflows: [template.id],
+          connected_accounts: template.connector_grants,
+          memory_scopes: (template.memory_scopes || ["workspace"]).map(scope => ({ scope, scope_id: "workspace" })),
+          autonomy_level: "supervised",
+          approval_policy: template.approval_policy,
+          schedule_permissions: { allowed: false, max_frequency: "disabled" },
         }),
       }).then(res => res.json()) as AgentProfile;
       await load();
       setSelectedId(created.id);
-      setNotice("Agent profile saved.");
+      setNotice(`${template.name} is ready to use.`);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to create agent");
+      setError(err instanceof Error ? err.message : "Unable to add agent");
     } finally {
-      setBusy(false);
+      setUsingId(null);
     }
   }
 
@@ -159,12 +147,28 @@ export default function AgentsScreen() {
     try {
       const data = await apiFetch(`/agents/${selected.id}/run`, {
         method: "POST",
-        body: JSON.stringify({ goal: runGoal.trim(), project_id: selected.project_ids[0] || projectId || undefined }),
+        body: JSON.stringify({ goal: runGoal.trim(), project_id: selected.project_ids[0] || undefined }),
       }).then(res => res.json()) as { task_id: string };
       setRunGoal("");
       setNotice(`Task queued: ${data.task_id}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unable to run agent");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeAgent() {
+    if (!selected) return;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await apiFetch(`/agents/${selected.id}`, { method: "DELETE" });
+      await load();
+      setNotice("Agent removed.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to remove agent");
     } finally {
       setBusy(false);
     }
@@ -197,9 +201,9 @@ export default function AgentsScreen() {
     <div className="flex-1 min-w-0 min-h-0 overflow-hidden flex flex-col" data-testid="agents-screen">
       <header className="px-10 pt-9 pb-5 flex items-start justify-between gap-6 flex-shrink-0">
         <div className="min-w-0">
-          <h1 className="h-page tracking-tight">Agent menu</h1>
+          <h1 className="h-page tracking-tight">Agents</h1>
           <p className="mt-1.5 text-[14px]" style={{ color: "var(--text-dim)" }}>
-            Configure executable agents here. Use /agent in chat to create or edit agents and assistants conversationally.
+            Browse ready-to-use agents and add them in one click. Need something custom? Just type <span className="font-mono">/agent</span> in chat and describe it.
           </p>
         </div>
         <button className="btn btn-ghost btn-sm" onClick={() => void load()} disabled={busy}>Refresh</button>
@@ -215,15 +219,15 @@ export default function AgentsScreen() {
         </div>
       )}
 
-      <div className="flex-1 min-h-0 px-10 pb-10 grid gap-4" style={{ gridTemplateColumns: "300px minmax(0, 1fr) 340px" }}>
+      <div className="flex-1 min-h-0 px-10 pb-10 grid gap-4" style={{ gridTemplateColumns: "280px minmax(0, 1fr) 320px" }}>
         <aside className="surface border border-soft rounded-lg min-h-0 overflow-hidden flex flex-col">
           <div className="px-3 py-2 border-b hairline flex items-center justify-between">
-            <span className="text-[12.5px] font-medium">Profiles</span>
+            <span className="text-[12.5px] font-medium">Your agents</span>
             <span className="text-[11.5px]" style={{ color: "var(--text-dim)" }}>{agents.length}</span>
           </div>
           <div className="overflow-y-auto p-2 space-y-2">
             {loading && <div className="text-[13px] p-3" style={{ color: "var(--text-dim)" }}>Loading...</div>}
-            {!loading && agents.length === 0 && <div className="text-[13px] p-3" style={{ color: "var(--text-dim)" }}>No agent profiles yet.</div>}
+            {!loading && agents.length === 0 && <div className="text-[13px] p-3" style={{ color: "var(--text-dim)" }}>No agents yet. Add one from the catalog.</div>}
             {agents.map(agent => (
               <button
                 key={agent.id}
@@ -245,97 +249,67 @@ export default function AgentsScreen() {
         </aside>
 
         <main className="surface border border-soft rounded-lg min-h-0 overflow-y-auto">
-          <div className="px-4 py-3 border-b hairline flex items-center justify-between">
-            <div>
-              <div className="text-[14px] font-medium">Agent builder</div>
-              <div className="text-[12px]" style={{ color: "var(--text-dim)" }}>Templates are starting policy, not hidden defaults.</div>
-            </div>
-            <button className="btn btn-accent btn-sm" onClick={createAgent} disabled={busy || !name.trim() || !instructions.trim()}>Save profile</button>
+          <div className="px-4 py-3 border-b hairline flex items-center gap-3 flex-wrap sticky top-0 z-10" style={{ background: "var(--surface)" }}>
+            <div className="text-[14px] font-medium mr-auto">Agent catalog</div>
+            <input
+              className="input"
+              style={{ maxWidth: 200 }}
+              placeholder="Search agents"
+              value={query}
+              onChange={e => setQuery(e.target.value)}
+            />
           </div>
 
-          <div className="p-4 grid gap-4">
-            <section>
-              <div className="text-[12.5px] font-medium mb-2">Templates</div>
-              <div className="grid gap-2" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))" }}>
-                {templates.map(template => (
-                  <button
-                    key={template.id}
-                    data-testid="agent-template"
-                    className="rounded-md border border-soft p-3 text-left"
-                    onClick={() => setSelectedTemplateId(template.id)}
-                    style={{ background: selectedTemplateId === template.id ? "var(--accent-soft)" : "transparent" }}
-                  >
-                    <div className="text-[13px] font-medium">{template.name}</div>
-                    <div className="mt-1 text-[11.5px] leading-5" style={{ color: "var(--text-dim)" }}>{template.description}</div>
-                  </button>
-                ))}
+          <div className="px-4 pt-3 flex items-center gap-1.5 flex-wrap">
+            {categories.map(cat => (
+              <button
+                key={cat}
+                className="rounded-full border border-soft px-3 py-1 text-[12px] smooth"
+                onClick={() => setCategory(cat)}
+                style={{
+                  background: category === cat ? "var(--accent-soft)" : "transparent",
+                  color: category === cat ? "var(--accent)" : "var(--text-dim)",
+                }}
+              >
+                {cat}
+              </button>
+            ))}
+          </div>
+
+          <div className="p-4 grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))" }}>
+            {filtered.map(template => (
+              <div key={template.id} data-testid="agent-template" className="rounded-lg border border-soft p-3.5 flex flex-col">
+                <div className="text-[13.5px] font-medium">{template.name}</div>
+                <div className="text-[11.5px] mt-0.5" style={{ color: "var(--text-faint)" }}>{template.category || "General"}</div>
+                <p className="mt-1.5 text-[12px] leading-5 flex-1" style={{ color: "var(--text-dim)" }}>{template.description}</p>
+                <button
+                  className="btn btn-accent btn-sm mt-3 w-full justify-center"
+                  onClick={() => void useTemplate(template)}
+                  disabled={usingId !== null}
+                >
+                  {usingId === template.id ? "Adding…" : "Use agent"}
+                </button>
               </div>
-            </section>
-
-            <section className="grid gap-3" style={{ gridTemplateColumns: "repeat(2, minmax(0, 1fr))" }}>
-              <label className="grid gap-1 text-[12.5px] font-medium">Name
-                <input className="input" value={name} onChange={e => setName(e.target.value)} />
-              </label>
-              <label className="grid gap-1 text-[12.5px] font-medium">Model
-                <select className="input" value={model} onChange={e => setModel(e.target.value)}>
-                  {MODELS.map(option => <option key={option} value={option}>{option}</option>)}
-                </select>
-              </label>
-              <label className="grid gap-1 text-[12.5px] font-medium">Project
-                <select className="input" value={projectId} onChange={e => setProjectId(e.target.value)}>
-                  <option value="">Workspace only</option>
-                  {projects.map(project => <option key={project.id} value={project.id}>{project.name}</option>)}
-                </select>
-              </label>
-              <label className="grid gap-1 text-[12.5px] font-medium">Autonomy
-                <select className="input" value={autonomy} onChange={e => setAutonomy(e.target.value)}>
-                  <option value="manual">Manual</option>
-                  <option value="supervised">Supervised</option>
-                  <option value="approval_required">Approval required</option>
-                  <option value="autonomous">Autonomous by policy</option>
-                </select>
-              </label>
-              <label className="grid gap-1 text-[12.5px] font-medium">Tool grants
-                <input className="input" data-testid="agent-tool-grants" value={tools} onChange={e => setTools(e.target.value)} />
-              </label>
-              <label className="grid gap-1 text-[12.5px] font-medium">Connector grants
-                <input className="input" data-testid="agent-connector-grants" value={connectors} onChange={e => setConnectors(e.target.value)} />
-              </label>
-              <label className="grid gap-1 text-[12.5px] font-medium">Memory scope
-                <select className="input" data-testid="agent-memory-scope" value={memoryScope} onChange={e => setMemoryScope(e.target.value)}>
-                  <option value="personal">Personal</option>
-                  <option value="project">Project</option>
-                  <option value="workspace">Workspace</option>
-                  <option value="org">Organization</option>
-                  <option value="task">Task scratchpad</option>
-                </select>
-              </label>
-              <label className="flex items-center gap-2 text-[12.5px] font-medium pt-6">
-                <input type="checkbox" checked={scheduleAllowed} onChange={e => setScheduleAllowed(e.target.checked)} />
-                Schedule permission
-              </label>
-            </section>
-
-            <label className="grid gap-1 text-[12.5px] font-medium">Instructions
-              <textarea className="input min-h-[120px]" value={instructions} onChange={e => setInstructions(e.target.value)} />
-            </label>
+            ))}
+            {!loading && filtered.length === 0 && (
+              <div className="text-[13px] p-3" style={{ color: "var(--text-dim)" }}>No agents match your search.</div>
+            )}
           </div>
         </main>
 
         <aside className="surface border border-soft rounded-lg min-h-0 overflow-y-auto">
           <div className="px-4 py-3 border-b hairline">
             <div className="text-[14px] font-medium truncate">{selected?.name || "No agent selected"}</div>
-            <div className="text-[12px] truncate" style={{ color: "var(--text-dim)" }}>{selected?.role || "Create a profile to run and publish."}</div>
+            <div className="text-[12px] truncate" style={{ color: "var(--text-dim)" }}>{selected?.role || "Add an agent from the catalog to run and publish."}</div>
           </div>
 
           <div className="p-4 space-y-5">
             <section data-testid="agent-policy-summary">
               <div className="text-[12.5px] font-medium">Policy</div>
               <div className="mt-2 rounded-md border border-soft p-3 text-[12px] space-y-1" style={{ color: "var(--text-dim)" }}>
-                <div>Autonomy: {selected?.autonomy_level || autonomy}</div>
-                <div>Approvals: risky writes and external replies</div>
-                <div>Memory: {(selected?.memory_scopes || [{ scope: memoryScope }]).map(scope => scope.scope).join(", ")}</div>
-                <div>Schedules: {String(selected?.schedule_permissions?.allowed ?? scheduleAllowed)}</div>
+                <div>Autonomy: {selected?.autonomy_level || "—"}</div>
+                <div>Tools: {(selected?.tool_grants || []).join(", ") || "—"}</div>
+                <div>Memory: {(selected?.memory_scopes || []).map(scope => scope.scope).join(", ") || "—"}</div>
               </div>
             </section>
 
@@ -353,6 +327,10 @@ export default function AgentsScreen() {
               <input className="input mt-2" value={externalChannel} onChange={e => setExternalChannel(e.target.value)} placeholder="Channel, address, embed, or API key label" />
               <button className="btn btn-ghost btn-sm mt-2 w-full" onClick={publishAgent} disabled={busy || !selected}>Publish target</button>
             </section>
+
+            {selected && (
+              <button className="btn btn-ghost btn-sm w-full" style={{ color: "var(--danger)" }} onClick={removeAgent} disabled={busy}>Remove agent</button>
+            )}
           </div>
         </aside>
       </div>

@@ -144,6 +144,20 @@ export function ArtifactDetail({ artifactId, onChanged, onDeleted }: { artifactI
 
   useEffect(() => { if (tab === "versions" || tab === "diff") void loadVersions(); }, [tab, loadVersions]);
 
+  // Live versioning: when the agent writes a new version of the artifact that's
+  // open, refresh the preview/version list in place (Claude-style), but never
+  // clobber an in-progress manual edit.
+  useEffect(() => {
+    function onUpdated(e: Event) {
+      const id = (e as CustomEvent<{ id: string }>).detail?.id;
+      if (id !== artifactId || tab === "edit") return;
+      void load();
+      if (tab === "versions" || tab === "diff") void loadVersions();
+    }
+    window.addEventListener("chronos:artifact-updated", onUpdated as EventListener);
+    return () => window.removeEventListener("chronos:artifact-updated", onUpdated as EventListener);
+  }, [artifactId, tab, load, loadVersions]);
+
   async function save() { setBusy(true); try { await editArtifact(artifactId, draft, "manual edit"); await load(); onChanged(); setTab("preview"); } finally { setBusy(false); } }
   async function aiEdit() { if (!aiInstruction.trim()) return; setBusy(true); try { await aiEditArtifact(artifactId, aiInstruction); setAiInstruction(""); await load(); onChanged(); setTab("preview"); } finally { setBusy(false); } }
   async function restore(v: number) { setBusy(true); try { await restoreVersion(artifactId, v); await load(); await loadVersions(); onChanged(); } finally { setBusy(false); } }

@@ -34,9 +34,8 @@ const FALLBACK_DEV_AUTH_CONFIG: AuthConfig = {
 
 export default function LoginPage() {
   const router = useRouter();
-  const [email, setEmail] = useState("admin@example.com");
+  const [email, setEmail] = useState("");
   const [code, setCode] = useState("");
-  const [devCode, setDevCode] = useState("");
   const [requested, setRequested] = useState(false);
   const [error, setError] = useState("");
   const [authConfig, setAuthConfig] = useState<AuthConfig | null>(null);
@@ -64,8 +63,6 @@ export default function LoginPage() {
       setError(await res.text());
       return;
     }
-    const data = await res.json();
-    setDevCode(typeof data.dev_code === "string" ? data.dev_code : "");
     setRequested(true);
   }
 
@@ -138,7 +135,7 @@ export default function LoginPage() {
             ? "Loading sign-in options…"
             : cognitoEnabled
               ? "Sign in with your organization account."
-              : "Sign in with your email to receive a one-time code. (Development mode: the code also appears in the server logs.)"}
+              : "Sign in with your email to receive a one-time code."}
         </p>
 
         {!authConfig && (
@@ -188,7 +185,7 @@ export default function LoginPage() {
             {cognitoEnabled ? (
               <div className="my-6 flex items-center gap-3">
                 <div className="h-px flex-1" style={{ background: "var(--border)" }} />
-                <span className="text-xs" style={{ color: "var(--text-dim)" }}>or dev OTP</span>
+                <span className="text-xs" style={{ color: "var(--text-dim)" }}>or one-time code</span>
                 <div className="h-px flex-1" style={{ background: "var(--border)" }} />
               </div>
             ) : null}
@@ -203,11 +200,6 @@ export default function LoginPage() {
                   type="email"
                 />
               </label>
-              {devCode ? (
-                <div className="rounded-[var(--r-sm)] border px-3 py-2 text-[13px]" style={{ borderColor: "var(--border-soft)", background: "var(--surface-2)", color: "var(--text-muted)" }}>
-                  Dev OTP: <span className="font-mono font-semibold" style={{ color: "var(--text)" }}>{devCode}</span>
-                </div>
-              ) : null}
               {requested ? (
                 <label className="block">
                   <span className="text-[13px] font-medium" style={{ color: "var(--text-muted)" }}>OTP</span>

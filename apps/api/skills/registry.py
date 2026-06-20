@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 
 def _runtime_root() -> Path:
     current = Path(__file__).resolve()
     for parent in current.parents:
-        if (parent / "skills").is_dir() and any((parent / "skills").glob("*/metadata.json")):
+        skills_dir = parent / "skills"
+        if skills_dir.is_dir() and (
+            any(skills_dir.glob("*/SKILL.md")) or any(skills_dir.glob("*/metadata.json"))
+        ):
             return parent
         if (parent / "apps" / "api").exists():
             return parent
@@ -20,28 +26,77 @@ def _runtime_root() -> Path:
 ROOT = _runtime_root()
 SKILLS_ROOT = ROOT / "skills"
 
+_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
+
+
+def parse_skill_frontmatter(content: str) -> dict[str, Any]:
+    """Parse the YAML frontmatter from a SKILL.md body (Claude's canonical format).
+
+    Returns the parsed mapping, or an empty dict when no valid frontmatter exists.
+    """
+    match = _FRONTMATTER_RE.match(content)
+    if not match:
+        return {}
+    try:
+        data = yaml.safe_load(match.group(1)) or {}
+    except yaml.YAMLError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _read_skill_metadata(skill_dir: Path) -> dict[str, Any] | None:
+    """Resolve a skill's Level-1 metadata.
+
+    Precedence mirrors Claude: the SKILL.md YAML frontmatter (``name``,
+    ``description``) is canonical. metadata.json supplements it for Chronos-only
+    fields (requires_connectors, spawns_sub_agent) and provides backward-compat
+    for skills authored before the frontmatter convention.
+    """
+    skill_md = skill_dir / "SKILL.md"
+    meta_json = skill_dir / "metadata.json"
+    if not skill_md.exists() and not meta_json.exists():
+        return None
+
+    frontmatter: dict[str, Any] = {}
+    if skill_md.exists():
+        try:
+            frontmatter = parse_skill_frontmatter(skill_md.read_text())
+        except OSError:
+            frontmatter = {}
+
+    legacy: dict[str, Any] = {}
+    if meta_json.exists():
+        try:
+            legacy = json.loads(meta_json.read_text())
+        except json.JSONDecodeError:
+            legacy = {}
+
+    skill_id = str(frontmatter.get("name") or legacy.get("id") or skill_dir.name)
+    name = str(frontmatter.get("name") or legacy.get("name") or skill_dir.name)
+    description = str(frontmatter.get("description") or legacy.get("description") or "")
+    return {
+        "id": skill_id,
+        "name": name,
+        "description": description,
+        "path": str(skill_dir),
+        "requires_connectors": list(
+            frontmatter.get("requires_connectors") or legacy.get("requires_connectors") or []
+        ),
+        "spawns_sub_agent": bool(
+            frontmatter.get("spawns_sub_agent", legacy.get("spawns_sub_agent", False))
+        ),
+    }
+
 
 @lru_cache
 def load_skill_index() -> list[dict[str, Any]]:
     index: list[dict[str, Any]] = []
     if not SKILLS_ROOT.exists():
         return index
-    for meta_path in sorted(SKILLS_ROOT.glob("*/metadata.json")):
-        try:
-            meta = json.loads(meta_path.read_text())
-        except json.JSONDecodeError:
-            continue
-        skill_id = str(meta.get("id") or meta_path.parent.name)
-        index.append(
-            {
-                "id": skill_id,
-                "name": str(meta.get("name") or skill_id),
-                "description": str(meta.get("description") or ""),
-                "path": str(meta_path.parent),
-                "requires_connectors": list(meta.get("requires_connectors") or []),
-                "spawns_sub_agent": bool(meta.get("spawns_sub_agent", False)),
-            }
-        )
+    for skill_dir in sorted(p for p in SKILLS_ROOT.iterdir() if p.is_dir()):
+        meta = _read_skill_metadata(skill_dir)
+        if meta is not None:
+            index.append(meta)
     return index
 
 

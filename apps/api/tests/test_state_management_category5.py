@@ -139,6 +139,13 @@ async def test_load_history_injects_inherited_block_then_goal(monkeypatch):
 
     monkeypatch.setattr(agent_loop, "_agent_system_message", fake_system)
 
+    import skills.loader as skills_loader
+
+    async def no_skills(goal, org_id="default", top_k=2):
+        return ""
+
+    monkeypatch.setattr(skills_loader, "build_agent_skills_block", no_skills)
+
     task = {
         "goal": "qualify the leads",
         "agent_state": {
@@ -162,6 +169,13 @@ async def test_load_history_no_block_without_inheritance(monkeypatch):
         return {"role": "system", "content": "sys"}
 
     monkeypatch.setattr(agent_loop, "_agent_system_message", fake_system)
+
+    import skills.loader as skills_loader
+
+    async def no_skills(goal, org_id="default", top_k=2):
+        return ""
+
+    monkeypatch.setattr(skills_loader, "build_agent_skills_block", no_skills)
 
     history = await agent_loop._load_history({"goal": "just do it", "agent_state": {}})
 

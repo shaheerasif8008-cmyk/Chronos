@@ -7,7 +7,7 @@ test("workflows screen: static route and phase 12 API guard", async () => {
   expect(pageSrc).toContain("<WorkflowsScreen");
   expect(pageSrc).toContain('route === "workflows"');
   expect(pageSrc).toContain('pathname === "/workflows"');
-  expect(pageSrc).toContain('label: "Workflows"');
+  expect(pageSrc).toContain('label: "Routines"');
   expect(pageSrc).not.toContain('route === "workflows"  && <EmptyPanel label="Workflows" />');
 
   const routeSrc = fs.readFileSync(path.join(process.cwd(), "app/workflows/page.tsx"), "utf8");

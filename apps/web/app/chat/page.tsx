@@ -5,6 +5,8 @@ import { usePathname, useRouter } from "next/navigation";
 import ArtifactsScreen from "../../components/artifacts/ArtifactsScreen";
 import AgentsScreen from "../../components/agents/AgentsScreen";
 import InChatArtifactPanel from "../../components/artifacts/InChatArtifactPanel";
+import { classifyRenderer } from "../../components/artifacts/ArtifactRenderer";
+import ComputerLiveView from "../../components/computer/ComputerLiveView";
 import SkillsScreen from "../../components/skills/SkillsScreen";
 import ResearchScreen from "../../components/research/ResearchScreen";
 import BrowserOperatorScreen from "../../components/browser/BrowserOperatorScreen";
@@ -1061,6 +1063,7 @@ function ChronosAppInner() {
         {route === "audit"      && <AuditScreen />}
       </main>
       <InChatArtifactPanel />
+      <ComputerLiveView />
       {agentMenuOpen && <AgentMenuModal onClose={() => setAgentMenuOpen(false)} />}
       {shellNotice && (
         <div
@@ -1121,7 +1124,7 @@ function Sidebar({
     ]},
     { label: "Build", items: [
       { id: "skills",     icon: <IC.Sparkles size={15}/>,   label: "Skills" },
-      { id: "workflows",  icon: <IC.Refresh size={15}/>,    label: "Workflows" },
+      { id: "workflows",  icon: <IC.Refresh size={15}/>,    label: "Routines" },
       { id: "connectors", icon: <IC.Connectors size={15}/>, label: "Connectors" },
     ]},
   ];
@@ -1437,6 +1440,8 @@ function ChatScreen({
   const [activeTaskStreamError, setActiveTaskStreamError] = useState("");
   const [browserSessions, setBrowserSessions] = useState<BrowserSession[]>([]);
   const [computerSessions, setComputerSessions] = useState<ComputerSession[]>([]);
+  // Artifacts we've already auto-popped open, so live re-streams don't reopen them.
+  const autoOpenedArtifactsRef = useRef<Set<string>>(new Set());
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [personaMenuOpen, setPersonaMenuOpen] = useState(false);
@@ -1474,13 +1479,23 @@ function ChatScreen({
   }, []);
 
   const loadOperations = useCallback(async () => {
-    const [browserRows, computerRows] = await Promise.all([
-      apiFetch("/browser-sessions/").then(r => r.json()).catch(() => []),
+    // Scope live work to the current task so the panel follows the active job
+    // (Manus-style) instead of surfacing a stale session from an old chat.
+    const browserUrl = activeTaskId
+      ? `/browser-sessions/?task_id=${encodeURIComponent(activeTaskId)}`
+      : "/browser-sessions/";
+    let [browserRows, computerRows] = await Promise.all([
+      apiFetch(browserUrl).then(r => r.json()).catch(() => []),
       apiFetch("/computer-sessions/").then(r => r.json()).catch(() => []),
     ]) as [BrowserSession[], ComputerSession[]];
+    // If the active task has no session yet, fall back to the most recent ones
+    // globally so manually opened/standalone sessions still appear.
+    if (activeTaskId && Array.isArray(browserRows) && browserRows.length === 0) {
+      browserRows = await apiFetch("/browser-sessions/").then(r => r.json()).catch(() => []) as BrowserSession[];
+    }
     setBrowserSessions(browserRows);
     setComputerSessions(computerRows);
-  }, []);
+  }, [activeTaskId]);
 
   useEffect(() => {
     void loadOperations();
@@ -2309,6 +2324,16 @@ function ChatScreen({
           if (existing.some(x => x.id === ref.id)) return updated;
           return [...updated.slice(0, -1), { ...last, artifacts: [...existing, ref] }];
         });
+        // Claude-style: pop the artifact open live the first time it appears, so
+        // the user sees what was built without hunting for an "Open" button.
+        // Only auto-open previewable artifacts (not plain downloads/binaries).
+        if (!autoOpenedArtifactsRef.current.has(ref.id) && classifyRenderer(ref.kind ?? "file", ref.mime_type ?? null) !== "download") {
+          autoOpenedArtifactsRef.current.add(ref.id);
+          window.dispatchEvent(new CustomEvent("chronos:open-artifact", { detail: { id: ref.id } }));
+        }
+        // Live versioning: if this artifact is already open in the panel, refresh it
+        // to the new version in place.
+        window.dispatchEvent(new CustomEvent("chronos:artifact-updated", { detail: { id: ref.id } }));
       } else if (ev.type === "structured_response" && ev.structured_response) {
         const sr = ev.structured_response;
         setMessages(prev => {
@@ -4028,13 +4053,22 @@ function LiveOperationsDrawer({
   onRefresh: () => void;
   onClose: () => void;
 }) {
-  const [activeBrowserId, setActiveBrowserId] = useState<string | null>(browserSessions[0]?.id ?? null);
+  // A session is "live" while the agent is driving it or waiting for takeover.
+  // Default to a live session so the feed follows the current job rather than a
+  // stale ended session's last screenshot (the "stuck on an old page" bug).
+  const isLive = (session: BrowserSession) => session.status === "active" || session.takeover_state === "requested";
+  const liveBrowsers = browserSessions.filter(isLive);
+  const [activeBrowserId, setActiveBrowserId] = useState<string | null>(liveBrowsers[0]?.id ?? null);
   const [handBackSummary, setHandBackSummary] = useState("");
-  const activeBrowser = browserSessions.find(session => session.id === activeBrowserId) ?? browserSessions[0] ?? null;
-  const activeComputer = computerSessions.find(session => session.status === "active") ?? computerSessions[0] ?? null;
+  const activeBrowser = browserSessions.find(session => session.id === activeBrowserId) ?? liveBrowsers[0] ?? null;
+  const activeComputer = computerSessions.find(session => session.status === "active") ?? null;
 
   useEffect(() => {
-    setActiveBrowserId(current => current && browserSessions.some(session => session.id === current) ? current : browserSessions[0]?.id ?? null);
+    setActiveBrowserId(current =>
+      current && browserSessions.some(session => session.id === current)
+        ? current
+        : browserSessions.filter(isLive)[0]?.id ?? null,
+    );
   }, [browserSessions]);
 
   async function postBrowser(path: string, body?: Record<string, unknown>) {
@@ -4121,9 +4155,12 @@ function LiveOperationsDrawer({
         </section>
 
         <section className="rounded-xl border border-soft overflow-hidden">
-          <div className="px-3 py-2 border-b hairline flex items-center justify-between">
+          <div className="px-3 py-2 border-b hairline flex items-center justify-between gap-2">
             <div className="flex items-center gap-2 text-[13px] font-medium"><IC.Briefcase size={14}/> Computer</div>
-            <Tag variant={activeComputer?.status === "active" ? "accent" : activeComputer?.status === "degraded" ? "warn" : "default"}>{activeComputer?.status || "No session"}</Tag>
+            <div className="flex items-center gap-2">
+              <button className="btn btn-ghost btn-sm" onClick={() => window.dispatchEvent(new CustomEvent("chronos:open-computer", { detail: { id: activeComputer?.id } }))}>Open full view</button>
+              <Tag variant={activeComputer?.status === "active" ? "accent" : activeComputer?.status === "degraded" ? "warn" : "default"}>{activeComputer?.status || "No session"}</Tag>
+            </div>
           </div>
           <div className="p-3">
             <div className="rounded-lg border border-soft overflow-hidden bg-black" style={{ aspectRatio: "16 / 10" }}>
@@ -6658,6 +6695,7 @@ type Phase12Schedule = {
   trigger_event_type?: string | null;
 };
 
+type ScheduleRun = { id: string; task_id?: string | null; status?: string | null; trigger_source?: string | null; created_at?: string | null; evidence?: Record<string, unknown> };
 type Phase12Workflow = { id: string; name: string; description?: string; status?: string; definition?: { steps?: Array<Record<string, unknown>> } };
 type Phase12Run = { id: string; workflow_id: string; status: string; trigger_source?: string; trigger_event_type?: string | null; updated_at?: string; created_at?: string };
 type Phase12Trigger = { id: string; workflow_id: string; trigger_type: string; source?: string; event_type?: string; status?: string; config?: Record<string, unknown> };
@@ -6674,8 +6712,13 @@ function WorkflowsScreen() {
   const [loading, setLoading] = useState(true);
   const [toast, setToast] = useState<{ kind: "ok" | "danger"; text: string } | null>(null);
   const [scheduleName, setScheduleName] = useState("Daily brief");
-  const [scheduleGoal, setScheduleGoal] = useState("Prepare a daily operations digest.");
+  const [scheduleGoal, setScheduleGoal] = useState("Prepare a daily operations digest of what changed since yesterday.");
   const [scheduleKind, setScheduleKind] = useState("daily");
+  const [scheduleTime, setScheduleTime] = useState("09:00");
+  const [scheduleCron, setScheduleCron] = useState("0 9 * * 1-5");
+  const [creatingRoutine, setCreatingRoutine] = useState(false);
+  const [expandedRoutine, setExpandedRoutine] = useState<string | null>(null);
+  const [routineRuns, setRoutineRuns] = useState<Record<string, ScheduleRun[]>>({});
   const [workflowName, setWorkflowName] = useState("Source monitor workflow");
   const [monitorName, setMonitorName] = useState("Pricing page monitor");
   const [monitorTarget, setMonitorTarget] = useState("https://example.com/pricing");
@@ -6715,19 +6758,77 @@ function WorkflowsScreen() {
   useEffect(() => { void load(); }, [load]);
 
   async function createSchedule() {
+    if (!scheduleGoal.trim()) { setToast({ kind: "danger", text: "Add an instruction for the routine." }); return; }
+    setCreatingRoutine(true);
     try {
-      const body: Record<string, unknown> = { name: scheduleName, goal: scheduleGoal, schedule_kind: scheduleKind, enabled: true, status: "active" };
-      if (scheduleKind === "daily") body.time_of_day = "09:00";
-      if (scheduleKind === "weekly") { body.day_of_week = "monday"; body.time_of_day = "09:00"; }
-      if (scheduleKind === "monthly") { body.day_of_month = 1; body.time_of_day = "09:00"; }
-      if (scheduleKind === "interval") body.interval_seconds = 3600;
-      if (scheduleKind === "one_time") body.run_at = new Date(Date.now() + 3600_000).toISOString();
-      if (scheduleKind === "webhook" || scheduleKind === "connector_trigger") { body.trigger_source = scheduleKind === "webhook" ? "webhooks" : "gmail"; body.trigger_event_type = scheduleKind === "webhook" ? "event.received" : "message.created"; }
+      const [hh, mm] = (scheduleTime || "09:00").split(":");
+      const cronHour = String(Number(hh) || 0);
+      const cronMin = String(Number(mm) || 0);
+      const body: Record<string, unknown> = { name: scheduleName, goal: scheduleGoal, enabled: true, status: "active" };
+      // Map Claude-style presets onto the schedules backend.
+      if (scheduleKind === "hourly") { body.schedule_kind = "interval"; body.interval_seconds = 3600; }
+      else if (scheduleKind === "daily") { body.schedule_kind = "daily"; body.time_of_day = scheduleTime; }
+      else if (scheduleKind === "weekdays") { body.schedule_kind = "cron"; body.cron = `${cronMin} ${cronHour} * * 1-5`; }
+      else if (scheduleKind === "weekly") { body.schedule_kind = "weekly"; body.day_of_week = "monday"; body.time_of_day = scheduleTime; }
+      else if (scheduleKind === "monthly") { body.schedule_kind = "monthly"; body.day_of_month = 1; body.time_of_day = scheduleTime; }
+      else if (scheduleKind === "custom") { body.schedule_kind = "cron"; body.cron = scheduleCron.trim(); }
+      else if (scheduleKind === "one_time") { body.schedule_kind = "one_time"; body.run_at = new Date(Date.now() + 3600_000).toISOString(); }
+      else { body.schedule_kind = "daily"; body.time_of_day = scheduleTime; }
       await apiFetch("/schedules/", { method: "POST", body: JSON.stringify(body) });
-      setToast({ kind: "ok", text: "Schedule created" });
+      setToast({ kind: "ok", text: "Routine created" });
       await load();
     } catch (exc) {
-      setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to create schedule" });
+      setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to create routine" });
+    } finally {
+      setCreatingRoutine(false);
+    }
+  }
+
+  async function toggleRoutine(schedule: Phase12Schedule) {
+    const paused = schedule.enabled === false || schedule.status === "paused";
+    try {
+      await apiFetch(`/schedules/${schedule.id}`, { method: "PATCH", body: JSON.stringify({ enabled: paused, status: paused ? "active" : "paused" }) });
+      await load();
+    } catch (exc) {
+      setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to update routine" });
+    }
+  }
+
+  async function deleteRoutine(id: string) {
+    try {
+      await apiFetch(`/schedules/${id}`, { method: "DELETE" });
+      setToast({ kind: "ok", text: "Routine deleted" });
+      await load();
+    } catch (exc) {
+      setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to delete routine" });
+    }
+  }
+
+  async function loadRoutineRuns(id: string) {
+    try {
+      const runs = await apiFetch(`/schedules/${id}/runs`).then(r => r.json()) as ScheduleRun[];
+      setRoutineRuns(prev => ({ ...prev, [id]: runs }));
+    } catch {
+      setRoutineRuns(prev => ({ ...prev, [id]: [] }));
+    }
+  }
+
+  function toggleRoutineHistory(id: string) {
+    setExpandedRoutine(current => {
+      const next = current === id ? null : id;
+      if (next) void loadRoutineRuns(id);
+      return next;
+    });
+  }
+
+  async function runRoutineNow(id: string) {
+    try {
+      await apiFetch(`/schedules/${id}/run`, { method: "POST" });
+      setToast({ kind: "ok", text: "Routine run started" });
+      await load();
+      if (expandedRoutine === id) await loadRoutineRuns(id);
+    } catch (exc) {
+      setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to run routine" });
     }
   }
 
@@ -6802,8 +6903,8 @@ function WorkflowsScreen() {
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-y-auto">
       <PageHeader
-        title="Schedules"
-        subtitle="Create recurring or one-time instructions for Chronos, then run them manually or on a cadence."
+        title="Routines"
+        subtitle="Give Chronos a standing instruction and a schedule. It runs automatically in the background and saves each result — no need to keep a chat open."
         right={<button className="btn btn-secondary btn-sm" onClick={() => void load()}><IC.Refresh size={14}/> Refresh</button>}
       />
       <div className="px-10 pb-10 space-y-7">
@@ -6811,15 +6912,74 @@ function WorkflowsScreen() {
         {loading && <div className="text-[13px]" style={{ color: "var(--text-dim)" }}>Loading workflow state...</div>}
 
         <section data-testid="phase12-schedules">
-          <div className="flex items-center justify-between mb-3"><h2 className="text-[16px] font-semibold">Scheduled tasks</h2><div className="flex gap-2"><TextInput ariaLabel="Schedule name" value={scheduleName} onChange={setScheduleName}/><SelectInput ariaLabel="Schedule kind" value={scheduleKind} onChange={setScheduleKind} options={["one_time", "daily", "weekly", "monthly", "interval", "webhook", "connector_trigger"]}/><button className="btn btn-accent btn-sm" onClick={() => void createSchedule()}><IC.Plus size={14}/> Create</button></div></div>
-          <TextInput ariaLabel="Schedule goal" wide value={scheduleGoal} onChange={setScheduleGoal}/>
-          <div className="surface border border-soft rounded-xl overflow-hidden mt-3">
-            {schedules.length === 0 ? <EmptyState title="No schedules" sub="Create a scheduled task to run Chronos work on a cadence or external trigger."/> : schedules.map(schedule => (
-              <div key={schedule.id} className="px-5 py-4 border-b hairline last:border-b-0 flex items-center justify-between gap-4">
-                <div className="min-w-0"><div className="font-medium text-[14px]">{schedule.name || schedule.goal}</div><div className="text-[12px] mt-1" style={{ color: "var(--text-dim)" }}>{schedule.schedule_kind} · {schedule.status || (schedule.enabled ? "active" : "paused")} · next {fmtDate(schedule.next_run_at)}</div></div>
-                <div className="flex items-center gap-2"><Tag variant={schedule.enabled === false || schedule.status === "paused" ? "warn" : "ok"}>{schedule.status || "active"}</Tag><button className="btn btn-sm" onClick={() => void apiFetch(`/schedules/${schedule.id}/run`, { method: "POST" }).then(load)}>Run now</button></div>
+          <div className="surface border border-soft rounded-xl p-4 mb-4">
+            <div className="text-[14px] font-semibold mb-2">New routine</div>
+            <div className="grid gap-2.5">
+              <TextInput ariaLabel="Routine name" wide value={scheduleName} onChange={setScheduleName}/>
+              <textarea
+                aria-label="Routine instruction"
+                className="w-full px-3 py-2 rounded-lg border text-[13px] resize-none"
+                style={{ borderColor: "var(--border)", background: "var(--surface)", minHeight: 72 }}
+                placeholder="What should Chronos do each time this runs? e.g. Summarize my unread email and post the digest to Slack."
+                value={scheduleGoal}
+                onChange={e => setScheduleGoal(e.target.value)}
+              />
+              <div className="flex flex-wrap items-center gap-2">
+                <SelectInput ariaLabel="Schedule" value={scheduleKind} onChange={setScheduleKind} options={["hourly", "daily", "weekdays", "weekly", "monthly", "custom", "one_time"]}/>
+                {(scheduleKind === "daily" || scheduleKind === "weekdays" || scheduleKind === "weekly" || scheduleKind === "monthly") && (
+                  <input aria-label="Time of day" type="time" className="px-2.5 py-1.5 rounded-lg border text-[13px]" style={{ borderColor: "var(--border)", background: "var(--surface)" }} value={scheduleTime} onChange={e => setScheduleTime(e.target.value)} />
+                )}
+                {scheduleKind === "custom" && (
+                  <TextInput ariaLabel="Cron expression" value={scheduleCron} onChange={setScheduleCron}/>
+                )}
+                <button className="btn btn-accent btn-sm" disabled={creatingRoutine} onClick={() => void createSchedule()}><IC.Plus size={14}/> {creatingRoutine ? "Creating…" : "Create routine"}</button>
               </div>
-            ))}
+            </div>
+          </div>
+
+          <h2 className="text-[16px] font-semibold mb-3">Your routines</h2>
+          <div className="surface border border-soft rounded-xl overflow-hidden">
+            {schedules.length === 0 ? <EmptyState title="No routines yet" sub="Create a routine above to have Chronos run a standing instruction on a schedule."/> : schedules.map(schedule => {
+              const paused = schedule.enabled === false || schedule.status === "paused";
+              const open = expandedRoutine === schedule.id;
+              const runs = routineRuns[schedule.id] || [];
+              return (
+              <div key={schedule.id} className="border-b hairline last:border-b-0">
+                <div className="px-5 py-4 flex items-center justify-between gap-4">
+                  <div className="min-w-0">
+                    <div className="font-medium text-[14px]">{schedule.name || schedule.goal}</div>
+                    {schedule.name && <div className="text-[12.5px] mt-0.5 truncate" style={{ color: "var(--text-muted)" }}>{schedule.goal}</div>}
+                    <div className="text-[12px] mt-1" style={{ color: "var(--text-dim)" }}>{schedule.schedule_kind} · next {fmtDate(schedule.next_run_at)} · last {fmtDate(schedule.last_run_at)}</div>
+                  </div>
+                  <div className="flex items-center gap-2 flex-shrink-0">
+                    <Tag variant={paused ? "warn" : "ok"}>{paused ? "paused" : "active"}</Tag>
+                    <button className="btn btn-sm" onClick={() => void runRoutineNow(schedule.id)}>Run now</button>
+                    <button className="btn btn-sm" onClick={() => void toggleRoutine(schedule)}>{paused ? "Resume" : "Pause"}</button>
+                    <button className="btn btn-sm" onClick={() => toggleRoutineHistory(schedule.id)}>{open ? "Hide" : "History"}</button>
+                    <button className="btn btn-sm" style={{ color: "var(--danger)" }} onClick={() => void deleteRoutine(schedule.id)}>Delete</button>
+                  </div>
+                </div>
+                {open && (
+                  <div className="px-5 pb-4">
+                    <div className="rounded-lg border border-soft overflow-hidden">
+                      {runs.length === 0 ? (
+                        <div className="px-4 py-3 text-[12.5px]" style={{ color: "var(--text-dim)" }}>No runs yet. Use “Run now” to trigger one.</div>
+                      ) : runs.map(run => (
+                        <div key={run.id} className="px-4 py-2.5 border-b hairline last:border-b-0 flex items-center justify-between gap-3">
+                          <div className="min-w-0">
+                            <div className="text-[12.5px]">{run.trigger_source || "scheduled"} · {fmtDate(run.created_at)}</div>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <Tag variant={run.status === "failed" ? "danger" : run.status === "success" || run.status === "completed" ? "ok" : "info"}>{run.status || "pending"}</Tag>
+                            {run.task_id && <button className="btn btn-sm" onClick={() => { window.location.href = "/activity"; }}>View result</button>}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            );})}
           </div>
         </section>
 
