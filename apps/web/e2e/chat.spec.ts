@@ -25,14 +25,12 @@ test("chat: send a message, stream a reply, and persist it", async ({ page }) =>
     page.evaluate(async (sentPrompt) => {
       const port = Number(window.location.port || "3001");
       const apiBase = `http://${window.location.hostname}:${8000 + (port - 3000)}`;
-      const token = localStorage.getItem("chronos_token") ?? "";
-      const auth = { Authorization: `Bearer ${token}` };
 
-      const convos = await (await fetch(`${apiBase}/chat/conversations`, { headers: auth })).json();
+      const convos = await (await fetch(`${apiBase}/chat/conversations`, { credentials: "include" })).json();
       if (!Array.isArray(convos)) return false;
       for (const c of convos.slice(0, 5)) {
         const msgs = await (
-          await fetch(`${apiBase}/chat/conversations/${c.id}/messages`, { headers: auth })
+          await fetch(`${apiBase}/chat/conversations/${c.id}/messages`, { credentials: "include" })
         ).json();
         const hasUser = msgs.some(
           (m: any) => m.role === "user" && (m.content ?? "").includes(sentPrompt),

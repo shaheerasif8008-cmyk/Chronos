@@ -10,7 +10,7 @@ import json
 import secrets
 from typing import Any
 
-from sqlalchemy import insert, select
+from sqlalchemy import delete as sa_delete, insert, select
 
 from core import audit
 from core.config import settings
@@ -135,6 +135,14 @@ async def update(vault_ref: str, credentials: dict[str, Any], actor_id: str = "s
 
 
 async def delete(vault_ref: str, actor_id: str, org_id: str = "default") -> None:
-    """Soft-delete by removing from Redis; Postgres record is retained for audit."""
+    """Delete cached and durable encrypted credentials for a disconnected connector."""
     await redis_client.delete(f"vault:data:{vault_ref}")
+    vault_entries = await reflect_table("vault_entries")
+    async with engine.begin() as conn:
+        await conn.execute(
+            sa_delete(vault_entries).where(
+                vault_entries.c.organization_id == org_id,
+                vault_entries.c.vault_ref == vault_ref,
+            )
+        )
     await audit.log("vault_delete", actor_id, "vault.delete", organization_id=org_id, resource_type="vault_entries", resource_id=vault_ref)

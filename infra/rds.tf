@@ -50,12 +50,12 @@ resource "aws_db_instance" "main" {
   parameter_group_name   = aws_db_parameter_group.postgres15.name
 
   multi_az                     = var.db_multi_az
-  backup_retention_period      = 0
+  backup_retention_period      = 14
   backup_window                = "03:00-04:00"
   maintenance_window           = "sun:04:00-sun:05:00"
   auto_minor_version_upgrade   = true
   deletion_protection          = true
-  skip_final_snapshot          = true
+  skip_final_snapshot          = false
   final_snapshot_identifier    = "${local.prefix}-final-snapshot"
   performance_insights_enabled = false
 

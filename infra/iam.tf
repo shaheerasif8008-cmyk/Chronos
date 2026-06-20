@@ -104,11 +104,10 @@ resource "aws_iam_role" "github_deploy" {
       Principal = { Federated = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:oidc-provider/token.actions.githubusercontent.com" }
       Action    = "sts:AssumeRoleWithWebIdentity"
       Condition = {
-        StringLike = {
-          "token.actions.githubusercontent.com:sub" = "repo:${var.github_org}/${var.github_repo}:*"
-        }
         StringEquals = {
-          "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+          "token.actions.githubusercontent.com:aud"          = "sts.amazonaws.com"
+          "token.actions.githubusercontent.com:sub"          = "repo:${var.github_org}/${var.github_repo}:ref:refs/heads/main"
+          "token.actions.githubusercontent.com:workflow_ref" = "${var.github_org}/${var.github_repo}/.github/workflows/deploy-aws.yml@refs/heads/main"
         }
       }
     }]
@@ -160,12 +159,6 @@ resource "aws_iam_role_policy" "github_deploy" {
         Effect   = "Allow"
         Action   = "iam:PassRole"
         Resource = [aws_iam_role.ecs_execution.arn, aws_iam_role.ecs_task.arn]
-      },
-      {
-        Sid      = "SecretsRead"
-        Effect   = "Allow"
-        Action   = ["secretsmanager:GetSecretValue"]
-        Resource = "arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:${local.prefix}/*"
       },
     ]
   })

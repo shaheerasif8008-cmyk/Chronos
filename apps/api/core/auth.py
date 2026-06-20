@@ -2,7 +2,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import jwt
-from fastapi import Depends, HTTPException
+from fastapi import Cookie, Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 
@@ -41,12 +41,14 @@ def create_access_token(member_id: str) -> str:
 
 async def get_current_member(
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
+    chronos_session: str | None = Cookie(default=None),
 ) -> Member:
-    if credentials is None:
-        raise HTTPException(status_code=401, detail="Missing bearer token")
+    token = credentials.credentials if credentials is not None else chronos_session
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing session token")
     try:
         payload = jwt.decode(
-            credentials.credentials,
+            token,
             settings.jwt_secret,
             algorithms=["HS256"],
             options={"require": ["exp", "sub"]},

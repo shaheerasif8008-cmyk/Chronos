@@ -72,14 +72,14 @@ export default function LoginPage() {
     const res = await fetch(`${apiBase()}/auth/verify-otp`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      credentials: "include",
       body: JSON.stringify({ email, code }),
     });
     if (!res.ok) {
       setError(await res.text());
       return;
     }
-    const data = await res.json();
-    localStorage.setItem("chronos_token", data.access_token);
+    await res.json();
     router.push("/chat");
   }
 

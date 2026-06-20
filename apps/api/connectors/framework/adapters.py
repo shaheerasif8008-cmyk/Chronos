@@ -224,13 +224,23 @@ class BrowserAdapter:
 
     async def execute(self, action_name: str, args: dict[str, Any], context: dict[str, Any]) -> ConnectorResult:
         tool = f"browser.{action_name}"
+        actor = context.get("actor") if isinstance(context, dict) else None
+        if isinstance(actor, dict):
+            scoped_args = {
+                **dict(args),
+                "__org_id": actor.get("org_id") or actor.get("organization_id") or "default",
+                "__member_id": actor.get("member_id") or actor.get("id") or "chronos",
+                "__task_id": actor.get("task_id") or actor.get("id"),
+            }
+        else:
+            scoped_args = dict(args)
         try:
             if action_name in {"search", "fetch", "extract_contacts"}:
                 from connectors.browser import browser_connector
-                result = await browser_connector.execute(tool, dict(args))
+                result = await browser_connector.execute(tool, scoped_args)
             else:
                 from connectors.browser_operator import browser_operator
-                result = await browser_operator.execute(tool, dict(args))
+                result = await browser_operator.execute(tool, scoped_args)
         except ValueError as exc:
             return ConnectorResult(status="validation_error", error=str(exc))
         return ConnectorResult(status="success", output={"summary": result.summary, "data": result.data})

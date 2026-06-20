@@ -16,9 +16,11 @@ Two enforcement layers, both ON BY DEFAULT:
    (``permissions_enforce`` defaults true, so configuring the engine is enough).
    When the engine is unreachable, these checks fail CLOSED.
 
-Actions that don't map to either layer (generic checks, ``use_tool:*``) are
-allowed and audited. Internal/system actors (the agent runtime, schedulers, sync
-jobs) bypass FGA; the broker's own safety limits still apply to their tool calls.
+Actions that don't map to either layer are only allowed for low-risk generic
+checks such as ``use_tool:*``. Sensitive router/governance actions must be
+listed in the deterministic role gates below; otherwise they fail closed.
+Internal/system actors (the agent runtime, schedulers, sync jobs) bypass FGA;
+the broker's own safety limits still apply to their tool calls.
 """
 from __future__ import annotations
 
@@ -58,7 +60,7 @@ _WORKSPACE_MANAGE_ACTIONS = {
 # governance gate. It is enforced deterministically by role — independent of
 # OpenFGA — so the guarantee "an unauthorized user cannot approve" holds even
 # when no policy engine is configured. Only these roles may decide.
-_APPROVAL_DECISION_ACTIONS = {"decide_approval"}
+_APPROVAL_DECISION_ACTIONS = {"decide_approval", "resolve_connector_approval"}
 _APPROVER_ROLES = {"admin", "owner", "approver"}
 
 # Admin-only governance mutations. Like approval decisions, these are enforced
@@ -74,8 +76,159 @@ _ADMIN_ACTIONS = {
     "export_evidence",
     "manage_sso",
     "manage_scim",
+    "list_memory",
+    "export_memory",
+    "list_audit_log",
+    "export_audit_log",
+    "list_connector_execution_logs",
+    "list_connector_approvals",
+    "list_connector_health",
+    "list_connector_execution_traces",
+    "get_connector_execution_trace",
+    "list_connector_execution_jobs",
+    "cancel_connector_execution_job",
+    "create_connector_plan",
+    "execute_connector_plan",
+    "register_mcp_server",
+    "discover_mcp_server",
+    "create_connector_policy",
+    "delete_connector_policy",
+    "install_connector",
+    "disable_connector",
+    "grant_connector_permission",
+    "revoke_connector_permission",
 }
 _ADMIN_ROLES = {"admin", "owner"}
+_GENERIC_ALLOWED_PREFIXES = ("use_tool:", "connect_", "disconnect_")
+_GENERIC_ALLOWED_ACTIONS = {
+    "chat",
+    "admin",
+    "agent",
+    "approver",
+    "owner",
+    "source_sync",
+    "user",
+    "analyze_dataset",
+    "apply_context_suggestion",
+    "approve_browser_sensitive_site",
+    "cancel_research",
+    "cancel_task",
+    "cancel_workflow_run",
+    "close_browser_session",
+    "close_desktop_session",
+    "complete_workflow_step",
+    "connect_gmail",
+    "connect_{provider}",
+    "create_agent",
+    "create_browser_session",
+    "create_computer_session",
+    "create_dataset",
+    "create_desktop_session",
+    "create_local_computer_grant",
+    "create_memory",
+    "create_monitor",
+    "create_project",
+    "create_research",
+    "create_schedule",
+    "create_task",
+    "create_workflow",
+    "create_workflow_trigger",
+    "delete_memory",
+    "delete_schedule",
+    "disconnect_{provider}",
+    "dispatch_workflow_event",
+    "evaluate_monitor",
+    "execute_connector_action",
+    "generate_context_suggestion",
+    "get_autonomy",
+    "get_dataset",
+    "get_workflow_run",
+    "hand_back_browser_session",
+    "list_activity_actions",
+    "list_agents",
+    "list_approvals",
+    "list_browser_sessions",
+    "list_chat_models",
+    "list_chat_modes",
+    "list_computer_sessions",
+    "list_context_suggestions",
+    "list_conversations",
+    "list_datasets",
+    "list_desktop_sessions",
+    "list_local_computer_grants",
+    "list_monitor_alerts",
+    "list_monitors",
+    "list_projects",
+    "list_schedule_runs",
+    "list_skills",
+    "list_tasks",
+    "list_workflow_runs",
+    "list_workflow_triggers",
+    "list_workflows",
+    "pause_workflow_run",
+    "publish_agent",
+    "read_settings",
+    "recover_workflows",
+    "reject_context_suggestion",
+    "request_browser_takeover",
+    "resume_workflow_run",
+    "retry_task",
+    "resolve_connector_approval",
+    "revoke_browser_session",
+    "revoke_desktop_session",
+    "revoke_local_computer_grant",
+    "run_schedule",
+    "search",
+    "skill.run_script",
+    "skill.write",
+    "start_workflow_run",
+    "stream_memory_events",
+    "stream_research",
+    "stream_task",
+    "tick_workflow_run",
+    "undo_memory",
+    "update_memory",
+    "update_monitor",
+    "update_schedule",
+    "upload_attachment",
+    "view_agent",
+    "view_approval",
+    "view_autonomy",
+    "view_browser_session",
+    "view_browser_session_events",
+    "view_computer_session_events",
+    "view_desktop_session_events",
+    "view_local_computer_events",
+    "view_project_artifacts",
+    "view_project_conversations",
+    "view_project_tasks",
+    "view_skill",
+    "view_task",
+    "view_task_events",
+    "list_connectors",
+    "list_connector_tools",
+    "list_connector_actions",
+    "execute_connector_tool_call",
+    "list_mcp_servers",
+    "list_connector_policies",
+    "view_conversation",
+    "rename_conversation",
+    "delete_conversation",
+    "pin_message",
+    "unpin_message",
+    "edit_message",
+    "branch_conversation",
+    "save_to_memory",
+    "convert_to_task",
+    "convert_to_workflow",
+    "regenerate_message",
+    "retry_from_message",
+    "artifact.create",
+    "artifact.read",
+    "artifact.edit",
+    "artifact.delete",
+    "artifact.publish",
+}
 
 # Actors that represent the system itself, not a human — they bypass FGA.
 _INTERNAL_ACTOR_IDS = {"chronos", "source_sync", "system", "scheduler"}
@@ -101,6 +254,12 @@ def _resource_for(action: str) -> tuple[str, str] | None:
 
 def _is_internal(actor: Member) -> bool:
     return actor.id in _INTERNAL_ACTOR_IDS or actor.role in _INTERNAL_ROLES
+
+
+def _is_generic_allowed_action(action: str) -> bool:
+    return action in _GENERIC_ALLOWED_ACTIONS or any(
+        action.startswith(prefix) for prefix in _GENERIC_ALLOWED_PREFIXES
+    )
 
 
 async def check(actor: Member, action: str, resource: str) -> bool:
@@ -146,9 +305,45 @@ async def check(actor: Member, action: str, resource: str) -> bool:
         )
         raise PermissionDenied(actor.id, action, resource)
 
+    if action in _APPROVAL_DECISION_ACTIONS and not _is_internal(actor):
+        await audit.log(
+            "permission_check",
+            actor.id,
+            action,
+            organization_id=actor.organization_id,
+            resource_type="approval",
+            resource_id=resource,
+            decision="granted_role_gate",
+        )
+        return True
+
+    if action in _ADMIN_ACTIONS and not _is_internal(actor):
+        await audit.log(
+            "permission_check",
+            actor.id,
+            action,
+            organization_id=actor.organization_id,
+            resource_type="admin",
+            resource_id=resource,
+            decision="granted_role_gate",
+        )
+        return True
+
     mapped = _resource_for(action)
     relation, object_type = mapped if mapped else (None, None)
     enforce = authz.is_enabled() and relation is not None and not _is_internal(actor)
+
+    if mapped is None and not _is_internal(actor) and not _is_generic_allowed_action(action):
+        await audit.log(
+            "permission_check",
+            actor.id,
+            action,
+            organization_id=actor.organization_id,
+            resource_type="generic",
+            resource_id=resource,
+            decision="denied_unmapped",
+        )
+        raise PermissionDenied(actor.id, action, resource)
 
     decision = "granted_stub"
     if enforce:

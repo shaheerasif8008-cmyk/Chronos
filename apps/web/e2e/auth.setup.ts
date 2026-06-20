@@ -37,12 +37,10 @@ setup("authenticate", async ({ page, request }) => {
     data: { email: EMAIL, code },
   });
   expect(verifyRes.ok()).toBeTruthy();
-  const { access_token } = await verifyRes.json();
-  expect(access_token, "verify-otp returned a token").toBeTruthy();
+  expect((await verifyRes.json()).access_token, "verify-otp returned a token").toBeTruthy();
 
-  // Seed the token into the web origin's localStorage, then persist storageState.
+  // Persist the HttpOnly session cookie set by verify-otp.
   await page.goto("/login");
-  await page.evaluate((t) => localStorage.setItem("chronos_token", t), access_token);
 
   fs.mkdirSync(path.dirname(AUTH_FILE), { recursive: true });
   await page.context().storageState({ path: AUTH_FILE });

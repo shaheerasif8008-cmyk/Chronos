@@ -13,10 +13,10 @@ test("artifacts: create, edit into a new version, then restore", async ({ page }
   const created = await page.evaluate(async (t) => {
     const port = Number(window.location.port || "3001");
     const apiBase = `http://${window.location.hostname}:${8000 + (port - 3000)}`;
-    const token = localStorage.getItem("chronos_token") ?? "";
     const res = await fetch(`${apiBase}/artifacts`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ content: "VERSION ONE", kind: "markdown", title: t }),
     });
     return res.ok ? await res.json() : { error: res.status };

@@ -87,7 +87,10 @@ async def sso_callback(
                     payload={"connection_id": conn.id})
 
     redirect_path = claims_state.get("redirect") or "/chat"
-    target = f"{settings.frontend_base_url.rstrip('/')}/login/callback#access_token={token}&redirect={redirect_path}"
+    from urllib.parse import urlencode
+
+    safe_redirect = redirect_path if isinstance(redirect_path, str) and redirect_path.startswith("/") else "/chat"
+    target = f"{settings.frontend_base_url.rstrip('/')}/login/callback?{urlencode({'redirect': safe_redirect})}"
     response = RedirectResponse(url=target, status_code=302)
     set_session_cookie(response, token)
     return response

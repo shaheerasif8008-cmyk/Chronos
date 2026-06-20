@@ -30,8 +30,10 @@ def test_browser_operator_tools_are_registered_for_agent_and_inline_use():
 
 
 @pytest.mark.asyncio
-async def test_browser_login_task_opens_site_and_requests_takeover():
+async def test_browser_login_task_opens_site_and_requests_takeover(monkeypatch):
     from connectors.browser_operator import BrowserOperator
+
+    monkeypatch.setattr("connectors.browser_operator.assert_safe_url", lambda _url: _url)
 
     operator = BrowserOperator()
     result = await operator.execute(
@@ -58,6 +60,8 @@ async def test_browser_login_task_opens_site_and_requests_takeover():
 @pytest.mark.asyncio
 async def test_browser_session_manager_persists_state_takeover_and_revocation(monkeypatch):
     from connectors.browser_operator import BrowserOperator
+
+    monkeypatch.setattr("connectors.browser_operator.assert_safe_url", lambda _url: _url)
 
     events = []
 
@@ -120,9 +124,11 @@ async def test_browser_session_manager_persists_state_takeover_and_revocation(mo
 
 
 @pytest.mark.asyncio
-async def test_browser_sensitive_navigation_requires_session_consent_and_approval():
+async def test_browser_sensitive_navigation_requires_session_consent_and_approval(monkeypatch):
     from core.exceptions import ApprovalRequired
     from connectors.browser_operator import BrowserOperator
+
+    monkeypatch.setattr("connectors.browser_operator.assert_safe_url", lambda _url: _url)
 
     operator = BrowserOperator()
     created = await operator.create_session(
@@ -143,8 +149,25 @@ async def test_browser_sensitive_navigation_requires_session_consent_and_approva
             },
         )
 
+    with pytest.raises(ApprovalRequired, match="outside the consented"):
+        await operator.execute(
+            "browser.navigate",
+            {
+                "session_id": created["id"],
+                "url": "https://bank.example/login",
+                "__org_id": "org-1",
+                "__task_id": "task-1",
+            },
+        )
+
+    same_sensitive_domain = await operator.create_session(
+        organization_id="org-1",
+        member_id="member-1",
+        task_id="task-2",
+        consent={"purpose": "bank login", "allowed_domains": ["bank.example"]},
+    )
     approved = await operator.approve_sensitive_site(
-        created["id"],
+        same_sensitive_domain["id"],
         organization_id="org-1",
         member_id="member-1",
         domain="bank.example",
@@ -155,7 +178,7 @@ async def test_browser_sensitive_navigation_requires_session_consent_and_approva
     result = await operator.execute(
         "browser.navigate",
         {
-            "session_id": created["id"],
+            "session_id": same_sensitive_domain["id"],
             "url": "https://bank.example/login",
             "__org_id": "org-1",
             "__task_id": "task-1",

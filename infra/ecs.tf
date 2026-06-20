@@ -57,6 +57,7 @@ resource "aws_ecs_task_definition" "api" {
     portMappings = [{ containerPort = 8000, protocol = "tcp" }]
 
     environment = [
+      { name = "ENVIRONMENT", value = "production" },
       { name = "ORG_ID", value = "default" },
       { name = "REGION", value = var.aws_region },
       { name = "AUTH_PROVIDER", value = var.auth_provider },
@@ -167,7 +168,7 @@ resource "aws_ecs_task_definition" "openfga" {
 
   container_definitions = jsonencode([{
     name      = "openfga"
-    image     = "openfga/openfga:latest"
+    image     = "openfga/openfga:v1.9.5"
     essential = true
     command   = ["run"]
 
@@ -211,6 +212,7 @@ resource "aws_ecs_task_definition" "migrate" {
     command   = ["sh", "-c", "alembic upgrade head && python seed.py --skip-if-exists"]
 
     environment = [
+      { name = "ENVIRONMENT", value = "production" },
       { name = "ORG_ID", value = "default" },
       { name = "REGION", value = var.aws_region },
       { name = "OBJECT_STORAGE_BACKEND", value = "s3" },

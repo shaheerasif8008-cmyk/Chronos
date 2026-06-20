@@ -1,7 +1,7 @@
 from __future__ import annotations
 """ConnectorRegistry — looks up which connector record to use for a given tool call."""
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import case, or_, select
 
 from core.db import engine, reflect_table
 from core.exceptions import ConnectorNotFound
@@ -33,6 +33,9 @@ async def get(agent: AgentContext, tool_name: str) -> ConnectorRecord:
         connectors.c.provider == provider,
         connectors.c.status == "active",
     ]
+    member_connector_id = f"{provider}:{agent.org_id}:{agent.member_id}"
+    scoped_prefix = f"{provider}:{agent.org_id}:%"
+    filters.append(or_(connectors.c.id == member_connector_id, ~connectors.c.id.like(scoped_prefix)))
     if agent.persona_id:
         # Prefer persona-scoped connector; fall back to org-level below
         from sqlalchemy import or_
@@ -53,8 +56,11 @@ async def get(agent: AgentContext, tool_name: str) -> ConnectorRecord:
                     connectors.c.persona_id,
                 )
                 .where(*filters)
-                # Persona-scoped connectors rank above org-level (NULL persona_id last)
-                .order_by(connectors.c.persona_id.desc().nullslast())
+                .order_by(
+                    case((connectors.c.id == member_connector_id, 0), else_=1),
+                    # Persona-scoped connectors rank above org-level (NULL persona_id last)
+                    connectors.c.persona_id.desc().nullslast(),
+                )
                 .limit(1)
             )
         ).mappings().all()

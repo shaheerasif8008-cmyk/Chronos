@@ -66,6 +66,10 @@ _FORBIDDEN_DATA_PATTERNS = [
     r"\bfrom\s+builtins\b",
     # Block absolute-path open
     r"\bopen\s*\(\s*['\"]/",
+    r"\bio\.open\s*\(\s*['\"]/",
+    r"\bPath\s*\(\s*['\"]/",
+    r"\bpathlib\.Path\s*\(\s*['\"]/",
+    r"\bos\.(listdir|scandir|walk|stat|lstat|readlink)\s*\(\s*['\"]/",
     # Block shell execution and forking
     r"\bos\.(system|popen|spawn|exec|fork|kill|killpg)",
     # Block arbitrary code execution / introspection escapes

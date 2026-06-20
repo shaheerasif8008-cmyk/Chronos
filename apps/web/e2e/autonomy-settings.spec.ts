@@ -23,14 +23,12 @@ test("settings autonomy: renders trust governance and exercises live autonomy en
   const apiProof = await page.evaluate(async ({ toolName }) => {
     const port = Number(window.location.port || "3001");
     const apiBase = `http://${window.location.hostname}:${8000 + (port - 3000)}`;
-    const token = localStorage.getItem("chronos_token") ?? "";
-    const headers = { Authorization: `Bearer ${token}` };
     const [trust, proposals, policies, overrides, evidence] = await Promise.all([
-      fetch(`${apiBase}/autonomy/trust?workspace_id=default`, { headers }),
-      fetch(`${apiBase}/autonomy/proposals`, { headers }),
-      fetch(`${apiBase}/autonomy/learned-policies`, { headers }),
-      fetch(`${apiBase}/autonomy/risk-overrides`, { headers }),
-      fetch(`${apiBase}/autonomy/evidence?scope=workspace%3Adefault&action_class=${encodeURIComponent(toolName)}`, { headers }),
+      fetch(`${apiBase}/autonomy/trust?workspace_id=default`, { credentials: "include" }),
+      fetch(`${apiBase}/autonomy/proposals`, { credentials: "include" }),
+      fetch(`${apiBase}/autonomy/learned-policies`, { credentials: "include" }),
+      fetch(`${apiBase}/autonomy/risk-overrides`, { credentials: "include" }),
+      fetch(`${apiBase}/autonomy/evidence?scope=workspace%3Adefault&action_class=${encodeURIComponent(toolName)}`, { credentials: "include" }),
     ]);
     const overrideRows = overrides.ok ? await overrides.json() : [];
     const evidenceBody = evidence.ok ? await evidence.json() : null;

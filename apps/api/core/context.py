@@ -54,6 +54,7 @@ async def load_org_context(org_id: str) -> str:
 async def _compact_history(
     conversation_id: str,
     *,
+    org_id: str | None = None,
     budget_tokens: int,
     verbatim_turns: int = 6,
 ) -> list[dict[str, str]]:
@@ -64,11 +65,14 @@ async def _compact_history(
     """
     messages_table = await reflect_table("messages")
     async with engine.begin() as conn:
+        stmt = select(messages_table.c.role, messages_table.c.content).where(
+            messages_table.c.conversation_id == conversation_id
+        )
+        if org_id is not None and hasattr(messages_table.c, "organization_id"):
+            stmt = stmt.where(messages_table.c.organization_id == org_id)
         rows = (
             await conn.execute(
-                select(messages_table.c.role, messages_table.c.content)
-                .where(messages_table.c.conversation_id == conversation_id)
-                .order_by(messages_table.c.created_at.desc())
+                stmt.order_by(messages_table.c.created_at.desc())
                 .limit(200)  # hard ceiling; compaction handles the rest
             )
         ).mappings().all()
@@ -189,7 +193,7 @@ async def assemble_context(
         _fetch_skills(),
         _fetch_memory(),
         _fetch_citations(),
-        _compact_history(conversation_id, budget_tokens=history_budget),
+        _compact_history(conversation_id, org_id=requester_context.org_id, budget_tokens=history_budget),
     )
 
     # ── Assembly phase (sequential, budget-gated — order preserved) ─────────

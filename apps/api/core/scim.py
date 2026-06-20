@@ -306,7 +306,11 @@ async def group_member_rows(org_id: str, group_id: str) -> list[dict]:
             await conn.execute(
                 select(gm.c.member_id, members.c.email)
                 .select_from(gm.join(members, members.c.id == gm.c.member_id))
-                .where(gm.c.organization_id == org_id, gm.c.group_id == group_id)
+                .where(
+                    gm.c.organization_id == org_id,
+                    gm.c.group_id == group_id,
+                    members.c.organization_id == org_id,
+                )
             )
         ).mappings().all()
     return [dict(r) for r in rows]
@@ -333,8 +337,21 @@ async def create_group(org_id: str, region: str, payload: dict, *, role: str = "
 
 async def set_group_members(org_id: str, group_id: str, member_ids: list[str]) -> None:
     gm = await reflect_table("group_memberships")
+    members = await reflect_table("members")
     member_ids = [m for m in member_ids if m]
     async with engine.begin() as conn:
+        if member_ids:
+            valid_ids = set(
+                (await conn.execute(
+                    select(members.c.id).where(
+                        members.c.organization_id == org_id,
+                        members.c.id.in_(member_ids),
+                    )
+                )).scalars().all()
+            )
+            invalid = sorted(set(member_ids) - {str(mid) for mid in valid_ids})
+            if invalid:
+                raise SCIMError(400, "Group members must belong to the same organization", "invalidValue")
         existing = (await conn.execute(select(gm.c.member_id).where(gm.c.organization_id == org_id, gm.c.group_id == group_id))).scalars().all()
         await conn.execute(delete(gm).where(gm.c.organization_id == org_id, gm.c.group_id == group_id))
         for mid in member_ids:

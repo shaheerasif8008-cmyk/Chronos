@@ -131,9 +131,25 @@ async def _save_message(
     messages = await reflect_table("messages")
     conversations = await reflect_table("conversations")
     async with engine.begin() as conn:
+        conv_row = None
+        if _member_id is not None and _org_id is not None:
+            conv_row = (
+                await conn.execute(
+                    select(conversations).where(
+                        conversations.c.id == conversation_id,
+                        conversations.c.member_id == _member_id,
+                        conversations.c.organization_id == _org_id,
+                    )
+                )
+            ).mappings().first()
+            if conv_row is None:
+                from fastapi import HTTPException
+
+                raise HTTPException(status_code=404, detail="Conversation not found")
+
         await conn.execute(
             insert(messages).values(
-                organization_id=settings.org_id,
+                organization_id=_org_id or settings.org_id,
                 region=settings.region,
                 conversation_id=conversation_id,
                 role=role,
@@ -157,17 +173,8 @@ async def _save_message(
             .where(conversations.c.id == conversation_id)
             .values(updated_at=datetime.now(timezone.utc))
         )
-        if _member_id is not None and _org_id is not None:
-            row = (
-                await conn.execute(
-                    select(conversations).where(
-                        conversations.c.id == conversation_id,
-                        conversations.c.member_id == _member_id,
-                        conversations.c.organization_id == _org_id,
-                    )
-                )
-            ).mappings().first()
-            return dict(row) if row else None
+        if conv_row is not None:
+            return dict(conv_row)
     return None
 
 
@@ -662,6 +669,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
         await _save_message(
             conversation_id, "user", req.message,
             artifact_refs=_user_artifact_refs or None,
+            _org_id=member.organization_id,
         )
         effective_project_id = req.project_id
 
@@ -684,7 +692,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
                 created_by=member.id,
             )
             assistant_response = f"Got it, I'll remember that: {explicit_memory}"
-            await _save_message(conversation_id, "assistant", assistant_response)
+            await _save_message(conversation_id, "assistant", assistant_response, _org_id=member.organization_id)
             await audit.log("chat_response", member.id, "chat.message", organization_id=member.organization_id, resource_id=conversation_id)
             yield f"data: {json.dumps({'type': 'conversation', 'conversation_id': conversation_id})}\n\n"
             yield f"data: {json.dumps({'type': 'memory_saved', 'entry_id': entry_id, 'content': explicit_memory, 'scope': 'org', 'source': 'explicit'})}\n\n"
@@ -786,11 +794,12 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
                         {"id": aid, "kind": "image", "mime_type": "image/png"}
                         for aid in artifact_ids
                     ],
+                    _org_id=member.organization_id,
                 )
             else:
                 # Honest degraded or error: surface the summary as an assistant message.
                 assistant_text = result.summary
-                await _save_message(conversation_id, "assistant", assistant_text, mode="image")
+                await _save_message(conversation_id, "assistant", assistant_text, mode="image", _org_id=member.organization_id)
 
             chunk_size = 40
             for i in range(0, len(assistant_text), chunk_size):

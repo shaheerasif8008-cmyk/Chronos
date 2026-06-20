@@ -32,9 +32,8 @@ test("approvals: seeded approval shows in inbox and Approve decides it", async (
       return page.evaluate(async (id) => {
         const port = Number(window.location.port || "3001");
         const apiBase = `http://${window.location.hostname}:${8000 + (port - 3000)}`;
-        const token = localStorage.getItem("chronos_token") ?? "";
         const res = await fetch(`${apiBase}/approvals/${id}`, {
-          headers: { Authorization: `Bearer ${token}` },
+          credentials: "include",
         });
         return res.ok ? (await res.json()).status : "missing";
       }, APPROVAL_ID);

@@ -305,8 +305,7 @@ async def gmail_oauth_callback(
             existing = (
                 await conn.execute(
                     select(connectors_table).where(
-                        (connectors_table.c.organization_id == org_id)
-                        & (connectors_table.c.provider == "gmail")
+                        connectors_table.c.id == connector_id
                     )
                 )
             ).mappings().first()
@@ -324,7 +323,7 @@ async def gmail_oauth_callback(
             else:
                 await conn.execute(
                     insert(connectors_table).values(
-                        id=str(uuid.uuid4()),
+                        id=connector_id,
                         organization_id=org_id,
                         provider="gmail",
                         account_handle=credential_data.get("email", ""),
@@ -546,8 +545,7 @@ async def generic_oauth_callback(
             existing = (
                 await conn.execute(
                     select(connectors_table).where(
-                        (connectors_table.c.organization_id == org_id)
-                        & (connectors_table.c.provider == provider)
+                        connectors_table.c.id == connector_id
                     )
                 )
             ).mappings().first()
@@ -561,7 +559,7 @@ async def generic_oauth_callback(
             else:
                 await conn.execute(
                     insert(connectors_table).values(
-                        id=str(uuid.uuid4()),
+                        id=connector_id,
                         organization_id=org_id,
                         provider=provider,
                         account_handle=account_handle,
@@ -592,20 +590,34 @@ async def disconnect_connector(
 ) -> dict[str, str]:
     """Revoke and remove a connected app."""
     from core.db import engine, reflect_table
+    from connectors.vault import delete as vault_delete
     from sqlalchemy import select, update
 
     await permissions.check(member, f"disconnect_{provider}", str(member.organization_id))
 
     connectors_table = await reflect_table("connectors")
+    connector_id = f"{provider}:{member.organization_id}:{member.id}"
     async with engine.begin() as conn:
+        row = (
+            await conn.execute(
+                select(connectors_table.c.id, connectors_table.c.vault_ref).where(
+                    (connectors_table.c.id == connector_id)
+                    & (connectors_table.c.organization_id == str(member.organization_id))
+                    & (connectors_table.c.provider == provider)
+                )
+            )
+        ).mappings().first()
         await conn.execute(
             update(connectors_table)
             .where(
-                (connectors_table.c.organization_id == str(member.organization_id))
+                (connectors_table.c.id == connector_id)
+                & (connectors_table.c.organization_id == str(member.organization_id))
                 & (connectors_table.c.provider == provider)
             )
             .values(status="disconnected")
         )
+    if row and row.get("vault_ref"):
+        await vault_delete(str(row["vault_ref"]), actor_id=str(member.id), org_id=str(member.organization_id))
 
     await audit.log(
         "connector_disconnected", str(member.id), f"{provider}.disconnect",
@@ -788,6 +800,8 @@ async def list_mcp_servers(member: Member = Depends(get_current_member)) -> dict
 @router.post("/mcp/register")
 async def register_mcp_server(req: RegisterMCPServerRequest, member: Member = Depends(get_current_member)) -> dict[str, Any]:
     await permissions.check(member, "register_mcp_server", member.organization_id)
+    if req.transport == "local" and settings.is_production:
+        raise HTTPException(status_code=400, detail="Local MCP transport is disabled in production")
     if req.transport == "local" and not req.command:
         raise HTTPException(status_code=400, detail="Local MCP servers require a command")
     if req.transport == "remote" and not req.server_url:

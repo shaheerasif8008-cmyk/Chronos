@@ -629,18 +629,14 @@ const PALETTE_TYPE_LABELS: Record<string, string> = {
 
 // ─── Auth helpers ─────────────────────────────────────────────────────────────
 function getToken() {
-  if (typeof window === "undefined") return "";
-  return localStorage.getItem("chronos_token") ?? "";
+  return "";
 }
 
 async function apiFetch(path: string, init: RequestInit = {}) {
   const headers = new Headers(init.headers);
-  const token = getToken();
-  if (token) headers.set("Authorization", `Bearer ${token}`);
   if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
-  const res = await fetch(`${apiBase()}${path}`, { ...init, headers });
+  const res = await fetch(`${apiBase()}${path}`, { ...init, headers, credentials: "include" });
   if (res.status === 401) {
-    localStorage.removeItem("chronos_token");
     window.location.href = "/login";
   }
   if (!res.ok) throw new Error(await res.text());
@@ -953,7 +949,6 @@ function ChronosAppInner() {
   }
 
   function signOut() {
-    localStorage.removeItem("chronos_token");
     router.replace("/login");
   }
 
@@ -3480,17 +3475,7 @@ function ArtifactCard({ artifact }: { artifact: ArtifactRef }) {
   }
 
   async function handleOpen() {
-    // Open the tab synchronously (inside the click gesture) so popup blockers
-    // don't kill it, then point it at the blob once fetched.
-    const tab = window.open("about:blank", "_blank", "noopener,noreferrer");
-    setBusy(true);
-    const blob = await fetchBlob();
-    setBusy(false);
-    if (!blob) { tab?.close(); return; }
-    const url = URL.createObjectURL(blob);
-    if (tab) tab.location.href = url;
-    else window.open(url, "_blank", "noopener,noreferrer");  // fallback
-    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    window.dispatchEvent(new CustomEvent("chronos:open-artifact", { detail: { id: artifact.id } }));
   }
 
   async function handleDownload() {
@@ -4776,17 +4761,7 @@ function formatTaskError(error?: string): string {
 function ActivityActionRow({ action, onTask }: { action: ActivityAction; onTask: () => void }) {
   async function openArtifact() {
     if (!action.artifact_id) return;
-    const tab = window.open("about:blank", "_blank", "noopener,noreferrer");
-    try {
-      const res = await apiFetch(`/artifacts/${action.artifact_id}/content`);
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      if (tab) tab.location.href = url;
-      else window.open(url, "_blank", "noopener,noreferrer");
-      setTimeout(() => URL.revokeObjectURL(url), 60_000);
-    } catch {
-      tab?.close();
-    }
+    window.dispatchEvent(new CustomEvent("chronos:open-artifact", { detail: { id: action.artifact_id } }));
   }
 
   return (

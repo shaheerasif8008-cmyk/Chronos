@@ -4,6 +4,7 @@ import base64
 import secrets
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -14,8 +15,10 @@ from core.config import settings
 from core.db import engine, reflect_table
 from core.exceptions import ApprovalRequired
 from core.models import ToolResult
+from core.ssrf import UnsafeURLError, assert_safe_url
 from core.tool_installer import ensure_runtime_tool
 from core.untrusted_content import scan_untrusted_content
+from core.workspace import jailed_path, task_workspace_root_from_args
 
 _TIMEOUT_MS = 20_000
 _SENSITIVE_DOMAINS = (
@@ -238,12 +241,22 @@ class BrowserOperator:
         if not url:
             raise ValueError("browser.navigate requires 'url'")
         self._enforce_url_consent(session, url)
+        try:
+            assert_safe_url(url)
+        except UnsafeURLError as exc:
+            raise ValueError(f"browser.navigate rejected unsafe URL: {exc}") from exc
         page = await self._runtime_page(session)
+        await self._install_network_guard(page)
         try:
             await page.goto(url, wait_until="domcontentloaded")
             title = await page.title()
         except Exception:
             title = url
+        current_url = str(getattr(page, "url", None) or url)
+        try:
+            assert_safe_url(current_url)
+        except UnsafeURLError as exc:
+            raise ValueError(f"browser.navigate reached unsafe URL after navigation: {exc}") from exc
         session.update({"current_url": url, "title": title, "status": "active"})
         await self._capture_state(session, "navigate")
         await self._record_action(session, "navigate", {"current_url": url})
@@ -379,7 +392,13 @@ class BrowserOperator:
 
     async def _upload(self, session: dict[str, Any], args: dict[str, Any]) -> ToolResult:
         selector = str(args.get("selector") or "")
-        path = str(args.get("path") or "")
+        requested_path = str(args.get("path") or "")
+        if not requested_path:
+            raise ValueError("browser.upload requires 'path'")
+        if Path(requested_path).is_absolute():
+            raise ValueError("browser.upload path must be relative to the task workspace")
+        root = task_workspace_root_from_args(args)
+        path = str(jailed_path(root, requested_path))
         page = await self._runtime_page(session)
         await page.set_input_files(selector, path)
         await self._capture_state(session, "upload")
@@ -436,6 +455,31 @@ class BrowserOperator:
                 await self._save_session(session)
                 return page
             return await self._launch_page(session, playwright_api)
+
+    async def _install_network_guard(self, page: Any) -> None:
+        if getattr(page, "_chronos_network_guard_installed", False):
+            return
+        route = getattr(page, "route", None)
+        if not callable(route):
+            setattr(page, "_chronos_network_guard_installed", True)
+            return
+
+        async def _guard_request(playwright_route: Any) -> None:
+            request = getattr(playwright_route, "request", None)
+            request_url = str(getattr(request, "url", "") or "")
+            try:
+                assert_safe_url(request_url)
+            except UnsafeURLError:
+                abort = getattr(playwright_route, "abort", None)
+                if callable(abort):
+                    await abort()
+                return
+            cont = getattr(playwright_route, "continue_", None)
+            if callable(cont):
+                await cont()
+
+        await route("**/*", _guard_request)
+        setattr(page, "_chronos_network_guard_installed", True)
 
     async def _playwright_api_or_none(self, session: dict[str, Any]) -> Any | None:
         try:
@@ -514,8 +558,7 @@ class BrowserOperator:
         consent = session.get("consent") or {}
         allowed = {str(item).lower() for item in consent.get("allowed_domains") or []}
         if allowed and domain not in allowed and not any(domain.endswith(f".{item}") for item in allowed):
-            if not _is_sensitive(domain):
-                raise ApprovalRequired("browser.navigate", f"domain {domain} is outside the consented browser session scope")
+            raise ApprovalRequired("browser.navigate", f"domain {domain} is outside the consented browser session scope")
         if _is_sensitive(domain) and not _has_sensitive_approval(session, domain):
             raise ApprovalRequired("browser.navigate", f"sensitive site {domain} requires explicit per-task approval")
 
