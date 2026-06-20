@@ -1474,13 +1474,23 @@ function ChatScreen({
   }, []);
 
   const loadOperations = useCallback(async () => {
-    const [browserRows, computerRows] = await Promise.all([
-      apiFetch("/browser-sessions/").then(r => r.json()).catch(() => []),
+    // Scope live work to the current task so the panel follows the active job
+    // (Manus-style) instead of surfacing a stale session from an old chat.
+    const browserUrl = activeTaskId
+      ? `/browser-sessions/?task_id=${encodeURIComponent(activeTaskId)}`
+      : "/browser-sessions/";
+    let [browserRows, computerRows] = await Promise.all([
+      apiFetch(browserUrl).then(r => r.json()).catch(() => []),
       apiFetch("/computer-sessions/").then(r => r.json()).catch(() => []),
     ]) as [BrowserSession[], ComputerSession[]];
+    // If the active task has no session yet, fall back to the most recent ones
+    // globally so manually opened/standalone sessions still appear.
+    if (activeTaskId && Array.isArray(browserRows) && browserRows.length === 0) {
+      browserRows = await apiFetch("/browser-sessions/").then(r => r.json()).catch(() => []) as BrowserSession[];
+    }
     setBrowserSessions(browserRows);
     setComputerSessions(computerRows);
-  }, []);
+  }, [activeTaskId]);
 
   useEffect(() => {
     void loadOperations();
@@ -4028,13 +4038,22 @@ function LiveOperationsDrawer({
   onRefresh: () => void;
   onClose: () => void;
 }) {
-  const [activeBrowserId, setActiveBrowserId] = useState<string | null>(browserSessions[0]?.id ?? null);
+  // A session is "live" while the agent is driving it or waiting for takeover.
+  // Default to a live session so the feed follows the current job rather than a
+  // stale ended session's last screenshot (the "stuck on an old page" bug).
+  const isLive = (session: BrowserSession) => session.status === "active" || session.takeover_state === "requested";
+  const liveBrowsers = browserSessions.filter(isLive);
+  const [activeBrowserId, setActiveBrowserId] = useState<string | null>(liveBrowsers[0]?.id ?? null);
   const [handBackSummary, setHandBackSummary] = useState("");
-  const activeBrowser = browserSessions.find(session => session.id === activeBrowserId) ?? browserSessions[0] ?? null;
-  const activeComputer = computerSessions.find(session => session.status === "active") ?? computerSessions[0] ?? null;
+  const activeBrowser = browserSessions.find(session => session.id === activeBrowserId) ?? liveBrowsers[0] ?? null;
+  const activeComputer = computerSessions.find(session => session.status === "active") ?? null;
 
   useEffect(() => {
-    setActiveBrowserId(current => current && browserSessions.some(session => session.id === current) ? current : browserSessions[0]?.id ?? null);
+    setActiveBrowserId(current =>
+      current && browserSessions.some(session => session.id === current)
+        ? current
+        : browserSessions.filter(isLive)[0]?.id ?? null,
+    );
   }, [browserSessions]);
 
   async function postBrowser(path: string, body?: Record<string, unknown>) {
