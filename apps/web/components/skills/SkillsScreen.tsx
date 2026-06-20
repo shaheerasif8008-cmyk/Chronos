@@ -1,5 +1,5 @@
 "use client";
-import { useCallback, useEffect, useState } from "react";
+import { Fragment, useCallback, useEffect, useState } from "react";
 import { apiFetch } from "../../lib/api";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -309,6 +309,9 @@ function buildSkillContent(input: {
 function SkillDetailPane({ slug, onDeleted }: { slug: string; onDeleted: () => void }) {
   const [skill, setSkill] = useState<SkillDetail | null>(null);
   const [versions, setVersions] = useState<SkillVersion[]>([]);
+  const [openVersion, setOpenVersion] = useState<number | null>(null);
+  const [versionContent, setVersionContent] = useState<string>("");
+  const [versionLoading, setVersionLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
@@ -333,6 +336,22 @@ function SkillDetailPane({ slug, onDeleted }: { slug: string; onDeleted: () => v
   }, [slug]);
 
   useEffect(() => { void load(); }, [load]);
+
+  async function viewVersion(version: number) {
+    if (openVersion === version) { setOpenVersion(null); return; }
+    setOpenVersion(version);
+    setVersionLoading(true);
+    setVersionContent("");
+    try {
+      const res = await apiFetch(`/skills/${slug}/versions/${version}`);
+      const data = await res.json() as { content?: string };
+      setVersionContent(data.content ?? "");
+    } catch (e) {
+      setVersionContent(e instanceof Error ? e.message : "Failed to load version.");
+    } finally {
+      setVersionLoading(false);
+    }
+  }
 
   async function remove() {
     setDeleting(true);
@@ -432,11 +451,24 @@ function SkillDetailPane({ slug, onDeleted }: { slug: string; onDeleted: () => v
                 </thead>
                 <tbody>
                   {versions.map(v => (
-                    <tr key={v.version} className="border-t" style={{ borderColor: "var(--border)" }}>
-                      <td className="px-3 py-2 font-mono">v{v.version}</td>
-                      <td className="px-3 py-2">{v.created_at ? new Date(v.created_at).toLocaleString() : "—"}</td>
-                      <td className="px-3 py-2" style={{ color: "var(--text-dim)" }}>{v.created_by ?? "—"}</td>
-                    </tr>
+                    <Fragment key={v.version}>
+                      <tr className="border-t cursor-pointer" style={{ borderColor: "var(--border)" }} onClick={() => void viewVersion(v.version)}>
+                        <td className="px-3 py-2 font-mono">v{v.version}</td>
+                        <td className="px-3 py-2">{v.created_at ? new Date(v.created_at).toLocaleString() : "—"}</td>
+                        <td className="px-3 py-2" style={{ color: "var(--text-dim)" }}>{v.created_by ?? "—"}</td>
+                      </tr>
+                      {openVersion === v.version && (
+                        <tr className="border-t" style={{ borderColor: "var(--border)" }}>
+                          <td colSpan={3} className="px-3 py-2" style={{ background: "var(--surface-2, var(--surface))" }}>
+                            {versionLoading ? (
+                              <span style={{ color: "var(--text-dim)" }}>Loading…</span>
+                            ) : (
+                              <pre className="whitespace-pre-wrap text-[12px] overflow-auto" style={{ maxHeight: 280, color: "var(--text-muted)" }}>{versionContent}</pre>
+                            )}
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
                   ))}
                 </tbody>
               </table>
