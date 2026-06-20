@@ -547,6 +547,7 @@ type SettingsOverview = {
   members: Array<{ id: string; name: string; email: string; role: string; status: string; is_self: boolean }>;
   connectors: Array<Connector & { scopes?: string[]; policy?: Record<string, unknown> }>;
   memory_stats: { active: number; deleted: number };
+  usage?: { tokens?: { metered?: boolean; tokens_today?: number; daily_limit?: number; enforced?: boolean } };
   runtime_health: Record<string, unknown> & {
     connectors?: Record<string, { status?: string; tier?: string; reason?: string; setup?: string | null }>;
   };
@@ -7570,7 +7571,11 @@ function SecuritySettings({ capabilities, signOut }: { capabilities: SettingsOve
 }
 
 function BillingSettings({ overview }: { overview: SettingsOverview }) {
-  return <><Unavailable reason={overview.capabilities.billing.reason}/><SettingsSection title="Read-only usage summary"><SettingsField label="Current plan"><Tag variant="accent">{String(overview.organization.plan || "trial")}</Tag></SettingsField><SettingsField label="Seats"><Tag>{String(overview.organization.seats || 0)}</Tag></SettingsField><SettingsField label="Runtime usage"><Tag>Not metered</Tag></SettingsField><SettingsField label="Token/model usage"><Tag>Not metered</Tag></SettingsField><SettingsField label="Storage usage"><Tag>{overview.memory_stats.active} memory entries</Tag></SettingsField></SettingsSection></>;
+  const tokenUsage = overview.usage?.tokens;
+  const tokenLabel = tokenUsage?.metered
+    ? `${Number(tokenUsage.tokens_today || 0).toLocaleString()} tokens today`
+    : "Metered when model usage is available";
+  return <><Unavailable reason={overview.capabilities.billing.reason}/><SettingsSection title="Read-only usage summary"><SettingsField label="Current plan"><Tag variant="accent">{String(overview.organization.plan || "trial")}</Tag></SettingsField><SettingsField label="Seats"><Tag>{String(overview.organization.seats || 0)}</Tag></SettingsField><SettingsField label="Runtime usage"><Tag>Metered through task activity</Tag></SettingsField><SettingsField label="Token/model usage"><Tag>{tokenLabel}</Tag></SettingsField><SettingsField label="Storage usage"><Tag>{overview.memory_stats.active} memory entries</Tag></SettingsField></SettingsSection></>;
 }
 
 function AuditSettings() {

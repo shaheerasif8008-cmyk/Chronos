@@ -40,6 +40,7 @@ from core.models import AgentContext
 from runtime import cognition
 from core.redis import redis_client
 from core.task_envelope import build_task_envelope, envelope_to_agent_prompt
+from core.token_budget import estimate_message_tokens, record_tokens_used
 from core.tool_manifest import generate_tool_manifest
 from core.workspace import jailed_path, task_workspace_root
 from runtime.tool_registry import (
@@ -547,6 +548,7 @@ async def _checkpoint(
     model: str | None = None,
     orchestration_state: dict[str, Any] | None = None,
     cognition_state: dict[str, Any] | None = None,
+    token_usage: dict[str, Any] | None = None,
     **extra: Any,
 ) -> None:
     state: dict[str, Any] = {"agent_history": history, "iteration_count": iteration}
@@ -556,7 +558,32 @@ async def _checkpoint(
         state["orchestration_state"] = orchestration_state
     if cognition_state:
         state["cognition"] = cognition_state  # reflections/replans used, survives resume
+    if token_usage:
+        state["token_usage"] = token_usage
     await save_task(task_id, agent_state=state, iteration_count=iteration, **extra)
+
+
+def _append_step_token_usage(
+    token_usage: dict[str, Any],
+    *,
+    iteration: int,
+    model: str,
+    tokens: int,
+    estimated_prompt_tokens: int,
+) -> dict[str, Any]:
+    if tokens <= 0:
+        return token_usage
+    steps = list(token_usage.get("steps") or [])
+    steps.append(
+        {
+            "iteration": iteration,
+            "model": model,
+            "tokens": int(tokens),
+            "estimated_prompt_tokens": int(estimated_prompt_tokens),
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    return {"total_tokens": sum(int(step.get("tokens") or 0) for step in steps), "steps": steps}
 
 
 # ── LLM step ──────────────────────────────────────────────────────────────────
@@ -686,6 +713,89 @@ def _tool_message_has_prompt_injection(message: dict[str, Any]) -> bool:
 
 def _history_has_prompt_injection(history: list[dict[str, Any]]) -> bool:
     return any(_tool_message_has_prompt_injection(message) for message in history)
+
+
+def _message_tool_call_ids(message: dict[str, Any]) -> set[str]:
+    ids: set[str] = set()
+    for call in message.get("tool_calls") or []:
+        if isinstance(call, dict) and call.get("id"):
+            ids.add(str(call["id"]))
+    if message.get("tool_call_id"):
+        ids.add(str(message["tool_call_id"]))
+    return ids
+
+
+def _summarize_tool_payload(message: dict[str, Any]) -> str:
+    name = str(message.get("name") or "tool")
+    try:
+        payload = json.loads(str(message.get("content") or "{}"))
+    except json.JSONDecodeError:
+        return f"- {name}: {str(message.get('content') or '')[:240]}"
+    if not isinstance(payload, dict):
+        return f"- {name}: {str(payload)[:240]}"
+    parts = [f"- {name}"]
+    summary = payload.get("summary")
+    if summary:
+        parts.append(f"summary={summary}")
+    error = payload.get("error")
+    if error:
+        parts.append(f"error={error}")
+    if payload.get("idempotency_key"):
+        parts.append(f"idempotency_key={payload['idempotency_key']}")
+    data = payload.get("data")
+    if isinstance(data, dict):
+        for key in ("artifact_id", "artifact_ids", "source_id", "source_ids", "citations", "untrusted_content"):
+            if key in data:
+                parts.append(f"{key}={str(data[key])[:240]}")
+    for key in ("artifact_id", "artifact_ids", "source_id", "source_ids", "citations", "prompt_injection"):
+        if key in payload:
+            parts.append(f"{key}={str(payload[key])[:240]}")
+    return "; ".join(parts)
+
+
+def compact_agent_history_for_model(
+    history: list[dict[str, Any]],
+    *,
+    recent_tool_iterations: int = 2,
+    pending_approval_calls: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Return a model-facing compact copy of agent history.
+
+    Persisted task history remains complete. This function only prepares the
+    next model call by summarizing older completed tool iterations.
+    """
+    pending_ids = {str(call.get("id")) for call in (pending_approval_calls or []) if call.get("id")}
+    tool_indices = [i for i, msg in enumerate(history) if msg.get("role") == "tool"]
+    if len(tool_indices) <= recent_tool_iterations:
+        return history
+    keep_from = tool_indices[-recent_tool_iterations]
+    if keep_from > 0 and history[keep_from - 1].get("role") == "assistant" and history[keep_from - 1].get("tool_calls"):
+        keep_from -= 1
+    kept: list[dict[str, Any]] = []
+    summarized: list[dict[str, Any]] = []
+    for index, message in enumerate(history):
+        ids = _message_tool_call_ids(message)
+        if index < keep_from and message.get("role") in {"assistant", "tool"} and (message.get("tool_calls") or message.get("role") == "tool") and not (ids & pending_ids):
+            summarized.append(message)
+        else:
+            kept.append(message)
+    if not summarized:
+        return history
+    summary_lines = ["# Prior Work Summary", "Older completed tool work was compacted to reduce repeated context."]
+    assistant_tools = []
+    for message in summarized:
+        if message.get("tool_calls"):
+            for call in message.get("tool_calls") or []:
+                if isinstance(call, dict):
+                    fn = call.get("function") or {}
+                    assistant_tools.append(str(fn.get("name") or "tool"))
+        elif message.get("role") == "tool":
+            summary_lines.append(_summarize_tool_payload(message))
+    if assistant_tools:
+        summary_lines.insert(2, "Tool calls already attempted: " + ", ".join(assistant_tools))
+    summary_message = {"role": "system", "content": "\n".join(summary_lines)}
+    insert_at = next((i for i, msg in enumerate(kept) if msg.get("role") not in {"system", "user"}), len(kept))
+    return [*kept[:insert_at], summary_message, *kept[insert_at:]]
 
 
 def _call_is_external_write(call: dict[str, Any]) -> bool:
@@ -1185,6 +1295,7 @@ async def _open_approval_gate(
     history: list[dict[str, Any]],
     iteration: int,
     model: str | None = None,
+    token_usage: dict[str, Any] | None = None,
 ) -> None:
     """Persist state and create approval records; set task to awaiting_approval."""
     task_id = task["id"]
@@ -1225,6 +1336,10 @@ async def _open_approval_gate(
     }
     if model:
         state["model"] = model
+    if token_usage is None and isinstance(task.get("agent_state"), dict):
+        token_usage = task["agent_state"].get("token_usage")
+    if token_usage:
+        state["token_usage"] = token_usage
     await save_task(task_id, agent_state=state, iteration_count=iteration, status="awaiting_approval")
     await emit_activity(task_id, {
         "type": "awaiting_approval",
@@ -1301,6 +1416,8 @@ async def resume_after_approval(task_id: str) -> None:
     chosen_model = state.get("model")
     if chosen_model:
         new_state["model"] = chosen_model
+    if state.get("token_usage"):
+        new_state["token_usage"] = state["token_usage"]
     await save_task(task_id, agent_state=new_state, status="running")
     refreshed = await get_task(task_id)
     if refreshed:
@@ -1764,6 +1881,8 @@ async def run_loop(
 
     history = await _load_history(task, effective_tools)
     iteration = int(task.get("iteration_count") or 0)
+    state_from_task = task.get("agent_state") if isinstance(task.get("agent_state"), dict) else {}
+    token_usage: dict[str, Any] = dict((state_from_task or {}).get("token_usage") or {"total_tokens": 0, "steps": []})
 
     await save_task(task_id, status="running",
                     started_at=task.get("started_at") or datetime.now(timezone.utc))
@@ -1829,7 +1948,12 @@ async def run_loop(
         # Transient per-step guidance (budget + plan position). Built as a fresh
         # list so persistent history is never bloated with repeated directives.
         budget.used = iteration
-        step_history = history
+        pending_approval_calls = (task.get("agent_state") or {}).get("pending_approval_calls") if isinstance(task.get("agent_state"), dict) else None
+        step_history = compact_agent_history_for_model(
+            history,
+            recent_tool_iterations=2,
+            pending_approval_calls=pending_approval_calls if isinstance(pending_approval_calls, list) else None,
+        )
         if light_cognition:
             _guidance: list[str] = []
             _bd = budget.directive()
@@ -1839,8 +1963,9 @@ async def run_loop(
             if _pd:
                 _guidance.append(_pd)
             if _guidance:
-                step_history = history + [{"role": "system", "content": "\n\n".join(_guidance)}]
+                step_history = step_history + [{"role": "system", "content": "\n\n".join(_guidance)}]
         try:
+            estimated_prompt_tokens = estimate_message_tokens(step_history)
             final_text, calls, step_tokens = await _llm_step(
                 step_history,
                 effective_tools,
@@ -1863,11 +1988,16 @@ async def run_loop(
             await emit_activity(task_id, failed_event)
             return {"error": str(exc)}
 
-        # Record token usage for per-org budget tracking.
-        if step_tokens > 0 and settings.per_org_daily_token_limit > 0:
-            _spawn_background(tool_broker.record_tokens_used(
-                task.get("organization_id", "default"), step_tokens
-            ))
+        # Record observed model usage for metering and, when configured, budget enforcement.
+        if step_tokens > 0:
+            token_usage = _append_step_token_usage(
+                token_usage,
+                iteration=iteration + 1,
+                model=effective_model,
+                tokens=step_tokens,
+                estimated_prompt_tokens=estimated_prompt_tokens,
+            )
+            _spawn_background(record_tokens_used(task.get("organization_id", "default"), step_tokens))
 
         # ── Final answer ────────────────────────────────────────────────────
         if not calls:
@@ -1914,6 +2044,7 @@ async def run_loop(
                             "reflections_used": budget.reflections_used,
                             "replans_used": budget.replans_used,
                         },
+                        token_usage=token_usage,
                     )
                     continue
 
@@ -1933,6 +2064,7 @@ async def run_loop(
             await _checkpoint(task_id, history, iteration + 1, model=effective_model,
                               status="complete", result=result,
                               current_step=len(plan_steps) if plan_steps else iteration + 1,
+                              token_usage=token_usage,
                               completed_at=datetime.now(timezone.utc))
             # Build the structured response envelope from runtime facts + prose composer.
             # Failures are silently suppressed so the loop never breaks on this path.
@@ -1990,6 +2122,8 @@ async def run_loop(
         if _history_has_prompt_injection(history):
             approval_needed.extend(c for c in calls if _call_is_external_write(c) and c not in approval_needed)
         if approval_needed:
+            if token_usage:
+                task.setdefault("agent_state", {})["token_usage"] = token_usage
             await _open_approval_gate(task, approval_needed, history, iteration, model=effective_model)
             return {"status": "awaiting_approval"}
 
@@ -2009,6 +2143,8 @@ async def run_loop(
             try:
                 tool_msg = await _execute_tool(calls[0], task, agent)
             except ApprovalRequired:
+                if token_usage:
+                    task.setdefault("agent_state", {})["token_usage"] = token_usage
                 await _open_approval_gate(task, calls, history, iteration, model=effective_model)
                 return {"status": "awaiting_approval"}
             # Artifacts from this tool call were already emitted to Redis pub/sub
@@ -2030,6 +2166,8 @@ async def run_loop(
                 (r for r in raw_results if isinstance(r, ApprovalRequired)), None
             )
             if approval_hit:
+                if token_usage:
+                    task.setdefault("agent_state", {})["token_usage"] = token_usage
                 await _open_approval_gate(task, calls, history, iteration, model=effective_model)
                 return {"status": "awaiting_approval"}
             for r in raw_results:
@@ -2120,6 +2258,7 @@ async def run_loop(
                 "reflections_used": budget.reflections_used,
                 "replans_used": budget.replans_used,
             },
+            token_usage=token_usage,
         )
 
     # Max iterations exceeded

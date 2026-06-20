@@ -98,6 +98,53 @@ async def test_settings_overview_includes_connector_health(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_settings_overview_includes_token_usage(monkeypatch):
+    from core.models import Member
+    from routers import settings
+
+    async def fake_get_settings_doc(member, section):
+        return dict(settings.DEFAULTS.get(section, {}))
+
+    async def fake_current_org(member):
+        return {"id": "default", "name": "Default", "plan": "trial", "seats": 1}
+
+    async def fake_members(member):
+        return []
+
+    async def fake_connectors(member):
+        return []
+
+    async def fake_memory_stats(member):
+        return {"active": 0, "deleted": 0}
+
+    async def fake_check_connectors():
+        return {}
+
+    async def fake_permission(member, action, resource):
+        return True
+
+    async def fake_token_usage(org_id):
+        assert org_id == "default"
+        return {"metered": True, "tokens_today": 1234, "daily_limit": 0}
+
+    monkeypatch.setattr(settings, "get_settings_doc", fake_get_settings_doc)
+    monkeypatch.setattr(settings, "_current_org", fake_current_org)
+    monkeypatch.setattr(settings, "_members", fake_members)
+    monkeypatch.setattr(settings, "_connectors", fake_connectors)
+    monkeypatch.setattr(settings, "_memory_stats", fake_memory_stats)
+    monkeypatch.setattr(settings, "check_connectors", fake_check_connectors)
+    monkeypatch.setattr(settings.permissions, "check", fake_permission)
+    monkeypatch.setattr(settings, "token_usage_summary", fake_token_usage)
+
+    overview = await settings.overview(
+        Member(id="member-1", organization_id="default", email="admin@example.com", role="admin")
+    )
+
+    assert overview["usage"]["tokens"]["metered"] is True
+    assert overview["usage"]["tokens"]["tokens_today"] == 1234
+
+
+@pytest.mark.asyncio
 async def test_export_memory_returns_org_json_download(monkeypatch):
     from core.models import Member
     from routers import settings

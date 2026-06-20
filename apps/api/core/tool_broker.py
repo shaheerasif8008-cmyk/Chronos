@@ -17,6 +17,7 @@ from core.exceptions import ApprovalRequired, LoopDetected, RateLimitExceeded, S
 from core.models import AgentContext, ToolResult
 from core.redis import redis_client
 from core.settings_store import tool_policy, workspace_autonomy
+from core.token_budget import record_tokens_used as _record_tokens_used, tokens_used_today
 from core.untrusted_content import scan_untrusted_content
 
 # The hard floor: tools that always require a human approval record — regardless
@@ -234,25 +235,14 @@ async def _check_token_budget(org_id: str) -> None:
     The counter is incremented by `record_tokens_used` after each model call.
     This function just reads the current total and raises if over budget.
     """
-    import datetime
-
-    day = datetime.date.today().isoformat()
-    key = f"tokens:{org_id}:{day}"
-    raw = await redis_client.get(key)
-    used = int(raw) if raw else 0
+    used = await tokens_used_today(org_id)
     if used >= settings.per_org_daily_token_limit:
         raise RateLimitExceeded(org_id, used, settings.per_org_daily_token_limit)
 
 
 async def record_tokens_used(org_id: str, tokens: int) -> None:
     """Increment the per-org daily token counter. Call after each model completion."""
-    import datetime
-
-    day = datetime.date.today().isoformat()
-    key = f"tokens:{org_id}:{day}"
-    count = await redis_client.incrby(key, tokens)
-    if count == tokens:  # first write today — set TTL to 25 hours
-        await redis_client.expire(key, 90_000)
+    await _record_tokens_used(org_id, tokens)
 
 
 async def _route_skill_run_script(agent: AgentContext, args: dict, tier: str) -> ToolResult:

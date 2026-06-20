@@ -63,3 +63,31 @@ async def generate_tool_manifest(
             )
         )
     return "# Available Runtime Tools\n" + "\n\n".join(blocks)
+
+
+async def generate_compact_tool_routing(
+    *,
+    persona_id: str | None = None,
+    org_id: str = "default",
+    sub_agent: bool = False,
+) -> str:
+    """Build compact prompt guidance; native tool schemas remain authoritative."""
+    del persona_id, org_id
+    families: dict[str, list[str]] = {}
+    for schema in available_tool_schemas(sub_agent=sub_agent):
+        name = tool_name(schema)
+        family, _, action = name.partition("__")
+        if not family:
+            continue
+        actions = families.setdefault(family, [])
+        if action and action not in actions and len(actions) < 8:
+            actions.append(action)
+    if not families:
+        return ""
+    lines = [
+        "# Runtime Tool Routing",
+        "Native tool schemas define exact arguments. Use this compact guide only to choose the right family.",
+    ]
+    for family in sorted(families):
+        lines.append(f"- {family}: {', '.join(families[family])}")
+    return "\n".join(lines)

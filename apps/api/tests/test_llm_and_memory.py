@@ -1039,7 +1039,7 @@ async def test_assemble_context_deduplicates_current_saved_user_message(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_assemble_context_injects_dynamic_tool_manifest(monkeypatch):
+async def test_assemble_context_injects_compact_tool_routing_guidance(monkeypatch):
     from core import context
     from core.models import RequesterContext
 
@@ -1117,6 +1117,7 @@ async def test_assemble_context_injects_dynamic_tool_manifest(monkeypatch):
     )
 
     system = assembled[0]["content"]
-    assert "# Available Runtime Tools" in system
-    assert "`browser__search`" in system
-    assert "`code__python`" in system
+    assert "# Runtime Tool Routing" in system
+    assert "browser:" in system
+    assert "code:" in system
+    assert "# Available Runtime Tools" not in system

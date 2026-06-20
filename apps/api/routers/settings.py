@@ -26,6 +26,7 @@ from core.settings_store import (
     save_settings_doc,
     workspace_autonomy,
 )
+from core.token_budget import token_usage_summary
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 
@@ -211,6 +212,9 @@ async def overview(member: Member = Depends(get_current_member)) -> dict[str, An
         "members": await _members(member),
         "connectors": await _connectors(member),
         "memory_stats": await _memory_stats(member),
+        "usage": {
+            "tokens": await token_usage_summary(member.organization_id),
+        },
         "runtime_health": {
             "status": "ok",
             "mode": sections["runtime"]["runtime_mode"],
