@@ -5,6 +5,7 @@ import { usePathname, useRouter } from "next/navigation";
 import ArtifactsScreen from "../../components/artifacts/ArtifactsScreen";
 import AgentsScreen from "../../components/agents/AgentsScreen";
 import InChatArtifactPanel from "../../components/artifacts/InChatArtifactPanel";
+import { classifyRenderer } from "../../components/artifacts/ArtifactRenderer";
 import SkillsScreen from "../../components/skills/SkillsScreen";
 import ResearchScreen from "../../components/research/ResearchScreen";
 import BrowserOperatorScreen from "../../components/browser/BrowserOperatorScreen";
@@ -1437,6 +1438,8 @@ function ChatScreen({
   const [activeTaskStreamError, setActiveTaskStreamError] = useState("");
   const [browserSessions, setBrowserSessions] = useState<BrowserSession[]>([]);
   const [computerSessions, setComputerSessions] = useState<ComputerSession[]>([]);
+  // Artifacts we've already auto-popped open, so live re-streams don't reopen them.
+  const autoOpenedArtifactsRef = useRef<Set<string>>(new Set());
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [personaMenuOpen, setPersonaMenuOpen] = useState(false);
@@ -2319,6 +2322,13 @@ function ChatScreen({
           if (existing.some(x => x.id === ref.id)) return updated;
           return [...updated.slice(0, -1), { ...last, artifacts: [...existing, ref] }];
         });
+        // Claude-style: pop the artifact open live the first time it appears, so
+        // the user sees what was built without hunting for an "Open" button.
+        // Only auto-open previewable artifacts (not plain downloads/binaries).
+        if (!autoOpenedArtifactsRef.current.has(ref.id) && classifyRenderer(ref.kind ?? "file", ref.mime_type ?? null) !== "download") {
+          autoOpenedArtifactsRef.current.add(ref.id);
+          window.dispatchEvent(new CustomEvent("chronos:open-artifact", { detail: { id: ref.id } }));
+        }
       } else if (ev.type === "structured_response" && ev.structured_response) {
         const sr = ev.structured_response;
         setMessages(prev => {
