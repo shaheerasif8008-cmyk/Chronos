@@ -212,3 +212,33 @@ async def test_signup_endpoint_404_when_dev_otp_disabled(monkeypatch):
     async with _client() as client:
         resp = await client.post("/auth/signup", json={"email": f"x@{_domain()}", "code": "123456"})
     assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_free_email_repeat_signup_is_idempotent():
+    email = f"person{uuid.uuid4().hex[:8]}@gmail.com"
+    first = await signup_or_join(email)
+    again = await signup_or_join(email)
+    assert again["org_id"] == first["org_id"]
+    assert again["member_id"] == first["member_id"]
+    assert again["created"] is False
+
+
+@pytest.mark.asyncio
+async def test_unclaimed_domain_race_resolves_to_join(monkeypatch):
+    """If the domain gets claimed between our check and our insert (concurrent
+    signup), the loser re-resolves to an auto-join instead of 500ing/orphaning."""
+    import core.signup as signup_mod
+    domain = f"race{uuid.uuid4().hex[:8]}.com"
+    winner = await signup_or_join(f"founder@{domain}")
+    real = signup_mod._claim_for_domain
+    calls = {"n": 0}
+    async def fake_claim(d):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None  # pretend unclaimed → take the create-org branch
+        return await real(d)
+    monkeypatch.setattr(signup_mod, "_claim_for_domain", fake_claim)
+    res = await signup_or_join(f"loser@{domain}")
+    assert res["org_id"] == winner["org_id"]
+    assert res["created"] is False and res["joined"] is True

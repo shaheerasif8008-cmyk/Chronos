@@ -122,6 +122,17 @@ async def provision_member(
     return Member(**dict(row))
 
 
+async def get_member_by_email_global(email: str) -> Member | None:
+    """Find a member by email across all orgs (first match by created_at). Used by
+    free-email signup to detect a returning user's existing personal org."""
+    members = await reflect_table("members")
+    async with engine.begin() as conn:
+        row = (await conn.execute(
+            select(members).where(members.c.email == email.lower()).order_by(members.c.created_at.asc())
+        )).mappings().first()
+    return Member(**dict(row)) if row else None
+
+
 async def set_member_status(org_id: str, member_id: str, status: str) -> bool:
     """SCIM lifecycle: 'active' or 'deactivated'. Deactivated members can't log in."""
     members = await reflect_table("members")

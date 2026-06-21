@@ -11,7 +11,7 @@ from sqlalchemy import insert, select
 from core import audit
 from core.config import settings
 from core.db import engine, reflect_table
-from core.members import get_member_in_org, provision_member
+from core.members import get_member_by_email_global, get_member_in_org, provision_member
 from core.provisioning import provision_org
 from core.tenancy import RESERVED_LABELS
 
@@ -83,6 +83,10 @@ async def signup_or_join(email: str, org_name: str | None = None) -> dict:
     domain = email.split("@", 1)[1]
 
     if is_free_email_domain(domain):
+        existing = await get_member_by_email_global(email)
+        if existing is not None:
+            return {"org_id": str(existing.organization_id), "member_id": str(existing.id),
+                    "role": existing.role, "created": False, "joined": False}
         local = email.split("@", 1)[0]
         sub = await unique_subdomain(local)
         prov = await provision_org(slug=sub, name=org_name or f"{local}'s workspace", owner_email=email)
