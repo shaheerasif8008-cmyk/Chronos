@@ -6,7 +6,7 @@ import uuid
 import pytest
 import httpx
 import main
-from routers.auth import _otp_store
+from routers.auth import _otp_store, _resolve_cognito_member
 
 from core.signup import RESERVED_SLUGS, derive_slug, is_free_email_domain, signup_or_join, unique_subdomain
 from core.db import engine, reflect_table
@@ -242,3 +242,17 @@ async def test_unclaimed_domain_race_resolves_to_join(monkeypatch):
     res = await signup_or_join(f"loser@{domain}")
     assert res["org_id"] == winner["org_id"]
     assert res["created"] is False and res["joined"] is True
+
+
+# ---------------------------------------------------------------------------
+# W1 Phase 2B-2 — _resolve_cognito_member routes Cognito through signup_or_join
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_cognito_resolution_creates_org_for_unclaimed_domain():
+    from routers.auth import _resolve_cognito_member
+    domain = f"corp{uuid.uuid4().hex[:8]}.com"
+    member = await _resolve_cognito_member(f"ceo@{domain}", name="CEO", resolved_org_id=None)
+    assert member.organization_id and member.role == "owner"
+    member2 = await _resolve_cognito_member(f"eng@{domain}", name="Eng", resolved_org_id=None)
+    assert member2.organization_id == member.organization_id and member2.role == "user"

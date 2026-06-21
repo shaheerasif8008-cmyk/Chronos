@@ -20,7 +20,7 @@ from core.cognito import (
 from core.config import settings
 from core.db import engine, reflect_table
 from core.invitations import accept_pending_invitation
-from core.members import get_member_by_email, get_member_in_org, get_or_create_member_for_email
+from core.members import get_member_by_email, get_member_in_org
 from core.signup import signup_or_join
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -77,6 +77,21 @@ def _consume_otp(email: str, code: str) -> None:
     if not secrets.compare_digest(code, entry["code"]):
         raise HTTPException(status_code=400, detail="Invalid or expired OTP")
     _otp_store.pop(email, None)
+
+
+async def _resolve_cognito_member(email: str, *, name: str | None, resolved_org_id: str | None):
+    """Resolve a Cognito-verified email to a member. Per-subdomain: log into the
+    resolved org if already a member there; otherwise self-serve create/join via
+    signup_or_join. Makes production signup tenant-correct instead of `default`."""
+    email = email.lower()
+    if resolved_org_id is not None:
+        member = await get_member_in_org(resolved_org_id, email=email)
+        if member is not None:
+            return member
+    result = await signup_or_join(email, org_name=name)
+    if result.get("member_id") is None:
+        raise HTTPException(status_code=403, detail="Membership pending approval")
+    return await get_member_in_org(result["org_id"], email=email)
 
 
 @router.get("/config")
@@ -174,7 +189,7 @@ async def signup(req: SignupRequest, response: Response) -> dict:
 
 
 @router.post("/cognito/callback")
-async def cognito_callback(req: CognitoCallbackRequest, response: Response) -> dict[str, str]:
+async def cognito_callback(req: CognitoCallbackRequest, request: Request, response: Response) -> dict[str, str]:
     """Exchange Cognito hosted-UI authorization code for a Chronos session JWT."""
     if not cognito_enabled():
         raise HTTPException(status_code=404, detail="Cognito auth is not enabled")
@@ -182,7 +197,9 @@ async def cognito_callback(req: CognitoCallbackRequest, response: Response) -> d
         tokens = await exchange_authorization_code(req.code, redirect_uri=req.redirect_uri)
         email = email_from_claims(tokens["claims"])
         name = tokens["claims"].get("name")
-        member = await get_or_create_member_for_email(email, name=name)
+        member = await _resolve_cognito_member(
+            email, name=name, resolved_org_id=getattr(request.state, "resolved_org_id", None)
+        )
     except CognitoAuthError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except PermissionError as exc:
@@ -195,14 +212,16 @@ async def cognito_callback(req: CognitoCallbackRequest, response: Response) -> d
 
 
 @router.post("/cognito/verify")
-async def cognito_verify_id_token(req: CognitoIdTokenRequest, response: Response) -> dict[str, str]:
+async def cognito_verify_id_token(req: CognitoIdTokenRequest, request: Request, response: Response) -> dict[str, str]:
     """Verify a Cognito ID token (e.g. from Amplify) and issue a Chronos session JWT."""
     if not cognito_enabled():
         raise HTTPException(status_code=404, detail="Cognito auth is not enabled")
     try:
         claims = verify_id_token(req.id_token)
         email = email_from_claims(claims)
-        member = await get_or_create_member_for_email(email, name=claims.get("name"))
+        member = await _resolve_cognito_member(
+            email, name=claims.get("name"), resolved_org_id=getattr(request.state, "resolved_org_id", None)
+        )
     except CognitoAuthError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except PermissionError as exc:
