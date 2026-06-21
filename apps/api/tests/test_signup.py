@@ -249,10 +249,22 @@ async def test_unclaimed_domain_race_resolves_to_join(monkeypatch):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_cognito_resolution_creates_org_for_unclaimed_domain():
+async def test_cognito_resolution_creates_org_for_unclaimed_domain(monkeypatch):
+    monkeypatch.setattr("routers.auth.settings.cognito_auto_provision_members", True, raising=False)
     from routers.auth import _resolve_cognito_member
     domain = f"corp{uuid.uuid4().hex[:8]}.com"
     member = await _resolve_cognito_member(f"ceo@{domain}", name="CEO", resolved_org_id=None)
     assert member.organization_id and member.role == "owner"
     member2 = await _resolve_cognito_member(f"eng@{domain}", name="Eng", resolved_org_id=None)
     assert member2.organization_id == member.organization_id and member2.role == "user"
+
+
+@pytest.mark.asyncio
+async def test_cognito_resolution_rejects_unknown_email_when_autoprovision_off(monkeypatch):
+    monkeypatch.setattr("routers.auth.settings.cognito_auto_provision_members", False, raising=False)
+    from routers.auth import _resolve_cognito_member
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc:
+        await _resolve_cognito_member(f"nobody{uuid.uuid4().hex[:6]}@corp{uuid.uuid4().hex[:6]}.com",
+                                      name=None, resolved_org_id=None)
+    assert exc.value.status_code == 403

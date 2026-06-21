@@ -81,13 +81,16 @@ def _consume_otp(email: str, code: str) -> None:
 
 async def _resolve_cognito_member(email: str, *, name: str | None, resolved_org_id: str | None):
     """Resolve a Cognito-verified email to a member. Per-subdomain: log into the
-    resolved org if already a member there; otherwise self-serve create/join via
-    signup_or_join. Makes production signup tenant-correct instead of `default`."""
+    resolved org if already a member there. Otherwise, self-serve create/join via
+    signup_or_join — but ONLY when auto-provisioning is enabled (preserves the
+    pre-existing cognito_auto_provision_members gate); else reject the unknown email."""
     email = email.lower()
     if resolved_org_id is not None:
         member = await get_member_in_org(resolved_org_id, email=email)
         if member is not None:
             return member
+    if not settings.cognito_auto_provision_members:
+        raise HTTPException(status_code=403, detail="Email is not registered as a Chronos member")
     result = await signup_or_join(email, org_name=name)
     if result.get("member_id") is None:
         raise HTTPException(status_code=403, detail="Membership pending approval")
