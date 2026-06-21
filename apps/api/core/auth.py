@@ -13,6 +13,10 @@ from core.models import Member
 bearer = HTTPBearer(auto_error=False)
 
 
+def _is_production() -> bool:
+    return settings.is_production
+
+
 def set_session_cookie(response, token: str) -> None:
     """Set the session JWT as an httpOnly cookie.
 
@@ -87,17 +91,19 @@ async def get_current_member(
     # member's existing tokens must stop working immediately.
     if getattr(member, "status", "active") != "active":
         raise HTTPException(status_code=403, detail="Member account is deactivated")
-    # Tenant binding: an org-bound token is valid only on its own tenant. Legacy
-    # tokens (no `org` claim) are grandfathered. Fail closed when the resolved
-    # tenant is known and does not match.
-    # NOTE (W1 Phase 2): when `resolved` is None (apex / unknown subdomain / a
-    # resolver failure), an org-bound token is currently ACCEPTED. Harmless in
-    # Phase 1 (no path mints org-bound tokens yet). Before Phase 2 flips minting,
-    # decide the no-tenant-host policy explicitly (reject vs. handoff-endpoint
-    # exception) and pin it with a test. See docs/superpowers/plans Phase 2.
+    # Tenant binding (secondary defense — data isolation is enforced downstream by
+    # member.organization_id scoping, not by this check). An org-bound token is
+    # valid only on its own tenant.
     token_org = payload.get("org")
     if token_org is not None:
         resolved = getattr(request.state, "resolved_org_id", None)
-        if resolved is not None and resolved != token_org:
+        if resolved is None:
+            # No tenant resolved from the host. In production this is the apex /
+            # an unknown subdomain — reject (C1): the app only serves authed
+            # traffic on a tenant subdomain. In non-production there is no
+            # wildcard DNS (Host is "test"/localhost), so trust the token's org.
+            if _is_production():
+                raise HTTPException(status_code=403, detail="Token not valid for this tenant")
+        elif resolved != token_org:
             raise HTTPException(status_code=403, detail="Token not valid for this tenant")
     return member

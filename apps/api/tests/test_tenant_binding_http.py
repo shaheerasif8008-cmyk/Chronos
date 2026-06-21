@@ -104,6 +104,27 @@ async def test_org_bound_cookie_token_rejected_on_wrong_tenant():
 
 
 @pytest.mark.asyncio
+async def test_org_bound_token_rejected_on_no_tenant_host_in_production(monkeypatch):
+    """C1: in production, an org-bound token on a host that resolves to no tenant
+    (apex / unknown subdomain) is rejected — closing the no-tenant-host hole."""
+    _, member_a = await _make_org_and_member(f"acme{uuid.uuid4().hex[:6]}")
+    orgs = await reflect_table("organizations")
+    members = await reflect_table("members")
+    async with engine.begin() as conn:
+        org_id = (await conn.execute(
+            members.select().where(members.c.id == member_a)
+        )).mappings().one()["organization_id"]
+    token = create_access_token(member_a, org_id=org_id)
+    # Force production via the module-level indirection so the no-tenant-host
+    # branch rejects. No X-Chronos-Org header → resolved_org_id is None.
+    monkeypatch.setattr("core.auth._is_production", lambda: True)
+    async with _client() as client:
+        resp = await client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "Token not valid for this tenant"
+
+
+@pytest.mark.asyncio
 async def test_signup_mints_org_bound_token():
     """A signup token carries the new org's id as its `org` claim."""
     import jwt as _jwt
