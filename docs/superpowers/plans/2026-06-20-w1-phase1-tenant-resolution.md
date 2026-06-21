@@ -49,7 +49,7 @@ from alembic import op
 import sqlalchemy as sa
 
 revision = "0039_org_subdomain"
-down_revision = "521e52e86de7"  # current head (merge); confirm with `alembic heads`
+down_revision = "0038_sso_scim"  # confirmed current head via `alembic heads`
 branch_labels = None
 depends_on = None
 
@@ -75,8 +75,8 @@ def downgrade() -> None:
 
 - [ ] **Step 2: Confirm the head revision id**
 
-Run: `cd apps/api && alembic heads`
-Expected: prints one head. If it is **not** `521e52e86de7`, set `down_revision` to whatever it prints. (Multiple heads → run `alembic merge` first; out of scope if a single head.)
+Run: `cd apps/api && python3.11 -m alembic heads`
+Expected: prints `0038_sso_scim (head)` (a single head). If it differs, set `down_revision` to whatever it prints. (Multiple heads → run `alembic merge` first; out of scope if a single head.)
 
 - [ ] **Step 3: Apply the migration on a fresh/dev DB**
 
