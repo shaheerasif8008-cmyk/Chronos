@@ -1,8 +1,12 @@
 """W1 Phase 2A — signup helpers + decision logic."""
 from __future__ import annotations
 
+import time
 import uuid
 import pytest
+import httpx
+import main
+from routers.auth import _otp_store
 
 from core.signup import RESERVED_SLUGS, derive_slug, is_free_email_domain, signup_or_join, unique_subdomain
 from core.db import engine, reflect_table
@@ -132,11 +136,6 @@ async def test_signup_normalizes_email_case_to_same_org():
 # ---------------------------------------------------------------------------
 # HTTP endpoint tests — POST /auth/signup
 # ---------------------------------------------------------------------------
-import httpx
-import main
-import time
-from routers.auth import _otp_store
-
 
 def _client() -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://test")
@@ -160,12 +159,21 @@ async def test_signup_endpoint_creates_org_for_unclaimed_domain():
 
 
 @pytest.mark.asyncio
-async def test_signup_endpoint_rejects_bad_otp():
-    email = f"founder@{_domain()}"
+async def test_signup_endpoint_rejects_bad_otp_and_creates_nothing():
+    domain = _domain()
+    email = f"founder@{domain}"
     _seed_otp(email, code="111111")
     async with _client() as client:
         resp = await client.post("/auth/signup", json={"email": email, "code": "999999"})
     assert resp.status_code == 400
+    claims = await reflect_table("email_domain_claims")
+    orgs = await reflect_table("organizations")
+    async with engine.begin() as conn:
+        claim_rows = (await conn.execute(claims.select().where(claims.c.domain == domain))).all()
+        # the derived subdomain for this domain must not exist either
+        sub = domain.split(".", 1)[0]
+        org_rows = (await conn.execute(orgs.select().where(orgs.c.subdomain == sub))).all()
+    assert claim_rows == [] and org_rows == []
 
 
 @pytest.mark.asyncio
@@ -178,3 +186,29 @@ async def test_signup_endpoint_second_same_domain_auto_joins():
         resp = await client.post("/auth/signup", json={"email": f"teammate@{domain}", "code": "123456"})
     assert resp.status_code == 200
     assert resp.json()["created"] is False
+
+
+@pytest.mark.asyncio
+async def test_signup_endpoint_pending_approval_returns_no_token():
+    domain = _domain()
+    _seed_otp(f"founder@{domain}")
+    async with _client() as client:
+        await client.post("/auth/signup", json={"email": f"founder@{domain}", "code": "123456"})
+    # Flip the domain claim to approval policy.
+    claims = await reflect_table("email_domain_claims")
+    async with engine.begin() as conn:
+        await conn.execute(claims.update().where(claims.c.domain == domain).values(join_policy="approval"))
+    _seed_otp(f"applicant@{domain}")
+    async with _client() as client:
+        resp = await client.post("/auth/signup", json={"email": f"applicant@{domain}", "code": "123456"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "pending_approval" and "access_token" not in body
+
+
+@pytest.mark.asyncio
+async def test_signup_endpoint_404_when_dev_otp_disabled(monkeypatch):
+    monkeypatch.setattr("routers.auth._dev_otp_enabled", lambda: False)
+    async with _client() as client:
+        resp = await client.post("/auth/signup", json={"email": f"x@{_domain()}", "code": "123456"})
+    assert resp.status_code == 404

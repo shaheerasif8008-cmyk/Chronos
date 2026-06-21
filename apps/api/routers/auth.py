@@ -3,7 +3,7 @@ import secrets
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Response
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select, update
 
 from core import audit
@@ -45,7 +45,7 @@ class OtpVerify(BaseModel):
 class SignupRequest(BaseModel):
     email: EmailStr
     code: str
-    org_name: str | None = None
+    org_name: str | None = Field(default=None, max_length=200)
 
 
 class CognitoCallbackRequest(BaseModel):
@@ -157,7 +157,6 @@ async def signup(req: SignupRequest, response: Response) -> dict:
     _consume_otp(email, req.code)
     result = await signup_or_join(email, org_name=req.org_name)
     if result.get("status") == "pending_approval":
-        await audit.log("signup_pending", email, "auth.signup", organization_id=result["org_id"])
         return {"status": "pending_approval", "org_id": result["org_id"]}
     # Phase 2A issues a legacy org-less token (grandfathered); Phase 2B flips this
     # to create_access_token(member_id, org_id=result["org_id"]).
