@@ -56,10 +56,15 @@ app.add_middleware(
 @app.middleware("http")
 async def _resolve_tenant(request: Request, call_next):
     """Bind each request to its tenant. Stored on request.state for the auth
-    dependency; ``None`` means the no-tenant (apex/signup) context."""
+    dependency; ``None`` means the no-tenant (apex/signup) context. A resolution
+    failure (e.g. DB unreachable) falls to no-tenant rather than 500ing here;
+    downstream auth still fails closed because member loading also requires the DB."""
     host = request.headers.get("host", "")
     org_header = request.headers.get("x-chronos-org")
-    request.state.resolved_org_id = await resolve_org_id(host, org_header)
+    try:
+        request.state.resolved_org_id = await resolve_org_id(host, org_header)
+    except Exception:
+        request.state.resolved_org_id = None
     return await call_next(request)
 
 

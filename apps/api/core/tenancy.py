@@ -27,11 +27,15 @@ def extract_tenant_label(host: str, *, base_domain: str | None = None) -> str | 
 
     label: str | None = None
     if host.endswith("." + base):
-        label = host[: -(len(base) + 1)].split(".")[0]
+        prefix = host[: -(len(base) + 1)]
+        if "." not in prefix:
+            label = prefix
     else:
         for suffix in _DEV_SUFFIXES:
             if host.endswith(suffix):
-                label = host[: -len(suffix)].split(".")[0]
+                prefix = host[: -len(suffix)]
+                if "." not in prefix:
+                    label = prefix
                 break
     if not label or label in RESERVED_LABELS:
         return None
@@ -46,9 +50,9 @@ async def resolve_org_id(host: str, org_header: str | None) -> str | None:
     """
     label: str | None = None
     if org_header and not settings.is_production:
-        label = org_header.strip().lower()
-        if label in RESERVED_LABELS:
-            label = None
+        stripped = org_header.strip().lower()
+        if stripped and stripped not in RESERVED_LABELS:
+            label = stripped
     if label is None:
         label = extract_tenant_label(host)
     if label is None:
