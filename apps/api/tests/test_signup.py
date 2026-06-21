@@ -127,3 +127,54 @@ async def test_signup_normalizes_email_case_to_same_org():
     assert again["org_id"] == first["org_id"]
     assert again["member_id"] == first["member_id"]
     assert again["created"] is False
+
+
+# ---------------------------------------------------------------------------
+# HTTP endpoint tests — POST /auth/signup
+# ---------------------------------------------------------------------------
+import httpx
+import main
+import time
+from routers.auth import _otp_store
+
+
+def _client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://test")
+
+
+def _seed_otp(email: str, code: str = "123456") -> None:
+    _otp_store[email.lower()] = {"code": code, "expires_at": time.time() + 300, "attempts": 0}
+
+
+@pytest.mark.asyncio
+async def test_signup_endpoint_creates_org_for_unclaimed_domain():
+    domain = _domain()
+    email = f"founder@{domain}"
+    _seed_otp(email)
+    async with _client() as client:
+        resp = await client.post("/auth/signup", json={"email": email, "code": "123456", "org_name": "Acme"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["created"] is True and body["org_id"] and body["member_id"]
+    assert body["access_token"]
+
+
+@pytest.mark.asyncio
+async def test_signup_endpoint_rejects_bad_otp():
+    email = f"founder@{_domain()}"
+    _seed_otp(email, code="111111")
+    async with _client() as client:
+        resp = await client.post("/auth/signup", json={"email": email, "code": "999999"})
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_signup_endpoint_second_same_domain_auto_joins():
+    domain = _domain()
+    _seed_otp(f"founder@{domain}")
+    async with _client() as client:
+        await client.post("/auth/signup", json={"email": f"founder@{domain}", "code": "123456"})
+        _seed_otp(f"teammate@{domain}")
+        resp = await client.post("/auth/signup", json={"email": f"teammate@{domain}", "code": "123456"})
+    assert resp.status_code == 200
+    assert resp.json()["created"] is False

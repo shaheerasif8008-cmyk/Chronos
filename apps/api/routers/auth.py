@@ -21,6 +21,7 @@ from core.config import settings
 from core.db import engine, reflect_table
 from core.invitations import accept_pending_invitation
 from core.members import get_member_by_email, get_or_create_member_for_email
+from core.signup import signup_or_join
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 # email -> {code, expires_at, attempts}. Codes are random, single-use, and
@@ -41,6 +42,12 @@ class OtpVerify(BaseModel):
     code: str
 
 
+class SignupRequest(BaseModel):
+    email: EmailStr
+    code: str
+    org_name: str | None = None
+
+
 class CognitoCallbackRequest(BaseModel):
     code: str
     redirect_uri: str | None = None
@@ -54,6 +61,22 @@ def _dev_otp_enabled() -> bool:
     # Hard gate: dev OTP is never available in production, regardless of config
     # (the config guard also refuses to boot with dev_otp in production).
     return (not settings.is_production) and settings.auth_provider in {"dev_otp", "both"}
+
+
+def _consume_otp(email: str, code: str) -> None:
+    """Validate and consume a dev OTP for ``email``. Raises HTTPException on failure."""
+    email = email.lower()
+    entry = _otp_store.get(email)
+    if entry is None or entry["expires_at"] < time.time():
+        _otp_store.pop(email, None)
+        raise HTTPException(status_code=400, detail="Invalid or expired OTP")
+    if entry["attempts"] >= _OTP_MAX_ATTEMPTS:
+        _otp_store.pop(email, None)
+        raise HTTPException(status_code=429, detail="Too many attempts; request a new code")
+    entry["attempts"] += 1
+    if not secrets.compare_digest(code, entry["code"]):
+        raise HTTPException(status_code=400, detail="Invalid or expired OTP")
+    _otp_store.pop(email, None)
 
 
 @router.get("/config")
@@ -106,18 +129,7 @@ async def verify_otp(req: OtpVerify, response: Response) -> dict[str, str]:
     if not _dev_otp_enabled():
         raise HTTPException(status_code=404, detail="Dev OTP auth is disabled")
     email = req.email.lower()
-    entry = _otp_store.get(email)
-    if entry is None or entry["expires_at"] < time.time():
-        _otp_store.pop(email, None)
-        raise HTTPException(status_code=400, detail="Invalid or expired OTP")
-    if entry["attempts"] >= _OTP_MAX_ATTEMPTS:
-        _otp_store.pop(email, None)
-        raise HTTPException(status_code=429, detail="Too many attempts; request a new code")
-    entry["attempts"] += 1
-    if not secrets.compare_digest(req.code, entry["code"]):
-        raise HTTPException(status_code=400, detail="Invalid or expired OTP")
-    # Single-use: consume the code on success so it can't be replayed.
-    _otp_store.pop(email, None)
+    _consume_otp(email, req.code)
 
     member = await get_member_by_email(email)
     if member is None:
@@ -134,6 +146,27 @@ async def verify_otp(req: OtpVerify, response: Response) -> dict[str, str]:
     await audit.log("otp_verified", member.id, "auth.verify_otp", organization_id=member.organization_id)
     set_session_cookie(response, token)
     return {"access_token": token, "token_type": "bearer", "member_id": member.id}
+
+
+@router.post("/signup")
+async def signup(req: SignupRequest, response: Response) -> dict:
+    """Self-serve signup: verify the work email (dev OTP), then create or join an org."""
+    if not _dev_otp_enabled():
+        raise HTTPException(status_code=404, detail="Self-serve signup requires dev OTP in this environment")
+    email = req.email.lower()
+    _consume_otp(email, req.code)
+    result = await signup_or_join(email, org_name=req.org_name)
+    if result.get("status") == "pending_approval":
+        await audit.log("signup_pending", email, "auth.signup", organization_id=result["org_id"])
+        return {"status": "pending_approval", "org_id": result["org_id"]}
+    # Phase 2A issues a legacy org-less token (grandfathered); Phase 2B flips this
+    # to create_access_token(member_id, org_id=result["org_id"]).
+    token = create_access_token(result["member_id"])
+    set_session_cookie(response, token)
+    await audit.log("signup_completed", result["member_id"], "auth.signup",
+                    organization_id=result["org_id"], payload={"created": result["created"]})
+    return {"access_token": token, "token_type": "bearer", "member_id": result["member_id"],
+            "org_id": result["org_id"], "created": result["created"]}
 
 
 @router.post("/cognito/callback")
