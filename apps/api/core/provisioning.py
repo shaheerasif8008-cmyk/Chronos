@@ -2,22 +2,22 @@
 
 Mirrors the shape of ``seed.py`` (org row + owner member + ``context/{org}/org.md``
 + OpenFGA owner grant), but for any org rather than the seeded ``default`` one.
-``ROOT`` matches ``core.context``'s loader root so the context folder is read at
-runtime.
+``ROOT`` is imported from ``core.context`` so the context folder is always read
+from the same location at runtime.
 """
 from __future__ import annotations
 
+import logging
 import uuid
-from pathlib import Path
 
 from sqlalchemy import insert
 
 from core import audit, permissions
 from core.config import settings
+from core.context import ROOT  # same root core.context.load_org_context reads from
 from core.db import engine, reflect_table
 
-# core/provisioning.py -> core -> apps/api (same dir seed.py uses and context loads).
-ROOT = Path(__file__).resolve().parent.parent
+logger = logging.getLogger(__name__)
 
 _ORG_MD_TEMPLATE = "# {name}\n\nWelcome to Chronos. This is your organization's context folder.\n"
 
@@ -50,7 +50,13 @@ async def provision_org(
             name=owner_name or owner_email.split("@", 1)[0],
         ))
 
-    await permissions.grant_org_membership(member_id, org_id, admin=True)
+    # Best-effort: the org+owner are already durably committed. A grant failure
+    # (OpenFGA configured but unreachable) must not lose the signup; the tuple is
+    # idempotently re-grantable. Surface it for observability instead of 500ing.
+    try:
+        await permissions.grant_org_membership(member_id, org_id, admin=True)
+    except Exception:
+        logger.warning("OpenFGA owner grant failed for org %s; re-grant needed", org_id, exc_info=True)
 
     ctx = ROOT / "context" / org_id
     ctx.mkdir(parents=True, exist_ok=True)

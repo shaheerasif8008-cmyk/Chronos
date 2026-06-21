@@ -40,8 +40,5 @@ async def _reset_db_engine():
 def _isolate_provisioning_context(tmp_path, monkeypatch):
     """Redirect provision_org's context-folder writes to a temp dir so tests
     never pollute apps/api/context/ with uuid-named org folders."""
-    try:
-        monkeypatch.setattr("core.provisioning.ROOT", tmp_path)
-    except (ImportError, AttributeError):
-        pass  # module not imported yet in suites that don't touch provisioning
+    monkeypatch.setattr("core.provisioning.ROOT", tmp_path)
     yield

@@ -31,3 +31,13 @@ async def test_provision_org_creates_org_owner_and_context():
     assert owner["email"] == "founder@acme.com"
     # Context folder written under the (monkeypatched) provisioning.ROOT.
     assert (provisioning.ROOT / "context" / org_id / "org.md").exists()
+
+    audit_log = await reflect_table("audit_log")
+    async with engine.begin() as conn:
+        rows = (await conn.execute(
+            select(audit_log).where(
+                audit_log.c.event_type == "org_provisioned",
+                audit_log.c.resource_id == org_id,
+            )
+        )).mappings().all()
+    assert len(rows) == 1 and rows[0]["organization_id"] == org_id

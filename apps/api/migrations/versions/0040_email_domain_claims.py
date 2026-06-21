@@ -18,12 +18,12 @@ def upgrade() -> None:
     op.create_table(
         "email_domain_claims",
         sa.Column("id", sa.Text(), primary_key=True, server_default=sa.text("gen_random_uuid()::text")),
-        sa.Column("organization_id", sa.Text(), nullable=False),
+        sa.Column("organization_id", sa.Text(), nullable=False, server_default="default"),
         sa.Column("region", sa.Text(), nullable=False, server_default="us"),
         sa.Column("domain", sa.Text(), nullable=False),
         sa.Column("claim_type", sa.Text(), nullable=False, server_default="soft_email"),
         sa.Column("join_policy", sa.Text(), nullable=False, server_default="auto"),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()")),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("NOW()")),
     )
     op.create_index("uq_email_domain_claims_domain", "email_domain_claims", ["domain"], unique=True)
     op.create_index("ix_email_domain_claims_org", "email_domain_claims", ["organization_id"])
