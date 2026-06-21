@@ -52,7 +52,7 @@ async def unique_subdomain(candidate: str) -> str:
                 select(organizations.c.id).where(organizations.c.subdomain == value)
             )).first() is not None
 
-    if label not in RESERVED_SLUGS and not await _taken(label):
+    if not await _taken(label):
         return label
     while True:
         suffixed = f"{label}-{secrets.token_hex(2)}"
@@ -75,6 +75,9 @@ async def signup_or_join(email: str, org_name: str | None = None) -> dict:
     Returns: ``org_id``, ``member_id`` (None if pending approval), ``role``,
     ``created`` (new org), ``joined`` (joined existing org), optionally
     ``status`` == "pending_approval".
+
+    On the approval path a members row IS written with status='pending_approval';
+    member_id is intentionally omitted from the response until an admin approves.
     """
     email = email.lower().strip()
     domain = email.split("@", 1)[1]
@@ -94,6 +97,8 @@ async def signup_or_join(email: str, org_name: str | None = None) -> dict:
             return {"org_id": org_id, "member_id": str(existing.id), "role": existing.role,
                     "created": False, "joined": False}
         if claim["join_policy"] == "approval":
+            # Direct insert (not provision_member): provision_member hardcodes
+            # status="active"; a pending member must be created as pending_approval.
             members = await reflect_table("members")
             member_id = str(_uuid.uuid4())
             async with engine.begin() as conn:

@@ -4,7 +4,7 @@ from __future__ import annotations
 import uuid
 import pytest
 
-from core.signup import RESERVED_SLUGS, derive_slug, is_free_email_domain, unique_subdomain
+from core.signup import RESERVED_SLUGS, derive_slug, is_free_email_domain, signup_or_join, unique_subdomain
 from core.db import engine, reflect_table
 
 
@@ -44,9 +44,6 @@ async def test_unique_subdomain_suffixes_on_collision_and_reserved():
     assert out != base and out.startswith(base)
     reserved_out = await unique_subdomain("api")
     assert reserved_out not in RESERVED_SLUGS
-
-
-from core.signup import signup_or_join
 
 
 def _domain() -> str:
@@ -95,3 +92,38 @@ async def test_free_email_creates_personal_org_without_claim():
     async with engine.begin() as conn:
         rows = (await conn.execute(claims.select().where(claims.c.domain == "gmail.com"))).all()
     assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_claimed_domain_with_approval_policy_creates_pending_member():
+    domain = _domain()
+    # Create an org via signup, then flip its claim to approval policy.
+    first = await signup_or_join(f"founder@{domain}")
+    claims = await reflect_table("email_domain_claims")
+    async with engine.begin() as conn:
+        await conn.execute(
+            claims.update().where(claims.c.domain == domain).values(join_policy="approval")
+        )
+    res = await signup_or_join(f"applicant@{domain}")
+    assert res.get("status") == "pending_approval"
+    assert res["member_id"] is None and res["org_id"] == first["org_id"]
+    # A pending member row exists in that org.
+    members = await reflect_table("members")
+    async with engine.begin() as conn:
+        row = (await conn.execute(
+            members.select().where(
+                members.c.organization_id == first["org_id"],
+                members.c.email == f"applicant@{domain}",
+            )
+        )).mappings().one()
+    assert row["status"] == "pending_approval"
+
+
+@pytest.mark.asyncio
+async def test_signup_normalizes_email_case_to_same_org():
+    domain = _domain()
+    first = await signup_or_join(f"Founder@{domain}")
+    again = await signup_or_join(f"FOUNDER@{domain.upper()}")
+    assert again["org_id"] == first["org_id"]
+    assert again["member_id"] == first["member_id"]
+    assert again["created"] is False
