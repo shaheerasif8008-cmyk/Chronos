@@ -90,7 +90,41 @@ New `POST /auth/signup`:
      request-to-join if the owner set `join_policy = approval`.
    - **Free-email domain** (gmail/outlook/… blocklist): create a *personal* org;
      no domain claim.
-3. Redirect to the new org's subdomain, logged in.
+3. Redirect to the new org's subdomain, logged in (handoff in §2e).
+
+**Reserved slugs.** Slug-from-domain (collision-suffixed) must refuse a
+reserved-label blocklist — `app`, `www`, `api`, `admin`, `static`, `assets`, and
+the apex itself — or a signup could hijack platform routing.
+
+### 2e. Cross-subdomain auth handoff + dev/CI tenant resolution
+
+Login happens at the apex/no-tenant host, but tokens are bound to a tenant
+subdomain (§2a), so the session must cross an origin boundary. Mechanism: after
+auth at apex, mint a **short-lived single-use handoff token** (signed JWT: org_id +
+member_id + nonce, ~60s TTL) and redirect to
+`https://{subdomain}.cognisiatech.com/login/handoff#token=…`; that page exchanges
+the handoff token at the tenant origin for the real subdomain-bound session
+cookie/token. Reuses the existing fragment-token pattern (`login/callback`); the
+handoff token is never logged.
+
+**Dev/CI tenant resolution (required for §6 proof).** There is no wildcard DNS in
+local dev or CI, so the middleware (§2a) must also accept tenant resolution via:
+(a) `*.lvh.me` / `acme.localhost` Host labels (both resolve to 127.0.0.1), and
+(b) an `X-Chronos-Org` header override that is honored **only** when
+`settings.is_production` is false. The web base-URL logic in `apps/web/lib/api.ts`
+gains a matching dev path so the E2E can drive two subdomains on localhost. Without
+this the §6 isolation E2E cannot run, so it is load-bearing, not polish.
+
+### 2f. Domain registry: single source of truth
+
+Two domain→org maps now exist: the new `email_domain_claims` and the existing
+`sso_connections.email_domain` (unique-indexed, used by
+`core/sso.py:get_connection_by_domain`). **`email_domain_claims` is canonical.**
+SSO connection creation must validate that `email_domain` is a domain the org has
+**hard-claimed** (DNS-verified, §4) — you cannot route SSO for a domain you don't
+own. Login domain routing reads `email_domain_claims` first; `sso_connections`
+only answers "which IdP for this already-claimed domain." This keeps the two
+registries from diverging.
 
 ### 2c. Provisioning (`core/provisioning.py`)
 
@@ -118,6 +152,13 @@ DNS-TXT to unlock enterprise features.
 
 All new tables carry `organization_id UUID NOT NULL` and `region TEXT NOT NULL`
 (Rules 4 & 5). Audit on every claim/provision/verify event (append-only).
+
+**Back-compat for `default`.** The existing `default` org (load-bearing in
+`seed.py` and across the test suite) is migrated to reserved subdomain
+`default.cognisiatech.com` (and resolvable via the dev paths in §2e). Its existing
+sessions remain valid: tokens minted before tenant-binding are grandfathered to
+`default` so the suite and any live `default` sessions don't break on deploy. New
+tokens are subdomain-bound.
 
 ## 4. Security / abuse model
 
