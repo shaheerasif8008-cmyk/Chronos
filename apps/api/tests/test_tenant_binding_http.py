@@ -62,6 +62,7 @@ async def test_org_bound_token_rejected_on_wrong_tenant():
             headers={"Authorization": f"Bearer {token}", "X-Chronos-Org": b_label},
         )
     assert resp.status_code == 403
+    assert resp.json()["detail"] == "Token not valid for this tenant"
 
 
 @pytest.mark.asyncio
@@ -84,3 +85,19 @@ async def test_legacy_token_without_org_claim_is_grandfathered():
     async with _client() as client:
         resp = await client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
     assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_org_bound_cookie_token_rejected_on_wrong_tenant():
+    org_a, member_a = await _make_org_and_member(f"acme{uuid.uuid4().hex[:6]}")
+    org_b, _ = await _make_org_and_member(f"globex{uuid.uuid4().hex[:6]}")
+    token = create_access_token(member_a, org_id=org_a)
+    b_label = await _subdomain_of(org_b)
+    async with _client() as client:
+        resp = await client.get(
+            "/auth/me",
+            headers={"X-Chronos-Org": b_label},
+            cookies={"chronos_session": token},
+        )
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "Token not valid for this tenant"
