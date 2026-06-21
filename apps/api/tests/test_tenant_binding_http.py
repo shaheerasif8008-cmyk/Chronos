@@ -101,3 +101,21 @@ async def test_org_bound_cookie_token_rejected_on_wrong_tenant():
         )
     assert resp.status_code == 403
     assert resp.json()["detail"] == "Token not valid for this tenant"
+
+
+@pytest.mark.asyncio
+async def test_signup_mints_org_bound_token():
+    """A signup token carries the new org's id as its `org` claim."""
+    import jwt as _jwt
+    from core.config import settings as _settings
+    from routers.auth import _otp_store
+    import time
+    domain = f"flip{uuid.uuid4().hex[:8]}.com"
+    email = f"founder@{domain}"
+    _otp_store[email] = {"code": "123456", "expires_at": time.time() + 300, "attempts": 0}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://test") as client:
+        resp = await client.post("/auth/signup", json={"email": email, "code": "123456"})
+    assert resp.status_code == 200
+    body = resp.json()
+    payload = _jwt.decode(body["access_token"], _settings.jwt_secret, algorithms=["HS256"])
+    assert payload["org"] == body["org_id"]

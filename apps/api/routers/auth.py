@@ -137,7 +137,7 @@ async def verify_otp(req: OtpVerify, response: Response) -> dict[str, str]:
     if member is None:
         raise HTTPException(status_code=403, detail="Email is not seeded as a Chronos member")
 
-    token = create_access_token(member.id)
+    token = create_access_token(member.id, org_id=member.organization_id)
     members = await reflect_table("members")
     async with engine.begin() as conn:
         await conn.execute(
@@ -158,9 +158,8 @@ async def signup(req: SignupRequest, response: Response) -> dict:
     result = await signup_or_join(email, org_name=req.org_name)
     if result.get("status") == "pending_approval":
         return {"status": "pending_approval", "org_id": result["org_id"]}
-    # Phase 2A issues a legacy org-less token (grandfathered); Phase 2B flips this
-    # to create_access_token(member_id, org_id=result["org_id"]).
-    token = create_access_token(result["member_id"])
+    # Phase 2B: token is now org-bound (org_id claim set to the resolved org).
+    token = create_access_token(result["member_id"], org_id=result["org_id"])
     set_session_cookie(response, token)
     await audit.log("signup_completed", result["member_id"], "auth.signup",
                     organization_id=result["org_id"], payload={"created": result["created"]})
@@ -183,7 +182,7 @@ async def cognito_callback(req: CognitoCallbackRequest, response: Response) -> d
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
-    token = create_access_token(member.id)
+    token = create_access_token(member.id, org_id=member.organization_id)
     await audit.log("cognito_login", member.id, "auth.cognito_callback", organization_id=member.organization_id)
     set_session_cookie(response, token)
     return {"access_token": token, "token_type": "bearer", "member_id": member.id}
@@ -203,7 +202,7 @@ async def cognito_verify_id_token(req: CognitoIdTokenRequest, response: Response
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
-    token = create_access_token(member.id)
+    token = create_access_token(member.id, org_id=member.organization_id)
     await audit.log("cognito_login", member.id, "auth.cognito_verify", organization_id=member.organization_id)
     set_session_cookie(response, token)
     return {"access_token": token, "token_type": "bearer", "member_id": member.id}

@@ -81,7 +81,7 @@ async def sso_callback(
     except sso.SSOError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    token = create_access_token(member.id)
+    token = create_access_token(member.id, org_id=member.organization_id)
     await audit.log("sso_login", member.id, "auth.sso_callback",
                     organization_id=member.organization_id,
                     payload={"connection_id": conn.id})
