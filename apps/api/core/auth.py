@@ -2,7 +2,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import jwt
-from fastapi import Cookie, Depends, HTTPException
+from fastapi import Cookie, Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 
@@ -42,6 +42,7 @@ def create_access_token(member_id: str, *, org_id: str | None = None) -> str:
 
 
 async def get_current_member(
+    request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
     chronos_session: str | None = Cookie(default=None),
 ) -> Member:
@@ -74,4 +75,12 @@ async def get_current_member(
     # member's existing tokens must stop working immediately.
     if getattr(member, "status", "active") != "active":
         raise HTTPException(status_code=403, detail="Member account is deactivated")
+    # Tenant binding: an org-bound token is valid only on its own tenant. Legacy
+    # tokens (no `org` claim) are grandfathered. Fail closed when the resolved
+    # tenant is known and does not match.
+    token_org = payload.get("org")
+    if token_org is not None:
+        resolved = getattr(request.state, "resolved_org_id", None)
+        if resolved is not None and resolved != token_org:
+            raise HTTPException(status_code=403, detail="Token not valid for this tenant")
     return member

@@ -2,12 +2,13 @@ from __future__ import annotations
 import secrets
 import time
 
-from fastapi import APIRouter, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import select, update
 
 from core import audit
-from core.auth import create_access_token, set_session_cookie
+from core.auth import create_access_token, get_current_member, set_session_cookie
+from core.models import Member
 from core.cognito import (
     CognitoAuthError,
     build_authorize_url,
@@ -174,3 +175,10 @@ async def cognito_verify_id_token(req: CognitoIdTokenRequest, response: Response
     await audit.log("cognito_login", member.id, "auth.cognito_verify", organization_id=member.organization_id)
     set_session_cookie(response, token)
     return {"access_token": token, "token_type": "bearer", "member_id": member.id}
+
+
+@router.get("/me")
+async def me(member: Member = Depends(get_current_member)) -> dict:
+    """Return the authenticated member's identity. Protected by tenant-binding enforcement."""
+    return {"id": member.id, "email": member.email, "role": member.role,
+            "organization_id": member.organization_id}
