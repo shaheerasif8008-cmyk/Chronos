@@ -15,6 +15,10 @@ playwright-report/
 .DS_Store
 dump.rdb
 
+# Per-org context folders are local runtime state written by provisioning/seed
+# (apps/api/context/<org_id>/org.md); never commit them.
+apps/api/context/
+
 # Terraform
 infra/.terraform/
 infra/.terraform.lock.hcl
