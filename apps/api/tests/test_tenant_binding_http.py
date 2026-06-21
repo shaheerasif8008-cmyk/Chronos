@@ -125,6 +125,27 @@ async def test_org_bound_token_rejected_on_no_tenant_host_in_production(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_enforce_flag_rejects_org_less_tokens(monkeypatch):
+    """C2: with enforcement on, a legacy org-less token is rejected (401)."""
+    _, member_a = await _make_org_and_member(f"acme{uuid.uuid4().hex[:6]}")
+    legacy = create_access_token(member_a)  # no org claim
+    monkeypatch.setattr("core.auth.settings.enforce_org_bound_tokens", True, raising=False)
+    async with _client() as client:
+        resp = await client.get("/auth/me", headers={"Authorization": f"Bearer {legacy}"})
+    assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_enforce_flag_off_grandfathers_org_less_tokens():
+    """C2 default: enforcement off → legacy org-less token still works."""
+    _, member_a = await _make_org_and_member(f"acme{uuid.uuid4().hex[:6]}")
+    legacy = create_access_token(member_a)
+    async with _client() as client:
+        resp = await client.get("/auth/me", headers={"Authorization": f"Bearer {legacy}"})
+    assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_signup_mints_org_bound_token():
     """A signup token carries the new org's id as its `org` claim."""
     import jwt as _jwt

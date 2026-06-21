@@ -71,6 +71,9 @@ class Settings(BaseSettings):
     jwt_secret: str = "change-me-in-dev"
     access_token_expire_minutes: int = 60
 
+    # When true, reject legacy org-less session tokens (post-flip enforcement, C2).
+    enforce_org_bound_tokens: bool = False
+
     # Auth: dev_otp (Phase 1 default), cognito, or both
     auth_provider: str = "dev_otp"
     cognito_region: str = "us-east-1"

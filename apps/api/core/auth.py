@@ -91,6 +91,10 @@ async def get_current_member(
     # member's existing tokens must stop working immediately.
     if getattr(member, "status", "active") != "active":
         raise HTTPException(status_code=403, detail="Member account is deactivated")
+    # C2: once minting is flipped, optionally refuse legacy org-less tokens.
+    if settings.enforce_org_bound_tokens and payload.get("org") is None:
+        raise HTTPException(status_code=401, detail="Session token missing tenant binding")
+
     # Tenant binding (secondary defense — data isolation is enforced downstream by
     # member.organization_id scoping, not by this check). An org-bound token is
     # valid only on its own tenant.
