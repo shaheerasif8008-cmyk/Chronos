@@ -7,6 +7,7 @@ import secrets
 import uuid as _uuid
 
 from sqlalchemy import insert, select
+from sqlalchemy.exc import IntegrityError
 
 from core import audit
 from core.config import settings
@@ -119,14 +120,28 @@ async def signup_or_join(email: str, org_name: str | None = None) -> dict:
         return {"org_id": org_id, "member_id": str(member.id), "role": "user",
                 "created": False, "joined": True}
 
+    # Unclaimed work domain: create the org, make the signer owner, soft-claim.
     sub = await unique_subdomain(domain.split(".", 1)[0])
     prov = await provision_org(slug=sub, name=org_name or domain.split(".", 1)[0].title(), owner_email=email)
     claims = await reflect_table("email_domain_claims")
-    async with engine.begin() as conn:
-        await conn.execute(insert(claims).values(
-            organization_id=prov["org_id"], region=settings.region, domain=domain,
-            claim_type="soft_email", join_policy="auto",
-        ))
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(insert(claims).values(
+                organization_id=prov["org_id"], region=settings.region, domain=domain,
+                claim_type="soft_email", join_policy="auto",
+            ))
+    except IntegrityError:
+        # Lost the race: a concurrent signup claimed this domain first. Roll back
+        # the org we just created and join the winner's org instead.
+        orgs = await reflect_table("organizations")
+        members_tbl = await reflect_table("members")
+        async with engine.begin() as conn:
+            await conn.execute(members_tbl.delete().where(members_tbl.c.id == prov["owner_member_id"]))
+            await conn.execute(orgs.delete().where(orgs.c.id == prov["org_id"]))
+        winner = await _claim_for_domain(domain)
+        member = await provision_member(winner["organization_id"], email, role="user")
+        return {"org_id": winner["organization_id"], "member_id": str(member.id),
+                "role": "user", "created": False, "joined": True}
     await audit.log("domain_soft_claimed", prov["owner_member_id"], "signup.claim_domain",
                     organization_id=prov["org_id"], payload={"domain": domain})
     return {"org_id": prov["org_id"], "member_id": prov["owner_member_id"],
