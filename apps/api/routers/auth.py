@@ -2,7 +2,7 @@ from __future__ import annotations
 import secrets
 import time
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select, update
 
@@ -20,7 +20,7 @@ from core.cognito import (
 from core.config import settings
 from core.db import engine, reflect_table
 from core.invitations import accept_pending_invitation
-from core.members import get_member_by_email, get_or_create_member_for_email
+from core.members import get_member_by_email, get_member_in_org, get_or_create_member_for_email
 from core.signup import signup_or_join
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -125,24 +125,30 @@ async def request_otp(req: OtpRequest) -> dict[str, str]:
 
 
 @router.post("/verify-otp")
-async def verify_otp(req: OtpVerify, response: Response) -> dict[str, str]:
+async def verify_otp(req: OtpVerify, request: Request, response: Response) -> dict[str, str]:
     if not _dev_otp_enabled():
         raise HTTPException(status_code=404, detail="Dev OTP auth is disabled")
     email = req.email.lower()
     _consume_otp(email, req.code)
 
-    member = await get_member_by_email(email)
+    # Per-subdomain login: resolve the member in the request's tenant. Apex / no
+    # tenant context falls back to the default org (dev convenience).
+    resolved = getattr(request.state, "resolved_org_id", None)
+    if resolved is not None:
+        member = await get_member_in_org(resolved, email=email)
+        if member is None:
+            member = await accept_pending_invitation(email, org_id=resolved)
+    else:
+        member = await get_member_by_email(email)
+        if member is None:
+            member = await accept_pending_invitation(email, org_id=settings.org_id)
     if member is None:
-        member = await accept_pending_invitation(email, org_id=settings.org_id)
-    if member is None:
-        raise HTTPException(status_code=403, detail="Email is not seeded as a Chronos member")
+        raise HTTPException(status_code=403, detail="Email is not a member of this organization")
 
     token = create_access_token(member.id, org_id=member.organization_id)
     members = await reflect_table("members")
     async with engine.begin() as conn:
-        await conn.execute(
-            update(members).where(members.c.id == member.id).values(region=settings.region)
-        )
+        await conn.execute(update(members).where(members.c.id == member.id).values(region=settings.region))
     await audit.log("otp_verified", member.id, "auth.verify_otp", organization_id=member.organization_id)
     set_session_cookie(response, token)
     return {"access_token": token, "token_type": "bearer", "member_id": member.id}
