@@ -1853,6 +1853,28 @@ async def _reflect(goal: str, answer: str, tool_summaries: list[str]) -> cogniti
         return None
 
 
+async def _verify_answer(
+    goal: str,
+    answer: str,
+    ledger: dict[str, Any],
+    tool_summaries: list[str],
+) -> cognition.Verdict | None:
+    """Evidence-check the proposed answer against the controller ledger.
+
+    Returns None on any verifier failure so the older reflection path remains
+    the fallback rather than a new hard dependency.
+    """
+    try:
+        raw = await complete_json(
+            cognition.build_evidence_verification_prompt(goal, answer, ledger, tool_summaries),
+            model=settings.fast_model,
+        )
+        return cognition.parse_verdict(raw)
+    except Exception as exc:  # noqa: BLE001 — verifier is advisory
+        logger.info("Evidence verifier unavailable, falling back to reflection: %s", exc)
+        return None
+
+
 def _persist_plan_shape(steps: list[dict[str, Any]]) -> dict[str, Any]:
     return {"steps": steps}
 
@@ -1919,6 +1941,11 @@ async def run_loop(
         budget.replans_used = int(_cog_state.get("replans_used") or 0)
     tracker = cognition.ProgressTracker()
     escalated = False  # model is upgraded at most once, when the loop struggles
+    available_tool_names = [
+        str(((tool or {}).get("function") or {}).get("name") or "")
+        for tool in effective_tools
+        if isinstance(tool, dict)
+    ]
 
     # Plan: build fresh on first entry, restore from the task row on resume.
     plan_steps: list[dict[str, Any]] = []
@@ -1967,6 +1994,17 @@ async def run_loop(
             pending_approval_calls=pending_approval_calls if isinstance(pending_approval_calls, list) else None,
         )
         if light_cognition:
+            ledger = cognition.build_task_ledger(
+                goal,
+                history,
+                plan_steps=plan_steps,
+                current_plan_step=current_plan_step,
+                token_usage=token_usage,
+                pending_approval_calls=pending_approval_calls if isinstance(pending_approval_calls, list) else None,
+            )
+            step_history = step_history + [
+                {"role": "system", "content": cognition.render_task_ledger(ledger)}
+            ]
             _guidance: list[str] = []
             _bd = budget.directive()
             if _bd:
@@ -1974,6 +2012,14 @@ async def run_loop(
             _pd = cognition.plan_directive(plan_steps, current_plan_step) if plan_steps else None
             if _pd:
                 _guidance.append(_pd)
+            _sd = cognition.subagent_orchestration_directive(
+                goal, plan_steps, available_tool_names=available_tool_names
+            )
+            if _sd:
+                _guidance.append(_sd)
+            _td = cognition.tool_batching_directive(available_tool_names)
+            if _td:
+                _guidance.append(_td)
             if _guidance:
                 step_history = step_history + [{"role": "system", "content": "\n\n".join(_guidance)}]
         try:
@@ -2014,9 +2060,16 @@ async def run_loop(
         # ── Final answer ────────────────────────────────────────────────────
         if not calls:
             answer = final_text or ""
-            # Reflection / self-verify: before accepting, critique the answer
-            # against the goal. If it's incomplete and budget remains, inject a
-            # concrete directive and keep working instead of finishing shallow.
+            final_ledger = cognition.build_task_ledger(
+                goal,
+                history,
+                plan_steps=plan_steps,
+                current_plan_step=current_plan_step,
+                token_usage=token_usage,
+            )
+            # Evidence verification / reflection: before accepting, check the
+            # answer against runtime facts. If it's incomplete and budget
+            # remains, inject a concrete directive and keep working.
             if (
                 model_cognition
                 and budget.can_reflect
@@ -2029,7 +2082,10 @@ async def run_loop(
                     "iteration": iteration + 1,
                     "summary": "Reviewing the answer against the goal.",
                 })
-                verdict = await _reflect(goal, answer, collect_tool_summaries(history))
+                tool_summaries = collect_tool_summaries(history)
+                verdict = await _verify_answer(goal, answer, final_ledger, tool_summaries)
+                if verdict is None:
+                    verdict = await _reflect(goal, answer, tool_summaries)
                 if verdict and not verdict.complete and budget.can_replan and not budget.exhausted:
                     budget.replans_used += 1
                     history.append({"role": "assistant", "content": answer})
@@ -2055,6 +2111,8 @@ async def run_loop(
                         cognition_state={
                             "reflections_used": budget.reflections_used,
                             "replans_used": budget.replans_used,
+                            "ledger": final_ledger,
+                            "trace_metrics": cognition.score_task_trace(history),
                         },
                         token_usage=token_usage,
                     )
@@ -2076,6 +2134,16 @@ async def run_loop(
             await _checkpoint(task_id, history, iteration + 1, model=effective_model,
                               status="complete", result=result,
                               current_step=len(plan_steps) if plan_steps else iteration + 1,
+                              cognition_state={
+                                  "reflections_used": budget.reflections_used,
+                                  "replans_used": budget.replans_used,
+                                  "ledger": final_ledger,
+                                  "trace_metrics": cognition.score_task_trace(history, result),
+                                  "learning_notes": cognition.derive_trace_learning_notes(
+                                      cognition.score_task_trace(history, result),
+                                      final_ledger,
+                                  ),
+                              },
                               token_usage=token_usage,
                               completed_at=datetime.now(timezone.utc))
             # Build the structured response envelope from runtime facts + prose composer.
@@ -2204,7 +2272,21 @@ async def run_loop(
         _append_replan_instruction(history, state)
 
         # ── Progress / loop detection + visible plan advancement ───────────────
+        plan_report = cognition.PlanComplianceReport(cognition.PlanComplianceSignal.NO_PLAN)
         if light_cognition:
+            plan_report = cognition.assess_plan_compliance(
+                plan_steps,
+                current_step=current_plan_step,
+                calls=calls,
+                tool_messages=tool_messages,
+            )
+            if plan_report.directive:
+                history.append({"role": "system", "content": plan_report.directive})
+                await publish_activity(task_id, {
+                    "type": "model_step",
+                    "iteration": iteration,
+                    "summary": "Checking plan fit after tool results.",
+                })
             signal = tracker.record(
                 calls, tool_messages,
                 args_for=lambda c: _parse_args(c.get("args_str", "{}")),
@@ -2245,7 +2327,7 @@ async def run_loop(
                 })
             # Advance the user-visible plan on a productive (error-free) step.
             _productive = bool(tool_messages) and not state.get("last_tool_errors")
-            if plan_steps and _productive and current_plan_step < len(plan_steps) - 1:
+            if plan_steps and _productive and plan_report.should_advance and current_plan_step < len(plan_steps) - 1:
                 await emit_activity(task_id, {
                     "type": "step_done",
                     "step": plan_steps[current_plan_step],
@@ -2258,6 +2340,21 @@ async def run_loop(
                     "step_index": current_plan_step,
                 })
 
+        controller_ledger = cognition.build_task_ledger(
+            goal,
+            history,
+            plan_steps=plan_steps,
+            current_plan_step=current_plan_step,
+            token_usage=token_usage,
+        )
+        trace_metrics = cognition.score_task_trace(history)
+        await publish_activity(task_id, {
+            "type": "controller_state",
+            "plan_signal": plan_report.signal,
+            "ledger": controller_ledger,
+            "trace_metrics": trace_metrics,
+        })
+
         # Persist after every iteration
         await _checkpoint(
             task_id,
@@ -2269,6 +2366,10 @@ async def run_loop(
             cognition_state={
                 "reflections_used": budget.reflections_used,
                 "replans_used": budget.replans_used,
+                "ledger": controller_ledger,
+                "trace_metrics": trace_metrics,
+                "learning_notes": cognition.derive_trace_learning_notes(trace_metrics, controller_ledger),
+                "last_plan_signal": plan_report.signal,
             },
             token_usage=token_usage,
         )

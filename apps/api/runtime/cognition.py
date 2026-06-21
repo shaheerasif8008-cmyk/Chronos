@@ -214,6 +214,291 @@ class ProgressTracker:
         return self.stall_breaks >= 3 or self.unproductive_streak >= self.stall_window * 2
 
 
+# ── Controller ledger / plan compliance / trace scoring ─────────────────────
+
+
+class PlanComplianceSignal(str, Enum):
+    NO_PLAN = "no_plan"
+    ON_PLAN = "on_plan"
+    TOOL_MISMATCH = "tool_mismatch"
+    STEP_BLOCKED = "step_blocked"
+
+
+@dataclass
+class PlanComplianceReport:
+    signal: PlanComplianceSignal
+    directive: str = ""
+    should_advance: bool = False
+
+
+def _tool_family(name: str | None) -> str:
+    raw = str(name or "")
+    return raw.partition("__")[0] or raw.partition(".")[0]
+
+
+def _call_name(call: dict[str, Any]) -> str:
+    if call.get("name"):
+        return str(call["name"])
+    fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+    return str(fn.get("name") or "")
+
+
+def _parse_tool_payload(message: dict[str, Any]) -> dict[str, Any]:
+    content = message.get("content")
+    if not isinstance(content, str):
+        return {}
+    try:
+        payload = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        return {"summary": content[:240]}
+    return payload if isinstance(payload, dict) else {"summary": str(payload)[:240]}
+
+
+def _tool_summary(message: dict[str, Any]) -> str:
+    name = str(message.get("name") or "tool")
+    payload = _parse_tool_payload(message)
+    parts = [f"- {name}"]
+    if payload.get("summary"):
+        parts.append(f"summary={payload['summary']}")
+    if payload.get("error"):
+        parts.append(f"error={payload['error']}")
+    data = payload.get("data")
+    if isinstance(data, dict):
+        for key in ("artifact_id", "artifact_ids", "source_id", "source_ids", "citations", "degraded_connector"):
+            if key in data:
+                parts.append(f"{key}={str(data[key])[:240]}")
+    return "; ".join(parts)
+
+
+def _artifact_ids_from_payload(payload: dict[str, Any]) -> list[str]:
+    out: list[str] = []
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    if not isinstance(data, dict):
+        return out
+    single = data.get("artifact_id")
+    if isinstance(single, str) and single:
+        out.append(single)
+    for artifact_id in data.get("artifact_ids") or []:
+        if isinstance(artifact_id, str) and artifact_id:
+            out.append(artifact_id)
+    return out
+
+
+def assess_plan_compliance(
+    steps: list[dict[str, Any]] | None,
+    *,
+    current_step: int,
+    calls: list[dict[str, Any]],
+    tool_messages: list[dict[str, Any]],
+) -> PlanComplianceReport:
+    """Return a compact controller assessment of whether the current step is on track."""
+    if not steps:
+        return PlanComplianceReport(PlanComplianceSignal.NO_PLAN)
+    step = steps[min(max(current_step, 0), len(steps) - 1)]
+    hinted_family = _tool_family(str(step.get("tool") or ""))
+    call_families = {_tool_family(_call_name(call)) for call in calls if _call_name(call)}
+    errors = [msg for msg in tool_messages if _message_is_error(msg)]
+    if errors:
+        return PlanComplianceReport(
+            PlanComplianceSignal.STEP_BLOCKED,
+            (
+                "Controller plan check: the current plan step is blocked by tool errors; "
+                "work around the failure with a different tool, narrower arguments, or a "
+                "truthful partial result instead of retrying blindly."
+            ),
+        )
+    if hinted_family and call_families and hinted_family not in call_families:
+        return PlanComplianceReport(
+            PlanComplianceSignal.TOOL_MISMATCH,
+            (
+                "Controller plan check: the current step expected the "
+                f"{hinted_family} tool family, but the model chose {', '.join(sorted(call_families))}. "
+                "Either explain why the plan changed in the next action or return to the planned step."
+            ),
+        )
+    productive = bool(tool_messages)
+    return PlanComplianceReport(PlanComplianceSignal.ON_PLAN, should_advance=productive)
+
+
+def build_task_ledger(
+    goal: str,
+    history: list[dict[str, Any]],
+    *,
+    plan_steps: list[dict[str, Any]] | None = None,
+    current_plan_step: int = 0,
+    token_usage: dict[str, Any] | None = None,
+    pending_approval_calls: list[dict[str, Any]] | None = None,
+    max_recent_evidence: int = 8,
+) -> dict[str, Any]:
+    """Build the small state object the controller shows the model each turn."""
+    tool_messages = [m for m in history if m.get("role") == "tool"]
+    attempted: list[str] = []
+    errors: list[dict[str, str]] = []
+    artifacts: list[str] = []
+    for message in tool_messages:
+        name = str(message.get("name") or "tool")
+        if name not in attempted:
+            attempted.append(name)
+        payload = _parse_tool_payload(message)
+        if payload.get("error"):
+            errors.append({"tool": name, "error": str(payload["error"])[:240]})
+        artifacts.extend(_artifact_ids_from_payload(payload))
+    plan: dict[str, Any] = {}
+    if plan_steps:
+        index = min(max(current_plan_step, 0), len(plan_steps) - 1)
+        plan = {
+            "current_step_index": index,
+            "current_step": plan_steps[index],
+            "step_count": len(plan_steps),
+        }
+    return {
+        "goal": goal[:500],
+        "plan": plan,
+        "attempted_tools": attempted,
+        "recent_evidence": [_tool_summary(m) for m in tool_messages[-max_recent_evidence:]],
+        "open_errors": errors[-5:],
+        "artifacts": list(dict.fromkeys(artifacts))[-10:],
+        "pending_approval_count": len(pending_approval_calls or []),
+        "token_usage": {
+            "total_tokens": int((token_usage or {}).get("total_tokens") or 0),
+            "steps": len((token_usage or {}).get("steps") or []),
+        },
+    }
+
+
+def render_task_ledger(ledger: dict[str, Any]) -> str:
+    """Render the structured ledger into a terse system message."""
+    lines = ["# Controller Task Ledger"]
+    goal = ledger.get("goal")
+    if goal:
+        lines.append(f"Goal: {goal}")
+    plan = ledger.get("plan") if isinstance(ledger.get("plan"), dict) else {}
+    if plan:
+        current = plan.get("current_step") or {}
+        lines.append(
+            f"Plan: step {int(plan.get('current_step_index') or 0) + 1}/{plan.get('step_count')} - "
+            f"{str(current.get('description') or '')[:200]}"
+        )
+    attempted = ledger.get("attempted_tools") or []
+    if attempted:
+        lines.append("Tools attempted: " + ", ".join(str(t) for t in attempted[-12:]))
+    if ledger.get("pending_approval_count"):
+        lines.append(f"Pending approvals: {ledger['pending_approval_count']}")
+    if ledger.get("artifacts"):
+        lines.append("Artifacts: " + ", ".join(str(a) for a in ledger["artifacts"]))
+    evidence = ledger.get("recent_evidence") or []
+    if evidence:
+        lines.append("Recent evidence:")
+        lines.extend(str(item)[:500] for item in evidence)
+    errors = ledger.get("open_errors") or []
+    if errors:
+        lines.append("Open errors:")
+        for error in errors:
+            lines.append(f"- {error.get('tool')}: {error.get('error')}")
+    usage = ledger.get("token_usage") if isinstance(ledger.get("token_usage"), dict) else {}
+    if usage.get("total_tokens"):
+        lines.append(f"Observed tokens: {usage['total_tokens']} across {usage.get('steps', 0)} model steps")
+    return "\n".join(lines)
+
+
+def build_evidence_verification_prompt(
+    goal: str,
+    answer: str,
+    ledger: dict[str, Any],
+    tool_summaries: list[str],
+) -> str:
+    """Prompt a critic to judge whether the final answer is backed by runtime evidence."""
+    return (
+        "You are the evidence verifier for an autonomous AI work assistant. Judge whether the "
+        "proposed final answer is supported by the actual task ledger and tool evidence. "
+        "Do not demand unnecessary work, but reject answers that claim files, research, actions, "
+        "or external changes that are not visible in the evidence.\n\n"
+        "Return ONLY JSON:\n"
+        '{"complete": true|false, "missing": ["<gap>", ...], '
+        '"directive": "<one concrete instruction for what to do next, or empty if complete>"}\n\n'
+        f"Goal:\n{goal[:1500]}\n\n"
+        f"Controller ledger:\n{json.dumps(ledger, indent=2, default=str)[:5000]}\n\n"
+        f"Tool summaries:\n{chr(10).join(f'- {s}' for s in tool_summaries[:30])[:4000]}\n\n"
+        f"Proposed final answer:\n{(answer or '')[:4000]}"
+    )
+
+
+def subagent_orchestration_directive(
+    goal: str,
+    steps: list[dict[str, Any]] | None,
+    *,
+    available_tool_names: list[str],
+) -> str | None:
+    if "spawn__subagent" not in available_tool_names:
+        return None
+    goal_lower = goal.lower()
+    broad_goal = any(word in goal_lower for word in ("all ", "compare", "audit", "research", "competitor", "multiple"))
+    if broad_goal or len(steps or []) >= 3:
+        return (
+            "Controller strategy: if the remaining work has independent workstreams, spawn the useful "
+            "parallel sub-agents in one assistant step with distinct roles, evidence requirements, and "
+            "small budgets. Synthesize their reports instead of serializing the same research yourself."
+        )
+    return None
+
+
+def tool_batching_directive(available_tool_names: list[str]) -> str | None:
+    names = set(available_tool_names)
+    if "code__python" not in names:
+        return None
+    if len(names) < 4:
+        return None
+    return (
+        "Controller strategy: use code__python to batch local data processing, filtering, joins, and "
+        "artifact generation. Keep network and connector access in broker tools, but do not route large "
+        "intermediate tables or repetitive transformations through the model when code can summarize them."
+    )
+
+
+def score_task_trace(history: list[dict[str, Any]], result: dict[str, Any] | None = None) -> dict[str, Any]:
+    tool_calls = 0
+    tool_errors = 0
+    tool_results = 0
+    assistant_finals = 0
+    seen_call_names: dict[str, int] = {}
+    for message in history:
+        if message.get("tool_calls"):
+            for call in message.get("tool_calls") or []:
+                if isinstance(call, dict):
+                    name = _call_name(call)
+                    tool_calls += 1
+                    seen_call_names[name] = seen_call_names.get(name, 0) + 1
+        if message.get("role") == "tool":
+            tool_results += 1
+            if _message_is_error(message):
+                tool_errors += 1
+        if message.get("role") == "assistant" and str(message.get("content") or "").strip() and not message.get("tool_calls"):
+            assistant_finals += 1
+    success_rate = 1.0 if tool_results == 0 else (tool_results - tool_errors) / max(tool_results, 1)
+    return {
+        "tool_calls": tool_calls,
+        "tool_results": tool_results,
+        "tool_errors": tool_errors,
+        "tool_success_rate": round(success_rate, 3),
+        "repeated_tool_names": {name: count for name, count in seen_call_names.items() if count > 1},
+        "final_answer_present": bool((result or {}).get("answer")) or assistant_finals > 0,
+    }
+
+
+def derive_trace_learning_notes(metrics: dict[str, Any], ledger: dict[str, Any]) -> list[str]:
+    notes: list[str] = []
+    if int(metrics.get("tool_errors") or 0) > 0 or ledger.get("open_errors"):
+        notes.append("Add or refine a recovery playbook for the recurring failing tool family.")
+    if float(metrics.get("tool_success_rate") or 1.0) < 0.6:
+        notes.append("Review connector health and tool routing: this trace had a low tool success rate.")
+    repeated = metrics.get("repeated_tool_names") or {}
+    if repeated:
+        notes.append("Tune progress detection or prompts for repeated tool choices: " + ", ".join(repeated.keys()))
+    if metrics.get("final_answer_present") and not ledger.get("recent_evidence"):
+        notes.append("Require evidence verification for final answers that claim completed work without tool evidence.")
+    return notes
+
+
 # ── Plan ─────────────────────────────────────────────────────────────────────
 
 # The plan is persisted in the ``tasks.plan`` JSONB column in the shape the web

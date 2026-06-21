@@ -88,7 +88,11 @@ async def test_run_loop_plans_then_reflects_before_finishing(monkeypatch):
     async def fake_persist(task_arg, content, **kwargs):
         return "msg-1"
 
+    async def fake_verify(goal, answer, ledger, summaries):
+        return None
+
     monkeypatch.setattr(agent_loop, "_build_plan", fake_build_plan)
+    monkeypatch.setattr(agent_loop, "_verify_answer", fake_verify)
     monkeypatch.setattr(agent_loop, "_reflect", fake_reflect)
     monkeypatch.setattr(agent_loop, "_llm_step", fake_llm_step)
     monkeypatch.setattr(agent_loop, "_execute_tool", fake_execute_tool)
@@ -146,7 +150,11 @@ async def test_run_loop_without_model_key_skips_cognition(monkeypatch):
     async def fake_persist(task_arg, content, **kwargs):
         return None
 
+    async def fake_verify(goal, answer, ledger, summaries):
+        return None
+
     monkeypatch.setattr(agent_loop, "_build_plan", boom_plan)
+    monkeypatch.setattr(agent_loop, "_verify_answer", fake_verify)
     monkeypatch.setattr(agent_loop, "_reflect", boom_reflect)
     monkeypatch.setattr(agent_loop, "_llm_step", fake_llm_step)
     monkeypatch.setattr(agent_loop, "_execute_tool", lambda *a, **k: None)
@@ -218,3 +226,95 @@ async def test_run_loop_escalates_model_when_errors_recur(monkeypatch):
     # Started on flash; escalated to a stronger model after the errors recurred.
     assert models_seen[0] == "openrouter/deepseek/deepseek-v4-flash"
     assert models_seen[-1] != "openrouter/deepseek/deepseek-v4-flash"
+
+
+@pytest.mark.asyncio
+async def test_run_loop_verifier_rejects_unsupported_final_answer(monkeypatch):
+    """Evidence verification can force another action before the loop finishes."""
+    from runtime import agent_loop
+
+    task = _task()
+    monkeypatch.setattr(agent_loop.settings, "openrouter_api_key", "test-key")
+    monkeypatch.setattr(agent_loop.settings, "agent_cognition_enabled", True)
+
+    verifier_verdicts = [
+        agent_loop.cognition.Verdict(
+            complete=False,
+            missing=["no artifact evidence"],
+            directive="Create or cite the deliverable before finalizing.",
+        ),
+        agent_loop.cognition.Verdict(complete=True, missing=[], directive=""),
+    ]
+    histories_seen: list[list[dict]] = []
+    saved: list[dict] = []
+
+    async def fake_verify(goal, answer, ledger, summaries):
+        assert "recent_evidence" in ledger
+        return verifier_verdicts.pop(0)
+
+    async def fake_reflect(goal, answer, summaries):
+        return agent_loop.cognition.Verdict(complete=True, missing=[], directive="")
+
+    steps = [
+        (None, [{"id": "c1", "name": "browser__search", "args_str": json.dumps({"q": "sources"})}], 100),
+        ("Unsupported final.", [], 50),
+        (None, [{"id": "c2", "name": "fs__write", "args_str": json.dumps({"path": "memo.md", "content": "Memo"})}], 100),
+        ("Supported final.", [], 50),
+    ]
+
+    async def fake_llm_step(history, tools, model, *, reasoning_effort=None):
+        histories_seen.append(history)
+        return steps.pop(0)
+
+    async def fake_execute_tool(call, task_arg, agent):
+        if call["name"] == "fs__write":
+            return {
+                "role": "tool",
+                "tool_call_id": call["id"],
+                "name": call["name"],
+                "content": json.dumps({"summary": "Wrote memo.md", "data": {"artifact_id": "art-memo"}}),
+            }
+        return {
+            "role": "tool",
+            "tool_call_id": call["id"],
+            "name": call["name"],
+            "content": json.dumps({"summary": "Found sources", "data": {}}),
+        }
+
+    async def fake_save_task(task_id, **values):
+        saved.append(values)
+        task.update(values)
+
+    async def fake_emit(task_id, event, actor_id="chronos"):
+        return None
+
+    async def fake_publish(task_id, event):
+        return None
+
+    async def fake_persist(task_arg, content, **kwargs):
+        return None
+
+    async def fake_build_plan(goal, tools=None):
+        return None
+
+    monkeypatch.setattr(agent_loop, "_build_plan", fake_build_plan)
+    monkeypatch.setattr(agent_loop, "_verify_answer", fake_verify)
+    monkeypatch.setattr(agent_loop, "_reflect", fake_reflect)
+    monkeypatch.setattr(agent_loop, "_llm_step", fake_llm_step)
+    monkeypatch.setattr(agent_loop, "_execute_tool", fake_execute_tool)
+    monkeypatch.setattr(agent_loop, "_needs_approval", lambda name: False)
+    monkeypatch.setattr(agent_loop, "save_task", fake_save_task)
+    monkeypatch.setattr(agent_loop, "emit_activity", fake_emit)
+    monkeypatch.setattr(agent_loop, "publish_activity", fake_publish)
+    monkeypatch.setattr(agent_loop, "_persist_to_conversation", fake_persist)
+
+    result = await agent_loop.run_loop(task)
+
+    assert result == {"answer": "Supported final."}
+    assert verifier_verdicts == []
+    assert any(
+        msg.get("role") == "system" and "Controller Task Ledger" in str(msg.get("content"))
+        for history in histories_seen
+        for msg in history
+    )
+    assert any((s.get("agent_state") or {}).get("cognition", {}).get("ledger") for s in saved)
