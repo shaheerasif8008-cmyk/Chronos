@@ -19,7 +19,10 @@ from sqlalchemy import select
 
 from core.config import settings as app_settings
 from core.exceptions import PermissionDenied
+
+logger = logging.getLogger(__name__)
 from core.scim import SCIMError as _SCIMError
+from core.tenancy import resolve_org_id
 
 from jobs import context_update, profile_synthesis, scheduled_tasks
 from core.db import engine, reflect_table
@@ -50,6 +53,23 @@ app.add_middleware(
     allow_headers=["*"],
     **_cors_kwargs,
 )
+
+
+@app.middleware("http")
+async def _resolve_tenant(request: Request, call_next):
+    """Bind each request to its tenant. Stored on request.state for the auth
+    dependency; ``None`` means the no-tenant (apex/signup) context. A resolution
+    failure (e.g. DB unreachable) falls to no-tenant rather than 500ing here;
+    downstream auth still fails closed because member loading also requires the DB."""
+    host = request.headers.get("host", "")
+    org_header = request.headers.get("x-chronos-org")
+    try:
+        request.state.resolved_org_id = await resolve_org_id(host, org_header)
+    except Exception:
+        logger.warning("tenant resolution failed; treating request as no-tenant", exc_info=True)
+        request.state.resolved_org_id = None
+    return await call_next(request)
+
 
 app.include_router(auth.router)
 app.include_router(sso.router)

@@ -1,0 +1,103 @@
+"""W1 Phase 1 — org-bound session tokens carry and enforce an `org` claim."""
+from __future__ import annotations
+
+import uuid
+
+import jwt
+import pytest
+import httpx
+import main
+
+from core.auth import create_access_token
+from core.config import settings
+from core.db import engine, reflect_table
+
+
+def test_token_includes_org_claim_when_provided():
+    token = create_access_token("member-123", org_id="org-abc")
+    payload = jwt.decode(token, settings.jwt_secret, algorithms=["HS256"])
+    assert payload["org"] == "org-abc"
+
+
+def test_token_omits_org_claim_when_not_provided():
+    token = create_access_token("member-123")
+    payload = jwt.decode(token, settings.jwt_secret, algorithms=["HS256"])
+    assert "org" not in payload  # legacy tokens stay org-less and grandfathered
+
+
+async def _make_org_and_member(subdomain: str):
+    org_id = str(uuid.uuid4())
+    member_id = str(uuid.uuid4())
+    orgs = await reflect_table("organizations")
+    members = await reflect_table("members")
+    async with engine.begin() as conn:
+        await conn.execute(orgs.insert().values(
+            id=org_id, slug=subdomain, subdomain=subdomain, name=subdomain.title(),
+        ))
+        await conn.execute(members.insert().values(
+            id=member_id, organization_id=org_id, email=f"{member_id[:8]}@{subdomain}.io", role="owner",
+        ))
+    return org_id, member_id
+
+
+def _client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://test")
+
+
+async def _subdomain_of(org_id: str) -> str:
+    orgs = await reflect_table("organizations")
+    async with engine.begin() as conn:
+        return (await conn.execute(orgs.select().where(orgs.c.id == org_id))).mappings().one()["subdomain"]
+
+
+@pytest.mark.asyncio
+async def test_org_bound_token_rejected_on_wrong_tenant():
+    org_a, member_a = await _make_org_and_member(f"acme{uuid.uuid4().hex[:6]}")
+    org_b, _ = await _make_org_and_member(f"globex{uuid.uuid4().hex[:6]}")
+    token = create_access_token(member_a, org_id=org_a)
+    b_label = await _subdomain_of(org_b)
+    async with _client() as client:
+        resp = await client.get(
+            "/auth/me",
+            headers={"Authorization": f"Bearer {token}", "X-Chronos-Org": b_label},
+        )
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "Token not valid for this tenant"
+
+
+@pytest.mark.asyncio
+async def test_org_bound_token_accepted_on_its_own_tenant():
+    org_a, member_a = await _make_org_and_member(f"acme{uuid.uuid4().hex[:6]}")
+    token = create_access_token(member_a, org_id=org_a)
+    a_label = await _subdomain_of(org_a)
+    async with _client() as client:
+        resp = await client.get(
+            "/auth/me",
+            headers={"Authorization": f"Bearer {token}", "X-Chronos-Org": a_label},
+        )
+    assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_legacy_token_without_org_claim_is_grandfathered():
+    _, member_a = await _make_org_and_member(f"acme{uuid.uuid4().hex[:6]}")
+    token = create_access_token(member_a)  # no org claim
+    async with _client() as client:
+        resp = await client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_org_bound_cookie_token_rejected_on_wrong_tenant():
+    org_a, member_a = await _make_org_and_member(f"acme{uuid.uuid4().hex[:6]}")
+    org_b, _ = await _make_org_and_member(f"globex{uuid.uuid4().hex[:6]}")
+    token = create_access_token(member_a, org_id=org_a)
+    b_label = await _subdomain_of(org_b)
+    async with _client() as client:
+        resp = await client.get(
+            "/auth/me",
+            headers={"X-Chronos-Org": b_label},
+            cookies={"chronos_session": token},
+        )
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "Token not valid for this tenant"

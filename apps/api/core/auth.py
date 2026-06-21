@@ -2,7 +2,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import jwt
-from fastapi import Cookie, Depends, HTTPException
+from fastapi import Cookie, Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 
@@ -37,17 +37,24 @@ def set_session_cookie(response, token: str) -> None:
     )
 
 
-def create_access_token(member_id: str) -> str:
+# W1 Phase 2 flip: these mint sites must pass `org_id=member.organization_id` so
+# tokens become org-bound, and grandfathering of org-less tokens must then be
+# closed (reject tokens with no `org` claim once enforcement is on):
+#   routers/auth.py (OTP verify, Cognito callback, Cognito verify) and routers/sso.py.
+def create_access_token(member_id: str, *, org_id: str | None = None) -> str:
     now = datetime.now(timezone.utc)
     payload = {
         "sub": member_id,
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(minutes=settings.access_token_expire_minutes)).timestamp()),
     }
+    if org_id is not None:
+        payload["org"] = org_id
     return jwt.encode(payload, settings.jwt_secret, algorithm="HS256")
 
 
 async def get_current_member(
+    request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
     chronos_session: str | None = Cookie(default=None),
 ) -> Member:
@@ -80,4 +87,17 @@ async def get_current_member(
     # member's existing tokens must stop working immediately.
     if getattr(member, "status", "active") != "active":
         raise HTTPException(status_code=403, detail="Member account is deactivated")
+    # Tenant binding: an org-bound token is valid only on its own tenant. Legacy
+    # tokens (no `org` claim) are grandfathered. Fail closed when the resolved
+    # tenant is known and does not match.
+    # NOTE (W1 Phase 2): when `resolved` is None (apex / unknown subdomain / a
+    # resolver failure), an org-bound token is currently ACCEPTED. Harmless in
+    # Phase 1 (no path mints org-bound tokens yet). Before Phase 2 flips minting,
+    # decide the no-tenant-host policy explicitly (reject vs. handoff-endpoint
+    # exception) and pin it with a test. See docs/superpowers/plans Phase 2.
+    token_org = payload.get("org")
+    if token_org is not None:
+        resolved = getattr(request.state, "resolved_org_id", None)
+        if resolved is not None and resolved != token_org:
+            raise HTTPException(status_code=403, detail="Token not valid for this tenant")
     return member
