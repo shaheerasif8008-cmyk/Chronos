@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     environment: str = "development"
     org_id: str = "default"
     region: str = "us"
+    # Apex domain for per-tenant subdomains: novatech.<base_domain>.
+    base_domain: str = "cognisiatech.com"
     admin_email: str = "admin@example.com"
     database_url: str = "postgresql+asyncpg://chronos:chronos@localhost:55432/chronos"
     # Connection pool sizing for the async engine. Defaults are tuned for a
