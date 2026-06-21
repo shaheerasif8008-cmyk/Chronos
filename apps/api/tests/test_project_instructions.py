@@ -735,15 +735,17 @@ async def test_send_message_skips_hydration_when_no_conversation_id(monkeypatch)
     async for chunk in response.body_iterator:
         body += chunk if isinstance(chunk, bytes) else chunk.encode()
 
-    # _save_message must have been called without _member_id/_org_id,
-    # meaning no RETURNING / hydration SELECT fired.
+    # Hydration (the RETURNING / conversation SELECT) only fires when both
+    # _member_id and _org_id are supplied; the new-conversation path omits
+    # _member_id, so no hydration runs. _org_id is still passed because the
+    # message insert is org-scoped.
     assert save_message_kwargs_list, "_save_message was not called"
     user_msg_kwargs = save_message_kwargs_list[0]
     assert user_msg_kwargs.get("_member_id") is None, (
         "_member_id must be None for a new conversation (no hydration path)"
     )
-    assert user_msg_kwargs.get("_org_id") is None, (
-        "_org_id must be None for a new conversation (no hydration path)"
+    assert user_msg_kwargs.get("_org_id") == "default", (
+        "_org_id is passed for the org-scoped insert even when hydration is skipped"
     )
     # project_id in requester_context must remain None
     assert captured_context.get("project_id") is None

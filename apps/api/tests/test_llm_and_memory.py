@@ -1013,7 +1013,7 @@ async def test_assemble_context_deduplicates_current_saved_user_message(monkeypa
     async def fake_retrieve(message, requester_context):
         return []
 
-    async def fake_compact_history(conversation_id, *, budget_tokens, verbatim_turns=6):
+    async def fake_compact_history(conversation_id, *, org_id=None, budget_tokens, verbatim_turns=6):
         return [
             {"role": "user", "content": "previous prompt"},
             {"role": "assistant", "content": "previous answer"},

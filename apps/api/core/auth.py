@@ -16,14 +16,22 @@ bearer = HTTPBearer(auto_error=False)
 def set_session_cookie(response, token: str) -> None:
     """Set the session JWT as an httpOnly cookie.
 
-    ``secure`` is enabled outside development so the session token is never sent
-    over plaintext HTTP; ``samesite=strict`` mitigates CSRF on the cookie path.
+    The web app and API are served from different hosts (``app.<domain>`` vs
+    ``api.<domain>``), so every authenticated request the SPA makes is a
+    cross-origin credentialed fetch, and the Cognito hosted-UI sign-in returns
+    through a cross-site redirect. A ``SameSite=Strict``/``Lax`` cookie is not
+    sent on (and, across registrable domains, not even stored from) those
+    cross-site requests, which silently breaks the session right after login.
+    In production we therefore use ``SameSite=None`` — which requires
+    ``Secure`` — so the cookie travels with the SPA's credentialed calls. In
+    development (plaintext HTTP, same-host) ``Lax`` is kept since ``None``
+    without ``Secure`` is rejected by browsers.
     """
     response.set_cookie(
         "chronos_session",
         token,
         httponly=True,
-        samesite="strict" if settings.is_production else "lax",
+        samesite="none" if settings.is_production else "lax",
         secure=settings.is_production,
         max_age=settings.access_token_expire_minutes * 60,
     )
