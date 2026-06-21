@@ -29,13 +29,15 @@ def set_session_cookie(response, token: str) -> None:
     )
 
 
-def create_access_token(member_id: str) -> str:
+def create_access_token(member_id: str, *, org_id: str | None = None) -> str:
     now = datetime.now(timezone.utc)
     payload = {
         "sub": member_id,
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(minutes=settings.access_token_expire_minutes)).timestamp()),
     }
+    if org_id is not None:
+        payload["org"] = org_id
     return jwt.encode(payload, settings.jwt_secret, algorithm="HS256")
 
 
