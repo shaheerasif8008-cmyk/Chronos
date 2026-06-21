@@ -98,7 +98,28 @@ git commit -m "feat(w1-2a): email_domain_claims table (domain->org registry)"
 
 ## Task 2: `core/provisioning.py` — `provision_org`
 
-**Files:** Create `apps/api/core/provisioning.py`; Test `apps/api/tests/test_provisioning.py`
+**Files:** Create `apps/api/core/provisioning.py`; Modify `apps/api/tests/conftest.py`; Test `apps/api/tests/test_provisioning.py`
+
+- [ ] **Step 0: Isolate provisioning's filesystem writes in tests**
+
+`provision_org` writes `apps/api/context/<org_uuid>/org.md` on every call. Without isolation, every test that provisions leaves a real uuid-named folder in the repo working tree. Add an autouse fixture to `apps/api/tests/conftest.py` so provisioning writes under a temp dir during tests. Append to `conftest.py`:
+
+```python
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_provisioning_context(tmp_path, monkeypatch):
+    """Redirect provision_org's context-folder writes to a temp dir so tests
+    never pollute apps/api/context/ with uuid-named org folders."""
+    try:
+        monkeypatch.setattr("core.provisioning.ROOT", tmp_path)
+    except (ImportError, AttributeError):
+        pass  # module not imported yet in suites that don't touch provisioning
+    yield
+```
+
+Note: `monkeypatch.setattr` with a string target imports the module; the try/except keeps this harmless for the rest of the suite. (If `monkeypatch.setattr("core.provisioning.ROOT", ...)` raises because the module isn't importable in some minimal env, the guard skips it.)
 
 - [ ] **Step 1: Write the failing test**
 
@@ -113,7 +134,8 @@ import pytest
 from sqlalchemy import select
 
 from core.db import engine, reflect_table
-from core.provisioning import ROOT, provision_org
+import core.provisioning as provisioning
+from core.provisioning import provision_org
 
 
 @pytest.mark.asyncio
@@ -135,8 +157,9 @@ async def test_provision_org_creates_org_owner_and_context():
     assert owner["organization_id"] == org_id
     assert owner["role"] == "owner"
     assert owner["email"] == "founder@acme.com"  # lowercased
-    # Context folder is written where context.load_org_context reads it.
-    assert (ROOT / "context" / org_id / "org.md").exists()
+    # Context folder is written under provisioning.ROOT (monkeypatched to a temp
+    # dir by the autouse fixture); read the module attribute, not a bound import.
+    assert (provisioning.ROOT / "context" / org_id / "org.md").exists()
 ```
 
 - [ ] **Step 2: Run to verify it fails**
@@ -680,17 +703,29 @@ psql -h localhost -U chronos -d chronos -c "DROP DATABASE chronos_2a_verify;"
 ```
 Expected: `upgrade head` reaches `0040_email_domain_claims` on the fresh DB with no error.
 
-- [ ] **Step 3: Commit (if any test-only fixups were needed)**
+- [ ] **Step 3: Guard against stray context dirs, then commit selectively**
 
+Defense-in-depth so a manual dev signup (which writes a real `apps/api/context/<uuid>/`) can't be committed accidentally. Check current ignore state first:
 ```bash
-git add -A && git commit -m "test(w1-2a): green suite with signup + provisioning" || echo "nothing to commit"
+cd "$(git rev-parse --show-toplevel)" && git status --porcelain apps/api/context | head
+```
+If untracked `apps/api/context/<uuid>/` dirs exist, they are test/dev leakage — do NOT commit them. Add to `.gitignore` (only if not already present): ignore everything under `apps/api/context/` except the tracked `default/` folder:
+```
+apps/api/context/*
+!apps/api/context/default/
+```
+Then commit ONLY the intended files (never `git add -A` here, to avoid sweeping in uuid context dirs):
+```bash
+git add .gitignore apps/api/tests/conftest.py
+git commit -m "chore(w1-2a): ignore stray org context dirs; test isolation" || echo "nothing to commit"
 ```
 
 ---
 
 ## Subsequent Phase 2 sub-plans (roadmap — each its own plan)
 
-- **Phase 2B — Org-bound token flip + handoff + C1/C2.** Flip all mint sites (`/auth/signup`, `verify_otp`, `cognito/callback`, `cognito/verify`, `sso.py`) to `create_access_token(member_id, org_id=...)`. Add `POST /auth/handoff` issuing/consuming the short-lived cross-subdomain handoff token (spec §2e). Enforce **C1**: reject org-bound tokens when `resolved_org_id is None` *except* the handoff endpoint. Add `settings.enforce_org_bound_tokens`; when on, `get_current_member` rejects org-less tokens (**C2** — closes grandfathering). Migrate the test harness to subdomain base URLs / `X-Chronos-Org`. This is the phase that makes tenancy *live*.
+- **Phase 2B — Org-bound token flip + handoff + C1/C2 + prod signup.** Flip all mint sites (`/auth/signup`, `verify_otp`, `cognito/callback`, `cognito/verify`, `sso.py`) to `create_access_token(member_id, org_id=...)`. Add `POST /auth/handoff` issuing/consuming the short-lived cross-subdomain handoff token (spec §2e). Enforce **C1**: reject org-bound tokens when `resolved_org_id is None` *except* the handoff endpoint. Add `settings.enforce_org_bound_tokens`; when on, `get_current_member` rejects org-less tokens (**C2** — closes grandfathering). Migrate the test harness to subdomain base URLs / `X-Chronos-Org`. This is the phase that makes tenancy *live*.
+  - **Prod signup path (GA gap — must build, not just dev OTP).** 2A's `POST /auth/signup` 404s outside dev (`_dev_otp_enabled()` false). For self-serve enterprise GA, route the production Cognito callback through `signup_or_join` (today `cognito/callback` hardcodes `get_or_create_member_for_email` into the `default` org — wrong for multi-tenant). Phase 2B/3 must make Cognito-verified email run the same create-org/join decision so signup works in production, not only dev.
 - **Phase 2C — Minimal signup + onboarding UI.** Next.js signup page (email → request-OTP → enter code + org name → `POST /auth/signup`), landing on the new org's subdomain; first-run onboarding (org name/branding, invite teammates via existing invitations). Replace env-only base-URL logic in `apps/web/lib/api.ts` (+ duplicated copies) with `window.location.hostname` derivation.
 - **Phase 3 — DNS-TXT hard domain verification + SSO registry reconciliation** (`domain_verifications` table; validate `sso_connections.email_domain` against a hard claim).
 
