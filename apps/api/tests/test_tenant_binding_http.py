@@ -107,14 +107,8 @@ async def test_org_bound_cookie_token_rejected_on_wrong_tenant():
 async def test_org_bound_token_rejected_on_no_tenant_host_in_production(monkeypatch):
     """C1: in production, an org-bound token on a host that resolves to no tenant
     (apex / unknown subdomain) is rejected — closing the no-tenant-host hole."""
-    _, member_a = await _make_org_and_member(f"acme{uuid.uuid4().hex[:6]}")
-    orgs = await reflect_table("organizations")
-    members = await reflect_table("members")
-    async with engine.begin() as conn:
-        org_id = (await conn.execute(
-            members.select().where(members.c.id == member_a)
-        )).mappings().one()["organization_id"]
-    token = create_access_token(member_a, org_id=org_id)
+    org_a, member_a = await _make_org_and_member(f"acme{uuid.uuid4().hex[:6]}")
+    token = create_access_token(member_a, org_id=org_a)
     # Force production via the module-level indirection so the no-tenant-host
     # branch rejects. No X-Chronos-Org header → resolved_org_id is None.
     monkeypatch.setattr("core.auth._is_production", lambda: True)
@@ -133,6 +127,7 @@ async def test_enforce_flag_rejects_org_less_tokens(monkeypatch):
     async with _client() as client:
         resp = await client.get("/auth/me", headers={"Authorization": f"Bearer {legacy}"})
     assert resp.status_code == 401
+    assert resp.json()["detail"] == "Session token missing tenant binding"
 
 
 @pytest.mark.asyncio
@@ -161,3 +156,15 @@ async def test_signup_mints_org_bound_token():
     body = resp.json()
     payload = _jwt.decode(body["access_token"], _settings.jwt_secret, algorithms=["HS256"])
     assert payload["org"] == body["org_id"]
+
+
+@pytest.mark.asyncio
+async def test_org_bound_token_accepted_on_no_tenant_host_in_non_production():
+    """C1 non-prod arm: an org-bound token on a no-tenant host (no X-Chronos-Org,
+    Host 'test', not production) is trusted and accepted — this is what keeps the
+    test suite green after the mint flip."""
+    org_a, member_a = await _make_org_and_member(f"acme{uuid.uuid4().hex[:6]}")
+    token = create_access_token(member_a, org_id=org_a)
+    async with _client() as client:
+        resp = await client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200

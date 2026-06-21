@@ -14,6 +14,9 @@ bearer = HTTPBearer(auto_error=False)
 
 
 def _is_production() -> bool:
+    # Thin shim over settings.is_production. Exists solely so tests can monkeypatch
+    # the C1 production-reject branch without patching the whole settings object.
+    # NOT the canonical production flag — other code reads settings.is_production directly.
     return settings.is_production
 
 
@@ -41,10 +44,6 @@ def set_session_cookie(response, token: str) -> None:
     )
 
 
-# W1 Phase 2 flip: these mint sites must pass `org_id=member.organization_id` so
-# tokens become org-bound, and grandfathering of org-less tokens must then be
-# closed (reject tokens with no `org` claim once enforcement is on):
-#   routers/auth.py (OTP verify, Cognito callback, Cognito verify) and routers/sso.py.
 def create_access_token(member_id: str, *, org_id: str | None = None) -> str:
     now = datetime.now(timezone.utc)
     payload = {
