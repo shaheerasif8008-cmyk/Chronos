@@ -132,16 +132,14 @@ async def signup_or_join(email: str, org_name: str | None = None) -> dict:
             ))
     except IntegrityError:
         # Lost the race: a concurrent signup claimed this domain first. Roll back
-        # the org we just created and join the winner's org instead.
+        # the org we just created, then re-resolve through the normal path (which
+        # now finds the claim and handles auto-join vs. approval correctly).
         orgs = await reflect_table("organizations")
-        members_tbl = await reflect_table("members")
+        members = await reflect_table("members")
         async with engine.begin() as conn:
-            await conn.execute(members_tbl.delete().where(members_tbl.c.id == prov["owner_member_id"]))
+            await conn.execute(members.delete().where(members.c.id == prov["owner_member_id"]))
             await conn.execute(orgs.delete().where(orgs.c.id == prov["org_id"]))
-        winner = await _claim_for_domain(domain)
-        member = await provision_member(winner["organization_id"], email, role="user")
-        return {"org_id": winner["organization_id"], "member_id": str(member.id),
-                "role": "user", "created": False, "joined": True}
+        return await signup_or_join(email, org_name)
     await audit.log("domain_soft_claimed", prov["owner_member_id"], "signup.claim_domain",
                     organization_id=prov["org_id"], payload={"domain": domain})
     return {"org_id": prov["org_id"], "member_id": prov["owner_member_id"],

@@ -81,12 +81,16 @@ def _consume_otp(email: str, code: str) -> None:
 
 async def _resolve_cognito_member(email: str, *, name: str | None, resolved_org_id: str | None):
     """Resolve a Cognito-verified email to a member. Per-subdomain: log into the
-    resolved org if already a member there. Otherwise, self-serve create/join via
-    signup_or_join — but ONLY when auto-provisioning is enabled (preserves the
-    pre-existing cognito_auto_provision_members gate); else reject the unknown email."""
+    resolved org if already a member there. At apex, an existing default-org member
+    logs in. Otherwise self-serve create/join via signup_or_join — but ONLY when
+    auto-provisioning is enabled (preserves the cognito_auto_provision_members gate)."""
     email = email.lower()
     if resolved_org_id is not None:
         member = await get_member_in_org(resolved_org_id, email=email)
+        if member is not None:
+            return member
+    else:
+        member = await get_member_by_email(email)  # apex: existing default-org member
         if member is not None:
             return member
     if not settings.cognito_auto_provision_members:
