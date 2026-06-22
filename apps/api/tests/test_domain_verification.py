@@ -114,6 +114,41 @@ async def test_verify_check_fails_without_txt(monkeypatch):
 # ── Task 4: SSO connections require a hard-claimed domain ─────────────────────
 
 @pytest.mark.asyncio
+async def test_check_returns_false_when_no_claim_to_upgrade(monkeypatch):
+    """DNS matches but the org holds no claim on the domain → not 'verified'."""
+    domain = f"noclaim{uuid.uuid4().hex[:8]}.com"
+    # Create an org WITHOUT an email_domain_claims row for this domain.
+    org_id = str(uuid.uuid4())
+    orgs = await reflect_table("organizations")
+    async with engine.begin() as conn:
+        await conn.execute(orgs.insert().values(id=org_id, slug=f"o{org_id[:8]}", subdomain=f"o{org_id[:8]}", name="T"))
+    rec = await domains.start_domain_verification(org_id, domain)
+    tok = rec["value"].split("=", 1)[1]
+    monkeypatch.setattr(domains, "_lookup_txt", lambda d: [f"chronos-verify={tok}"])
+    assert await domains.check_domain_verification(org_id, domain) is False
+    assert await domains.is_domain_hard_claimed(org_id, domain) is False
+
+
+@pytest.mark.asyncio
+async def test_verify_start_rejects_non_admin():
+    domain = f"verify{uuid.uuid4().hex[:8]}.com"
+    org_id = await _seed_claim(domain)
+    # A non-admin member of the org.
+    members = await reflect_table("members")
+    mid = str(uuid.uuid4())
+    async with engine.begin() as conn:
+        await conn.execute(members.insert().values(
+            id=mid, organization_id=org_id, email=f"{mid[:8]}@t.io", role="user"))
+    token = create_access_token(mid, org_id=org_id)
+    headers = {"Authorization": f"Bearer {token}", "X-Chronos-Org": await _subdomain(org_id)}
+    async with _http_client() as client:
+        resp = await client.post("/domains/verify/start", json={"domain": domain}, headers=headers)
+    assert resp.status_code == 403
+
+
+# ── Task 4: SSO connections require a hard-claimed domain ─────────────────────
+
+@pytest.mark.asyncio
 async def test_sso_connection_requires_hard_claimed_domain(monkeypatch):
     domain = f"ssov{uuid.uuid4().hex[:8]}.com"
     org_id = await _seed_claim(domain)  # soft claim only

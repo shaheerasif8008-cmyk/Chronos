@@ -65,12 +65,16 @@ async def check_domain_verification(org_id: str, domain: str) -> bool:
         return False
     claims = await reflect_table("email_domain_claims")
     async with engine.begin() as conn:
+        upd = await conn.execute(claims.update().where(
+            claims.c.organization_id == org_id, claims.c.domain == domain
+        ).values(claim_type="verified_dns"))
+        if upd.rowcount == 0:
+            # DNS matched but this org holds no claim on the domain — nothing to
+            # upgrade. Do not report success (and leave the verification pending).
+            return False
         await conn.execute(verifs.update().where(
             verifs.c.organization_id == org_id, verifs.c.domain == domain
         ).values(status="verified", verified_at=datetime.now(timezone.utc)))
-        await conn.execute(claims.update().where(
-            claims.c.organization_id == org_id, claims.c.domain == domain
-        ).values(claim_type="verified_dns"))
     await audit.log("domain_verified", org_id, "domains.verify_check",
                     organization_id=org_id, resource_type="domain", resource_id=domain)
     return True
