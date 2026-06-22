@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select, update
 
 from core import audit, invitations, permissions
+from core.plans import get_entitlements
 from core.auth import get_current_member
 from core.connector_health import check_connectors
 from core.config import settings
@@ -379,6 +380,41 @@ async def create_member_invitation(req: InvitationCreate, member: Member = Depen
         ).first()
     if existing:
         raise HTTPException(status_code=409, detail="That email is already a member")
+
+    # Seat-cap enforcement (W4): count active members + pending invitations and
+    # reject before creating a new invitation if the plan limit is reached.
+    organizations = await reflect_table("organizations")
+    invitations_table = await reflect_table("invitations")
+    async with engine.begin() as conn:
+        org_row = (
+            await conn.execute(
+                select(organizations.c.plan).where(organizations.c.id == member.organization_id)
+            )
+        ).first()
+        plan = (org_row[0] if org_row else None) or "trial"
+        member_count = (
+            await conn.execute(
+                select(func.count()).select_from(members).where(
+                    members.c.organization_id == member.organization_id
+                )
+            )
+        ).scalar_one()
+        pending_count = (
+            await conn.execute(
+                select(func.count()).select_from(invitations_table).where(
+                    invitations_table.c.organization_id == member.organization_id,
+                    invitations_table.c.status == "pending",
+                )
+            )
+        ).scalar_one()
+    seats_used = member_count + pending_count
+    entitlements = get_entitlements(plan)
+    if seats_used >= entitlements.max_seats:
+        raise HTTPException(
+            status_code=402,
+            detail=f"Seat limit reached for the {plan} plan",
+        )
+
     return await invitations.create_invitation(member, email, req.role)
 
 
