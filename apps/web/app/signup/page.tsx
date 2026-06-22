@@ -57,17 +57,19 @@ export default function SignupPage() {
       });
       if (!res.ok) throw new Error(await res.text());
       const body = await res.json();
-      // Prod: land on the org's subdomain. Dev single-host: go straight to the app.
+      // A newly created org goes through the first-run onboarding wizard.
+      const dest = body.created ? "/onboarding" : "/chat";
+      // Prod: land on the org's subdomain. Dev single-host: route in place.
       if (typeof window !== "undefined") {
         const host = window.location.host;
         const isLocal = host.includes("localhost") || host.startsWith("127.");
         if (!isLocal && body.subdomain) {
           const baseDomain = host.split(".").slice(-2).join(".");
-          window.location.href = `${window.location.protocol}//${body.subdomain}.${baseDomain}/chat`;
+          window.location.href = `${window.location.protocol}//${body.subdomain}.${baseDomain}${dest}`;
           return;
         }
       }
-      router.push("/chat");
+      router.push(dest);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Signup failed");
     } finally {
