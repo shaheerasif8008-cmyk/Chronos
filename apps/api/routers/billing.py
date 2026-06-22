@@ -1,13 +1,18 @@
-"""Billing endpoints (W4.2)."""
+"""Billing endpoints (W4.2 / W4.3)."""
 from __future__ import annotations
+
+import dataclasses
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
+from sqlalchemy import select as _select
 
-from core import billing
+from core import billing, billing_usage
 from core.auth import get_current_member
 from core.config import settings
+from core.db import engine, reflect_table
 from core.models import Member
+from core.plans import get_entitlements
 from core.settings_store import require_admin
 
 router = APIRouter(tags=["billing"])
@@ -35,6 +40,36 @@ async def billing_portal(member: Member = Depends(get_current_member)) -> dict:
     except billing.BillingNotConfigured as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {"portal_url": url}
+
+
+@router.get("/settings/billing/usage")
+async def billing_usage_endpoint(member: Member = Depends(get_current_member)) -> dict:
+    """Return the current month's accumulated usage for the member's org.
+
+    Includes plan entitlements and a best-effort over_budget flag.
+    Accessible to any org member (no admin gate — it's their own org).
+    """
+    usage = await billing_usage.monthly_usage(member.organization_id)
+
+    # Resolve the org's plan for entitlements and overage signal.
+    orgs = await reflect_table("organizations")
+    async with engine.begin() as conn:
+        plan = (
+            await conn.execute(
+                _select(orgs.c.plan).where(orgs.c.id == member.organization_id)
+            )
+        ).scalar_one_or_none() or "trial"
+
+    ent = get_entitlements(plan)
+    ent_d = dataclasses.asdict(ent)
+    ent_d["features"] = sorted(ent.features)
+
+    # over_budget: monthly cost vs monthly equivalent of the daily limit.
+    # daily_cost_limit_usd == 0 means unlimited (enterprise).
+    monthly_cap = (ent.daily_cost_limit_usd * 30) if ent.daily_cost_limit_usd else 0.0
+    over = bool(monthly_cap and usage["cost_usd"] > monthly_cap)
+
+    return {**usage, "plan": plan, "entitlements": ent_d, "over_budget": over}
 
 
 @router.post("/billing/webhook")

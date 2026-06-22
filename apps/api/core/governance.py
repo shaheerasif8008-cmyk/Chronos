@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
@@ -7,12 +8,15 @@ from typing import Any
 from sqlalchemy import func, select
 
 from core import audit
+from core.billing_usage import record as _record_billing_usage
 from core.config import settings
 from core.db import engine, reflect_table
 from core.models import Member
 from core.plans import get_entitlements
 from core.redis import redis_client
 from core.token_budget import record_tokens_used, tokens_used_today
+
+_logger = logging.getLogger(__name__)
 
 
 class GovernanceLimitExceeded(Exception):
@@ -247,6 +251,18 @@ async def record_model_usage(
                 await redis_client.expire(_cost_key(org_id), _SUSPENSION_TTL_SECONDS)
         except Exception:
             pass
+    # Persist to the monthly billing ledger (W4.3).
+    # Use per-call deltas (total_tokens and re-derived cost) — NOT cumulative totals.
+    # Wrapped in try/except so a ledger failure never breaks a model call.
+    try:
+        await _record_billing_usage(
+            org_id,
+            tokens=int(total_tokens),
+            cost_usd=estimate_model_cost_usd(model, int(total_tokens)),
+        )
+    except Exception as _exc:
+        _logger.warning("billing ledger record failed for org %s: %s", org_id, _exc)
+
     cfg = await governance_config(org_id)
     cost_today = await cost_used_today_usd(org_id)
     hard_stop = bool(cfg.daily_cost_limit_usd and cost_today >= cfg.daily_cost_limit_usd)
