@@ -226,6 +226,12 @@ class Settings(BaseSettings):
     # Per-org token budget guard (category 9) — 0 means unlimited
     per_org_daily_token_limit: int = 0
 
+    # Billing (Stripe) — empty disables billing (truthful-degraded).
+    stripe_secret_key: str = ""
+    stripe_webhook_secret: str = ""
+    stripe_price_pro: str = ""
+    stripe_price_enterprise: str = ""
+
     # Observability (category 10)
     langfuse_public_key: str = ""
     langfuse_secret_key: str = ""

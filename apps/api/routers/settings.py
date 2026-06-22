@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select, update
 
-from core import audit, invitations, permissions
+from core import audit, billing, invitations, permissions
 from core.plans import get_entitlements
 from core.auth import get_current_member
 from core.connector_health import check_connectors
@@ -249,7 +249,7 @@ async def overview(member: Member = Depends(get_current_member)) -> dict[str, An
             "password": _unsupported("OTP auth has no password credential."),
             "two_factor": _unsupported("OTP login is the configured second factor."),
             "api_keys": _unsupported("API key authentication is not implemented."),
-            "billing": _unsupported("No billing provider is configured."),
+            "billing": ({"supported": True} if billing.is_configured() else _unsupported("No billing provider is configured.")),
             "webhooks": _unsupported("Webhook dispatcher is not implemented."),
             "notification_email_dispatch": _unsupported("Email notification delivery service is not configured."),
             "delete_workspace": _unsupported("Workspace deletion has no archival workflow yet."),
