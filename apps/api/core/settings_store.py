@@ -70,8 +70,10 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "log_retention_days": 14,
         "max_task_queue_size": 100,
         "failure_recovery": "resume",
-        "token_budget_daily": 100000,
-        "cost_budget_daily_usd": 10,
+        # token_budget_daily and cost_budget_daily_usd are intentionally absent from DEFAULTS
+        # so that save_settings_doc never writes them into settings_documents unless an admin
+        # explicitly overrides them. governance_config falls back to plan entitlements when
+        # these keys are absent from the stored doc.
         "request_rate_per_minute": 60,
         "connector_rate_per_minute": 60,
     },
