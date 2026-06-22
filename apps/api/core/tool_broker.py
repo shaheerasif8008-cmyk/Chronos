@@ -6,14 +6,21 @@ Every tool call routes through execute(). No direct connector calls. Ever.
 Signature is frozen: execute(agent, tool, args) → ToolResult.
 """
 import hashlib
+import importlib
 import json
 import time
 from typing import Any
 
-from core import audit, autonomy, permissions, risk as risk_pricer, risk_registry, trust
+audit = importlib.import_module("core.audit")
+autonomy = importlib.import_module("core.autonomy")
+permissions = importlib.import_module("core.permissions")
+risk_pricer = importlib.import_module("core.risk")
+risk_registry = importlib.import_module("core.risk_registry")
+trust = importlib.import_module("core.trust")
 from core.connector_health import connector_tier, degraded_note
 from core.config import settings
 from core.exceptions import ApprovalRequired, LoopDetected, RateLimitExceeded, SafetyLimitViolation
+from core.governance import enforce_request_rate, suspend_org
 from core.models import AgentContext, ToolResult
 from core.redis import redis_client
 from core.settings_store import tool_policy, workspace_autonomy
@@ -174,13 +181,7 @@ def _mark_untrusted_connector_result(tool: str, result: ToolResult) -> ToolResul
 
 
 async def _check_rate_limit(org_id: str) -> None:
-    window = int(time.time() / 60)
-    key = f"rate:{org_id}:{window}"
-    count = await redis_client.incr(key)
-    if count == 1:
-        await redis_client.expire(key, 120)  # 2-min TTL covers window boundary
-    if count > _RATE_LIMIT:
-        raise RateLimitExceeded(org_id, count, _RATE_LIMIT)
+    await enforce_request_rate(org_id, scope="connector")
 
 
 async def _check_loop(org_id: str, tool: str, args_hash: str) -> None:
@@ -189,6 +190,7 @@ async def _check_loop(org_id: str, tool: str, args_hash: str) -> None:
     if count == 1:
         await redis_client.expire(key, 300)  # 5-minute window
     if count >= _LOOP_THRESHOLD:
+        await suspend_org(org_id, f"loop detected for {tool}", actor_id="tool_broker")
         raise LoopDetected(tool, count)
 
 

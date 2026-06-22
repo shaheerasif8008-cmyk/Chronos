@@ -26,13 +26,13 @@ log = logging.getLogger(__name__)
 TOKEN_REFRESH_BUFFER = 300  # seconds
 
 
-async def _get_token(vault_ref: str) -> tuple[str, dict]:
+async def _get_token(vault_ref: str, *, org_id: str) -> tuple[str, dict]:
     """Return (access_token, full_creds). Refreshes proactively if near expiry."""
     from connectors.vault import get as vault_get, update as vault_update
     from connectors.oauth_apps import get_app, get_client_credentials
     import os
 
-    creds = await vault_get(vault_ref)
+    creds = await vault_get(vault_ref, org_id=org_id)
     provider = creds.get("provider", "")
     app = get_app(provider)
 
@@ -76,6 +76,7 @@ async def call(
     method: str,
     endpoint: str,
     *,
+    org_id: str,
     params: dict | None = None,
     body: dict | None = None,
 ) -> dict[str, Any]:
@@ -83,12 +84,12 @@ async def call(
     from connectors.oauth_apps import get_app
     from connectors.vault import get as vault_get, update as vault_update
 
-    creds = await vault_get(vault_ref)
+    creds = await vault_get(vault_ref, org_id=org_id)
     provider = creds.get("provider", "")
     app = get_app(provider)
     api_base = app.api_base if app else creds.get("api_base", "")
 
-    token, creds = await _get_token(vault_ref)
+    token, creds = await _get_token(vault_ref, org_id=org_id)
     url = api_base.rstrip("/") + "/" + endpoint.lstrip("/")
     # Never send the bearer token to an internal/loopback address — the api_base
     # (stored) or endpoint (LLM-controlled) could point at metadata/internal hosts.
@@ -121,7 +122,7 @@ async def call(
         creds["expires_at"] = "0"
         from connectors.vault import update as vault_update
         await vault_update(vault_ref, creds)
-        token, _ = await _get_token(vault_ref)
+        token, _ = await _get_token(vault_ref, org_id=org_id)
         headers["Authorization"] = f"Bearer {token}"
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.request(
@@ -148,7 +149,7 @@ class GenericHTTPConnector:
         action = tool.split(".", 1)[1] if "." in tool else "api"
 
         tier = args.pop("__connector_tier", "live")
-        args.pop("__org_id", None)
+        org_id = str(args.pop("__org_id", "") or "")
         args.pop("__task_id", None)
 
         if tier in {"demo", "fixture"}:
@@ -163,7 +164,7 @@ class GenericHTTPConnector:
         body = args.get("body") or args.get("json")
 
         try:
-            data = await call(vault_ref, method, endpoint, params=params, body=body)
+            data = await call(vault_ref, method, endpoint, org_id=org_id, params=params, body=body)
         except RuntimeError as exc:
             return ToolResult(data={"error": str(exc)}, summary=f"{tool} failed: {exc}")
 

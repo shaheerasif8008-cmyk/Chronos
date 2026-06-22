@@ -72,6 +72,8 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "failure_recovery": "resume",
         "token_budget_daily": 100000,
         "cost_budget_daily_usd": 10,
+        "request_rate_per_minute": 60,
+        "connector_rate_per_minute": 60,
     },
     "memory": {
         "workspace_memory": True,
@@ -230,8 +232,11 @@ async def workspace_autonomy(org_id: str, workspace_id: str | None) -> str:
     workspace is supplied the ``default`` workspace document is used.
     """
     member = Member(id="system", organization_id=org_id, region=settings.region, email="system@local", role="admin")
-    doc = await get_settings_doc(
-        member, "autonomy", scope="workspace", scope_id=str(workspace_id or "default")
-    )
+    try:
+        doc = await get_settings_doc(
+            member, "autonomy", scope="workspace", scope_id=str(workspace_id or "default")
+        )
+    except Exception:
+        return "supervised"
     level = str(doc.get("level") or "supervised")
     return level if level in AUTONOMY_LEVELS else "supervised"

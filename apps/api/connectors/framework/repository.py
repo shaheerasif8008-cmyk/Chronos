@@ -841,7 +841,7 @@ class DatabaseConnectorRepository:
             return {}
         from connectors import vault
 
-        return await vault.get(row["vault_ref"])
+        return await vault.get(row["vault_ref"], org_id=tenant_id)
 
     async def log_execution(self, **values: Any) -> dict[str, Any]:
         from sqlalchemy import insert

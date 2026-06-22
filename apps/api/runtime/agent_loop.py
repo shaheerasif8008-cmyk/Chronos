@@ -35,12 +35,13 @@ from core import audit, tool_broker
 from core.config import settings
 from core.db import engine, reflect_table
 from core.exceptions import ApprovalRequired
+from core.governance import GovernanceLimitExceeded, enforce_model_budget, enforce_task_start, record_model_usage
 from core.llm import _message_content, _message, _tool_calls, _with_retry, complete_json, default_chat_model_id, model_kwargs, resolve_agent_model, stream_step, stronger_agent_model
 from core.models import AgentContext
 from runtime import cognition
 from core.redis import redis_client
 from core.task_envelope import build_task_envelope, envelope_to_agent_prompt
-from core.token_budget import estimate_message_tokens, record_tokens_used
+from core.token_budget import estimate_message_tokens, estimate_tokens
 from core.tool_manifest import generate_tool_manifest
 from core.workspace import jailed_path, task_workspace_root
 from runtime.tool_registry import (
@@ -1641,7 +1642,13 @@ async def stream_chat_turn(
         iteration += 1
         final_text: str | None = None
         calls: list[dict[str, Any]] = []
+        estimated_prompt_tokens = estimate_message_tokens(history)
         try:
+            await enforce_model_budget(
+                requester_context.org_id,
+                model=effective_model,
+                estimated_tokens=estimated_prompt_tokens,
+            )
             stream_kwargs: dict[str, str] = {}
             if reasoning_effort:
                 stream_kwargs["reasoning_effort"] = reasoning_effort
@@ -1652,6 +1659,12 @@ async def stream_chat_turn(
                     final_text = ev["text"]
                 elif ev["type"] == "tool_calls":
                     calls = ev["calls"]
+        except GovernanceLimitExceeded as exc:
+            msg = str(exc)
+            await save_inline_answer(msg)
+            yield {"type": "token", "content": msg}
+            yield {"type": "done"}
+            return
         except Exception as exc:
             logger.error("Inline turn model error: %s", exc)
             msg = "Sorry — I hit a model error and couldn't finish that. Please try again."
@@ -1662,6 +1675,12 @@ async def stream_chat_turn(
 
         if not calls:
             answer = final_text or ""
+            await record_model_usage(
+                requester_context.org_id,
+                model=effective_model,
+                total_tokens=estimated_prompt_tokens + estimate_tokens(answer),
+                prompt_tokens=estimated_prompt_tokens,
+            )
             await save_inline_answer(answer)
             _spawn_background(extract_and_save(conversation_id, message, answer, requester_context))
             yield {"type": "done"}
@@ -1710,6 +1729,12 @@ async def stream_chat_turn(
             return
 
         history.append(_serialise_assistant(calls, final_text))
+        await record_model_usage(
+            requester_context.org_id,
+            model=effective_model,
+            total_tokens=estimated_prompt_tokens + estimate_tokens(final_text or "") + estimate_tokens(str(calls)),
+            prompt_tokens=estimated_prompt_tokens,
+        )
         if task_id is None:
             task_id = await create_task_from_history(
                 goal=message, history=history, requester_context=requester_context,
@@ -1920,6 +1945,17 @@ async def run_loop(
 
     await save_task(task_id, status="running",
                     started_at=task.get("started_at") or datetime.now(timezone.utc))
+    try:
+        await enforce_task_start(task.get("organization_id", "default"), task_id)
+    except GovernanceLimitExceeded as exc:
+        friendly = str(exc)
+        await save_task(task_id, status="failed", error=friendly, completed_at=datetime.now(timezone.utc))
+        failed_msg_id = await _persist_to_conversation(task, friendly)
+        failed_event: dict[str, Any] = {"type": "task_failed", "error": friendly}
+        if failed_msg_id:
+            failed_event["message_id"] = failed_msg_id
+        await emit_activity(task_id, failed_event)
+        return {"error": friendly}
 
     # ── Cognition setup (plan · budget · progress) ─────────────────────────────
     # All cognition degrades to the prior model-native behavior: light cognition
@@ -2024,12 +2060,27 @@ async def run_loop(
                 step_history = step_history + [{"role": "system", "content": "\n\n".join(_guidance)}]
         try:
             estimated_prompt_tokens = estimate_message_tokens(step_history)
+            await enforce_model_budget(
+                task.get("organization_id", "default"),
+                model=effective_model,
+                estimated_tokens=estimated_prompt_tokens,
+            )
             final_text, calls, step_tokens = await _llm_step(
                 step_history,
                 effective_tools,
                 effective_model,
                 reasoning_effort=stored_reasoning_effort,
             )
+        except GovernanceLimitExceeded as exc:
+            friendly = str(exc)
+            logger.warning("Governance blocked agent loop for task %s: %s", task_id, friendly)
+            await save_task(task_id, status="failed", error=friendly)
+            failed_msg_id = await _persist_to_conversation(task, friendly)
+            failed_event: dict[str, Any] = {"type": "task_failed", "error": friendly}
+            if failed_msg_id:
+                failed_event["message_id"] = failed_msg_id
+            await emit_activity(task_id, failed_event)
+            return {"error": friendly}
         except Exception as exc:
             logger.error("LLM error in agent loop for task %s: %s", task_id, exc)
             # task.error keeps the raw exception for diagnostics; everything the
@@ -2055,7 +2106,12 @@ async def run_loop(
                 tokens=step_tokens,
                 estimated_prompt_tokens=estimated_prompt_tokens,
             )
-            _spawn_background(record_tokens_used(task.get("organization_id", "default"), step_tokens))
+            await record_model_usage(
+                task.get("organization_id", "default"),
+                model=effective_model,
+                total_tokens=step_tokens,
+                prompt_tokens=estimated_prompt_tokens,
+            )
 
         # ── Final answer ────────────────────────────────────────────────────
         if not calls:
