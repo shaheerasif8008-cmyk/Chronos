@@ -23,7 +23,7 @@ The permission seam (`apps/api/core/permissions.py`) is mature:
 
 ## Phase decomposition
 
-- **W2.1 — Enable + prove the relationship path (DETAILED below).** Stand up OpenFGA (already in `docker-compose.yml`), enable it in a test config, and prove the negative relationship paths (unauthorized project/workspace access denied; fail-closed when the server is down; authorized access allowed). Emit a mapped-vs-unmapped action inventory. This proves the moat's unproven half.
+- **W2.1 — Enable + prove the relationship path (DONE).** Stand up OpenFGA (already in `docker-compose.yml`), enable it in a test config, and prove the negative relationship paths (unauthorized project/workspace access denied; fail-closed when the server is down; authorized access allowed). Emit a mapped-vs-unmapped action inventory. This proves the moat's unproven half. _Implemented: `apps/api/tests/test_authz_enforced.py`, `apps/api/scripts/authz_coverage.py` → `docs/authz_coverage.md`, CI provisions OpenFGA in the backend job._
 - **W2.2 — Coverage expansion.** Using W2.1's inventory, map high-value resource-scoped actions (act-on-specific-task/memory/connector/artifact by id) to FGA relations + tuple seeding on resource creation. Each task starts by confirming the action is genuinely under-scoped.
 - **W2.3 — Groups & departments.** Model FGA group/department relations; reconcile SCIM groups → group tuples; effective access via group membership.
 - **W2.4 — Memory-scope enforcement.** Replace `memory.retrieve`'s org-only filter with FGA-authorized scope pairs (the frozen-signature drop-in noted in CLAUDE.md), proven with negative-path tests.
@@ -39,21 +39,21 @@ The permission seam (`apps/api/core/permissions.py`) is mature:
 
 ### Task 1: A test fixture that enables OpenFGA against a live server
 
-- [ ] **Step 1:** Confirm OpenFGA reachability and how the model/store bootstrap works — read `core/authz.py` for `is_enabled()`, the bootstrap (store/model creation), `check()`, `write_tuples`/`delete_tuples`, and how `settings.openfga_api_url/store_id/model_id` are consumed. Confirm `docker-compose up -d openfga` exposes `:8080`.
-- [ ] **Step 2:** Add a pytest fixture (in a new `tests/test_authz_enforced.py`, marked so it's skipped when OpenFGA isn't reachable) that: sets `settings.openfga_api_url` to the live server (monkeypatch or env), triggers bootstrap (store + model), and yields. Use `pytest.importorskip`/a reachability probe to skip gracefully in environments without OpenFGA so the default suite stays green; CI runs it where OpenFGA is up.
+- [x] **Step 1:** Confirm OpenFGA reachability and how the model/store bootstrap works — read `core/authz.py` for `is_enabled()`, the bootstrap (store/model creation), `check()`, `write_tuples`/`delete_tuples`, and how `settings.openfga_api_url/store_id/model_id` are consumed. Confirm `docker-compose up -d openfga` exposes `:8080`.
+- [x] **Step 2:** Add a pytest fixture (in a new `tests/test_authz_enforced.py`, marked so it's skipped when OpenFGA isn't reachable) that: sets `settings.openfga_api_url` to the live server (monkeypatch or env), triggers bootstrap (store + model), and yields. Use `pytest.importorskip`/a reachability probe to skip gracefully in environments without OpenFGA so the default suite stays green; CI runs it where OpenFGA is up.
 
 ### Task 2: Prove the negative + positive relationship paths
 
-- [ ] **Step 1 (failing test):** With FGA enabled, a member with **no** `can_edit` tuple on `project:X` calling `permission.check(member, "update_project", "X")` must raise `PermissionDenied`. Also: granting the tuple (`grant_project_access`) then checking the same action returns True. And: with FGA enabled but the server made unreachable, a mapped action **fails closed** (`PermissionDenied`, decision `denied_authz_unavailable`).
-- [ ] **Step 2:** These should pass against the *existing* `check()` logic once FGA is enabled (no product code change expected — this is a proof task). If a test reveals a real enforcement bug, fix `permissions.py`/`authz.py` minimally and note it.
+- [x] **Step 1 (failing test):** With FGA enabled, a member with **no** `can_edit` tuple on `project:X` calling `permission.check(member, "update_project", "X")` must raise `PermissionDenied`. Also: granting the tuple (`grant_project_access`) then checking the same action returns True. And: with FGA enabled but the server made unreachable, a mapped action **fails closed** (`PermissionDenied`, decision `denied_authz_unavailable`).
+- [x] **Step 2:** These should pass against the *existing* `check()` logic once FGA is enabled (no product code change expected — this is a proof task). If a test reveals a real enforcement bug, fix `permissions.py`/`authz.py` minimally and note it.
 
 ### Task 3: Coverage inventory
 
-- [ ] **Step 1:** Add a test (or a small script `scripts/authz_coverage.py`) that introspects `permissions.py` and prints, for every known action, whether it is: role-gated (`_ADMIN_ACTIONS`/`_APPROVAL_DECISION_ACTIONS`), relationship-mapped (`_resource_for`), generic-allowed (`_GENERIC_ALLOWED_*`), or unmapped→denied. Output the mapped-vs-allowlisted-vs-denied breakdown. Commit the inventory as `docs/authz_coverage.md` — it drives W2.2's scope.
+- [x] **Step 1:** Add a test (or a small script `scripts/authz_coverage.py`) that introspects `permissions.py` and prints, for every known action, whether it is: role-gated (`_ADMIN_ACTIONS`/`_APPROVAL_DECISION_ACTIONS`), relationship-mapped (`_resource_for`), generic-allowed (`_GENERIC_ALLOWED_*`), or unmapped→denied. Output the mapped-vs-allowlisted-vs-denied breakdown. Commit the inventory as `docs/authz_coverage.md` — it drives W2.2's scope.
 
 ### Task 4: CI wiring + gate
 
-- [ ] **Step 1:** Ensure `.github/workflows/ci.yml`'s backend job provisions OpenFGA (compose already has it) and that `test_authz_enforced.py` runs there (skipped locally when absent). Confirm the enabled-path tests pass in CI.
+- [x] **Step 1:** Ensure `.github/workflows/ci.yml`'s backend job provisions OpenFGA (compose already has it) and that `test_authz_enforced.py` runs there (skipped locally when absent). Confirm the enabled-path tests pass in CI.
 
 **Proof bar for W2.1:** CI runs the FGA-enabled suite; the unauthorized-relationship-action denial + fail-closed are green; `docs/authz_coverage.md` exists. The moat's relationship half is now proven, and the coverage gap is quantified for W2.2.
 
