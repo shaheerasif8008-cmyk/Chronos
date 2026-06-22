@@ -34,9 +34,14 @@ def set_session_cookie(response, token: str) -> None:
     development (plaintext HTTP, same-host) ``Lax`` is kept since ``None``
     without ``Secure`` is rejected by browsers.
     """
+    # In production, scope the cookie to the parent domain (.<base_domain>) so a
+    # cookie set during apex signup is valid on the tenant subdomain after redirect
+    # (W1 Phase 2C). Host-only in dev.
+    domain = f".{settings.base_domain}" if _is_production() else None
     response.set_cookie(
         "chronos_session",
         token,
+        domain=domain,
         httponly=True,
         samesite="none" if settings.is_production else "lax",
         secure=settings.is_production,

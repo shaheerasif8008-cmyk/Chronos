@@ -268,3 +268,18 @@ async def test_cognito_resolution_rejects_unknown_email_when_autoprovision_off(m
         await _resolve_cognito_member(f"nobody{uuid.uuid4().hex[:6]}@corp{uuid.uuid4().hex[:6]}.com",
                                       name=None, resolved_org_id=None)
     assert exc.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_signup_response_includes_subdomain():
+    domain = f"sub{uuid.uuid4().hex[:8]}.com"
+    email = f"founder@{domain}"
+    _seed_otp(email)
+    async with _client() as client:
+        resp = await client.post("/auth/signup", json={"email": email, "code": "123456"})
+    assert resp.status_code == 200
+    body = resp.json()
+    orgs = await reflect_table("organizations")
+    async with engine.begin() as conn:
+        sub = (await conn.execute(orgs.select().where(orgs.c.id == body["org_id"]))).mappings().one()["subdomain"]
+    assert body["subdomain"] == sub

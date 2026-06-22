@@ -191,8 +191,13 @@ async def signup(req: SignupRequest, response: Response) -> dict:
     set_session_cookie(response, token)
     await audit.log("signup_completed", result["member_id"], "auth.signup",
                     organization_id=result["org_id"], payload={"created": result["created"]})
+    organizations = await reflect_table("organizations")
+    async with engine.begin() as conn:
+        subdomain = (await conn.execute(
+            select(organizations.c.subdomain).where(organizations.c.id == result["org_id"])
+        )).scalar_one()
     return {"access_token": token, "token_type": "bearer", "member_id": result["member_id"],
-            "org_id": result["org_id"], "created": result["created"]}
+            "org_id": result["org_id"], "subdomain": subdomain, "created": result["created"]}
 
 
 @router.post("/cognito/callback")
