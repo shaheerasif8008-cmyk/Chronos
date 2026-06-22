@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import dataclasses
 import io
 from typing import Any
 
@@ -278,6 +279,53 @@ async def complete_onboarding(member: Member = Depends(get_current_member)) -> d
                     organization_id=member.organization_id, resource_type="organization",
                     resource_id=member.organization_id)
     return {"state": "complete"}
+
+
+@router.get("/plan")
+async def get_plan(member: Member = Depends(get_current_member)) -> dict[str, Any]:
+    """Return the org's plan, its entitlements, and today's usage.
+
+    Available to any authenticated member (no admin gate — everyone can see their plan tier).
+    """
+    # Resolve org plan from organizations table
+    organizations = await reflect_table("organizations")
+    members_table = await reflect_table("members")
+    async with engine.begin() as conn:
+        org_row = (
+            await conn.execute(
+                select(organizations.c.plan).where(organizations.c.id == member.organization_id)
+            )
+        ).first()
+        seats_used = (
+            await conn.execute(
+                select(func.count()).select_from(members_table).where(
+                    members_table.c.organization_id == member.organization_id
+                )
+            )
+        ).scalar_one()
+    plan = (org_row[0] if org_row and org_row[0] else None) or "trial"
+    ent = get_entitlements(plan)
+    ent_dict = dataclasses.asdict(ent)
+    ent_dict["features"] = sorted(ent_dict["features"])
+
+    # Usage today from governance (tokens + cost)
+    try:
+        summary = await usage_summary(member.organization_id)
+        tokens_today = summary.get("tokens", {}).get("tokens_today", 0)
+        cost_today_usd = summary.get("cost", {}).get("cost_today_usd", 0.0)
+    except Exception:
+        tokens_today = 0
+        cost_today_usd = 0.0
+
+    return {
+        "plan": plan,
+        "entitlements": ent_dict,
+        "usage": {
+            "seats_used": int(seats_used),
+            "tokens_today": tokens_today,
+            "cost_today_usd": cost_today_usd,
+        },
+    }
 
 
 @router.patch("/{section}")
