@@ -7,11 +7,12 @@ import secrets
 import uuid as _uuid
 
 from sqlalchemy import insert, select
+from sqlalchemy.exc import IntegrityError
 
 from core import audit
 from core.config import settings
 from core.db import engine, reflect_table
-from core.members import get_member_in_org, provision_member
+from core.members import get_member_by_email_global, get_member_in_org, provision_member
 from core.provisioning import provision_org
 from core.tenancy import RESERVED_LABELS
 
@@ -83,6 +84,10 @@ async def signup_or_join(email: str, org_name: str | None = None) -> dict:
     domain = email.split("@", 1)[1]
 
     if is_free_email_domain(domain):
+        existing = await get_member_by_email_global(email)
+        if existing is not None:
+            return {"org_id": str(existing.organization_id), "member_id": str(existing.id),
+                    "role": existing.role, "created": False, "joined": False}
         local = email.split("@", 1)[0]
         sub = await unique_subdomain(local)
         prov = await provision_org(slug=sub, name=org_name or f"{local}'s workspace", owner_email=email)
@@ -115,14 +120,26 @@ async def signup_or_join(email: str, org_name: str | None = None) -> dict:
         return {"org_id": org_id, "member_id": str(member.id), "role": "user",
                 "created": False, "joined": True}
 
+    # Unclaimed work domain: create the org, make the signer owner, soft-claim.
     sub = await unique_subdomain(domain.split(".", 1)[0])
     prov = await provision_org(slug=sub, name=org_name or domain.split(".", 1)[0].title(), owner_email=email)
     claims = await reflect_table("email_domain_claims")
-    async with engine.begin() as conn:
-        await conn.execute(insert(claims).values(
-            organization_id=prov["org_id"], region=settings.region, domain=domain,
-            claim_type="soft_email", join_policy="auto",
-        ))
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(insert(claims).values(
+                organization_id=prov["org_id"], region=settings.region, domain=domain,
+                claim_type="soft_email", join_policy="auto",
+            ))
+    except IntegrityError:
+        # Lost the race: a concurrent signup claimed this domain first. Roll back
+        # the org we just created, then re-resolve through the normal path (which
+        # now finds the claim and handles auto-join vs. approval correctly).
+        orgs = await reflect_table("organizations")
+        members = await reflect_table("members")
+        async with engine.begin() as conn:
+            await conn.execute(members.delete().where(members.c.id == prov["owner_member_id"]))
+            await conn.execute(orgs.delete().where(orgs.c.id == prov["org_id"]))
+        return await signup_or_join(email, org_name)
     await audit.log("domain_soft_claimed", prov["owner_member_id"], "signup.claim_domain",
                     organization_id=prov["org_id"], payload={"domain": domain})
     return {"org_id": prov["org_id"], "member_id": prov["owner_member_id"],

@@ -6,7 +6,7 @@ import uuid
 import pytest
 import httpx
 import main
-from routers.auth import _otp_store
+from routers.auth import _otp_store, _resolve_cognito_member
 
 from core.signup import RESERVED_SLUGS, derive_slug, is_free_email_domain, signup_or_join, unique_subdomain
 from core.db import engine, reflect_table
@@ -212,3 +212,74 @@ async def test_signup_endpoint_404_when_dev_otp_disabled(monkeypatch):
     async with _client() as client:
         resp = await client.post("/auth/signup", json={"email": f"x@{_domain()}", "code": "123456"})
     assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_free_email_repeat_signup_is_idempotent():
+    email = f"person{uuid.uuid4().hex[:8]}@gmail.com"
+    first = await signup_or_join(email)
+    again = await signup_or_join(email)
+    assert again["org_id"] == first["org_id"]
+    assert again["member_id"] == first["member_id"]
+    assert again["created"] is False
+
+
+@pytest.mark.asyncio
+async def test_unclaimed_domain_race_resolves_to_join(monkeypatch):
+    """If the domain gets claimed between our check and our insert (concurrent
+    signup), the loser re-resolves to an auto-join instead of 500ing/orphaning."""
+    import core.signup as signup_mod
+    domain = f"race{uuid.uuid4().hex[:8]}.com"
+    winner = await signup_or_join(f"founder@{domain}")
+    real = signup_mod._claim_for_domain
+    calls = {"n": 0}
+    async def fake_claim(d):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None  # pretend unclaimed → take the create-org branch
+        return await real(d)
+    monkeypatch.setattr(signup_mod, "_claim_for_domain", fake_claim)
+    res = await signup_or_join(f"loser@{domain}")
+    assert res["org_id"] == winner["org_id"]
+    assert res["created"] is False and res["joined"] is True
+
+
+# ---------------------------------------------------------------------------
+# W1 Phase 2B-2 — _resolve_cognito_member routes Cognito through signup_or_join
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_cognito_resolution_creates_org_for_unclaimed_domain(monkeypatch):
+    monkeypatch.setattr("routers.auth.settings.cognito_auto_provision_members", True, raising=False)
+    from routers.auth import _resolve_cognito_member
+    domain = f"corp{uuid.uuid4().hex[:8]}.com"
+    member = await _resolve_cognito_member(f"ceo@{domain}", name="CEO", resolved_org_id=None)
+    assert member.organization_id and member.role == "owner"
+    member2 = await _resolve_cognito_member(f"eng@{domain}", name="Eng", resolved_org_id=None)
+    assert member2.organization_id == member.organization_id and member2.role == "user"
+
+
+@pytest.mark.asyncio
+async def test_cognito_resolution_rejects_unknown_email_when_autoprovision_off(monkeypatch):
+    monkeypatch.setattr("routers.auth.settings.cognito_auto_provision_members", False, raising=False)
+    from routers.auth import _resolve_cognito_member
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc:
+        await _resolve_cognito_member(f"nobody{uuid.uuid4().hex[:6]}@corp{uuid.uuid4().hex[:6]}.com",
+                                      name=None, resolved_org_id=None)
+    assert exc.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_signup_response_includes_subdomain():
+    domain = f"sub{uuid.uuid4().hex[:8]}.com"
+    email = f"founder@{domain}"
+    _seed_otp(email)
+    async with _client() as client:
+        resp = await client.post("/auth/signup", json={"email": email, "code": "123456"})
+    assert resp.status_code == 200
+    body = resp.json()
+    orgs = await reflect_table("organizations")
+    async with engine.begin() as conn:
+        sub = (await conn.execute(orgs.select().where(orgs.c.id == body["org_id"]))).mappings().one()["subdomain"]
+    assert body["subdomain"] == sub

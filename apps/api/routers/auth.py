@@ -2,7 +2,7 @@ from __future__ import annotations
 import secrets
 import time
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select, update
 
@@ -20,7 +20,7 @@ from core.cognito import (
 from core.config import settings
 from core.db import engine, reflect_table
 from core.invitations import accept_pending_invitation
-from core.members import get_member_by_email, get_or_create_member_for_email
+from core.members import get_member_by_email, get_member_in_org
 from core.signup import signup_or_join
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -79,6 +79,28 @@ def _consume_otp(email: str, code: str) -> None:
     _otp_store.pop(email, None)
 
 
+async def _resolve_cognito_member(email: str, *, name: str | None, resolved_org_id: str | None):
+    """Resolve a Cognito-verified email to a member. Per-subdomain: log into the
+    resolved org if already a member there. At apex, an existing default-org member
+    logs in. Otherwise self-serve create/join via signup_or_join — but ONLY when
+    auto-provisioning is enabled (preserves the cognito_auto_provision_members gate)."""
+    email = email.lower()
+    if resolved_org_id is not None:
+        member = await get_member_in_org(resolved_org_id, email=email)
+        if member is not None:
+            return member
+    else:
+        member = await get_member_by_email(email)  # apex: existing default-org member
+        if member is not None:
+            return member
+    if not settings.cognito_auto_provision_members:
+        raise HTTPException(status_code=403, detail="Email is not registered as a Chronos member")
+    result = await signup_or_join(email, org_name=name)
+    if result.get("member_id") is None:
+        raise HTTPException(status_code=403, detail="Membership pending approval")
+    return await get_member_in_org(result["org_id"], email=email)
+
+
 @router.get("/config")
 async def auth_config() -> dict:
     """Public auth configuration for the web app."""
@@ -125,24 +147,30 @@ async def request_otp(req: OtpRequest) -> dict[str, str]:
 
 
 @router.post("/verify-otp")
-async def verify_otp(req: OtpVerify, response: Response) -> dict[str, str]:
+async def verify_otp(req: OtpVerify, request: Request, response: Response) -> dict[str, str]:
     if not _dev_otp_enabled():
         raise HTTPException(status_code=404, detail="Dev OTP auth is disabled")
     email = req.email.lower()
     _consume_otp(email, req.code)
 
-    member = await get_member_by_email(email)
+    # Per-subdomain login: resolve the member in the request's tenant. Apex / no
+    # tenant context falls back to the default org (dev convenience).
+    resolved = getattr(request.state, "resolved_org_id", None)
+    if resolved is not None:
+        member = await get_member_in_org(resolved, email=email)
+        if member is None:
+            member = await accept_pending_invitation(email, org_id=resolved)
+    else:
+        member = await get_member_by_email(email)
+        if member is None:
+            member = await accept_pending_invitation(email, org_id=settings.org_id)
     if member is None:
-        member = await accept_pending_invitation(email, org_id=settings.org_id)
-    if member is None:
-        raise HTTPException(status_code=403, detail="Email is not seeded as a Chronos member")
+        raise HTTPException(status_code=403, detail="Email is not a member of this organization")
 
-    token = create_access_token(member.id)
+    token = create_access_token(member.id, org_id=member.organization_id)
     members = await reflect_table("members")
     async with engine.begin() as conn:
-        await conn.execute(
-            update(members).where(members.c.id == member.id).values(region=settings.region)
-        )
+        await conn.execute(update(members).where(members.c.id == member.id).values(region=settings.region))
     await audit.log("otp_verified", member.id, "auth.verify_otp", organization_id=member.organization_id)
     set_session_cookie(response, token)
     return {"access_token": token, "token_type": "bearer", "member_id": member.id}
@@ -158,18 +186,22 @@ async def signup(req: SignupRequest, response: Response) -> dict:
     result = await signup_or_join(email, org_name=req.org_name)
     if result.get("status") == "pending_approval":
         return {"status": "pending_approval", "org_id": result["org_id"]}
-    # Phase 2A issues a legacy org-less token (grandfathered); Phase 2B flips this
-    # to create_access_token(member_id, org_id=result["org_id"]).
-    token = create_access_token(result["member_id"])
+    # Phase 2B: token is now org-bound (org_id claim set to the resolved org).
+    token = create_access_token(result["member_id"], org_id=result["org_id"])
     set_session_cookie(response, token)
     await audit.log("signup_completed", result["member_id"], "auth.signup",
                     organization_id=result["org_id"], payload={"created": result["created"]})
+    organizations = await reflect_table("organizations")
+    async with engine.begin() as conn:
+        subdomain = (await conn.execute(
+            select(organizations.c.subdomain).where(organizations.c.id == result["org_id"])
+        )).scalar_one()
     return {"access_token": token, "token_type": "bearer", "member_id": result["member_id"],
-            "org_id": result["org_id"], "created": result["created"]}
+            "org_id": result["org_id"], "subdomain": subdomain, "created": result["created"]}
 
 
 @router.post("/cognito/callback")
-async def cognito_callback(req: CognitoCallbackRequest, response: Response) -> dict[str, str]:
+async def cognito_callback(req: CognitoCallbackRequest, request: Request, response: Response) -> dict[str, str]:
     """Exchange Cognito hosted-UI authorization code for a Chronos session JWT."""
     if not cognito_enabled():
         raise HTTPException(status_code=404, detail="Cognito auth is not enabled")
@@ -177,33 +209,37 @@ async def cognito_callback(req: CognitoCallbackRequest, response: Response) -> d
         tokens = await exchange_authorization_code(req.code, redirect_uri=req.redirect_uri)
         email = email_from_claims(tokens["claims"])
         name = tokens["claims"].get("name")
-        member = await get_or_create_member_for_email(email, name=name)
+        member = await _resolve_cognito_member(
+            email, name=name, resolved_org_id=getattr(request.state, "resolved_org_id", None)
+        )
     except CognitoAuthError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
-    token = create_access_token(member.id)
+    token = create_access_token(member.id, org_id=member.organization_id)
     await audit.log("cognito_login", member.id, "auth.cognito_callback", organization_id=member.organization_id)
     set_session_cookie(response, token)
     return {"access_token": token, "token_type": "bearer", "member_id": member.id}
 
 
 @router.post("/cognito/verify")
-async def cognito_verify_id_token(req: CognitoIdTokenRequest, response: Response) -> dict[str, str]:
+async def cognito_verify_id_token(req: CognitoIdTokenRequest, request: Request, response: Response) -> dict[str, str]:
     """Verify a Cognito ID token (e.g. from Amplify) and issue a Chronos session JWT."""
     if not cognito_enabled():
         raise HTTPException(status_code=404, detail="Cognito auth is not enabled")
     try:
         claims = verify_id_token(req.id_token)
         email = email_from_claims(claims)
-        member = await get_or_create_member_for_email(email, name=claims.get("name"))
+        member = await _resolve_cognito_member(
+            email, name=claims.get("name"), resolved_org_id=getattr(request.state, "resolved_org_id", None)
+        )
     except CognitoAuthError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
-    token = create_access_token(member.id)
+    token = create_access_token(member.id, org_id=member.organization_id)
     await audit.log("cognito_login", member.id, "auth.cognito_verify", organization_id=member.organization_id)
     set_session_cookie(response, token)
     return {"access_token": token, "token_type": "bearer", "member_id": member.id}

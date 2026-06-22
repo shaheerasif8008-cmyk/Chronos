@@ -219,6 +219,9 @@ export default function LoginPage() {
             </form>
           </>
         ) : null}
+        <p style={{ marginTop: 16, textAlign: "center" }}>
+          <a href="/signup">Create an organization</a>
+        </p>
       </section>
     </main>
   );
