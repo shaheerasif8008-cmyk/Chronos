@@ -35,6 +35,18 @@ async def set_org_plan(org_id: str, plan: str, *, actor_id: str = "system") -> N
 
 
 # ── Provider seams (monkeypatched in tests; real Stripe behind these) ──────────
+# SECURITY CONTRACT for the real Stripe wiring (handle_webhook applies a plan to
+# whatever org_id/plan the event names): a valid signature only proves the event
+# came from our Stripe account — NOT that the event's org_id/plan are legitimate.
+# Therefore the real impls MUST:
+#   - `_provider_create_checkout`: bind org_id into server-side Checkout Session
+#     metadata (never a client-settable field), and set price from the trusted
+#     plan→price map. org_id here already comes from the authenticated admin's
+#     `member.organization_id`, not client input — keep it that way.
+#   - `_parse_event`: verify the Stripe signature FIRST (raise/return None on
+#     failure → no plan change), then derive org_id ONLY from the session's
+#     server-bound metadata (or a customer→org table) and plan ONLY from the
+#     Stripe price→plan map. Never trust an org_id/plan from a raw payload field.
 def _provider_create_checkout(*, org_id: str, plan: str, price: str) -> str:
     """Create a Stripe Checkout Session and return its URL. Real impl calls Stripe;
     raises if the SDK/secret isn't available. Tests monkeypatch this."""
@@ -47,7 +59,9 @@ def _provider_create_portal(*, org_id: str) -> str:
 
 def _parse_event(payload: bytes, signature: str) -> dict | None:
     """Verify the webhook signature and return a normalized event
-    {type, org_id, plan} or None. Tests monkeypatch this."""
+    {type, org_id, plan} or None (see the SECURITY CONTRACT above — org_id/plan
+    must be derived from server-bound metadata + the price map, not the payload).
+    Tests monkeypatch this."""
     raise BillingNotConfigured("Stripe SDK not wired in this build")
 
 
