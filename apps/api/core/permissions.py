@@ -29,6 +29,11 @@ from core.authz import AuthzUnavailable
 from core.exceptions import PermissionDenied
 from core.models import Member
 
+# Imported lazily inside reconcile_org_tuples to avoid circular imports at
+# module load time (db depends on config which is fine, but keep it isolated).
+from sqlalchemy import select
+from sqlalchemy.exc import NoSuchTableError
+
 # action → relation on project:{resource}
 _VIEW_ACTIONS = {"view_project", "view_project_sources"}
 _EDIT_ACTIONS = {
@@ -457,3 +462,94 @@ async def _write_tuples_idempotently(tuples: list[tuple[str, str, str]]) -> None
         if "tuple to be written already existed" in str(exc):
             return
         raise
+
+
+async def reconcile_org_tuples(org_id: str) -> dict[str, int]:
+    """Backfill OpenFGA relationship tuples from the DB for an org.
+
+    Idempotently writes tuples for every member, project-member, and workspace
+    row in the org so that enabling FGA on a populated org does not lock out
+    existing members.
+
+    Returns a dict with the count of tuples written per category::
+
+        {"members": n, "projects": n, "workspaces": n}
+
+    No-ops (returns all-zero counts) when OpenFGA is not configured.
+    """
+    if not settings_openfga_configured():
+        return {"members": 0, "projects": 0, "workspaces": 0}
+
+    from core.db import engine, reflect_table
+
+    # ── Members ─────────────────────────────────────────────────────────────
+    members_tbl = await reflect_table("members")
+    async with engine.begin() as conn:
+        rows = (
+            await conn.execute(
+                select(members_tbl.c.id, members_tbl.c.role).where(
+                    members_tbl.c.organization_id == org_id
+                )
+            )
+        ).fetchall()
+
+    member_count = 0
+    for row in rows:
+        admin = row.role in {"admin", "owner"}
+        await grant_org_membership(row.id, org_id, admin=admin)
+        member_count += 1
+
+    # ── Project members ──────────────────────────────────────────────────────
+    pm_tbl = await reflect_table("project_members")
+    async with engine.begin() as conn:
+        pm_rows = (
+            await conn.execute(
+                select(
+                    pm_tbl.c.member_id,
+                    pm_tbl.c.role,
+                    pm_tbl.c.project_id,
+                ).where(pm_tbl.c.organization_id == org_id)
+            )
+        ).fetchall()
+
+    project_count = 0
+    for row in pm_rows:
+        await grant_project_role(row.member_id, row.role, row.project_id, org_id)
+        project_count += 1
+
+    # ── Workspace → org links ────────────────────────────────────────────────
+    # There is no per-member workspace relationship to backfill — only the
+    # workspace→org link (`organization:{org}` -[org]-> `workspace:{id}`) so
+    # org-admin inheritance works.  The ``workspaces`` table may not exist in
+    # all deployed schemas, so we guard against NoSuchTableError.
+    workspace_count = 0
+    try:
+        ws_tbl = await reflect_table("workspaces")
+        async with engine.begin() as conn:
+            ws_rows = (
+                await conn.execute(
+                    select(ws_tbl.c.id).where(ws_tbl.c.organization_id == org_id)
+                )
+            ).fetchall()
+        ws_tuples = [
+            (f"organization:{org_id}", "org", f"workspace:{row.id}") for row in ws_rows
+        ]
+        if ws_tuples:
+            await _write_tuples_idempotently(ws_tuples)
+        workspace_count = len(ws_rows)
+    except NoSuchTableError:
+        workspace_count = 0
+
+    counts: dict[str, int] = {
+        "members": member_count,
+        "projects": project_count,
+        "workspaces": workspace_count,
+    }
+    await audit.log(
+        "authz_reconciled",
+        None,
+        "reconcile_org_tuples",
+        organization_id=org_id,
+        payload=counts,
+    )
+    return counts
