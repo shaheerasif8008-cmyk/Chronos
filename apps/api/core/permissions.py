@@ -34,6 +34,13 @@ from core.models import Member
 from sqlalchemy import select
 from sqlalchemy.exc import NoSuchTableError
 
+# Role precedence used when aggregating group roles (mirrors core/scim.py).
+_ROLE_RANK = {"viewer": 0, "user": 1, "operator": 2, "manager": 3, "admin": 4, "owner": 5}
+
+
+def _rank(role: str) -> int:
+    return _ROLE_RANK.get(role, 1)
+
 # action → relation on project:{resource}
 _VIEW_ACTIONS = {"view_project", "view_project_sources"}
 _EDIT_ACTIONS = {
@@ -549,6 +556,90 @@ async def reconcile_org_tuples(org_id: str) -> dict[str, int]:
         "authz_reconciled",
         None,
         "reconcile_org_tuples",
+        organization_id=org_id,
+        payload=counts,
+    )
+    return counts
+
+
+async def reconcile_org_groups(org_id: str) -> dict[str, int]:
+    """Backfill OpenFGA relationship tuples from SCIM group memberships for an org.
+
+    For each ``scim_groups`` row + its ``group_memberships``, grants each member
+    the org-level role that the group confers.  A member in multiple groups gets
+    the highest role among those groups (matching ``recompute_member_role`` DB
+    semantics).  The approach is *materialized*: we write direct
+    ``user:{member_id}`` → ``member|admin`` → ``organization:{org_id}`` tuples
+    rather than adding a ``group`` type to the authorization model.  This means
+    the existing model is untouched (no live OpenFGA needed to validate a model
+    change) and the required behavioral outcome — a member of an admin-role group
+    ends up with ``admin`` on ``organization:{org_id}`` — is achieved via the
+    same ``grant_org_membership`` helper already used for direct member backfill.
+
+    Returns::
+
+        {"groups": n_groups, "grants": n_member_grants}
+
+    No-ops (returns all-zero counts) when OpenFGA is not configured.
+
+    Known limitation: revocation is not covered here — removing a member from
+    their sole admin group will not retract the FGA admin tuple.  That is out of
+    scope for W2.3 (additive grants only) and should be addressed in a dedicated
+    revoke pass.
+    """
+    if not settings_openfga_configured():
+        return {"groups": 0, "grants": 0}
+
+    from core.db import engine, reflect_table
+
+    groups_tbl = await reflect_table("scim_groups")
+    gm_tbl = await reflect_table("group_memberships")
+
+    async with engine.begin() as conn:
+        group_rows = (
+            await conn.execute(
+                select(groups_tbl.c.id, groups_tbl.c.role).where(
+                    groups_tbl.c.organization_id == org_id
+                )
+            )
+        ).fetchall()
+
+    if not group_rows:
+        return {"groups": 0, "grants": 0}
+
+    # Collect per-member max role across all groups (mirrors recompute_member_role).
+    # Use None as sentinel so a member in a single user-role group still gets granted.
+    member_max_role: dict[str, str | None] = {}
+
+    for group_row in group_rows:
+        async with engine.begin() as conn:
+            member_ids = (
+                await conn.execute(
+                    select(gm_tbl.c.member_id).where(
+                        gm_tbl.c.organization_id == org_id,
+                        gm_tbl.c.group_id == group_row.id,
+                    )
+                )
+            ).scalars().all()
+        for mid in member_ids:
+            mid_str = str(mid)
+            current = member_max_role.get(mid_str)
+            if current is None or _rank(group_row.role) > _rank(current):
+                member_max_role[mid_str] = group_row.role
+
+    grant_count = 0
+    for mid_str, role in member_max_role.items():
+        if role is None:
+            continue  # defensive: no group role resolved (should not happen)
+        admin = role in {"admin", "owner"}
+        await grant_org_membership(mid_str, org_id, admin=admin)
+        grant_count += 1
+
+    counts: dict[str, int] = {"groups": len(group_rows), "grants": grant_count}
+    await audit.log(
+        "authz_reconciled",
+        None,
+        "reconcile_org_groups",
         organization_id=org_id,
         payload=counts,
     )

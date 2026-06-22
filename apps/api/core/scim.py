@@ -360,6 +360,10 @@ async def set_group_members(org_id: str, group_id: str, member_ids: list[str]) -
     for mid in affected:
         await recompute_member_role(org_id, str(mid))
 
+    # Propagate group-derived org roles to FGA when enabled (no-op when off).
+    from core.permissions import reconcile_org_groups  # lazy to avoid circular import
+    await reconcile_org_groups(org_id)
+
 
 async def patch_group(org_id: str, group_id: str, patch: dict) -> dict | None:
     group = await get_group(org_id, group_id)
