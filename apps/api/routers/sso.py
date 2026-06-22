@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from sqlalchemy import delete, insert, select, update
 
 from core import audit, permissions, sso
+from core.domains import is_domain_hard_claimed
 from core.auth import create_access_token, get_current_member, set_session_cookie
 from core.config import settings
 from core.db import engine, reflect_table
@@ -122,7 +123,11 @@ async def create_connection(req: SSOConnectionInput, member: Member = Depends(ge
     table = await reflect_table("sso_connections")
     values = {**req.model_dump(), "organization_id": member.organization_id, "region": member.region}
     if req.email_domain:
-        values["email_domain"] = req.email_domain.lower().strip()
+        domain = req.email_domain.lower().strip()
+        if not await is_domain_hard_claimed(member.organization_id, domain):
+            raise HTTPException(status_code=403,
+                                detail="Domain must be DNS-verified by this org before configuring SSO")
+        values["email_domain"] = domain
     async with engine.begin() as conn:
         row = (await conn.execute(insert(table).values(**values).returning(table))).mappings().one()
     await audit.log("sso_connection_created", member.id, "sso.create",
@@ -137,7 +142,11 @@ async def update_connection(connection_id: str, req: SSOConnectionInput, member:
     table = await reflect_table("sso_connections")
     values = {**req.model_dump(), "region": member.region}
     if req.email_domain:
-        values["email_domain"] = req.email_domain.lower().strip()
+        domain = req.email_domain.lower().strip()
+        if not await is_domain_hard_claimed(member.organization_id, domain):
+            raise HTTPException(status_code=403,
+                                detail="Domain must be DNS-verified by this org before configuring SSO")
+        values["email_domain"] = domain
     async with engine.begin() as conn:
         row = (await conn.execute(
             update(table)
