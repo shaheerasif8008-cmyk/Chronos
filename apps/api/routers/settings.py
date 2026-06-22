@@ -238,6 +238,29 @@ async def overview(member: Member = Depends(get_current_member)) -> dict[str, An
     }
 
 
+@router.get("/onboarding")
+async def get_onboarding(member: Member = Depends(get_current_member)) -> dict:
+    organizations = await reflect_table("organizations")
+    async with engine.begin() as conn:
+        state = (await conn.execute(
+            select(organizations.c.onboarding_state).where(organizations.c.id == member.organization_id)
+        )).scalar_one_or_none()
+    return {"state": state or "new"}
+
+
+@router.post("/onboarding/complete")
+async def complete_onboarding(member: Member = Depends(get_current_member)) -> dict:
+    require_admin(member)
+    organizations = await reflect_table("organizations")
+    async with engine.begin() as conn:
+        await conn.execute(update(organizations).where(
+            organizations.c.id == member.organization_id).values(onboarding_state="complete"))
+    await audit.log("onboarding_completed", member.id, "settings.onboarding_complete",
+                    organization_id=member.organization_id, resource_type="organization",
+                    resource_id=member.organization_id)
+    return {"state": "complete"}
+
+
 @router.patch("/{section}")
 async def update_section(section: str, req: SettingsPatch, member: Member = Depends(get_current_member)) -> dict[str, Any]:
     if section not in DEFAULTS:
