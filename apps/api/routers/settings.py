@@ -26,6 +26,7 @@ from core.settings_store import (
     save_settings_doc,
     workspace_autonomy,
 )
+from core.governance import usage_summary
 from core.token_budget import token_usage_summary
 
 router = APIRouter(prefix="/settings", tags=["settings"])
@@ -64,6 +65,13 @@ class InvitationCreate(BaseModel):
 
 class MemoryPurgeRequest(BaseModel):
     confirmation: str
+
+
+async def _safe_token_usage_summary(org_id: str) -> dict[str, Any]:
+    try:
+        return await token_usage_summary(org_id)
+    except Exception:
+        return {"metered": False, "tokens_today": 0, "daily_limit": settings.per_org_daily_token_limit, "enforced": False}
 
 
 def _unsupported(reason: str) -> dict[str, Any]:
@@ -205,6 +213,18 @@ async def overview(member: Member = Depends(get_current_member)) -> dict[str, An
     sections["profile"]["display_name"] = sections["profile"].get("display_name") or member.name or ""
     org = await _current_org(member)
     sections["organization"] = {**DEFAULTS["organization"], **org}
+    try:
+        usage = await usage_summary(member.organization_id)
+    except Exception:
+        usage = {
+            "tokens": await _safe_token_usage_summary(member.organization_id),
+            "cost": {"metered": False, "cost_today_usd": 0.0, "daily_limit_usd": 0.0, "enforced": False},
+            "suspended": False,
+        }
+    else:
+        # Preserve the old token-summary seam so existing tests and callers that
+        # patch it still control the token portion of the overview.
+        usage["tokens"] = await _safe_token_usage_summary(member.organization_id)
     return {
         "member": {"id": member.id, "email": member.email, "name": member.name, "role": member.role, "can_admin": member.role in ADMIN_ROLES},
         "organization": org,
@@ -212,9 +232,7 @@ async def overview(member: Member = Depends(get_current_member)) -> dict[str, An
         "members": await _members(member),
         "connectors": await _connectors(member),
         "memory_stats": await _memory_stats(member),
-        "usage": {
-            "tokens": await token_usage_summary(member.organization_id),
-        },
+        "usage": usage,
         "runtime_health": {
             "status": "ok",
             "mode": sections["runtime"]["runtime_mode"],

@@ -32,6 +32,7 @@ from core.llm import (
 from core.modes import available_modes
 from core.memory_writes import create_memory_entry, extract_explicit_memory_content
 from core.models import Member, RequesterContext
+from core.governance import enforce_request_rate
 from core.redis import redis_client
 from core.artifacts import get_artifact as _get_artifact
 from core.artifacts import read_artifact_content as _read_artifact_content
@@ -622,6 +623,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
     from fastapi import HTTPException
 
     await permissions.check(member, "chat", req.conversation_id or "new_conversation")
+    await enforce_request_rate(member.organization_id, scope="request")
     try:
         selected_model = normalize_chat_model(req.model)
         selected_reasoning_effort = normalize_reasoning_effort(req.reasoning_effort)

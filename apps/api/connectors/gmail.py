@@ -124,14 +124,14 @@ async def _refresh_access_token(refresh_token: str) -> dict[str, Any]:
     }
 
 
-async def _get_valid_access_token(vault_ref: str) -> str:
+async def _get_valid_access_token(vault_ref: str, *, org_id: str) -> str:
     """Return a valid access_token, refreshing proactively when needed.
 
     Updates the vault in-place if a refresh is performed.
     """
     from connectors.vault import get as vault_get
 
-    creds = await vault_get(vault_ref)
+    creds = await vault_get(vault_ref, org_id=org_id)
     refresh_token = creds.get("refresh_token")
     if not refresh_token:
         raise RuntimeError(f"vault_ref {vault_ref!r} has no refresh_token — user must reconnect Gmail")
@@ -182,6 +182,7 @@ class _GmailUnauthorised(Exception):
 
 async def _gmail_call_with_refresh(
     vault_ref: str,
+    org_id: str,
     method: str,
     path: str,
     *,
@@ -189,17 +190,17 @@ async def _gmail_call_with_refresh(
     json_body: dict | None = None,
 ) -> dict[str, Any]:
     """Call Gmail API; on 401 refresh once and retry."""
-    token = await _get_valid_access_token(vault_ref)
+    token = await _get_valid_access_token(vault_ref, org_id=org_id)
     try:
         return await _gmail_request(method, path, token, params=params, json_body=json_body)
     except _GmailUnauthorised:
         log.warning("Gmail 401 for vault_ref=%r — forcing token refresh", vault_ref)
         # Force-expire so _get_valid_access_token will definitely refresh
         from connectors.vault import get as vault_get, update as vault_update
-        creds = await vault_get(vault_ref)
+        creds = await vault_get(vault_ref, org_id=org_id)
         creds["expires_at"] = 0
         await vault_update(vault_ref, creds)
-        token = await _get_valid_access_token(vault_ref)
+        token = await _get_valid_access_token(vault_ref, org_id=org_id)
         return await _gmail_request(method, path, token, params=params, json_body=json_body)
 
 
@@ -253,13 +254,14 @@ def _normalise_thread_detail(detail: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def _fetch_thread_details(vault_ref: str, thread_refs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+async def _fetch_thread_details(vault_ref: str, org_id: str, thread_refs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     async def fetch_one(thread: dict[str, Any]) -> dict[str, Any] | None:
         thread_id = str(thread.get("id") or "")
         if not thread_id:
             return None
         detail = await _gmail_call_with_refresh(
             vault_ref,
+            org_id,
             "GET",
             f"/threads/{thread_id}",
             params={
@@ -294,17 +296,19 @@ class GmailConnector:
             raise ApprovalRequired("gmail.send", "use gmail.draft; sending requires an approval record")
 
         tier = args.pop("__connector_tier", None) or await connector_tier("gmail")
+        org_id = str(args.pop("__org_id", "") or "")
+        args.pop("__task_id", None)
 
         from core.config import settings
         if settings.demo_mode or tier in {"demo", "fixture"} or vault_ref in {"demo", "fixture"}:
             return await self._demo_dispatch(tool, args, tier)
 
         if tool == "gmail.read_inbox":
-            return await self._read_inbox(vault_ref, args)
+            return await self._read_inbox(vault_ref, org_id, args)
         if tool == "gmail.draft":
-            return await self._create_draft(vault_ref, args)
+            return await self._create_draft(vault_ref, org_id, args)
         if tool == "gmail.search":
-            return await self._search(vault_ref, args)
+            return await self._search(vault_ref, org_id, args)
 
         raise ValueError(f"Unknown gmail tool: {tool}")
 
@@ -354,38 +358,40 @@ class GmailConnector:
     # Live path — Google Gmail REST API
     # ------------------------------------------------------------------
 
-    async def _read_inbox(self, vault_ref: str, args: dict) -> ToolResult:
+    async def _read_inbox(self, vault_ref: str, org_id: str, args: dict) -> ToolResult:
         max_results = int(args.get("max_results", 10))
         data = await _gmail_call_with_refresh(
             vault_ref,
+            org_id,
             "GET",
             "/threads",
             params={"labelIds": "INBOX", "maxResults": max_results},
         )
         thread_refs = data.get("threads") or []
-        threads = await _fetch_thread_details(vault_ref, thread_refs[:max_results])
+        threads = await _fetch_thread_details(vault_ref, org_id, thread_refs[:max_results])
         return ToolResult(
             data={**data, "threads": threads, "result_count": len(threads)},
             summary=f"Read inbox: {len(threads)} thread(s)",
         )
 
-    async def _search(self, vault_ref: str, args: dict) -> ToolResult:
+    async def _search(self, vault_ref: str, org_id: str, args: dict) -> ToolResult:
         query = args.get("query", "")
         max_results = int(args.get("max_results", 10))
         data = await _gmail_call_with_refresh(
             vault_ref,
+            org_id,
             "GET",
             "/threads",
             params={"q": query, "maxResults": max_results},
         )
         thread_refs = data.get("threads") or []
-        threads = await _fetch_thread_details(vault_ref, thread_refs[:max_results])
+        threads = await _fetch_thread_details(vault_ref, org_id, thread_refs[:max_results])
         return ToolResult(
             data={**data, "threads": threads, "result_count": len(threads), "query": query},
             summary=f"Gmail search '{query}': {len(threads)} result(s)",
         )
 
-    async def _create_draft(self, vault_ref: str, args: dict) -> ToolResult:
+    async def _create_draft(self, vault_ref: str, org_id: str, args: dict) -> ToolResult:
         to = args.get("to", "")
         subject = args.get("subject", "")
         body = args.get("body", "")
@@ -394,6 +400,7 @@ class GmailConnector:
         raw_rfc822 = _build_rfc822(to=to, subject=subject, body=body, cc=cc)
         data = await _gmail_call_with_refresh(
             vault_ref,
+            org_id,
             "POST",
             "/drafts",
             json_body={"message": {"raw": raw_rfc822}},

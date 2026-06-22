@@ -18,6 +18,19 @@ Already present (confirmed by reading):
 
 So W3 is **hardening + closing specific holes + proving**, not building the system.
 
+## Implementation status (2026-06-22)
+
+Implemented:
+- **W3.1 cost metering and budgets:** `core/governance.py` records token and estimated dollar usage per org/day, enforces token/cost hard-stops before chat/task model calls, auto-suspends an org when daily cost is exhausted, and surfaces usage through `/settings`.
+- **W3.2 rate and task admission controls:** request, connector, task-queue, and concurrent-runtime checks are centralized in `core/governance.py`; chat requests, broker calls, task creation, and task startup now pass through those checks.
+- **W3.4 secrets isolation:** `connectors.vault.get` now requires `org_id`, uses tenant-qualified cache keys, and queries vault rows by `(organization_id, vault_ref)` before decrypting. Gmail, generic OAuth, and connector-framework credential loaders pass the tenant through.
+- **W3.5 abuse circuit-breakers:** runaway connector-loop detection and daily cost exhaustion suspend the org through the governance circuit-breaker. Suspended orgs are blocked from new requests, task creation, task startup, and model spend.
+- **Usage visibility:** the settings overview includes token usage, cost usage, hard-stop/suspension state, and runtime controls for daily cost budget plus request/connector rate limits.
+
+Proof:
+- `tests/test_w3_governance.py`
+- Focused regressions: `tests/test_settings.py`, `tests/test_token_efficiency.py`, selected runtime reliability tests, connector framework/operations/phase8 tests, and autonomy broker tests.
+
 ## Hypothesized gaps (MUST be audit-confirmed before planning a phase)
 
 1. **Cost (dollars) vs tokens.** Budgets are token-count based; there may be no per-model $-cost accounting or a $-denominated cap. Verify whether real cost (model price × tokens, across providers) is tracked/enforced, or only token counts.

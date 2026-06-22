@@ -68,17 +68,22 @@ async def store(connector_id: str, credentials: dict[str, Any], org_id: str = "d
         )
 
     # Redis fast cache
-    await redis_client.set(f"vault:data:{vault_ref}", encrypted, ex=_REDIS_TTL)
+    await redis_client.set(f"vault:data:{org_id}:{vault_ref}", encrypted, ex=_REDIS_TTL)
 
     # Only vault_ref in audit — never the credential content
     await audit.log("vault_write", connector_id, "vault.store", organization_id=org_id, resource_type="vault_entries", resource_id=vault_ref)
     return vault_ref
 
 
-async def get(vault_ref: str) -> dict[str, Any]:
-    """Retrieve and decrypt credentials.  vault_ref is safe to log; return value is NOT."""
+async def get(vault_ref: str, *, org_id: str) -> dict[str, Any]:
+    """Retrieve and decrypt credentials for one tenant.
+
+    vault_ref is safe to log; return value is NOT. The org_id argument is
+    required so a leaked/reflected vault_ref cannot be used to read another
+    tenant's credential row.
+    """
     # Try Redis first
-    cached = await redis_client.get(f"vault:data:{vault_ref}")
+    cached = await redis_client.get(f"vault:data:{org_id}:{vault_ref}")
     if cached:
         raw = cached if isinstance(cached, str) else cached.decode()
         return _decrypt(raw)
@@ -88,15 +93,18 @@ async def get(vault_ref: str) -> dict[str, Any]:
     async with engine.begin() as conn:
         row = (
             await conn.execute(
-                select(vault_entries.c.encrypted_data).where(vault_entries.c.vault_ref == vault_ref)
+                select(vault_entries.c.encrypted_data).where(
+                    vault_entries.c.organization_id == org_id,
+                    vault_entries.c.vault_ref == vault_ref,
+                )
             )
         ).scalar_one_or_none()
 
     if row is None:
-        raise VaultError(f"vault_ref not found: {vault_ref}")
+        raise VaultError(f"vault_ref not found for org {org_id}: {vault_ref}")
 
     # Re-populate Redis cache
-    await redis_client.set(f"vault:data:{vault_ref}", row, ex=_REDIS_TTL)
+    await redis_client.set(f"vault:data:{org_id}:{vault_ref}", row, ex=_REDIS_TTL)
     return _decrypt(row)
 
 
@@ -130,13 +138,13 @@ async def update(vault_ref: str, credentials: dict[str, Any], actor_id: str = "s
         raise VaultError(f"vault_ref not found: {vault_ref}")
 
     # Overwrite Redis cache
-    await redis_client.set(f"vault:data:{vault_ref}", encrypted, ex=_REDIS_TTL)
+    await redis_client.set(f"vault:data:{org_id}:{vault_ref}", encrypted, ex=_REDIS_TTL)
     await audit.log("vault_update", actor_id, "vault.update", organization_id=org_id, resource_type="vault_entries", resource_id=vault_ref)
 
 
 async def delete(vault_ref: str, actor_id: str, org_id: str = "default") -> None:
     """Delete cached and durable encrypted credentials for a disconnected connector."""
-    await redis_client.delete(f"vault:data:{vault_ref}")
+    await redis_client.delete(f"vault:data:{org_id}:{vault_ref}")
     vault_entries = await reflect_table("vault_entries")
     async with engine.begin() as conn:
         await conn.execute(

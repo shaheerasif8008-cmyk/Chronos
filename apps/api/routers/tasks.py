@@ -16,6 +16,7 @@ from core.auth import get_current_member
 from core.config import settings
 from core.db import engine, reflect_table
 from core.models import Member
+from core.governance import enforce_task_admission
 from core.redis import redis_client
 from core.task_envelope import build_task_envelope
 from runtime import task_runner
@@ -60,6 +61,7 @@ async def create_task_record(
     from core.llm import default_chat_model_id, normalize_reasoning_effort, resolve_agent_model
 
     await permissions.check(member, "create_task", workspace_id or "default")
+    await enforce_task_admission(member.organization_id)
     resolved_model = resolve_agent_model(model or default_chat_model_id())
     normalized_reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     normalized_mode = normalize_mode(mode)
