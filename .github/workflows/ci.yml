@@ -44,6 +44,11 @@ jobs:
       OBJECT_STORAGE_BACKEND: s3
       AWS_S3_BUCKET: chronos-ci-local-fallback
       AWS_S3_REGION: us-east-1
+      # Where the FGA-enabled authz proofs (test_authz_enforced.py) find a live
+      # OpenFGA. Deliberately NOT named OPENFGA_API_URL: that name feeds Settings
+      # and would switch enforcement on for the whole suite. The proofs read this
+      # and enable enforcement only within their own fixture scope.
+      OPENFGA_TEST_URL: http://localhost:8080
     defaults:
       run:
         working-directory: apps/api
@@ -63,6 +68,20 @@ jobs:
         # Also guards the migration chain: a too-long revision id (>VARCHAR(32))
         # would fail here on a clean DB.
         run: alembic upgrade head
+      - name: Start OpenFGA
+        # In-memory OpenFGA for the FGA-enabled authz proofs. A service container
+        # can't pass the `run` subcommand, so launch it as a detached container
+        # and wait for the HTTP API. The proofs skip gracefully if it's absent;
+        # here it's present, so they run and prove the relationship path.
+        run: |
+          docker run -d --name openfga -p 8080:8080 openfga/openfga:latest run
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/stores >/dev/null 2>&1; then
+              echo "OpenFGA is up"; exit 0
+            fi
+            sleep 1
+          done
+          echo "OpenFGA did not become ready"; docker logs openfga; exit 1
       - name: Run tests
         run: pytest -q
 
