@@ -28,7 +28,7 @@ The payment provider is a **seam** (`core/billing.py`) added in W4.2 — truthfu
 - **W4.1 — Plan & entitlements model + enforcement (DETAILED below).** `core/plans.py` entitlements map + `get_entitlements(org)`; seat-cap enforcement on invite; plan → governance budget wiring; `has_feature` gate; `GET /settings/plan` (plan + entitlements + usage). Admin can change plan via an internal/admin path (no provider yet).
 - **W4.2 — Billing provider seam + subscription lifecycle.** `core/billing.py` provider seam (Stripe behind config, truthful-degraded otherwise); checkout/portal links; webhook → `organizations.plan` sync; audited.
 - **W4.3 — Usage-based metering → billing.** Tie W3 cost metering to billing usage records / overage reporting.
-- **W4.4 — Billing UI.** Settings billing page: current plan, usage vs entitlements, upgrade/manage (provider portal link or truthful-degraded notice).
+- **W4.4 — Billing UI.** Settings billing page: current plan, usage vs entitlements, upgrade/manage (provider portal link or truthful-degraded notice). _Carried from W4.1 review: the runtime-settings UI's "Token/Cost budget daily" inputs now render blank (the keys were removed from `DEFAULTS["runtime"]` so plan budgets take effect); W4.4 should display the **plan-derived effective budget** there instead of empty, so admins see the real value._
 
 ---
 
