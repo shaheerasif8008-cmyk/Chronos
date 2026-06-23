@@ -1276,6 +1276,23 @@ async def _run_subagent(
         )
         child_id = str(result.scalar_one())
 
+    # Seed FGA task ownership (no-op when FGA off). Inherit member from parent;
+    # sentinel/null members get only the org→task link via _seed_task_org_link.
+    _child_member_id = str(parent_task.get("triggered_by_member_id") or "")
+    _child_org_id = str(parent_task["organization_id"])
+    from core import permissions as _perm
+    from core.permissions import _INTERNAL_ACTOR_IDS
+    if _child_member_id and _child_member_id not in _INTERNAL_ACTOR_IDS:
+        import asyncio as _asyncio
+        _asyncio.create_task(
+            _perm.grant_task_role(_child_member_id, "owner", child_id, _child_org_id)
+        )
+    else:
+        import asyncio as _asyncio
+        _asyncio.create_task(
+            _perm._seed_task_org_link(child_id, _child_org_id)
+        )
+
     child_task = await get_task(child_id)
     if not child_task:
         raise RuntimeError("Failed to create child task")
@@ -1559,7 +1576,25 @@ async def create_task_from_history(
             )
             .returning(tasks.c.id)
         )
-        return str(result.scalar_one())
+        lazy_task_id = str(result.scalar_one())
+
+    # Seed FGA task ownership for this lazily-persisted task (no-op when FGA off).
+    _lazy_member_id = str(requester_context.member_id) if requester_context.member_id else ""
+    from core import permissions as _perm
+    from core.permissions import _INTERNAL_ACTOR_IDS
+    if _lazy_member_id and _lazy_member_id not in _INTERNAL_ACTOR_IDS:
+        import asyncio as _asyncio
+        _asyncio.create_task(
+            _perm.grant_task_role(
+                _lazy_member_id, "owner", lazy_task_id, requester_context.org_id
+            )
+        )
+    else:
+        import asyncio as _asyncio
+        _asyncio.create_task(
+            _perm._seed_task_org_link(lazy_task_id, requester_context.org_id)
+        )
+    return lazy_task_id
 
 
 def requires_mailbox_grounding(message: str) -> bool:

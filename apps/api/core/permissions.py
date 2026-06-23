@@ -68,6 +68,10 @@ _WORKSPACE_MANAGE_ACTIONS = {
     "set_workspace_autonomy",
 }
 
+# action → relation on task:{resource}
+_TASK_VIEW_ACTIONS = {"view_task", "view_task_events", "stream_task"}
+_TASK_MANAGE_ACTIONS = {"cancel_task", "retry_task"}
+
 # Deciding an approval (approving/rejecting a risky write) is the core enterprise
 # governance gate. It is enforced deterministically by role — independent of
 # OpenFGA — so the guarantee "an unauthorized user cannot approve" holds even
@@ -124,7 +128,6 @@ _GENERIC_ALLOWED_ACTIONS = {
     "apply_context_suggestion",
     "approve_browser_sensitive_site",
     "cancel_research",
-    "cancel_task",
     "cancel_workflow_run",
     "close_browser_session",
     "close_desktop_session",
@@ -184,7 +187,6 @@ _GENERIC_ALLOWED_ACTIONS = {
     "reject_context_suggestion",
     "request_browser_takeover",
     "resume_workflow_run",
-    "retry_task",
     "resolve_connector_approval",
     "revoke_browser_session",
     "revoke_desktop_session",
@@ -196,7 +198,6 @@ _GENERIC_ALLOWED_ACTIONS = {
     "start_workflow_run",
     "stream_memory_events",
     "stream_research",
-    "stream_task",
     "tick_workflow_run",
     "undo_memory",
     "update_memory",
@@ -215,8 +216,6 @@ _GENERIC_ALLOWED_ACTIONS = {
     "view_project_conversations",
     "view_project_tasks",
     "view_skill",
-    "view_task",
-    "view_task_events",
     "list_connectors",
     "list_connector_tools",
     "list_connector_actions",
@@ -261,6 +260,10 @@ def _resource_for(action: str) -> tuple[str, str] | None:
         return "can_edit", "workspace"
     if action in _WORKSPACE_MANAGE_ACTIONS:
         return "can_manage", "workspace"
+    if action in _TASK_VIEW_ACTIONS:
+        return "can_view", "task"
+    if action in _TASK_MANAGE_ACTIONS:
+        return "can_manage", "task"
     return None
 
 
@@ -455,6 +458,39 @@ async def revoke_workspace_role(member_id: str, role: str, workspace_id: str) ->
     await authz.delete_tuples([(f"user:{member_id}", relation, f"workspace:{workspace_id}")])
 
 
+async def grant_task_role(member_id: str, role: str, task_id: str, org_id: str) -> None:
+    """Seed a task tuple for a member plus the task→org link.
+
+    Maps DB roles to model relations: owner→owner, anything else→editor.
+    """
+    if not settings_openfga_configured():
+        return
+    relation = "owner" if role == "owner" else "editor"
+    await _write_tuples_idempotently(
+        [
+            (f"user:{member_id}", relation, f"task:{task_id}"),
+            (f"organization:{org_id}", "org", f"task:{task_id}"),
+        ]
+    )
+
+
+async def revoke_task_role(member_id: str, role: str, task_id: str) -> None:
+    """Remove a task ownership/editor tuple for a member."""
+    if not settings_openfga_configured():
+        return
+    relation = "owner" if role == "owner" else "editor"
+    await authz.delete_tuples([(f"user:{member_id}", relation, f"task:{task_id}")])
+
+
+async def _seed_task_org_link(task_id: str, org_id: str) -> None:
+    """Write only the org→task link (for system/sub-agent tasks with no human owner)."""
+    if not settings_openfga_configured():
+        return
+    await _write_tuples_idempotently(
+        [(f"organization:{org_id}", "org", f"task:{task_id}")]
+    )
+
+
 def settings_openfga_configured() -> bool:
     """Tuples are only written when an OpenFGA server is configured."""
     from core.config import settings
@@ -485,7 +521,7 @@ async def reconcile_org_tuples(org_id: str) -> dict[str, int]:
     No-ops (returns all-zero counts) when OpenFGA is not configured.
     """
     if not settings_openfga_configured():
-        return {"members": 0, "projects": 0, "workspaces": 0}
+        return {"members": 0, "projects": 0, "workspaces": 0, "tasks": 0}
 
     from core.db import engine, reflect_table
 
@@ -547,10 +583,37 @@ async def reconcile_org_tuples(org_id: str) -> dict[str, int]:
     except NoSuchTableError:
         workspace_count = 0
 
+    # ── Tasks → owner tuples + org links ────────────────────────────────────
+    # For each task with a real human triggered_by_member_id, write owner+org.
+    # For system tasks (null or sentinel member), write only the org→task link
+    # so org-admin inheritance still works.
+    task_count = 0
+    try:
+        tasks_tbl = await reflect_table("tasks")
+        async with engine.begin() as conn:
+            task_rows = (
+                await conn.execute(
+                    select(tasks_tbl.c.id, tasks_tbl.c.triggered_by_member_id).where(
+                        tasks_tbl.c.organization_id == org_id
+                    )
+                )
+            ).fetchall()
+        for row in task_rows:
+            member_id = str(row.triggered_by_member_id) if row.triggered_by_member_id else None
+            task_id = str(row.id)
+            if member_id and member_id not in _INTERNAL_ACTOR_IDS:
+                await grant_task_role(member_id, "owner", task_id, org_id)
+            else:
+                await _seed_task_org_link(task_id, org_id)
+            task_count += 1
+    except NoSuchTableError:
+        task_count = 0
+
     counts: dict[str, int] = {
         "members": member_count,
         "projects": project_count,
         "workspaces": workspace_count,
+        "tasks": task_count,
     }
     await audit.log(
         "authz_reconciled",

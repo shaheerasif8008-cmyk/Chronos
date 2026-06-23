@@ -114,6 +114,7 @@ AUTHORIZATION_MODEL: dict = {
         },
         _scoped_resource_type("project"),
         _scoped_resource_type("workspace"),
+        _scoped_resource_type("task"),
     ],
 }
 

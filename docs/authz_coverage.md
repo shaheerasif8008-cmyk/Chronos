@@ -10,7 +10,7 @@ Every known action in `core.permissions.check` falls into one of four enforcemen
 | --- | ---: | --- |
 | role-gated | 31 | deterministic role gate, always on (no OpenFGA needed) |
 | relationship-mapped | 19 | OpenFGA relationship check (fails closed when unreachable) |
-| generic-allowed | 130 | allowlist pass-through (`granted_stub`) — W2.2 scoping candidates |
+| generic-allowed | 125 | allowlist pass-through (`granted_stub`) — W2.2 scoping candidates |
 | unmapped-denied | (catch-all) | default deny (`denied_unmapped`) — any action not listed above |
 
 ## Role-gated (deterministic, always on)
@@ -90,7 +90,6 @@ Every known action in `core.permissions.check` falls into one of four enforcemen
 | `artifact.read` | granted_stub |
 | `branch_conversation` | granted_stub |
 | `cancel_research` | granted_stub |
-| `cancel_task` | granted_stub |
 | `cancel_workflow_run` | granted_stub |
 | `chat` | granted_stub |
 | `close_browser_session` | granted_stub |
@@ -167,7 +166,6 @@ Every known action in `core.permissions.check` falls into one of four enforcemen
 | `resolve_connector_approval` | granted_stub |
 | `resume_workflow_run` | granted_stub |
 | `retry_from_message` | granted_stub |
-| `retry_task` | granted_stub |
 | `revoke_browser_session` | granted_stub |
 | `revoke_desktop_session` | granted_stub |
 | `revoke_local_computer_grant` | granted_stub |
@@ -180,7 +178,6 @@ Every known action in `core.permissions.check` falls into one of four enforcemen
 | `start_workflow_run` | granted_stub |
 | `stream_memory_events` | granted_stub |
 | `stream_research` | granted_stub |
-| `stream_task` | granted_stub |
 | `tick_workflow_run` | granted_stub |
 | `undo_memory` | granted_stub |
 | `unpin_message` | granted_stub |
@@ -202,8 +199,6 @@ Every known action in `core.permissions.check` falls into one of four enforcemen
 | `view_project_conversations` | granted_stub |
 | `view_project_tasks` | granted_stub |
 | `view_skill` | granted_stub |
-| `view_task` | granted_stub |
-| `view_task_events` | granted_stub |
 | `connect_*` | granted_stub (prefix) |
 | `disconnect_*` | granted_stub (prefix) |
 | `use_tool:*` | granted_stub (prefix) |
