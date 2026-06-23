@@ -3,6 +3,9 @@ from __future__ import annotations
 import csv
 import dataclasses
 import io
+import json
+import uuid as _uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -535,24 +538,77 @@ async def export_memory(member: Member = Depends(get_current_member)) -> JSONRes
     )
 
 
+_AUDIT_EXPORT_COLUMNS = [
+    "id", "created_at", "actor_id", "event_type", "action", "resource_type", "resource_id", "decision",
+]
+_AUDIT_EXPORT_BATCH = 1000
+
+
+def _parse_audit_ts(value: str | None, field: str) -> datetime | None:
+    """Parse an ISO-8601 timestamp from a query param; trailing 'Z' allowed."""
+    if not value:
+        return None
+    raw = value.strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        raise HTTPException(status_code=422, detail=f"Invalid {field} timestamp: {value!r}")
+
+
+def _audit_select(
+    audit_log,
+    *,
+    organization_id: str,
+    actor: str | None = None,
+    action: str | None = None,
+    query: str | None = None,
+    event_type: str | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
+):
+    """Build the shared, tenant-scoped, filtered audit query used by list + export."""
+    stmt = select(audit_log).where(audit_log.c.organization_id == organization_id)
+    if actor:
+        stmt = stmt.where(audit_log.c.actor_id == actor)
+    if action:
+        stmt = stmt.where(audit_log.c.action == action)
+    if event_type:
+        stmt = stmt.where(audit_log.c.event_type == event_type)
+    if query:
+        stmt = stmt.where(audit_log.c.action.ilike(f"%{query}%"))
+    if since is not None:
+        stmt = stmt.where(audit_log.c.created_at >= since)  # inclusive lower
+    if until is not None:
+        stmt = stmt.where(audit_log.c.created_at < until)  # exclusive upper
+    return stmt
+
+
 @router.get("/audit")
 async def list_audit(
     actor: str | None = None,
     action: str | None = None,
     query: str | None = None,
+    event_type: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     member: Member = Depends(get_current_member),
 ) -> list[dict[str, Any]]:
     await permissions.check(member, "list_audit_log", member.organization_id)
     audit_log = await reflect_table("audit_log")
-    stmt = select(audit_log).where(audit_log.c.organization_id == member.organization_id)
-    if actor:
-        stmt = stmt.where(audit_log.c.actor_id == actor)
-    if action:
-        stmt = stmt.where(audit_log.c.action == action)
-    if query:
-        stmt = stmt.where(audit_log.c.action.ilike(f"%{query}%"))
+    stmt = _audit_select(
+        audit_log,
+        organization_id=member.organization_id,
+        actor=actor,
+        action=action,
+        query=query,
+        event_type=event_type,
+        since=_parse_audit_ts(since, "since"),
+        until=_parse_audit_ts(until, "until"),
+    )
     stmt = stmt.order_by(audit_log.c.created_at.desc()).limit(limit).offset(offset)
     async with engine.begin() as conn:
         rows = (await conn.execute(stmt)).mappings().all()
@@ -570,13 +626,159 @@ async def reconcile_authz(member: Member = Depends(get_current_member)) -> dict[
     return await permissions.reconcile_org_tuples(member.organization_id)
 
 
+def _audit_json_default(value: Any) -> str:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, _uuid.UUID):
+        return str(value)
+    return str(value)
+
+
+@router.get("/audit/export")
+async def export_audit(
+    format: str = Query(default="csv", pattern="^(csv|json)$"),
+    actor: str | None = None,
+    action: str | None = None,
+    query: str | None = None,
+    event_type: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    member: Member = Depends(get_current_member),
+) -> StreamingResponse:
+    """Compliance-grade audit export (W5.1).
+
+    Streams the **complete** filtered audit trail for the member's org — no
+    silent row cap — in CSV or JSON, with a manifest (count, range, filters,
+    generated_at, org, generated_by) that proves completeness. The export is
+    itself admin-gated and audited. ``audit_log`` is never mutated (RULE 6).
+    """
+    await permissions.check(member, "export_audit_log", member.organization_id)
+    since_dt = _parse_audit_ts(since, "since")
+    until_dt = _parse_audit_ts(until, "until")
+    audit_log = await reflect_table("audit_log")
+    base = _audit_select(
+        audit_log,
+        organization_id=member.organization_id,
+        actor=actor,
+        action=action,
+        query=query,
+        event_type=event_type,
+        since=since_dt,
+        until=until_dt,
+    )
+    # Complete, deterministic order (oldest→newest) for reproducible exports.
+    ordered = base.order_by(audit_log.c.created_at.asc(), audit_log.c.id.asc())
+
+    # Known up front so the manifest/headers can assert completeness without
+    # buffering every row in memory.
+    async with engine.begin() as conn:
+        total = (await conn.execute(
+            select(func.count()).select_from(base.subquery())
+        )).scalar_one()
+
+    generated_at = datetime.now(timezone.utc)
+    filters = {
+        "actor": actor,
+        "action": action,
+        "query": query,
+        "event_type": event_type,
+        "since": since_dt.isoformat() if since_dt else None,
+        "until": until_dt.isoformat() if until_dt else None,
+    }
+    manifest = {
+        "organization_id": member.organization_id,
+        "generated_by": member.id,
+        "generated_at": generated_at.isoformat(),
+        "count": int(total),
+        "filters": filters,
+        "format": format,
+    }
+
+    # Record the export itself before streaming, so it is captured even if the
+    # client disconnects mid-download.
+    await audit.log(
+        "compliance",
+        member.id,
+        "export_audit_log",
+        organization_id=member.organization_id,
+        resource_type="audit_log",
+        resource_id=member.organization_id,
+        payload={"count": int(total), "filters": filters, "format": format},
+    )
+
+    async def _iter_rows():
+        offset = 0
+        while True:
+            async with engine.begin() as conn:
+                rows = (await conn.execute(
+                    ordered.limit(_AUDIT_EXPORT_BATCH).offset(offset)
+                )).mappings().all()
+            if not rows:
+                return
+            for row in rows:
+                yield dict(row)
+            if len(rows) < _AUDIT_EXPORT_BATCH:
+                return
+            offset += _AUDIT_EXPORT_BATCH
+
+    if format == "json":
+        async def stream_json():
+            yield '{"manifest": ' + json.dumps(manifest) + ', "records": ['
+            first = True
+            async for row in _iter_rows():
+                yield ("" if first else ",") + json.dumps(row, default=_audit_json_default)
+                first = False
+            yield "]}"
+
+        return StreamingResponse(
+            stream_json(),
+            media_type="application/json",
+            headers={
+                "Content-Disposition": "attachment; filename=chronos-audit.json",
+                "X-Chronos-Audit-Export-Count": str(total),
+            },
+        )
+
+    async def stream_csv():
+        handle = io.StringIO()
+        writer = csv.DictWriter(handle, fieldnames=_AUDIT_EXPORT_COLUMNS)
+        writer.writeheader()
+        yield handle.getvalue()
+        async for row in _iter_rows():
+            handle.seek(0)
+            handle.truncate(0)
+            writer.writerow({key: row.get(key) for key in _AUDIT_EXPORT_COLUMNS})
+            yield handle.getvalue()
+
+    return StreamingResponse(
+        stream_csv(),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": "attachment; filename=chronos-audit.csv",
+            "X-Chronos-Audit-Export-Count": str(total),
+            "X-Chronos-Audit-Export-Generated-At": generated_at.isoformat(),
+        },
+    )
+
+
 @router.get("/audit/export.csv")
-async def export_audit(member: Member = Depends(get_current_member)) -> StreamingResponse:
-    rows = await list_audit(limit=500, member=member)
-    handle = io.StringIO()
-    writer = csv.DictWriter(handle, fieldnames=["id", "created_at", "actor_id", "event_type", "action", "resource_type", "resource_id", "decision"])
-    writer.writeheader()
-    for row in rows:
-        writer.writerow({key: row.get(key) for key in writer.fieldnames})
-    handle.seek(0)
-    return StreamingResponse(iter([handle.getvalue()]), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=chronos-audit.csv"})
+async def export_audit_csv(
+    actor: str | None = None,
+    action: str | None = None,
+    query: str | None = None,
+    event_type: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    member: Member = Depends(get_current_member),
+) -> StreamingResponse:
+    """Back-compat alias for the existing web link; now complete (no 500 cap)."""
+    return await export_audit(
+        format="csv",
+        actor=actor,
+        action=action,
+        query=query,
+        event_type=event_type,
+        since=since,
+        until=until,
+        member=member,
+    )
