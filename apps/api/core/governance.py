@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
@@ -7,11 +8,15 @@ from typing import Any
 from sqlalchemy import func, select
 
 from core import audit
+from core.billing_usage import record as _record_billing_usage
 from core.config import settings
 from core.db import engine, reflect_table
 from core.models import Member
+from core.plans import get_entitlements
 from core.redis import redis_client
 from core.token_budget import record_tokens_used, tokens_used_today
+
+_logger = logging.getLogger(__name__)
 
 
 class GovernanceLimitExceeded(Exception):
@@ -70,6 +75,47 @@ def _positive_float(value: Any, default: float = 0.0) -> float:
     return max(0.0, parsed)
 
 
+async def _org_plan(org_id: str) -> str:
+    """Return the plan slug for an org, defaulting to 'trial' on any error."""
+    try:
+        orgs = await reflect_table("organizations")
+        async with engine.begin() as conn:
+            row = (
+                await conn.execute(
+                    select(orgs.c.plan).where(orgs.c.id == org_id)
+                )
+            ).first()
+        return (row[0] if row and row[0] else None) or "trial"
+    except Exception:
+        return "trial"
+
+
+async def _raw_budget_overrides(org_id: str) -> dict[str, Any]:
+    """Return only the explicitly stored budget keys from the org's runtime settings doc.
+
+    Unlike ``get_settings_doc``, this does NOT merge in DEFAULTS, so the caller can
+    distinguish "explicitly set by an admin" from "came from the static defaults".
+    Returns a dict that may be empty or contain only a subset of budget keys.
+    """
+    try:
+        docs = await reflect_table("settings_documents")
+        async with engine.begin() as conn:
+            row = (
+                await conn.execute(
+                    select(docs.c["values"]).where(
+                        docs.c.organization_id == org_id,
+                        docs.c.scope == "org",
+                        docs.c.scope_id == org_id,
+                        docs.c.section == "runtime",
+                    )
+                )
+            ).first()
+        stored: dict[str, Any] = dict(row[0] or {}) if row else {}
+        return {k: stored[k] for k in ("token_budget_daily", "cost_budget_daily_usd") if k in stored}
+    except Exception:
+        return {}
+
+
 async def governance_config(org_id: str) -> GovernanceConfig:
     try:
         from core.settings_store import get_settings_doc
@@ -80,12 +126,31 @@ async def governance_config(org_id: str) -> GovernanceConfig:
     except Exception:
         runtime = {}
         ai_employee = {}
-    token_limit = _positive_int(runtime.get("token_budget_daily"), settings.per_org_daily_token_limit)
+
+    # Determine the effective budget limits.
+    # Priority (highest to lowest):
+    #   1. Global settings override (per_org_daily_token_limit > 0) — operator-level cap
+    #   2. Explicit per-org stored override in settings_documents (set via admin UI)
+    #   3. Plan entitlements (trial / pro / enterprise defaults)
+    plan_ent = get_entitlements(await _org_plan(org_id))
+    raw_overrides = await _raw_budget_overrides(org_id)
+
+    if "token_budget_daily" in raw_overrides:
+        token_limit = _positive_int(raw_overrides["token_budget_daily"], plan_ent.daily_token_limit)
+    else:
+        token_limit = plan_ent.daily_token_limit
+
     if settings.per_org_daily_token_limit > 0:
         token_limit = settings.per_org_daily_token_limit
+
+    if "cost_budget_daily_usd" in raw_overrides:
+        cost_limit = _positive_float(raw_overrides["cost_budget_daily_usd"], plan_ent.daily_cost_limit_usd)
+    else:
+        cost_limit = plan_ent.daily_cost_limit_usd
+
     return GovernanceConfig(
         daily_token_limit=token_limit,
-        daily_cost_limit_usd=_positive_float(runtime.get("cost_budget_daily_usd"), 0.0),
+        daily_cost_limit_usd=cost_limit,
         request_rate_per_minute=_positive_int(runtime.get("request_rate_per_minute"), 60),
         connector_rate_per_minute=_positive_int(runtime.get("connector_rate_per_minute"), 60),
         max_task_queue_size=_positive_int(runtime.get("max_task_queue_size"), 100),
@@ -186,6 +251,18 @@ async def record_model_usage(
                 await redis_client.expire(_cost_key(org_id), _SUSPENSION_TTL_SECONDS)
         except Exception:
             pass
+    # Persist to the monthly billing ledger (W4.3).
+    # Use per-call deltas (total_tokens and re-derived cost) — NOT cumulative totals.
+    # Wrapped in try/except so a ledger failure never breaks a model call.
+    try:
+        await _record_billing_usage(
+            org_id,
+            tokens=int(total_tokens),
+            cost_usd=estimate_model_cost_usd(model, int(total_tokens)),
+        )
+    except Exception as _exc:
+        _logger.warning("billing ledger record failed for org %s: %s", org_id, _exc)
+
     cfg = await governance_config(org_id)
     cost_today = await cost_used_today_usd(org_id)
     hard_stop = bool(cfg.daily_cost_limit_usd and cost_today >= cfg.daily_cost_limit_usd)

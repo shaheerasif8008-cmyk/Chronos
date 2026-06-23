@@ -28,7 +28,7 @@ from jobs import context_update, profile_synthesis, scheduled_tasks
 from core.db import engine, reflect_table
 from runtime import task_runner
 from runtime.research_executor import start_research
-from routers import activity, agents, approvals, artifact_share, artifacts, attachments, auth, autonomy, browser_sessions, chat, computer_sessions, connectors, context, data, desktop_sessions, domains, memory, monitors, projects, research, schedules, scim, search, settings, skills, sso, tasks, workflows
+from routers import activity, agents, approvals, artifact_share, artifacts, attachments, auth, autonomy, billing, browser_sessions, chat, computer_sessions, connectors, context, data, desktop_sessions, domains, memory, monitors, projects, research, schedules, scim, search, settings, skills, sso, tasks, workflows
 
 app = FastAPI(title="Chronos API", version="0.1.0")
 
@@ -94,6 +94,7 @@ app.include_router(artifact_share.router)
 app.include_router(artifacts.router)
 app.include_router(attachments.router)
 app.include_router(settings.router)
+app.include_router(billing.router)
 app.include_router(workflows.router)
 app.include_router(schedules.router)
 app.include_router(monitors.router)
