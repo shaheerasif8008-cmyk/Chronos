@@ -34,6 +34,13 @@ from core.models import Member
 from sqlalchemy import select
 from sqlalchemy.exc import NoSuchTableError
 
+# Role precedence used when aggregating group roles (mirrors core/scim.py).
+_ROLE_RANK = {"viewer": 0, "user": 1, "operator": 2, "manager": 3, "admin": 4, "owner": 5}
+
+
+def _rank(role: str) -> int:
+    return _ROLE_RANK.get(role, 1)
+
 # action → relation on project:{resource}
 _VIEW_ACTIONS = {"view_project", "view_project_sources"}
 _EDIT_ACTIONS = {
@@ -60,6 +67,10 @@ _WORKSPACE_MANAGE_ACTIONS = {
     "remove_workspace_member",
     "set_workspace_autonomy",
 }
+
+# action → relation on task:{resource}
+_TASK_VIEW_ACTIONS = {"view_task", "view_task_events", "stream_task"}
+_TASK_MANAGE_ACTIONS = {"cancel_task", "retry_task"}
 
 # Deciding an approval (approving/rejecting a risky write) is the core enterprise
 # governance gate. It is enforced deterministically by role — independent of
@@ -117,7 +128,6 @@ _GENERIC_ALLOWED_ACTIONS = {
     "apply_context_suggestion",
     "approve_browser_sensitive_site",
     "cancel_research",
-    "cancel_task",
     "cancel_workflow_run",
     "close_browser_session",
     "close_desktop_session",
@@ -177,7 +187,6 @@ _GENERIC_ALLOWED_ACTIONS = {
     "reject_context_suggestion",
     "request_browser_takeover",
     "resume_workflow_run",
-    "retry_task",
     "resolve_connector_approval",
     "revoke_browser_session",
     "revoke_desktop_session",
@@ -189,7 +198,6 @@ _GENERIC_ALLOWED_ACTIONS = {
     "start_workflow_run",
     "stream_memory_events",
     "stream_research",
-    "stream_task",
     "tick_workflow_run",
     "undo_memory",
     "update_memory",
@@ -208,8 +216,6 @@ _GENERIC_ALLOWED_ACTIONS = {
     "view_project_conversations",
     "view_project_tasks",
     "view_skill",
-    "view_task",
-    "view_task_events",
     "list_connectors",
     "list_connector_tools",
     "list_connector_actions",
@@ -254,6 +260,10 @@ def _resource_for(action: str) -> tuple[str, str] | None:
         return "can_edit", "workspace"
     if action in _WORKSPACE_MANAGE_ACTIONS:
         return "can_manage", "workspace"
+    if action in _TASK_VIEW_ACTIONS:
+        return "can_view", "task"
+    if action in _TASK_MANAGE_ACTIONS:
+        return "can_manage", "task"
     return None
 
 
@@ -448,6 +458,39 @@ async def revoke_workspace_role(member_id: str, role: str, workspace_id: str) ->
     await authz.delete_tuples([(f"user:{member_id}", relation, f"workspace:{workspace_id}")])
 
 
+async def grant_task_role(member_id: str, role: str, task_id: str, org_id: str) -> None:
+    """Seed a task tuple for a member plus the task→org link.
+
+    Maps DB roles to model relations: owner→owner, anything else→editor.
+    """
+    if not settings_openfga_configured():
+        return
+    relation = "owner" if role == "owner" else "editor"
+    await _write_tuples_idempotently(
+        [
+            (f"user:{member_id}", relation, f"task:{task_id}"),
+            (f"organization:{org_id}", "org", f"task:{task_id}"),
+        ]
+    )
+
+
+async def revoke_task_role(member_id: str, role: str, task_id: str) -> None:
+    """Remove a task ownership/editor tuple for a member."""
+    if not settings_openfga_configured():
+        return
+    relation = "owner" if role == "owner" else "editor"
+    await authz.delete_tuples([(f"user:{member_id}", relation, f"task:{task_id}")])
+
+
+async def _seed_task_org_link(task_id: str, org_id: str) -> None:
+    """Write only the org→task link (for system/sub-agent tasks with no human owner)."""
+    if not settings_openfga_configured():
+        return
+    await _write_tuples_idempotently(
+        [(f"organization:{org_id}", "org", f"task:{task_id}")]
+    )
+
+
 def settings_openfga_configured() -> bool:
     """Tuples are only written when an OpenFGA server is configured."""
     from core.config import settings
@@ -478,7 +521,7 @@ async def reconcile_org_tuples(org_id: str) -> dict[str, int]:
     No-ops (returns all-zero counts) when OpenFGA is not configured.
     """
     if not settings_openfga_configured():
-        return {"members": 0, "projects": 0, "workspaces": 0}
+        return {"members": 0, "projects": 0, "workspaces": 0, "tasks": 0}
 
     from core.db import engine, reflect_table
 
@@ -540,15 +583,126 @@ async def reconcile_org_tuples(org_id: str) -> dict[str, int]:
     except NoSuchTableError:
         workspace_count = 0
 
+    # ── Tasks → owner tuples + org links ────────────────────────────────────
+    # For each task with a real human triggered_by_member_id, write owner+org.
+    # For system tasks (null or sentinel member), write only the org→task link
+    # so org-admin inheritance still works.
+    task_count = 0
+    try:
+        tasks_tbl = await reflect_table("tasks")
+        async with engine.begin() as conn:
+            task_rows = (
+                await conn.execute(
+                    select(tasks_tbl.c.id, tasks_tbl.c.triggered_by_member_id).where(
+                        tasks_tbl.c.organization_id == org_id
+                    )
+                )
+            ).fetchall()
+        for row in task_rows:
+            member_id = str(row.triggered_by_member_id) if row.triggered_by_member_id else None
+            task_id = str(row.id)
+            if member_id and member_id not in _INTERNAL_ACTOR_IDS:
+                await grant_task_role(member_id, "owner", task_id, org_id)
+            else:
+                await _seed_task_org_link(task_id, org_id)
+            task_count += 1
+    except NoSuchTableError:
+        task_count = 0
+
     counts: dict[str, int] = {
         "members": member_count,
         "projects": project_count,
         "workspaces": workspace_count,
+        "tasks": task_count,
     }
     await audit.log(
         "authz_reconciled",
         None,
         "reconcile_org_tuples",
+        organization_id=org_id,
+        payload=counts,
+    )
+    return counts
+
+
+async def reconcile_org_groups(org_id: str) -> dict[str, int]:
+    """Backfill OpenFGA relationship tuples from SCIM group memberships for an org.
+
+    For each ``scim_groups`` row + its ``group_memberships``, grants each member
+    the org-level role that the group confers.  A member in multiple groups gets
+    the highest role among those groups (matching ``recompute_member_role`` DB
+    semantics).  The approach is *materialized*: we write direct
+    ``user:{member_id}`` → ``member|admin`` → ``organization:{org_id}`` tuples
+    rather than adding a ``group`` type to the authorization model.  This means
+    the existing model is untouched (no live OpenFGA needed to validate a model
+    change) and the required behavioral outcome — a member of an admin-role group
+    ends up with ``admin`` on ``organization:{org_id}`` — is achieved via the
+    same ``grant_org_membership`` helper already used for direct member backfill.
+
+    Returns::
+
+        {"groups": n_groups, "grants": n_member_grants}
+
+    No-ops (returns all-zero counts) when OpenFGA is not configured.
+
+    Known limitation: revocation is not covered here — removing a member from
+    their sole admin group will not retract the FGA admin tuple.  That is out of
+    scope for W2.3 (additive grants only) and should be addressed in a dedicated
+    revoke pass.
+    """
+    if not settings_openfga_configured():
+        return {"groups": 0, "grants": 0}
+
+    from core.db import engine, reflect_table
+
+    groups_tbl = await reflect_table("scim_groups")
+    gm_tbl = await reflect_table("group_memberships")
+
+    async with engine.begin() as conn:
+        group_rows = (
+            await conn.execute(
+                select(groups_tbl.c.id, groups_tbl.c.role).where(
+                    groups_tbl.c.organization_id == org_id
+                )
+            )
+        ).fetchall()
+
+    if not group_rows:
+        return {"groups": 0, "grants": 0}
+
+    # Collect per-member max role across all groups (mirrors recompute_member_role).
+    # Use None as sentinel so a member in a single user-role group still gets granted.
+    member_max_role: dict[str, str | None] = {}
+
+    for group_row in group_rows:
+        async with engine.begin() as conn:
+            member_ids = (
+                await conn.execute(
+                    select(gm_tbl.c.member_id).where(
+                        gm_tbl.c.organization_id == org_id,
+                        gm_tbl.c.group_id == group_row.id,
+                    )
+                )
+            ).scalars().all()
+        for mid in member_ids:
+            mid_str = str(mid)
+            current = member_max_role.get(mid_str)
+            if current is None or _rank(group_row.role) > _rank(current):
+                member_max_role[mid_str] = group_row.role
+
+    grant_count = 0
+    for mid_str, role in member_max_role.items():
+        if role is None:
+            continue  # defensive: no group role resolved (should not happen)
+        admin = role in {"admin", "owner"}
+        await grant_org_membership(mid_str, org_id, admin=admin)
+        grant_count += 1
+
+    counts: dict[str, int] = {"groups": len(group_rows), "grants": grant_count}
+    await audit.log(
+        "authz_reconciled",
+        None,
+        "reconcile_org_groups",
         organization_id=org_id,
         payload=counts,
     )

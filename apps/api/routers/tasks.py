@@ -112,7 +112,12 @@ async def create_task_record(
             .values(**insert_values)
             .returning(tasks.c.id)
         )
-        return str(result.scalar_one())
+        new_task_id = str(result.scalar_one())
+
+    await permissions.grant_task_role(
+        str(member.id), "owner", new_task_id, member.organization_id
+    )
+    return new_task_id
 
 
 @router.post("/")

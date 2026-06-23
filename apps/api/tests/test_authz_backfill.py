@@ -60,7 +60,7 @@ async def test_reconcile_is_noop_when_fga_disabled(monkeypatch):
     monkeypatch.setattr("core.permissions.settings_openfga_configured", lambda: False)
     org_id, _ = await _seed_org()
     result = await permissions.reconcile_org_tuples(org_id)
-    assert result == {"members": 0, "projects": 0, "workspaces": 0}
+    assert result == {"members": 0, "projects": 0, "workspaces": 0, "tasks": 0}
 
 
 @pytest.mark.asyncio
@@ -88,6 +88,8 @@ async def test_reconcile_writes_tuples_per_db_row(monkeypatch):
     assert result["projects"] == 1
     # workspaces table does not exist in this schema — count must be 0, not an error
     assert result["workspaces"] == 0
+    # tasks count must be present (0 tasks seeded in this test — no task rows)
+    assert result["tasks"] == 0
     # the owner (first member) was granted admin on the org
     assert any(admin for (_mid, admin) in calls["org"])
     assert len(calls["project"]) == 1

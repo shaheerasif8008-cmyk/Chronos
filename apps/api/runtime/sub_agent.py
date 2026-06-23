@@ -90,6 +90,19 @@ class SubAgentManager:
             }
         )
 
+        # Seed FGA task ownership for the sub-task (no-op when FGA off).
+        from core.permissions import _INTERNAL_ACTOR_IDS
+        _sub_member_id = str(parent_task.get("triggered_by_member_id") or "")
+        _sub_org_id = str(parent_task["organization_id"])
+        if _sub_member_id and _sub_member_id not in _INTERNAL_ACTOR_IDS:
+            asyncio.create_task(
+                permissions.grant_task_role(_sub_member_id, "owner", sub_task_id, _sub_org_id)
+            )
+        else:
+            asyncio.create_task(
+                permissions._seed_task_org_link(sub_task_id, _sub_org_id)
+            )
+
         await emit_activity(
             parent_task["id"],
             {
