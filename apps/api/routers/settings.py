@@ -559,6 +559,17 @@ async def list_audit(
     return [dict(row) for row in rows]
 
 
+@router.post("/authz/reconcile")
+async def reconcile_authz(member: Member = Depends(get_current_member)) -> dict[str, int]:
+    """Backfill OpenFGA relationship tuples from the DB for this org (W2.5).
+
+    Idempotent — safe to run multiple times. No-ops if OpenFGA is not
+    configured. Requires admin or owner role.
+    """
+    require_admin(member)
+    return await permissions.reconcile_org_tuples(member.organization_id)
+
+
 @router.get("/audit/export.csv")
 async def export_audit(member: Member = Depends(get_current_member)) -> StreamingResponse:
     rows = await list_audit(limit=500, member=member)
