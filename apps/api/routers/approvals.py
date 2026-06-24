@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import select, update
 
-from core import permissions
+from core import notifications, permissions
 from core.auth import get_current_member
 from core.config import settings
 from core.db import engine, reflect_table
@@ -160,6 +160,24 @@ async def decide_approval(
         },
         actor_id=member.id,
     )
+
+    # Notify the org that an approval was decided (best-effort; gated by the
+    # org's notification settings). Never let it break the decision response.
+    try:
+        await notifications.emit(
+            organization_id=member.organization_id,
+            type="approval_decision",
+            title=f"Approval {req.decision}",
+            body=approval_summary(
+                str(row_dict.get("action_type") or ""), row_dict.get("action_payload")
+            ),
+            severity="success" if req.decision == "approved" else "warning",
+            resource_type="task",
+            resource_id=str(row_dict["task_id"]),
+            created_by=str(member.id),
+        )
+    except Exception:
+        pass
 
     # Feed the trust ledger and, on rejection, propose a learned guardrail from the
     # reviewer's note. Best-effort — never let it break the decision response.

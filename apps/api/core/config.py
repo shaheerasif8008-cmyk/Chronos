@@ -232,6 +232,12 @@ class Settings(BaseSettings):
     stripe_price_pro: str = ""
     stripe_price_enterprise: str = ""
 
+    # Notification email delivery (W5.3) — empty disables email delivery
+    # (truthful-degraded; in-app notifications still work). When set, the
+    # provider seam in core/notification_delivery.py sends from this address.
+    sendgrid_api_key: str = ""
+    notification_from_email: str = ""
+
     # Observability (category 10)
     langfuse_public_key: str = ""
     langfuse_secret_key: str = ""

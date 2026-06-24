@@ -96,6 +96,8 @@ _ADMIN_ACTIONS = {
     "export_memory",
     "list_audit_log",
     "export_audit_log",
+    "deliver_notifications",
+    "view_admin_console",
     "list_connector_execution_logs",
     "list_connector_approvals",
     "list_connector_health",

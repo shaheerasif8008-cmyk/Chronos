@@ -54,18 +54,29 @@ Audited against the checkout on 2026-06-23:
   formats; attach a self-describing manifest (count, range, filters, generated_at,
   org, generated_by); admin-gate and audit the export itself. Minimal UI: date
   range + format on the existing audit screen.
-- **W5.2 — In-app notifications: durable records + feed.** A `notifications`
-  table (tenant-scoped), a feed API (list/unread-count/mark-read/dismiss), and
-  emission from the events that already exist (approval requested/decided,
-  runtime/task failure, security) gated by the existing notification settings.
-  Begins by confirming no feed exists and that the settings are currently inert.
-- **W5.3 — Notification delivery channels.** Wire email (truthful-degraded until
-  a provider is configured) and any digest/weekly rollup, driven by W5.2 records
-  and the per-org settings. Honest-degraded posture preserved.
-- **W5.4 — Admin console depth.** Consolidate the scattered admin surfaces into a
-  real `/admin` console (members/roles, SSO/SCIM status, connectors, authz
-  reconcile, audit/compliance, notifications), each action admin-gated and
-  audited. Replace the `/audit` stub.
+- **W5.2 — In-app notifications: durable records + feed (DONE).** `notifications`
+  table (migration `0043_notifications`, tenant-scoped; `member_id` NULL = org-wide,
+  set = targeted); `core/notifications.py` (`emit`/`list_for`/`unread_count`/
+  `mark_read`/`dismiss`) with emission gated by the previously-inert
+  `settings_store` notification toggles and every creation audited; `/notifications`
+  router (list/unread_count/read/dismiss) + `/notifications` web feed. Emission
+  wired into the real event sites: approval requested (`runtime/agent_loop.py`),
+  approval decided (`routers/approvals.py`), and permanent task failure
+  (`runtime/task_runner.py`) — all best-effort, never breaking the host flow.
+  _Proof: `tests/test_notifications.py`._
+- **W5.3 — Notification delivery channels (DONE).** `core/notification_delivery.py`
+  email seam (SendGrid behind config, truthful-degraded otherwise): `deliver_pending`
+  sends to org admins / the targeted member and marks `emailed_at` only on real
+  send (degraded leaves it untouched so nothing is silently dropped); `build_digest`
+  rolls up unread notifications by type. `/notifications/deliver` (admin-gated) +
+  `/notifications/digest`; the `notification_email_dispatch` settings capability now
+  reflects the real provider status. _Proof: `tests/test_notification_delivery.py`._
+- **W5.4 — Admin console depth (DONE).** `routers/admin.py` `GET /admin/overview`
+  aggregates org / members-by-role / connectors / pending approvals / audit volume /
+  unread org notifications / governance posture (OpenFGA, SSO, email delivery) into
+  one admin-gated, audited landing summary; `/admin` web console renders it with
+  deep links to the existing admin surfaces (connectors, approvals, audit,
+  notifications). _Proof: `tests/test_admin_console.py`._
 
 ---
 
