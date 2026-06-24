@@ -54,6 +54,26 @@ async def _default_mark_failed(task_id: str, error: str) -> None:
     reason = classify_failure(error)
     await _persist_terminal(task_id, status="failed", error=error, failure_reason=reason, dead_letter=True)
     await emit_activity(task_id, {"type": "task_failed", "error": error, "failure_reason": reason, "dead_letter": True})
+    # Alert the org that a task failed permanently (best-effort; gated by the
+    # org's notification settings).
+    try:
+        from core import notifications
+        from runtime.agent_loop import get_task
+
+        task = await get_task(task_id)
+        if task:
+            await notifications.emit(
+                organization_id=task["organization_id"],
+                type="task_failure",
+                title="Task failed",
+                body=(task.get("goal") or "A task failed.") + f" ({reason})",
+                severity="critical",
+                resource_type="task",
+                resource_id=str(task_id),
+                created_by="chronos",
+            )
+    except Exception:
+        pass
 
 
 class TaskRunner:

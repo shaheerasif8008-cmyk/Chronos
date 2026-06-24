@@ -1376,6 +1376,24 @@ async def _open_approval_gate(
         "approval_ids": approval_ids,
         "step_id": "agent_loop",
     })
+    # Surface an in-app notification so an approver is alerted (best-effort,
+    # gated by the org's notification settings).
+    try:
+        from core import notifications
+
+        tools = ", ".join(sorted({to_broker_name(c["name"]) for c in pending_calls}))
+        await notifications.emit(
+            organization_id=task["organization_id"],
+            type="approval_request",
+            title="Approval needed" + (f": {tools}" if tools else ""),
+            body=f"A task is waiting for approval to run: {tools}." if tools else "A task is waiting for approval.",
+            severity="warning",
+            resource_type="task",
+            resource_id=str(task_id),
+            created_by="chronos",
+        )
+    except Exception:
+        pass
 
 
 # ── Resume after approval ─────────────────────────────────────────────────────
