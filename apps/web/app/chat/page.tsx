@@ -7863,14 +7863,24 @@ function BillingSettings({ overview }: { overview: SettingsOverview }) {
 function AuditSettings() {
   const [rows, setRows] = useState<Array<Record<string, unknown>>>([]);
   const [query, setQuery] = useState("");
+  const [since, setSince] = useState("");
+  const [until, setUntil] = useState("");
   const [selected, setSelected] = useState<Record<string, unknown> | null>(null);
-  useEffect(() => { apiFetch(`/settings/audit${query ? `?query=${encodeURIComponent(query)}` : ""}`).then(r => r.json()).then(setRows).catch(() => setRows([])); }, [query]);
-  async function exportCsv() {
-    const blob = await (await apiFetch("/settings/audit/export.csv")).blob();
+  function auditParams(extra?: Record<string, string>): string {
+    const params = new URLSearchParams(extra);
+    if (query) params.set("query", query);
+    if (since) params.set("since", new Date(since).toISOString());
+    if (until) params.set("until", new Date(until).toISOString());
+    const qs = params.toString();
+    return qs ? `?${qs}` : "";
+  }
+  useEffect(() => { apiFetch(`/settings/audit${auditParams()}`).then(r => r.json()).then(setRows).catch(() => setRows([])); }, [query, since, until]);
+  async function exportAudit(format: "csv" | "json") {
+    const blob = await (await apiFetch(`/settings/audit/export${auditParams({ format })}`)).blob();
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     anchor.href = url;
-    anchor.download = "chronos-audit.csv";
+    anchor.download = `chronos-audit.${format}`;
     anchor.click();
     URL.revokeObjectURL(url);
   }
@@ -7884,7 +7894,7 @@ function AuditSettings() {
         ["Decision", String(selected.decision || "—")],
       ] as Array<[string, string]>)
     : [];
-  return <><div className="flex gap-2 mb-4"><TextInput ariaLabel="Search audit logs" value={query} onChange={setQuery}/><button className="btn btn-sm" onClick={() => void exportCsv()}>Export CSV</button></div><div className="surface border border-soft rounded-xl overflow-hidden">{rows.map(row => <button key={String(row.id)} onClick={() => setSelected(row)} className="w-full text-left px-4 py-3 border-b hairline last:border-b-0 hover:bg-[var(--surface-2)]"><div className="font-medium text-[13px]">{String(row.action)}</div><div className="text-[12px]" style={{ color: "var(--text-dim)" }}>{String(row.actor_id || "system")} · {row.created_at ? new Date(String(row.created_at)).toLocaleString() : "—"}</div></button>)}</div>{selected && <div className="mt-4 surface border border-soft rounded-xl p-4"><div className="font-medium mb-2">Audit detail</div><div className="space-y-1.5 text-[13px]" style={{ color: "var(--text-muted)" }}>{detailRows.map(([label, value]) => <div key={label} className="flex gap-2"><span className="w-32 flex-shrink-0 font-medium" style={{ color: "var(--text-dim)" }}>{label}</span><span className="min-w-0 break-words">{value}</span></div>)}</div><details className="mt-3"><summary className="cursor-pointer text-[12px]" style={{ color: "var(--text-dim)" }}>Technical details</summary><pre className="mt-2 text-[12px] overflow-auto" style={{ color: "var(--text-muted)" }}>{JSON.stringify(selected, null, 2)}</pre></details></div>}</>;
+  return <><div className="flex flex-wrap gap-2 mb-4 items-center"><TextInput ariaLabel="Search audit logs" value={query} onChange={setQuery}/><input aria-label="Audit from date" type="date" value={since} onChange={e => setSince(e.target.value)} className="surface border border-soft rounded-lg px-3 py-2 text-[14px] outline-none" style={{ color: "var(--text)" }}/><input aria-label="Audit to date" type="date" value={until} onChange={e => setUntil(e.target.value)} className="surface border border-soft rounded-lg px-3 py-2 text-[14px] outline-none" style={{ color: "var(--text)" }}/><button className="btn btn-sm" onClick={() => void exportAudit("csv")}>Export CSV</button><button className="btn btn-sm" onClick={() => void exportAudit("json")}>Export JSON</button></div><div className="surface border border-soft rounded-xl overflow-hidden">{rows.map(row => <button key={String(row.id)} onClick={() => setSelected(row)} className="w-full text-left px-4 py-3 border-b hairline last:border-b-0 hover:bg-[var(--surface-2)]"><div className="font-medium text-[13px]">{String(row.action)}</div><div className="text-[12px]" style={{ color: "var(--text-dim)" }}>{String(row.actor_id || "system")} · {row.created_at ? new Date(String(row.created_at)).toLocaleString() : "—"}</div></button>)}</div>{selected && <div className="mt-4 surface border border-soft rounded-xl p-4"><div className="font-medium mb-2">Audit detail</div><div className="space-y-1.5 text-[13px]" style={{ color: "var(--text-muted)" }}>{detailRows.map(([label, value]) => <div key={label} className="flex gap-2"><span className="w-32 flex-shrink-0 font-medium" style={{ color: "var(--text-dim)" }}>{label}</span><span className="min-w-0 break-words">{value}</span></div>)}</div><details className="mt-3"><summary className="cursor-pointer text-[12px]" style={{ color: "var(--text-dim)" }}>Technical details</summary><pre className="mt-2 text-[12px] overflow-auto" style={{ color: "var(--text-muted)" }}>{JSON.stringify(selected, null, 2)}</pre></details></div>}</>;
 }
 
 function DeveloperSettings({ data, patch, capabilities }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void; capabilities: SettingsOverview["capabilities"] }) {
