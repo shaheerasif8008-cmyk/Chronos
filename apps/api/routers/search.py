@@ -38,6 +38,30 @@ def _snippet(text: str | None, *, max_len: int = 200) -> str:
     return text[:max_len] + ("…" if len(text) > max_len else "")
 
 
+def _relevance(hit: dict[str, Any], q_lower: str) -> int:
+    """Higher is more relevant. Title matches outrank body-only matches, and
+    exact/prefix title matches outrank substring matches, so the merged result
+    set reads as a single ranked list rather than per-type buckets."""
+    title = (hit.get("title") or "").lower()
+    snippet = (hit.get("snippet") or "").lower()
+    if title == q_lower:
+        return 100
+    if title.startswith(q_lower):
+        return 70
+    if q_lower in title:
+        return 50
+    if q_lower in snippet:
+        return 20
+    return 10
+
+
+def _rank_key(hit: dict[str, Any], q_lower: str):
+    """Sort by relevance, then recency (newer first). ``created_at``/``updated_at``
+    are stringified timestamps where present; absent values sort last."""
+    ts = hit.get("updated_at") or hit.get("created_at") or ""
+    return (_relevance(hit, q_lower), ts)
+
+
 async def _search_conversations(q: str, member: Member) -> list[dict[str, Any]]:
     escaped = _escape_like(q)
     tbl = await reflect_table("conversations")
@@ -136,6 +160,7 @@ async def _search_tasks(q: str, member: Member) -> list[dict[str, Any]]:
             "title": _snippet(row["goal"], max_len=80),
             "snippet": _snippet(row["goal"]),
             "url": "/tasks",
+            "created_at": str(row["created_at"]) if row["created_at"] is not None else None,
         }
         for row in rows
     ]
@@ -165,6 +190,7 @@ async def _search_artifacts(q: str, member: Member) -> list[dict[str, Any]]:
             "title": row["title"] or "Untitled artifact",
             "snippet": _snippet(row["title"]),
             "url": "/artifacts",
+            "created_at": str(row["created_at"]) if row["created_at"] is not None else None,
         }
         for row in rows
     ]
@@ -187,10 +213,17 @@ async def _search_memory(q: str, member: Member) -> list[dict[str, Any]]:
 
 
 async def _search_sources(q: str, member: Member) -> list[dict[str, Any]]:
-    """Search project_sources if the table exists; degrade to [] if not."""
+    """Search project sources the caller can see.
+
+    Sources are scoped to projects the member belongs to (via ``project_members``),
+    not merely to the org — an org peer who is not a project member must not see
+    that project's sources in search results. Degrades to ``[]`` if the tables do
+    not exist yet (older checkouts).
+    """
     escaped = _escape_like(q)
     try:
         tbl = await reflect_table("project_sources")
+        members_tbl = await reflect_table("project_members")
     except Exception:
         # Table does not exist yet (arrives in a later sprint)
         return []
@@ -198,10 +231,18 @@ async def _search_sources(q: str, member: Member) -> list[dict[str, Any]]:
         async with engine.begin() as conn:
             rows = (
                 await conn.execute(
-                    select(tbl.c.id, tbl.c.title)
+                    select(tbl.c.id, tbl.c.title, tbl.c.project_id, tbl.c.created_at)
+                    .select_from(
+                        tbl.join(
+                            members_tbl,
+                            tbl.c.project_id == members_tbl.c.project_id,
+                        )
+                    )
                     .where(
                         and_(
                             tbl.c.organization_id == member.organization_id,
+                            members_tbl.c.organization_id == member.organization_id,
+                            members_tbl.c.member_id == member.id,
                             tbl.c.title.ilike(f"%{escaped}%", escape="\\"),
                         )
                     )
@@ -215,7 +256,8 @@ async def _search_sources(q: str, member: Member) -> list[dict[str, Any]]:
                 "id": str(row["id"]),
                 "title": row["title"] or "Untitled source",
                 "snippet": _snippet(row["title"]),
-                "url": "/projects",
+                "url": f"/projects?p={row['project_id']}",
+                "created_at": str(row["created_at"]) if row["created_at"] is not None else None,
             }
             for row in rows
         ]
@@ -239,8 +281,14 @@ async def run_search(
     q: str,
     types_csv: str | None,
     member: Member,
+    limit: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Core search logic — extracted so tests can call it without HTTP machinery."""
+    """Core search logic — extracted so tests can call it without HTTP machinery.
+
+    Results from all requested types are merged and ranked into a single list
+    (most relevant first). ``limit`` optionally caps the total returned after
+    ranking; ``None`` returns every match.
+    """
     await permissions.check(member, "search", "global")
     await audit.log(
         "search",
@@ -273,6 +321,12 @@ async def run_search(
     for hits in nested:
         results.extend(hits)
 
+    q_lower = q.lower()
+    results.sort(key=lambda hit: _rank_key(hit, q_lower), reverse=True)
+
+    if limit is not None:
+        results = results[:limit]
+
     return results
 
 
@@ -280,6 +334,7 @@ async def run_search(
 async def search(
     q: str = Query(..., min_length=1, max_length=200),
     types: str | None = None,
+    limit: int | None = Query(default=None, ge=1, le=100),
     member: Member = Depends(get_current_member),
 ) -> list[dict[str, Any]]:
     """Search across conversations, messages, tasks, artifacts, memory, and sources.
@@ -288,8 +343,9 @@ async def search(
         q: Required search term (1–200 characters).
         types: Optional comma-separated list of result types to include.
                Defaults to all types. Unknown types are silently ignored.
+        limit: Optional cap on the total number of ranked results (1–100).
 
     Returns:
-        Unified list of search hits: {type, id, title, snippet, url}.
+        Unified, relevance-ranked list of hits: {type, id, title, snippet, url}.
     """
-    return await run_search(q=q, types_csv=types, member=member)
+    return await run_search(q=q, types_csv=types, member=member, limit=limit)
