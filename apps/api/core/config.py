@@ -86,7 +86,8 @@ class Settings(BaseSettings):
     frontend_base_url: str = "http://localhost:3000"
     # Connector / vault
     vault_encryption_key: str = ""   # 32-byte key as 64 hex chars; required outside dev
-    composio_api_key: str = ""       # kept for backward compat; not actively used
+    composio_api_key: str = ""       # set to route all SaaS connectors through Composio managed auth
+    composio_entity_scope: str = "member"  # "member" (per-user connections) or "org" (one shared connection)
     composio_callback_base_url: str = "http://localhost:8000"
     tavily_api_key: str = ""
     # Google OAuth2 — covers Gmail, Calendar, Drive

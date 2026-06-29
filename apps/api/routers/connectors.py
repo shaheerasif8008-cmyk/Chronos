@@ -40,6 +40,38 @@ def _gmail_module():
     return importlib.import_module("connectors.gmail")
 
 
+async def _composio_oauth_start(provider: str, member: Member) -> dict[str, str]:
+    """Initiate a Composio managed-auth connection and return its consent URL.
+
+    Used for every Composio-managed SaaS provider when COMPOSIO_API_KEY is set.
+    The state is HMAC-signed so the callback can verify it and rebuild context.
+    """
+    from connectors import composio_client
+
+    state = _gmail_module()._build_state(str(member.id), str(member.organization_id))
+    redirect_url = (
+        f"{settings.composio_callback_base_url}/connectors/{provider}/composio-callback?state={state}"
+    )
+    entity = composio_client.entity_id(str(member.organization_id), str(member.id))
+    try:
+        result = await composio_client.initiate_connection(
+            provider, entity=entity, redirect_url=redirect_url
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail=f"Composio connect failed: {exc}") from exc
+
+    url = result.get("redirect_url")
+    if not url:
+        raise HTTPException(status_code=502, detail="Composio did not return a consent URL")
+
+    await audit.log(
+        "connector_oauth_start", str(member.id), f"{provider}.composio_oauth_start",
+        organization_id=member.organization_id,
+        resource_type="connector", resource_id=provider,
+    )
+    return {"url": url}
+
+
 class InstallConnectorRequest(BaseModel):
     workspace_id: str = "default"
 
@@ -230,6 +262,9 @@ async def gmail_oauth_start(member: Member = Depends(get_current_member)) -> dic
     parameter is HMAC-signed so the callback can verify it without a DB lookup.
     """
     await permissions.check(member, "connect_gmail", member.organization_id)
+    from connectors import composio_client
+    if composio_client.is_configured() and composio_client.is_composio_provider("gmail"):
+        return await _composio_oauth_start("gmail", member)
     if not settings.google_client_id or not settings.google_client_secret:
         raise HTTPException(
             status_code=503,
@@ -374,6 +409,10 @@ async def generic_oauth_start(
         raise HTTPException(status_code=501, detail=f"{app.name} uses {app.auth_type} setup, not OAuth2")
 
     await permissions.check(member, f"connect_{provider}", str(member.organization_id))
+
+    from connectors import composio_client
+    if composio_client.is_configured() and composio_client.is_composio_provider(provider):
+        return await _composio_oauth_start(provider, member)
 
     client_id, client_secret = get_client_credentials(app)
     if not client_id or not client_secret:
@@ -577,6 +616,80 @@ async def generic_oauth_callback(
 
     await audit.log(
         "connector_oauth_complete", member_id, f"{provider}.oauth_callback",
+        organization_id=org_id,
+        resource_type="connector", resource_id=provider,
+    )
+    return _connectors_redirect(connector_success=provider)
+
+
+@router.get("/{provider}/composio-callback")
+async def composio_oauth_callback(
+    provider: str,
+    state: str = Query(...),
+    error: str | None = Query(default=None),
+) -> RedirectResponse:
+    """Composio managed-auth callback — verifies the connection and records it.
+
+    Composio holds the OAuth tokens; Chronos persists only the connector row with
+    a ``composio:<entity>`` reference (no secret) so the catalog shows it as
+    connected and the broker routes the provider through Composio.
+    """
+    from connectors import composio_client
+    from connectors.oauth_apps import get_app
+    from core.db import engine, reflect_table
+    from sqlalchemy import insert, select, update
+
+    if error:
+        return _connectors_redirect(connector_error=error, connector_provider=provider)
+
+    try:
+        member_id, org_id = _gmail_module()._verify_state(state)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if not composio_client.is_composio_provider(provider):
+        raise HTTPException(status_code=404, detail=f"{provider} is not a Composio-managed provider")
+
+    entity = composio_client.entity_id(org_id, member_id)
+    status = await composio_client.connection_status(provider, entity=entity)
+    if status != "active":
+        return _connectors_redirect(
+            connector_error=f"Composio connection is not active (status: {status})",
+            connector_provider=provider,
+        )
+
+    app = get_app(provider)
+    connector_id = f"{provider}:{org_id}:{member_id}"
+    vault_ref = f"composio:{entity}"
+    connectors_table = await reflect_table("connectors")
+    async with engine.begin() as conn:
+        existing = (
+            await conn.execute(
+                select(connectors_table).where(connectors_table.c.id == connector_id)
+            )
+        ).mappings().first()
+        if existing:
+            await conn.execute(
+                update(connectors_table)
+                .where(connectors_table.c.id == existing["id"])
+                .values(vault_ref=vault_ref, status="active", account_handle=entity)
+            )
+        else:
+            await conn.execute(
+                insert(connectors_table).values(
+                    id=connector_id,
+                    organization_id=org_id,
+                    provider=provider,
+                    account_handle=entity,
+                    vault_ref=vault_ref,
+                    status="active",
+                    scopes=app.scopes if app else [],
+                    region=settings.region,
+                )
+            )
+
+    await audit.log(
+        "connector_oauth_complete", member_id, f"{provider}.composio_oauth_callback",
         organization_id=org_id,
         resource_type="connector", resource_id=provider,
     )
