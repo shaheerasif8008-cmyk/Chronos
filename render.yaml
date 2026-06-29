@@ -8,6 +8,10 @@ services:
     preDeployCommand: alembic upgrade head
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
+    # The API process runs the in-process APScheduler schedulers and the agent
+    # task runner. Until leader-election is added, running more than one instance
+    # would fire every schedule N times — keep this at 1.
+    numInstances: 1
     envVars:
       - key: ENVIRONMENT
         value: production
@@ -86,6 +90,87 @@ services:
         sync: false
       - key: SENTRY_DSN
         sync: false
+      # ── Authorization (OpenFGA) ───────────────────────────────────────────────
+      # Without OPENFGA_API_URL the permission seam only enforces the always-on
+      # role gates (approvals + admin governance); project/workspace/task
+      # relationship checks are skipped. Point it at the OpenFGA private service
+      # so intra-tenant least-privilege is enforced. Run reconcile_org_tuples for
+      # existing orgs after first enabling it so members are not locked out.
+      - key: OPENFGA_API_URL
+        fromService:
+          name: chronos-openfga
+          type: pserv
+          property: hostport
+          transform: "http://{value}"
+      - key: PERMISSIONS_ENFORCE
+        value: "true"
+
+  # ── Connector framework worker ───────────────────────────────────────────────
+  # Drains the Redis connector-execution queue (workflow steps, connector plans).
+  # Without this process those jobs enqueue and never run.
+  - type: worker
+    name: chronos-worker
+    runtime: python
+    rootDir: apps/api
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m connectors.worker_main
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: REGION
+        value: us
+      - key: DATABASE_URL
+        fromDatabase:
+          name: chronos-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          name: chronos-redis
+          type: redis
+          property: connectionString
+      - key: VAULT_ENCRYPTION_KEY
+        sync: false          # MUST match the API's key (same vault)
+      - key: OBJECT_STORAGE_BACKEND
+        value: s3
+      - key: AWS_S3_BUCKET
+        sync: false
+      - key: AWS_S3_REGION
+        value: us-east-1
+      - key: AWS_ACCESS_KEY_ID
+        sync: false
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: OPENROUTER_API_BASE
+        value: https://openrouter.ai/api/v1
+      - key: OPENFGA_API_URL
+        fromService:
+          name: chronos-openfga
+          type: pserv
+          property: hostport
+          transform: "http://{value}"
+      - key: PERMISSIONS_ENFORCE
+        value: "true"
+
+  # ── OpenFGA authorization engine ──────────────────────────────────────────────
+  # Private (internal-only) service behind the permission seam. NOTE: this uses
+  # the in-memory datastore — tuples reset on restart, and the API re-seeds them
+  # on member/project/workspace/task creation, but a restart drops historical
+  # grants until reconcile runs. For durable authorization, switch to the
+  # postgres datastore (OPENFGA_DATASTORE_ENGINE=postgres + OPENFGA_DATASTORE_URI)
+  # against a dedicated database and run `openfga migrate` first.
+  - type: pserv
+    name: chronos-openfga
+    runtime: image
+    image:
+      url: openfga/openfga:v1.9.5
+    dockerCommand: run
+    envVars:
+      - key: OPENFGA_DATASTORE_ENGINE
+        value: memory
+      - key: OPENFGA_LOG_LEVEL
+        value: warn
 
   # ── Next.js frontend ─────────────────────────────────────────────────────────
   - type: web
@@ -105,15 +190,22 @@ services:
         value: production
 
   # ── Redis ────────────────────────────────────────────────────────────────────
+  # `starter` adds persistence (the free tier is ephemeral). `noeviction` so the
+  # broker's rate-limit / loop-detection / idempotency keys and the vault cache
+  # are not silently evicted under memory pressure (the vault still falls back to
+  # Postgres, but rate-limit/idempotency loss weakens safety guarantees).
   - type: redis
     name: chronos-redis
-    plan: free
-    maxmemoryPolicy: allkeys-lru
+    plan: starter
+    maxmemoryPolicy: noeviction
 
 databases:
   # ── Postgres + pgvector ──────────────────────────────────────────────────────
   - name: chronos-db
-    plan: free              # upgrade to starter ($7/mo) for pgvector support
+    # MUST be a paid plan: the schema uses pgvector (VECTOR columns + ivfflat
+    # indexes) which the free plan does not support, so `alembic upgrade head`
+    # fails on the free tier.
+    plan: starter
     databaseName: chronos
     user: chronos
     postgresMajorVersion: "15"

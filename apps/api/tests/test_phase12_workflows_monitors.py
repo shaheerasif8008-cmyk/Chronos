@@ -245,3 +245,49 @@ async def test_monitor_evaluation_creates_cited_alert_and_run_history():
     assert alert["severity"] == "info"
     assert alert["evidence"]["url"] == "https://example.com/pricing"
     assert "Enterprise price changed" in alert["summary"]
+
+
+@pytest.mark.asyncio
+async def test_recover_incomplete_workflows_covers_all_tenants():
+    """Regression: recovery must not be limited to the 'default' tenant.
+
+    Two different orgs each have an interrupted (running) workflow run. The
+    startup recovery enumerates distinct tenants from workflow_runs, so both
+    runs must be discovered — not just the default tenant's.
+    """
+    import uuid
+
+    import main
+    from connectors.framework.repository import DatabaseConnectorRepository
+
+    repo = DatabaseConnectorRepository()
+    org_a = f"recover-a-{uuid.uuid4().hex[:8]}"
+    org_b = f"recover-b-{uuid.uuid4().hex[:8]}"
+
+    run_ids: dict[str, str] = {}
+    for org in (org_a, org_b):
+        workflow = await repo.create_workflow(
+            tenant_id=org,
+            workspace_id="default",
+            employee_id="employee-1",
+            user_id="member-1",
+            name="Interrupted workflow",
+            definition={"steps": []},
+        )
+        run = await repo.create_workflow_run(
+            tenant_id=org,
+            workflow_id=workflow["id"],
+            workspace_id="default",
+            employee_id="employee-1",
+            user_id="member-1",
+            status="running",
+            correlation_id=uuid.uuid4().hex,
+        )
+        run_ids[org] = run["id"]
+
+    # The enumeration that recovery iterates must include BOTH tenants, not
+    # just "default" (the previously hardcoded value).
+    tenants = await main._tenants_with_interrupted_workflows()
+    assert org_a in tenants
+    assert org_b in tenants
+    assert "default" not in {org_a, org_b}  # guard: these are non-default tenants

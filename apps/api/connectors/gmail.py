@@ -32,6 +32,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import time
 import uuid
 import asyncio
@@ -48,6 +49,17 @@ from core.models import ToolResult
 log = logging.getLogger(__name__)
 
 DEMO_DRAFTS_PATH = Path("/tmp/chronos_demo_drafts.jsonl")
+
+
+def _demo_drafts_path(org_id: str) -> Path:
+    """Per-tenant demo draft file derived from ``DEMO_DRAFTS_PATH``.
+
+    Demo drafts must not share one global file across tenants — that would let
+    one org's draft content land in another org's store. Namespace by a
+    filesystem-safe org_id while keeping the base path (so tests can still
+    monkeypatch ``DEMO_DRAFTS_PATH`` to redirect the directory)."""
+    safe_org = re.sub(r"[^A-Za-z0-9_.-]", "_", org_id or "default")
+    return DEMO_DRAFTS_PATH.with_name(f"{DEMO_DRAFTS_PATH.stem}.{safe_org}{DEMO_DRAFTS_PATH.suffix}")
 TOKEN_REFRESH_BUFFER_SECONDS = 300  # refresh if token expires within 5 minutes
 
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -301,7 +313,7 @@ class GmailConnector:
 
         from core.config import settings
         if settings.demo_mode or tier in {"demo", "fixture"} or vault_ref in {"demo", "fixture"}:
-            return await self._demo_dispatch(tool, args, tier)
+            return await self._demo_dispatch(tool, args, tier, org_id)
 
         if tool == "gmail.read_inbox":
             return await self._read_inbox(vault_ref, org_id, args)
@@ -316,9 +328,9 @@ class GmailConnector:
     # Demo / fixture path
     # ------------------------------------------------------------------
 
-    async def _demo_dispatch(self, tool: str, args: dict, tier: str) -> ToolResult:
+    async def _demo_dispatch(self, tool: str, args: dict, tier: str, org_id: str = "") -> ToolResult:
         if tool == "gmail.draft":
-            return await self._create_demo_draft(args)
+            return await self._create_demo_draft(args, org_id)
         if tool == "gmail.read_inbox":
             return ToolResult(data={"threads": [], "tier": tier}, summary="Demo inbox: 0 threads")
         if tool == "gmail.search":
@@ -328,29 +340,31 @@ class GmailConnector:
             )
         raise ValueError(f"Unknown gmail tool: {tool}")
 
-    async def _create_demo_draft(self, args: dict) -> ToolResult:
-        DEMO_DRAFTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    async def _create_demo_draft(self, args: dict, org_id: str = "") -> ToolResult:
+        path = _demo_drafts_path(org_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
         existing: list[dict] = []
-        if DEMO_DRAFTS_PATH.exists():
-            for line in DEMO_DRAFTS_PATH.read_text().splitlines():
+        if path.exists():
+            for line in path.read_text().splitlines():
                 line = line.strip()
                 if not line:
                     continue
                 try:
                     existing.append(json.loads(line))
                 except json.JSONDecodeError:
-                    log.warning("Skipping malformed demo draft line in %s", DEMO_DRAFTS_PATH)
+                    log.warning("Skipping malformed demo draft line in %s", path)
         draft = {
             "id": f"demo-draft-{len(existing) + 1}",
+            "organization_id": org_id or "default",
             "to": args.get("to", ""),
             "subject": args.get("subject", ""),
             "body": args.get("body", ""),
             "cc": args.get("cc", ""),
         }
-        with DEMO_DRAFTS_PATH.open("a") as fh:
+        with path.open("a") as fh:
             fh.write(json.dumps(draft) + "\n")
         return ToolResult(
-            data={"id": draft["id"], "path": str(DEMO_DRAFTS_PATH)},
+            data={"id": draft["id"], "path": str(path)},
             summary=f"Demo draft recorded: {draft['id']}",
         )
 
