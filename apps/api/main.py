@@ -27,6 +27,8 @@ from core.tenancy import resolve_org_id
 
 from jobs import context_update, profile_synthesis, scheduled_tasks
 from core.db import engine, reflect_table
+from core.leader import LeaderElection
+from core.redis import redis_client
 from runtime import task_runner
 from runtime.research_executor import start_research
 from routers import activity, admin, agents, approvals, artifact_share, artifacts, attachments, auth, autonomy, billing, browser_sessions, chat, comments, computer_sessions, connectors, context, data, desktop_sessions, domains, memory, monitors, notifications, projects, research, schedules, scim, search, settings, skills, sso, tasks, workflows
@@ -161,27 +163,56 @@ async def _scim_error_handler(_request: Request, exc: _SCIMError) -> JSONRespons
     return JSONResponse(status_code=exc.status, content=exc.to_dict(), media_type="application/scim+json")
 
 
+# Schedulers that must run on exactly one instance (cron-like jobs would
+# otherwise fire once per replica). They are started PAUSED and only the elected
+# leader resumes them.
+_SCHEDULERS = (profile_synthesis.scheduler, context_update.scheduler, scheduled_tasks.scheduler)
+_scheduler_leader: LeaderElection | None = None
+
+
 @app.on_event("startup")
 async def start_schedulers() -> None:
     await _bootstrap_authz()
     await _bootstrap_skills()
-    for scheduler in (profile_synthesis.scheduler, context_update.scheduler, scheduled_tasks.scheduler):
+    # Start paused; the leader resumes them. This makes running multiple API
+    # instances safe — only the leader fires schedules.
+    for scheduler in _SCHEDULERS:
         if not scheduler.running:
-            scheduler.start()
+            scheduler.start(paused=True)
+    # The task runner is lease-coordinated, so every instance can run workers
+    # safely (they won't double-execute a task another instance holds a lease on).
     task_runner.start_runner()
+
     _log = logging.getLogger(__name__)
-    try:
-        await recover_incomplete_tasks()
-    except Exception as exc:
-        _log.warning("Task recovery skipped: %s", exc)
-    try:
-        await recover_incomplete_workflows()
-    except Exception as exc:
-        _log.warning("Workflow recovery skipped: %s", exc)
-    try:
-        await recover_incomplete_research()
-    except Exception as exc:
-        _log.warning("Research recovery skipped: %s", exc)
+
+    async def _become_leader() -> None:
+        for scheduler in _SCHEDULERS:
+            if scheduler.running:
+                scheduler.resume()
+        # Recovery is leader-only so N instances don't each re-recover every run.
+        for label, recover in (
+            ("Task", recover_incomplete_tasks),
+            ("Workflow", recover_incomplete_workflows),
+            ("Research", recover_incomplete_research),
+        ):
+            try:
+                await recover()
+            except Exception as exc:
+                _log.warning("%s recovery skipped: %s", label, exc)
+
+    def _step_down() -> None:
+        for scheduler in _SCHEDULERS:
+            if scheduler.running:
+                scheduler.pause()
+
+    global _scheduler_leader
+    _scheduler_leader = LeaderElection(
+        redis_client,
+        "chronos:leader:scheduler",
+        on_acquire=_become_leader,
+        on_release=_step_down,
+    )
+    await _scheduler_leader.start()
 
 
 async def _bootstrap_authz() -> None:
@@ -284,7 +315,11 @@ async def recover_incomplete_workflows() -> list[str]:
 
 @app.on_event("shutdown")
 async def stop_schedulers() -> None:
-    for scheduler in (profile_synthesis.scheduler, context_update.scheduler, scheduled_tasks.scheduler):
+    global _scheduler_leader
+    if _scheduler_leader is not None:
+        await _scheduler_leader.stop()
+        _scheduler_leader = None
+    for scheduler in _SCHEDULERS:
         if scheduler.running:
             scheduler.shutdown(wait=False)
     await task_runner.stop_runner()

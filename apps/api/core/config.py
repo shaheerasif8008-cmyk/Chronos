@@ -71,8 +71,15 @@ class Settings(BaseSettings):
     jwt_secret: str = "change-me-in-dev"
     access_token_expire_minutes: int = 60
 
-    # When true, reject legacy org-less session tokens (post-flip enforcement, C2).
-    enforce_org_bound_tokens: bool = False
+    # Reject legacy org-less session tokens. Enforced by default, but only in
+    # production (dev/test keep org-less tokens for ergonomics — every minted
+    # token already carries `org`). During a rollout, set the grace window below
+    # so active sessions drain instead of breaking the moment enforcement lands.
+    enforce_org_bound_tokens: bool = True
+    # ISO-8601 timestamp. While now < this, legacy org-less tokens are still
+    # accepted in production (with a warning). Empty = no grace (immediate). Set
+    # to roughly one access-token lifetime past a deploy that flips enforcement.
+    org_bound_tokens_grace_until: str = ""
 
     # Auth: dev_otp (Phase 1 default), cognito, or both
     auth_provider: str = "dev_otp"

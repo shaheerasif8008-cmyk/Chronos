@@ -8,9 +8,10 @@ services:
     preDeployCommand: alembic upgrade head
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
-    # The API process runs the in-process APScheduler schedulers and the agent
-    # task runner. Until leader-election is added, running more than one instance
-    # would fire every schedule N times — keep this at 1.
+    # The API process runs the in-process APScheduler schedulers and the startup
+    # recovery sweep. These are now Redis leader-elected (core/leader.py), so only
+    # one instance runs them and scaling beyond 1 is safe. Raise numInstances as
+    # needed; kept at 1 as a conservative default.
     numInstances: 1
     envVars:
       - key: ENVIRONMENT

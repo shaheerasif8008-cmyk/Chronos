@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import jwt
 import pytest
@@ -119,11 +120,13 @@ async def test_org_bound_token_rejected_on_no_tenant_host_in_production(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_enforce_flag_rejects_org_less_tokens(monkeypatch):
-    """C2: with enforcement on, a legacy org-less token is rejected (401)."""
+async def test_enforce_rejects_org_less_tokens_in_production(monkeypatch):
+    """In production, enforcement is on by default: a legacy org-less token with
+    no grace window is rejected (401)."""
     _, member_a = await _make_org_and_member(f"acme{uuid.uuid4().hex[:6]}")
     legacy = create_access_token(member_a)  # no org claim
-    monkeypatch.setattr("core.auth.settings.enforce_org_bound_tokens", True, raising=False)
+    monkeypatch.setattr("core.auth._is_production", lambda: True)
+    monkeypatch.setattr("core.auth.settings.org_bound_tokens_grace_until", "", raising=False)
     async with _client() as client:
         resp = await client.get("/auth/me", headers={"Authorization": f"Bearer {legacy}"})
     assert resp.status_code == 401
@@ -131,8 +134,23 @@ async def test_enforce_flag_rejects_org_less_tokens(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_enforce_flag_off_grandfathers_org_less_tokens():
-    """C2 default: enforcement off → legacy org-less token still works."""
+async def test_org_less_token_accepted_in_production_during_grace(monkeypatch):
+    """During the migration grace window, a production org-less token is still
+    accepted (so active sessions drain instead of breaking)."""
+    _, member_a = await _make_org_and_member(f"acme{uuid.uuid4().hex[:6]}")
+    legacy = create_access_token(member_a)
+    monkeypatch.setattr("core.auth._is_production", lambda: True)
+    future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    monkeypatch.setattr("core.auth.settings.org_bound_tokens_grace_until", future, raising=False)
+    async with _client() as client:
+        resp = await client.get("/auth/me", headers={"Authorization": f"Bearer {legacy}"})
+    assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_org_less_tokens_accepted_outside_production():
+    """Enforcement is production-gated, so dev/test accept org-less tokens
+    (every minted token already carries `org`; this keeps local ergonomics)."""
     _, member_a = await _make_org_and_member(f"acme{uuid.uuid4().hex[:6]}")
     legacy = create_access_token(member_a)
     async with _client() as client:
