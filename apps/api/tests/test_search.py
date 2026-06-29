@@ -514,3 +514,150 @@ async def test_search_like_metacharacters_escaped(monkeypatch):
     )
 
     await sqlite_engine.dispose()
+
+
+# ─── Test 8: sources are scoped to project membership (not just org) ───────────
+
+@pytest.mark.asyncio
+async def test_search_sources_scoped_to_project_membership(monkeypatch):
+    """A project source must only surface for members of that project.
+
+    Seeds two projects in the SAME org: project-A (caller is a member) and
+    project-B (caller is NOT a member). Both have a source whose title matches
+    the query. Only project-A's source may be returned — an org peer outside a
+    project must not see that project's sources via search.
+    """
+    from routers import search
+
+    sqlite_engine = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
+    meta = sa.MetaData()
+    project_sources_tbl = sa.Table(
+        "project_sources", meta,
+        sa.Column("id", sa.String, primary_key=True),
+        sa.Column("organization_id", sa.String, nullable=False),
+        sa.Column("project_id", sa.String, nullable=False),
+        sa.Column("title", sa.String),
+        sa.Column("created_at", sa.String),
+    )
+    project_members_tbl = sa.Table(
+        "project_members", meta,
+        sa.Column("id", sa.String, primary_key=True),
+        sa.Column("organization_id", sa.String, nullable=False),
+        sa.Column("project_id", sa.String, nullable=False),
+        sa.Column("member_id", sa.String, nullable=False),
+    )
+
+    async with sqlite_engine.begin() as conn:
+        await conn.run_sync(meta.create_all)
+        # Caller (member-1) belongs to project-A only.
+        await conn.execute(project_members_tbl.insert().values(
+            id="pm-1", organization_id="default", project_id="project-A", member_id="member-1",
+        ))
+        await conn.execute(project_sources_tbl.insert().values(
+            id="src-A", organization_id="default", project_id="project-A",
+            title="acme handbook", created_at="2024-01-02T00:00:00Z",
+        ))
+        # project-B is in the same org but the caller is NOT a member.
+        await conn.execute(project_sources_tbl.insert().values(
+            id="src-B", organization_id="default", project_id="project-B",
+            title="acme secrets", created_at="2024-01-03T00:00:00Z",
+        ))
+
+    TABLE_MAP = {
+        "project_sources": project_sources_tbl,
+        "project_members": project_members_tbl,
+    }
+
+    async def fake_reflect_table(name: str):
+        if name not in TABLE_MAP:
+            raise Exception(f"Table {name!r} does not exist")
+        return TABLE_MAP[name]
+
+    monkeypatch.setattr(search, "reflect_table", fake_reflect_table)
+    monkeypatch.setattr(search, "engine", sqlite_engine)
+    monkeypatch.setattr(search.permissions, "check", AsyncMock(return_value=True))
+    monkeypatch.setattr(search.audit, "log", AsyncMock(return_value="audit-1"))
+
+    member = _make_member(org_id="default", member_id="member-1")
+    results = await search.run_search(q="acme", types_csv="sources", member=member)
+
+    returned_ids = {r["id"] for r in results}
+    assert "src-A" in returned_ids, "Member's own project source should be found"
+    assert "src-B" not in returned_ids, (
+        "Authorization breach: a non-member saw project-B's source via search"
+    )
+
+    await sqlite_engine.dispose()
+
+
+# ─── Test 9: results are relevance-ranked (title match outranks body match) ────
+
+@pytest.mark.asyncio
+async def test_search_results_are_relevance_ranked(monkeypatch):
+    """An exact title match must rank above a body-only (snippet) match."""
+    from routers import search
+
+    sqlite_engine = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
+    meta = sa.MetaData()
+    conversations_tbl = sa.Table(
+        "conversations", meta,
+        sa.Column("id", sa.String, primary_key=True),
+        sa.Column("organization_id", sa.String, nullable=False),
+        sa.Column("member_id", sa.String, nullable=False),
+        sa.Column("title", sa.String),
+        sa.Column("created_at", sa.String),
+        sa.Column("updated_at", sa.String),
+    )
+    messages_tbl = sa.Table(
+        "messages", meta,
+        sa.Column("id", sa.String, primary_key=True),
+        sa.Column("organization_id", sa.String, nullable=False),
+        sa.Column("conversation_id", sa.String, nullable=False),
+        sa.Column("content", sa.String),
+        sa.Column("created_at", sa.String),
+    )
+
+    async with sqlite_engine.begin() as conn:
+        await conn.run_sync(meta.create_all)
+        # Exact-title conversation match for "acme".
+        await conn.execute(conversations_tbl.insert().values(
+            id="conv-exact", organization_id="default", member_id="member-1",
+            title="acme", created_at="2024-01-01T00:00:00Z", updated_at="2024-01-01T00:00:00Z",
+        ))
+        # Message whose body merely contains "acme" (lower relevance).
+        await conn.execute(conversations_tbl.insert().values(
+            id="conv-host", organization_id="default", member_id="member-1",
+            title="quarterly planning", created_at="2024-01-09T00:00:00Z", updated_at="2024-01-09T00:00:00Z",
+        ))
+        await conn.execute(messages_tbl.insert().values(
+            id="msg-body", organization_id="default", conversation_id="conv-host",
+            content="we should reach out to acme next week", created_at="2024-01-09T00:00:00Z",
+        ))
+
+    TABLE_MAP = {"conversations": conversations_tbl, "messages": messages_tbl}
+
+    async def fake_reflect_table(name: str):
+        if name not in TABLE_MAP:
+            raise Exception(f"Table {name!r} does not exist")
+        return TABLE_MAP[name]
+
+    monkeypatch.setattr(search, "reflect_table", fake_reflect_table)
+    monkeypatch.setattr(search, "engine", sqlite_engine)
+    monkeypatch.setattr(search.permissions, "check", AsyncMock(return_value=True))
+    monkeypatch.setattr(search.audit, "log", AsyncMock(return_value="audit-1"))
+
+    member = _make_member(org_id="default", member_id="member-1")
+    results = await search.run_search(q="acme", types_csv="conversations,messages", member=member)
+
+    ids = [r["id"] for r in results]
+    assert ids[0] == "conv-exact", f"Exact title match should rank first, got order {ids}"
+    assert "msg-body" in ids
+    assert ids.index("conv-exact") < ids.index("msg-body")
+
+    # limit caps the ranked set.
+    limited = await search.run_search(
+        q="acme", types_csv="conversations,messages", member=member, limit=1
+    )
+    assert len(limited) == 1 and limited[0]["id"] == "conv-exact"
+
+    await sqlite_engine.dispose()
