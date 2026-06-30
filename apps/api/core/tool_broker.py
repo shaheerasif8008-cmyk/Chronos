@@ -300,6 +300,13 @@ async def _route(agent: AgentContext, tool: str, args: dict, vault_ref: str, tie
     if tool == "skill.run_script":
         return await _route_skill_run_script(agent, args, tier)
 
+    # Composio-managed SaaS providers (gmail, slack, notion, github, …) when a
+    # COMPOSIO_API_KEY is configured. Managed auth lives in Composio, so this
+    # branch needs no vault_ref — it is flagged with the "composio" sentinel.
+    if vault_ref == "composio":
+        from connectors.composio_connector import composio_connector
+        return await composio_connector.execute(tool, routed_args, agent)
+
     if provider == "gmail":
         from connectors.gmail import gmail_connector
         return await gmail_connector.execute(tool, routed_args, vault_ref)
@@ -450,7 +457,15 @@ class ToolBroker:
         # when external OAuth or browser dependencies are not configured.
         provider = tool.split(".")[0]
         tier = await connector_tier(provider)
-        if tier == "live" and provider not in {"browser", "fs", "code", "doc", "image", "voice", "data", "chat_history", "repo", "computer", "local_computer", "desktop", "canva", "skill", "platform"}:
+        from connectors.composio_client import is_composio_provider, is_configured as composio_configured
+        if composio_configured() and is_composio_provider(provider):
+            # Composio managed auth — credentials live in Composio, not the vault.
+            # The "composio" sentinel tells _route() to dispatch to the Composio
+            # connector; promote a fixture tier to live so it makes a real call.
+            vault_ref = "composio"
+            if tier not in {"demo", "fixture"}:
+                tier = "live"
+        elif tier == "live" and provider not in {"browser", "fs", "code", "doc", "image", "voice", "data", "chat_history", "repo", "computer", "local_computer", "desktop", "canva", "skill", "platform"}:
             from connectors.registry import get as registry_get
 
             connector = await registry_get(agent, tool)
