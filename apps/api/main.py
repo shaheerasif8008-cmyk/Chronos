@@ -12,7 +12,7 @@ os.environ.setdefault("SSL_CERT_FILE", certifi.where())
 _default_ssl_ctx = ssl.create_default_context(cafile=certifi.where())
 ssl._create_default_https_context = lambda: _default_ssl_ctx
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
@@ -21,11 +21,14 @@ from core.config import settings as app_settings
 from core.exceptions import PermissionDenied
 
 logger = logging.getLogger(__name__)
+from core.auth import get_current_member
 from core.scim import SCIMError as _SCIMError
 from core.tenancy import resolve_org_id
 
 from jobs import context_update, profile_synthesis, scheduled_tasks
 from core.db import engine, reflect_table
+from core.leader import LeaderElection
+from core.redis import redis_client
 from runtime import task_runner
 from runtime.research_executor import start_research
 from routers import activity, admin, agents, approvals, artifact_share, artifacts, attachments, auth, autonomy, billing, browser_sessions, chat, comments, computer_sessions, connectors, context, data, desktop_sessions, domains, memory, monitors, notifications, projects, research, schedules, scim, search, settings, skills, sso, tasks, workflows
@@ -160,27 +163,56 @@ async def _scim_error_handler(_request: Request, exc: _SCIMError) -> JSONRespons
     return JSONResponse(status_code=exc.status, content=exc.to_dict(), media_type="application/scim+json")
 
 
+# Schedulers that must run on exactly one instance (cron-like jobs would
+# otherwise fire once per replica). They are started PAUSED and only the elected
+# leader resumes them.
+_SCHEDULERS = (profile_synthesis.scheduler, context_update.scheduler, scheduled_tasks.scheduler)
+_scheduler_leader: LeaderElection | None = None
+
+
 @app.on_event("startup")
 async def start_schedulers() -> None:
     await _bootstrap_authz()
     await _bootstrap_skills()
-    for scheduler in (profile_synthesis.scheduler, context_update.scheduler, scheduled_tasks.scheduler):
+    # Start paused; the leader resumes them. This makes running multiple API
+    # instances safe — only the leader fires schedules.
+    for scheduler in _SCHEDULERS:
         if not scheduler.running:
-            scheduler.start()
+            scheduler.start(paused=True)
+    # The task runner is lease-coordinated, so every instance can run workers
+    # safely (they won't double-execute a task another instance holds a lease on).
     task_runner.start_runner()
+
     _log = logging.getLogger(__name__)
-    try:
-        await recover_incomplete_tasks()
-    except Exception as exc:
-        _log.warning("Task recovery skipped: %s", exc)
-    try:
-        await recover_incomplete_workflows()
-    except Exception as exc:
-        _log.warning("Workflow recovery skipped: %s", exc)
-    try:
-        await recover_incomplete_research()
-    except Exception as exc:
-        _log.warning("Research recovery skipped: %s", exc)
+
+    async def _become_leader() -> None:
+        for scheduler in _SCHEDULERS:
+            if scheduler.running:
+                scheduler.resume()
+        # Recovery is leader-only so N instances don't each re-recover every run.
+        for label, recover in (
+            ("Task", recover_incomplete_tasks),
+            ("Workflow", recover_incomplete_workflows),
+            ("Research", recover_incomplete_research),
+        ):
+            try:
+                await recover()
+            except Exception as exc:
+                _log.warning("%s recovery skipped: %s", label, exc)
+
+    def _step_down() -> None:
+        for scheduler in _SCHEDULERS:
+            if scheduler.running:
+                scheduler.pause()
+
+    global _scheduler_leader
+    _scheduler_leader = LeaderElection(
+        redis_client,
+        "chronos:leader:scheduler",
+        on_acquire=_become_leader,
+        on_release=_step_down,
+    )
+    await _scheduler_leader.start()
 
 
 async def _bootstrap_authz() -> None:
@@ -248,32 +280,59 @@ async def recover_incomplete_research() -> list[str]:
     return run_ids
 
 
+async def _tenants_with_interrupted_workflows() -> list[str]:
+    """Return every org that has a workflow run in an interrupted state.
+
+    Recovery is per-tenant, so a hardcoded ``"default"`` silently strands every
+    other tenant's interrupted runs after a restart. Enumerate the distinct
+    organization_ids instead.
+    """
+    from connectors.framework.workflows import INTERRUPTED_RUN_STATES
+
+    runs = await reflect_table("workflow_runs")
+    async with engine.begin() as conn:
+        rows = (
+            await conn.execute(
+                select(runs.c.organization_id)
+                .where(runs.c.status.in_(sorted(INTERRUPTED_RUN_STATES)))
+                .distinct()
+            )
+        ).all()
+    return [str(row[0]) for row in rows]
+
+
 async def recover_incomplete_workflows() -> list[str]:
     from connectors.framework.queue_factory import connector_execution_queue
     from connectors.framework.repository import DatabaseConnectorRepository
     from connectors.framework.workflows import WorkflowRuntime
 
-    return await WorkflowRuntime(DatabaseConnectorRepository(), connector_execution_queue()).recover_interrupted_runs(tenant_id="default")
+    runtime = WorkflowRuntime(DatabaseConnectorRepository(), connector_execution_queue())
+    recovered: list[str] = []
+    for tenant_id in await _tenants_with_interrupted_workflows():
+        recovered.extend(await runtime.recover_interrupted_runs(tenant_id=tenant_id))
+    return recovered
 
 
 @app.on_event("shutdown")
 async def stop_schedulers() -> None:
-    for scheduler in (profile_synthesis.scheduler, context_update.scheduler, scheduled_tasks.scheduler):
+    global _scheduler_leader
+    if _scheduler_leader is not None:
+        await _scheduler_leader.stop()
+        _scheduler_leader = None
+    for scheduler in _SCHEDULERS:
         if scheduler.running:
             scheduler.shutdown(wait=False)
     await task_runner.stop_runner()
 
 
-@app.get("/health")
-async def health() -> dict:
-    """Deep health check — verifies all critical dependencies.
+async def _core_health_checks() -> dict[str, str]:
+    """Check core infrastructure dependencies. No external/billed calls.
 
-    Returns only ``ok``/``error``/``degraded`` per dependency. Exception detail
-    (which can leak DSN fragments, internal hostnames, and provider error
-    bodies) is logged server-side, never returned to unauthenticated callers.
+    Returns only ``ok``/``error`` per dependency. Exception detail (which can
+    leak DSN fragments, internal hostnames, and provider error bodies) is logged
+    server-side, never returned to unauthenticated callers.
     """
     import logging
-    import time
 
     log = logging.getLogger("chronos.health")
     checks: dict[str, str] = {}
@@ -308,12 +367,48 @@ async def health() -> dict:
         log.exception("health check: object storage")
         checks[storage_health_name] = "error"
 
+    return checks
+
+
+@app.get("/health")
+async def health() -> dict:
+    """Liveness/readiness probe — core dependencies only.
+
+    Deliberately does NOT call the model provider: a model completion costs
+    money and is unauthenticated here, so probing it would let any caller drive
+    billed requests and would tie readiness to a third party. Use the admin-only
+    ``/health/deep`` for a model-reachability probe.
+    """
+    import time
+
+    checks = await _core_health_checks()
+    overall = "ok" if all(v == "ok" for v in checks.values()) else "degraded"
+    return {"status": overall, "checks": checks, "ts": time.time()}
+
+
+@app.get("/health/deep")
+async def health_deep(member=Depends(get_current_member)) -> dict:
+    """Admin-only deep health check — includes a billed model-reachability probe.
+
+    Gated behind ``view_admin_console`` so the (paid) model call can only be
+    triggered by an authenticated admin/owner, never an anonymous caller.
+    """
+    import logging
+    import time
+
+    from core import permissions
+
+    await permissions.check(member, "view_admin_console", "health")
+
+    log = logging.getLogger("chronos.health")
+    checks = await _core_health_checks()
+
     # Model reachability (quick probe — no retries)
     try:
         import litellm
         from core.config import settings as cfg
         from core.llm import model_kwargs
-        probe = await litellm.acompletion(
+        await litellm.acompletion(
             **model_kwargs(cfg.fast_model, messages=[{"role": "user", "content": "ping"}], stream=False),
             max_tokens=1,
         )

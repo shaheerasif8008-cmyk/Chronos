@@ -109,14 +109,26 @@ async def test_demo_gmail_drafts_are_written_to_tmp_jsonl(monkeypatch, tmp_path)
     monkeypatch.setattr(gmail, "DEMO_DRAFTS_PATH", draft_path)
 
     result = await gmail.gmail_connector._create_demo_draft(
-        {"to": "lead@example.com", "subject": "Proof", "body": "Hello"}
+        {"to": "lead@example.com", "subject": "Proof", "body": "Hello"}, "org-1"
     )
 
+    # Demo drafts are namespaced per tenant so one org's drafts never land in
+    # another org's file.
+    expected_path = tmp_path / "chronos_demo_drafts.org-1.jsonl"
     assert result.summary == "Demo draft recorded: demo-draft-1"
-    assert result.data["path"] == str(draft_path)
-    lines = draft_path.read_text().splitlines()
+    assert result.data["path"] == str(expected_path)
+    lines = expected_path.read_text().splitlines()
     assert len(lines) == 1
-    assert json.loads(lines[0])["to"] == "lead@example.com"
+    record = json.loads(lines[0])
+    assert record["to"] == "lead@example.com"
+    assert record["organization_id"] == "org-1"
+
+    # A second tenant writing a draft gets its own file and its own counter.
+    other = await gmail.gmail_connector._create_demo_draft(
+        {"to": "other@example.com", "subject": "Other", "body": "Hi"}, "org-2"
+    )
+    assert other.data["id"] == "demo-draft-1"
+    assert other.data["path"] == str(tmp_path / "chronos_demo_drafts.org-2.jsonl")
 
 
 def test_approved_approval_without_draft_result_is_ready_for_execution():
