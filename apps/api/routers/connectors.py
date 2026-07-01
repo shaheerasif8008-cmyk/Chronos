@@ -48,6 +48,14 @@ async def _composio_oauth_start(provider: str, member: Member) -> dict[str, str]
     """
     from connectors import composio_client
 
+    if not composio_client.is_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="COMPOSIO_API_KEY and composio SDK are required for managed auth",
+        )
+    if not composio_client.is_composio_provider(provider):
+        raise HTTPException(status_code=404, detail=f"{provider} is not a Composio-managed provider")
+
     state = _gmail_module()._build_state(str(member.id), str(member.organization_id))
     redirect_url = (
         f"{settings.composio_callback_base_url}/connectors/{provider}/composio-callback?state={state}"
@@ -631,8 +639,8 @@ async def composio_oauth_callback(
     """Composio managed-auth callback — verifies the connection and records it.
 
     Composio holds the OAuth tokens; Chronos persists only the connector row with
-    a ``composio:<entity>`` reference (no secret) so the catalog shows it as
-    connected and the broker routes the provider through Composio.
+    a ``composio:<provider>:<entity>`` reference (no secret) so the catalog
+    shows it as connected and the broker routes the provider through Composio.
     """
     from connectors import composio_client
     from connectors.oauth_apps import get_app
@@ -641,6 +649,12 @@ async def composio_oauth_callback(
 
     if error:
         return _connectors_redirect(connector_error=error, connector_provider=provider)
+
+    if not composio_client.is_configured():
+        return _connectors_redirect(
+            connector_error="Composio managed auth is not configured.",
+            connector_provider=provider,
+        )
 
     try:
         member_id, org_id = _gmail_module()._verify_state(state)
@@ -659,8 +673,10 @@ async def composio_oauth_callback(
         )
 
     app = get_app(provider)
-    connector_id = f"{provider}:{org_id}:{member_id}"
-    vault_ref = f"composio:{entity}"
+    if not app:
+        raise HTTPException(status_code=404, detail=f"Unknown provider: {provider}")
+    connector_id = composio_client.managed_connector_id(provider, org_id, member_id)
+    vault_ref = composio_client.managed_vault_ref(provider, entity)
     connectors_table = await reflect_table("connectors")
     async with engine.begin() as conn:
         existing = (
@@ -709,7 +725,13 @@ async def disconnect_connector(
     await permissions.check(member, f"disconnect_{provider}", str(member.organization_id))
 
     connectors_table = await reflect_table("connectors")
-    connector_id = f"{provider}:{member.organization_id}:{member.id}"
+    from connectors import composio_client
+
+    connector_id = (
+        composio_client.managed_connector_id(provider, str(member.organization_id), str(member.id))
+        if composio_client.is_configured() and composio_client.is_composio_provider(provider)
+        else f"{provider}:{member.organization_id}:{member.id}"
+    )
     async with engine.begin() as conn:
         row = (
             await conn.execute(
@@ -729,7 +751,7 @@ async def disconnect_connector(
             )
             .values(status="disconnected")
         )
-    if row and row.get("vault_ref"):
+    if row and row.get("vault_ref") and not str(row["vault_ref"]).startswith("composio:"):
         await vault_delete(str(row["vault_ref"]), actor_id=str(member.id), org_id=str(member.organization_id))
 
     await audit.log(

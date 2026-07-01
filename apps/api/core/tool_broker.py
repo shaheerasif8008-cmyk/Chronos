@@ -19,7 +19,7 @@ risk_registry = importlib.import_module("core.risk_registry")
 trust = importlib.import_module("core.trust")
 from core.connector_health import connector_tier, degraded_note
 from core.config import settings
-from core.exceptions import ApprovalRequired, LoopDetected, RateLimitExceeded, SafetyLimitViolation
+from core.exceptions import ApprovalRequired, ConnectorNotFound, LoopDetected, RateLimitExceeded, SafetyLimitViolation
 from core.governance import enforce_request_rate, suspend_org
 from core.models import AgentContext, ToolResult
 from core.redis import redis_client
@@ -457,9 +457,25 @@ class ToolBroker:
         # when external OAuth or browser dependencies are not configured.
         provider = tool.split(".")[0]
         tier = await connector_tier(provider)
-        from connectors.composio_client import is_composio_provider, is_configured as composio_configured
+        from connectors.composio_client import (
+            entity_id as composio_entity_id,
+            is_composio_provider,
+            is_configured as composio_configured,
+            parse_managed_vault_ref,
+        )
         if composio_configured() and is_composio_provider(provider):
             # Composio managed auth — credentials live in Composio, not the vault.
+            # Require an active connector row for this provider/entity before the
+            # sentinel dispatch, otherwise a user with no managed connection would
+            # get a generic SDK failure instead of an honest setup error.
+            if tier not in {"demo", "fixture"}:
+                from connectors.registry import get as registry_get
+
+                connector = await registry_get(agent, tool)
+                parsed = parse_managed_vault_ref(connector.vault_ref)
+                expected_entity = composio_entity_id(agent.org_id, agent.member_id)
+                if not parsed or parsed != (provider, expected_entity):
+                    raise ConnectorNotFound(agent.org_id, provider)
             # The "composio" sentinel tells _route() to dispatch to the Composio
             # connector; promote a fixture tier to live so it makes a real call.
             vault_ref = "composio"

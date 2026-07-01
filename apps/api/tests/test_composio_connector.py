@@ -7,6 +7,8 @@ monkeypatched, so these run without composio-core installed.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from connectors import composio_client
@@ -55,12 +57,58 @@ def test_resolve_action_maps_known_gmail_tools():
     assert params == {"query": "from:x", "max_results": 5}
 
 
-def test_resolve_action_generic_passthrough_with_explicit_action():
+def test_resolve_action_maps_managed_slack_github_and_google_drive_tools():
+    slug, params = composio_client.resolve_action(
+        "slack.send",
+        {"channel": "C123", "text": "standup notes", "thread_ts": "170000.1"},
+    )
+    assert slug == "SLACK_CHAT_POST_MESSAGE"
+    assert params == {"channel": "C123", "text": "standup notes", "thread_ts": "170000.1"}
+
+    slug, params = composio_client.resolve_action(
+        "slack.read",
+        {"channel": "C123", "limit": "5"},
+    )
+    assert slug == "SLACK_FETCH_CONVERSATION_HISTORY"
+    assert params == {"channel": "C123", "limit": 5}
+
+    slug, params = composio_client.resolve_action("github.create_issue", {
+        "owner": "acme",
+        "repo": "app",
+        "title": "Bug",
+        "body": "Steps",
+        "labels": "bug",
+    })
+    assert slug == "GITHUB_CREATE_AN_ISSUE"
+    assert params == {"owner": "acme", "repo": "app", "title": "Bug", "body": "Steps", "labels": ["bug"]}
+
+    slug, params = composio_client.resolve_action("github.read", {
+        "owner": "acme",
+        "repo": "app",
+        "path": "README.md",
+        "ref": "main",
+    })
+    assert slug == "GITHUB_GET_REPOSITORY_CONTENT"
+    assert params == {"owner": "acme", "repo": "app", "path": "README.md", "ref": "main"}
+
+    slug, params = composio_client.resolve_action("google_drive.search", {
+        "query": "name contains 'roadmap'",
+        "max_results": "3",
+    })
+    assert slug == "GOOGLEDRIVE_FIND_FILE"
+    assert params == {"query": "name contains 'roadmap'", "page_size": 3}
+
+    slug, params = composio_client.resolve_action("google_drive.read", {"file_id": "file-1"})
+    assert slug == "GOOGLEDRIVE_GET_FILE_METADATA"
+    assert params == {"file_id": "file-1"}
+
+
+def test_resolve_action_generic_passthrough_is_limited_to_api_tool():
     slug, params = composio_client.resolve_action(
         "slack.api",
-        {"composio_action": "SLACK_SENDS_A_MESSAGE", "channel": "#general", "text": "hi", "__org_id": "acme"},
+        {"composio_action": "SLACK_SEND_MESSAGE", "channel": "#general", "text": "hi", "__org_id": "acme"},
     )
-    assert slug == "SLACK_SENDS_A_MESSAGE"
+    assert slug == "SLACK_SEND_MESSAGE"
     # Internal (__) and routing keys are stripped; real params pass through.
     assert params == {"channel": "#general", "text": "hi"}
 
@@ -68,6 +116,40 @@ def test_resolve_action_generic_passthrough_with_explicit_action():
 def test_resolve_action_raises_without_mapping_or_explicit_action():
     with pytest.raises(ValueError):
         composio_client.resolve_action("notion.search", {"query": "roadmap"})
+
+
+def test_managed_vault_ref_is_provider_and_entity_scoped():
+    ref = composio_client.managed_vault_ref("slack", "acme:user-1")
+    assert ref == "composio:slack:acme:user-1"
+    assert composio_client.parse_managed_vault_ref(ref) == ("slack", "acme:user-1")
+    assert composio_client.parse_managed_vault_ref("composio:acme:user-1") is None
+
+
+def test_managed_connector_id_matches_entity_scope(monkeypatch):
+    monkeypatch.setattr(composio_client.settings, "composio_entity_scope", "member")
+    assert composio_client.managed_connector_id("slack", "acme", "user-1") == "slack:acme:user-1"
+    monkeypatch.setattr(composio_client.settings, "composio_entity_scope", "org")
+    assert composio_client.managed_connector_id("slack", "acme", "user-1") == "slack:acme"
+
+
+@pytest.mark.asyncio
+async def test_connector_health_reports_composio_managed_setup_for_core_saas(monkeypatch):
+    from core import connector_health
+
+    async def fake_browser_available():
+        return False, "browser unavailable"
+
+    monkeypatch.setattr(composio_client, "is_configured", lambda: True)
+    monkeypatch.setattr(connector_health, "_browser_available", fake_browser_available)
+    connector_health._CACHE = None
+
+    health = await connector_health.check_connectors(refresh=True)
+
+    for provider in ("gmail", "slack", "github", "google_drive"):
+        assert health[provider]["tier"] == "live"
+        assert health[provider]["auth"] == "composio_managed"
+        assert "Composio managed auth" in health[provider]["reason"]
+        assert "Connect" in health[provider]["setup"]
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +199,31 @@ async def test_connector_executes_and_normalises_success(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_connector_executes_slack_mapping_without_explicit_composio_action(monkeypatch):
+    captured = {}
+
+    async def fake_execute(action, params, *, entity):
+        captured.update(action=action, params=params, entity=entity)
+        return {"successful": True, "data": {"ok": True, "channel": params["channel"]}}
+
+    monkeypatch.setattr(composio_client, "is_configured", lambda: True)
+    monkeypatch.setattr(composio_client, "execute_action", fake_execute)
+
+    result = await composio_connector.execute(
+        "slack.send",
+        {"channel": "C123", "text": "hi", "__connector_tier": "live", "__org_id": "acme"},
+        _agent(),
+    )
+
+    assert result.data == {"ok": True, "channel": "C123"}
+    assert captured == {
+        "action": "SLACK_CHAT_POST_MESSAGE",
+        "params": {"channel": "C123", "text": "hi"},
+        "entity": "acme:user-1",
+    }
+
+
+@pytest.mark.asyncio
 async def test_connector_reports_failure_response(monkeypatch):
     async def fake_execute(action, params, *, entity):
         return {"successful": False, "error": "boom"}
@@ -161,3 +268,71 @@ async def test_route_dispatches_composio_sentinel(monkeypatch):
 
     result = await tool_broker._route(_agent(), "slack.api", {"text": "hi"}, vault_ref="composio", tier="live")
     assert result.data["routed"] == "slack.api"
+
+
+@pytest.mark.asyncio
+async def test_broker_requires_active_managed_connector_for_composio_live_call(monkeypatch):
+    from core import tool_broker
+    from core.exceptions import ConnectorNotFound
+    import connectors.registry as registry
+
+    async def fake_noop(*args, **kwargs):
+        return None
+
+    async def fake_allow(*args, **kwargs):
+        return True
+
+    async def fake_policy(*args, **kwargs):
+        return {"enabled": True}
+
+    async def fake_autonomy(*args, **kwargs):
+        return "supervised"
+
+    async def fake_gate(*args, **kwargs):
+        return SimpleNamespace(allow=True, reason="")
+
+    async def fake_overrides(*args, **kwargs):
+        return {}
+
+    async def fake_level(*args, **kwargs):
+        return SimpleNamespace(successes=3)
+
+    async def fake_degraded(*args, **kwargs):
+        return None
+
+    async def fake_tier(*args, **kwargs):
+        return "live"
+
+    async def fake_route(agent, tool, args, vault_ref, tier="live"):
+        return ToolResult(data={"vault_ref": vault_ref, "tier": tier}, summary="routed")
+
+    monkeypatch.setattr(tool_broker.permissions, "check", fake_allow)
+    monkeypatch.setattr(tool_broker, "_check_rate_limit", fake_noop)
+    monkeypatch.setattr(tool_broker, "_check_loop", fake_noop)
+    monkeypatch.setattr(tool_broker, "tool_policy", fake_policy)
+    monkeypatch.setattr(tool_broker, "workspace_autonomy", fake_autonomy)
+    monkeypatch.setattr(tool_broker.risk_registry, "get_overrides", fake_overrides)
+    monkeypatch.setattr(tool_broker.autonomy, "evaluate", fake_gate)
+    monkeypatch.setattr(tool_broker.trust, "get_trust_level", fake_level)
+    monkeypatch.setattr(tool_broker.trust, "novelty_from_successes", lambda successes: 0.0)
+    monkeypatch.setattr(tool_broker.trust, "record_outcome", fake_noop)
+    monkeypatch.setattr(tool_broker.audit, "log", fake_noop)
+    monkeypatch.setattr(tool_broker, "connector_tier", fake_tier)
+    monkeypatch.setattr(tool_broker, "degraded_note", fake_degraded)
+    monkeypatch.setattr(tool_broker, "_route", fake_route)
+    monkeypatch.setattr(composio_client, "is_configured", lambda: True)
+    monkeypatch.setattr(composio_client.settings, "composio_entity_scope", "member")
+
+    async def wrong_connector(agent, tool):
+        return SimpleNamespace(vault_ref="composio:slack:acme:someone-else")
+
+    monkeypatch.setattr(registry, "get", wrong_connector)
+    with pytest.raises(ConnectorNotFound):
+        await tool_broker.tool_broker.execute(_agent(), "slack.send", {"channel": "C123", "text": "hi"})
+
+    async def matching_connector(agent, tool):
+        return SimpleNamespace(vault_ref="composio:slack:acme:user-1")
+
+    monkeypatch.setattr(registry, "get", matching_connector)
+    result = await tool_broker.tool_broker.execute(_agent(), "slack.send", {"channel": "C123", "text": "hi"})
+    assert result.data == {"vault_ref": "composio", "tier": "live"}

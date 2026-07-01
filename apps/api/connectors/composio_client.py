@@ -80,11 +80,115 @@ def _gmail_send_params(args: dict[str, Any]) -> dict[str, Any]:
     return params
 
 
+def _as_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_list(value: Any) -> list[Any]:
+    if value is None or value == "":
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return [value]
+
+
+def _copy_params(args: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
+    return {key: args[key] for key in keys if args.get(key) not in (None, "")}
+
+
+def _slack_send_params(args: dict[str, Any]) -> dict[str, Any]:
+    return _copy_params(args, ("channel", "text", "thread_ts", "blocks", "attachments"))
+
+
+def _slack_read_params(args: dict[str, Any]) -> dict[str, Any]:
+    params = _copy_params(args, ("channel", "cursor", "oldest", "latest", "inclusive"))
+    params["limit"] = _as_int(args.get("limit"), 20)
+    return params
+
+
+def _slack_search_params(args: dict[str, Any]) -> dict[str, Any]:
+    params = {
+        "query": str(args.get("query") or ""),
+        "count": _as_int(args.get("count", args.get("max_results")), 20),
+    }
+    if args.get("sort"):
+        params["sort"] = args["sort"]
+    if args.get("sort_dir"):
+        params["sort_dir"] = args["sort_dir"]
+    return params
+
+
+def _github_create_issue_params(args: dict[str, Any]) -> dict[str, Any]:
+    params = _copy_params(args, ("owner", "repo", "title", "body", "assignees", "milestone"))
+    labels = _as_list(args.get("labels"))
+    if labels:
+        params["labels"] = labels
+    return params
+
+
+def _github_read_params(args: dict[str, Any]) -> dict[str, Any]:
+    return _copy_params(args, ("owner", "repo", "path", "ref"))
+
+
+def _github_search_params(args: dict[str, Any]) -> dict[str, Any]:
+    params = {
+        "query": str(args.get("query") or args.get("q") or ""),
+        "per_page": _as_int(args.get("per_page", args.get("max_results")), 10),
+    }
+    if args.get("page"):
+        params["page"] = _as_int(args.get("page"), 1)
+    return params
+
+
+def _drive_search_params(args: dict[str, Any]) -> dict[str, Any]:
+    params = {
+        "query": str(args.get("query") or args.get("q") or ""),
+        "page_size": _as_int(args.get("page_size", args.get("max_results")), 10),
+    }
+    if args.get("page_token"):
+        params["page_token"] = args["page_token"]
+    return params
+
+
+def _drive_read_params(args: dict[str, Any]) -> dict[str, Any]:
+    return _copy_params(args, ("file_id", "fields", "supports_all_drives"))
+
+
+def _drive_upload_params(args: dict[str, Any]) -> dict[str, Any]:
+    return _copy_params(
+        args,
+        (
+            "file_name",
+            "name",
+            "mime_type",
+            "content",
+            "parent_id",
+            "folder_id",
+            "drive_id",
+            "supports_all_drives",
+        ),
+    )
+
+
 _ACTION_MAP: dict[str, tuple[str, Callable[[dict[str, Any]], dict[str, Any]]]] = {
     "gmail.read_inbox": ("GMAIL_FETCH_EMAILS", _gmail_fetch_params),
     "gmail.search": ("GMAIL_FETCH_EMAILS", _gmail_search_params),
     "gmail.draft": ("GMAIL_CREATE_EMAIL_DRAFT", _gmail_draft_params),
     "gmail.send": ("GMAIL_SEND_EMAIL", _gmail_send_params),
+    "slack.send": ("SLACK_CHAT_POST_MESSAGE", _slack_send_params),
+    "slack.read": ("SLACK_FETCH_CONVERSATION_HISTORY", _slack_read_params),
+    "slack.search": ("SLACK_SEARCH_MESSAGES", _slack_search_params),
+    "github.create_issue": ("GITHUB_CREATE_AN_ISSUE", _github_create_issue_params),
+    "github.read": ("GITHUB_GET_REPOSITORY_CONTENT", _github_read_params),
+    "github.search": ("GITHUB_SEARCH_REPOSITORIES", _github_search_params),
+    "google_drive.search": ("GOOGLEDRIVE_FIND_FILE", _drive_search_params),
+    "google_drive.read": ("GOOGLEDRIVE_GET_FILE_METADATA", _drive_read_params),
+    "google_drive.upload": ("GOOGLEDRIVE_UPLOAD_FILE", _drive_upload_params),
 }
 
 _INTERNAL_ARG_PREFIX = "__"
@@ -124,6 +228,31 @@ def entity_id(org_id: str, member_id: str | None) -> str:
     return f"{org_id}:{member_id}"
 
 
+def managed_vault_ref(provider: str, entity: str) -> str:
+    """Non-secret connector reference for a Composio-managed provider/entity."""
+    return f"composio:{provider}:{entity}"
+
+
+def managed_connector_id(provider: str, org_id: str, member_id: str | None) -> str:
+    """Connector table id that matches the configured Composio entity scope."""
+    if getattr(settings, "composio_entity_scope", "member") == "org" or not member_id:
+        return f"{provider}:{org_id}"
+    return f"{provider}:{org_id}:{member_id}"
+
+
+def parse_managed_vault_ref(vault_ref: str) -> tuple[str, str] | None:
+    """Parse a provider-scoped Composio vault ref, or None for legacy/invalid refs."""
+    parts = vault_ref.split(":", 2)
+    if (
+        len(parts) != 3
+        or parts[0] != "composio"
+        or parts[1] not in _APP_SLUGS
+        or not parts[2]
+    ):
+        return None
+    return parts[1], parts[2]
+
+
 @lru_cache(maxsize=1)
 def _toolset():
     """Return a cached ComposioToolSet. Raises if the SDK/key are unavailable."""
@@ -146,6 +275,9 @@ def resolve_action(tool: str, args: dict[str, Any]) -> tuple[str, dict[str, Any]
     if tool in _ACTION_MAP:
         slug, adapter = _ACTION_MAP[tool]
         return slug, adapter(args)
+
+    if not tool.endswith(".api"):
+        raise ValueError(f"No Composio action mapping for '{tool}'.")
 
     explicit = args.get("composio_action") or args.get("action")
     if not explicit:
