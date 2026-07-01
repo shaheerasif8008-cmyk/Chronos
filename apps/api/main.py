@@ -298,7 +298,7 @@ async def _tenants_with_interrupted_workflows() -> list[str]:
                 .distinct()
             )
         ).all()
-    return [str(row[0]) for row in rows]
+    return [str(row[0]) for row in rows if row[0]]
 
 
 async def recover_incomplete_workflows() -> list[str]:

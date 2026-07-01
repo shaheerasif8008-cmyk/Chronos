@@ -291,3 +291,85 @@ async def test_recover_incomplete_workflows_covers_all_tenants():
     assert org_a in tenants
     assert org_b in tenants
     assert "default" not in {org_a, org_b}  # guard: these are non-default tenants
+
+
+@pytest.mark.asyncio
+async def test_startup_workflow_recovery_hands_non_default_tenant_to_runtime(monkeypatch):
+    import main
+    from connectors.framework.workflows import INTERRUPTED_RUN_STATES
+
+    recovered_tenants: list[str] = []
+
+    class FakeColumn:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def in_(self, values: list[str]) -> tuple[str, tuple[str, ...]]:
+            assert set(values) == INTERRUPTED_RUN_STATES
+            return ("status-in", tuple(values))
+
+    class FakeWorkflowRuns:
+        class c:
+            organization_id = FakeColumn("organization_id")
+            status = FakeColumn("status")
+
+    class FakeSelect:
+        def where(self, clause: tuple[str, tuple[str, ...]]) -> "FakeSelect":
+            assert clause[0] == "status-in"
+            return self
+
+        def distinct(self) -> "FakeSelect":
+            return self
+
+    class FakeResult:
+        def all(self) -> list[tuple[str | None]]:
+            return [("org-acme",), (None,)]
+
+    class FakeConn:
+        async def __aenter__(self) -> "FakeConn":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def execute(self, stmt: FakeSelect) -> FakeResult:
+            return FakeResult()
+
+    class FakeEngine:
+        def begin(self) -> FakeConn:
+            return FakeConn()
+
+    async def fake_reflect_table(name: str) -> type[FakeWorkflowRuns]:
+        assert name == "workflow_runs"
+        return FakeWorkflowRuns
+
+    def fake_select(*columns: FakeColumn) -> FakeSelect:
+        assert columns == (FakeWorkflowRuns.c.organization_id,)
+        return FakeSelect()
+
+    class FakeRuntime:
+        def __init__(self, repo, queue) -> None:
+            self.repo = repo
+            self.queue = queue
+
+        async def recover_interrupted_runs(self, *, tenant_id: str) -> list[str]:
+            recovered_tenants.append(tenant_id)
+            return [f"{tenant_id}:run-1"]
+
+    class FakeRepository:
+        pass
+
+    monkeypatch.setattr(main, "engine", FakeEngine())
+    monkeypatch.setattr(main, "reflect_table", fake_reflect_table)
+    monkeypatch.setattr(main, "select", fake_select)
+    monkeypatch.setattr("connectors.framework.workflows.WorkflowRuntime", FakeRuntime)
+    monkeypatch.setattr("connectors.framework.repository.DatabaseConnectorRepository", FakeRepository)
+    monkeypatch.setattr(
+        "connectors.framework.queue_factory.connector_execution_queue",
+        lambda: object(),
+    )
+
+    recovered = await main.recover_incomplete_workflows()
+
+    assert recovered == ["org-acme:run-1"]
+    assert recovered_tenants == ["org-acme"]
