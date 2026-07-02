@@ -35,6 +35,24 @@ from routers import activity, admin, agents, approvals, artifact_share, artifact
 
 app = FastAPI(title="Chronos API", version="0.1.0")
 
+
+# Catch-all error boundary. Registered BEFORE CORSMiddleware so it sits INSIDE
+# it (Starlette: first-added middleware is innermost): an unhandled exception
+# becomes a JSON 500 that flows back out through CORSMiddleware and gets CORS
+# headers. Without this, unhandled exceptions bypass CORS entirely and the
+# browser reports an unreadable "Failed to fetch" instead of the real error.
+@app.middleware("http")
+async def _json_error_boundary(request: Request, call_next):
+    try:
+        return await call_next(request)
+    except Exception:  # noqa: BLE001 — last-resort boundary for unhandled errors
+        logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Internal server error. The failure was logged."},
+        )
+
+
 # CORS: in production, pin to the configured frontend origin only. The broad
 # localhost regex is dev-only attack surface (any local app on port 30xx could
 # otherwise drive credentialed requests), so it is not registered in production.
