@@ -85,6 +85,10 @@ class ChatRequest(BaseModel):
     workspace_id: str | None = None
     project_id: str | None = None
     attachment_ids: list[str] = Field(default_factory=list)
+    # Per-conversation connector/tool toggles (the in-chat "Search and tools"
+    # menu): tool families ("gmail") or exact names ("gmail__send") to hide
+    # from the model for this turn.
+    disabled_tools: list[str] = Field(default_factory=list)
 
 
 async def _create_conversation(member: Member, title: str, project_id: str | None = None) -> str:
@@ -859,6 +863,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
                 mode=req.mode,
                 user_content=_user_content,
                 reasoning_effort=effective_reasoning_effort,
+                disabled_tools=getattr(req, "disabled_tools", None) or None,
             )
         ),
         media_type="text/event-stream",

@@ -11,6 +11,8 @@ const GOV_TABS = [
   { id: "approvals", label: "Approvals" },
   { id: "policies", label: "Policies" },
   { id: "mcp", label: "MCP servers" },
+  { id: "traces", label: "Traces" },
+  { id: "jobs", label: "Jobs" },
 ] as const;
 type GovTab = typeof GOV_TABS[number]["id"];
 
@@ -44,6 +46,8 @@ export default function ConnectorGovernanceScreen() {
   const [approvals, setApprovals] = useState<Row[]>([]);
   const [policies, setPolicies] = useState<Row[]>([]);
   const [mcp, setMcp] = useState<{ servers: Row[]; discovery_logs: Row[] }>({ servers: [], discovery_logs: [] });
+  const [traces, setTraces] = useState<Row[]>([]);
+  const [jobs, setJobs] = useState<Row[]>([]);
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -52,6 +56,11 @@ export default function ConnectorGovernanceScreen() {
   const [mcpName, setMcpName] = useState("");
   const [mcpTransport, setMcpTransport] = useState<"local" | "remote">("remote");
   const [mcpTarget, setMcpTarget] = useState("");
+
+  // Policy create form
+  const [policyConnector, setPolicyConnector] = useState("");
+  const [policyAction, setPolicyAction] = useState("");
+  const [policyDecision, setPolicyDecision] = useState<"allow" | "deny" | "require_approval">("require_approval");
 
   const load = useCallback(async (which: GovTab) => {
     setLoading(true);
@@ -62,6 +71,8 @@ export default function ConnectorGovernanceScreen() {
       else if (which === "approvals") setApprovals(await (await apiFetch("/connectors/approvals?status=pending")).json());
       else if (which === "policies") setPolicies(await (await apiFetch("/connectors/policies")).json());
       else if (which === "mcp") setMcp(await (await apiFetch("/connectors/mcp")).json());
+      else if (which === "traces") setTraces(await (await apiFetch("/connectors/execution-traces")).json());
+      else if (which === "jobs") setJobs(await (await apiFetch("/connectors/execution-jobs")).json());
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unable to load");
     } finally {
@@ -118,6 +129,41 @@ export default function ConnectorGovernanceScreen() {
       await load("mcp");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unable to register MCP server");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function createPolicy() {
+    setBusy("policy-create");
+    setError(null);
+    try {
+      await apiFetch("/connectors/policies", {
+        method: "POST",
+        body: JSON.stringify({
+          connector_id: policyConnector.trim() || null,
+          action_name: policyAction.trim() || null,
+          decision: policyDecision,
+        }),
+      });
+      setPolicyConnector("");
+      setPolicyAction("");
+      await load("policies");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to create policy");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function cancelJob(id: string) {
+    setBusy(id);
+    setError(null);
+    try {
+      await apiFetch(`/connectors/execution-jobs/${id}/cancel`, { method: "POST" });
+      await load("jobs");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to cancel job");
     } finally {
       setBusy(null);
     }
@@ -223,6 +269,22 @@ export default function ConnectorGovernanceScreen() {
 
       {!loading && tab === "policies" && (
         <div className="space-y-2">
+          <div className="surface border border-soft rounded-lg p-3">
+            <div className="text-[13px] font-medium mb-2">New policy</div>
+            <div className="flex flex-wrap gap-2">
+              <input value={policyConnector} onChange={e => setPolicyConnector(e.target.value)} placeholder="Connector id (blank = any)"
+                     className="surface border border-soft rounded-md px-3 py-1.5 text-[12.5px] outline-none w-52" />
+              <input value={policyAction} onChange={e => setPolicyAction(e.target.value)} placeholder="Action name (blank = any)"
+                     className="surface border border-soft rounded-md px-3 py-1.5 text-[12.5px] outline-none w-52" />
+              <select value={policyDecision} onChange={e => setPolicyDecision(e.target.value as typeof policyDecision)}
+                      className="surface border border-soft rounded-md px-3 py-1.5 text-[12.5px] outline-none">
+                <option value="allow">allow</option>
+                <option value="require_approval">require_approval</option>
+                <option value="deny">deny</option>
+              </select>
+              <button className="btn btn-accent btn-sm" disabled={busy === "policy-create"} onClick={() => void createPolicy()}>Create</button>
+            </div>
+          </div>
           {policies.length === 0 && <div className="px-4 py-6 text-[13px]" style={{ color: "var(--text-dim)" }}>No connector policies configured. Default governance applies.</div>}
           {policies.map((row, i) => {
             const id = field(row, "id");
@@ -239,6 +301,44 @@ export default function ConnectorGovernanceScreen() {
                   </div>
                 </div>
                 <button className="btn btn-ghost btn-sm flex-shrink-0" disabled={busy === id} onClick={() => void deletePolicy(id)}>Delete</button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {!loading && tab === "traces" && (
+        <div className="surface border border-soft rounded-lg divide-y" style={{ borderColor: "var(--border-soft)" }}>
+          {traces.length === 0 && <div className="px-4 py-6 text-[13px]" style={{ color: "var(--text-dim)" }}>No execution traces recorded yet.</div>}
+          {traces.map((row, i) => (
+            <div key={field(row, "id") || i} className="px-4 py-2.5 text-[12.5px] flex items-start gap-3">
+              <span className="mt-1 inline-block w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ background: statusColor(field(row, "status")) }} />
+              <div className="min-w-0 flex-1">
+                <div className="font-medium truncate">{field(row, "action_name", "action") || "trace"} · {field(row, "connector_id")}</div>
+                <div className="truncate" style={{ color: "var(--text-dim)" }}>{field(row, "status")} · {field(row, "duration_ms") && `${field(row, "duration_ms")}ms`}</div>
+                <div className="text-[11.5px]" style={{ color: "var(--text-faint)" }}>{labelTime(row.started_at)}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {!loading && tab === "jobs" && (
+        <div className="space-y-2">
+          {jobs.length === 0 && <div className="px-4 py-6 text-[13px]" style={{ color: "var(--text-dim)" }}>No queued connector jobs.</div>}
+          {jobs.map((row, i) => {
+            const id = field(row, "id");
+            const status = field(row, "status");
+            return (
+              <div key={id || i} className="surface border border-soft rounded-lg p-3 flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="text-[13px] font-medium truncate">{field(row, "action_name", "action") || "job"} · {field(row, "connector_id")}</div>
+                  <div className="text-[11.5px]" style={{ color: "var(--text-dim)" }}>{status} · attempts {field(row, "attempts") || "0"}</div>
+                  <div className="text-[11.5px]" style={{ color: "var(--text-faint)" }}>{labelTime(row.created_at)}</div>
+                </div>
+                {["queued", "pending", "running"].includes(status) && (
+                  <button className="btn btn-ghost btn-sm flex-shrink-0" disabled={busy === id} onClick={() => void cancelJob(id)}>Cancel</button>
+                )}
               </div>
             );
           })}

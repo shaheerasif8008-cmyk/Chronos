@@ -16,16 +16,30 @@ def _score_skill(message: str, skill: dict) -> int:
     return len(tokens & terms)
 
 
-async def _connectors_available(required: list[str]) -> dict[str, bool]:
-    """Return {connector: is_live} for each required connector."""
+async def _connectors_available(required: list[str], org_id: str = "default") -> dict[str, bool]:
+    """Return {connector: is_available} for each required connector.
+
+    A connector counts as available when the org actually connected it
+    (active connector row — the Anthropic model) or when its runtime family
+    is live without a per-user connection (browser, fs, code, …).
+    """
     if not required:
         return {}
+    connected: set[str] = set()
+    try:
+        from core.connector_tools import connected_providers
+        connected = set((await connected_providers(org_id)).keys())
+    except Exception:
+        connected = set()
     try:
         from core.connector_health import check_connectors
         health = await check_connectors()
-        return {c: health.get(c, {}).get("tier") == "live" for c in required}
+        return {
+            c: c in connected or health.get(c, {}).get("tier") == "live"
+            for c in required
+        }
     except Exception:
-        return {c: False for c in required}
+        return {c: c in connected for c in required}
 
 
 async def find_relevant_skills(
@@ -156,6 +170,9 @@ async def build_agent_skills_block(goal: str, org_id: str = "default", top_k: in
         if not content.strip():
             continue
         name = index.get(skill_id, {}).get("name", skill_id)
+        warning = await skill_connector_warning(index.get(skill_id, {}), org_id=org_id)
+        if warning:
+            content = f"{warning}\n\n{content}"
         loaded.append(f"## Skill: {name}\n{content}")
 
     if loaded:
@@ -167,12 +184,12 @@ async def build_agent_skills_block(goal: str, org_id: str = "default", top_k: in
     return "\n".join(lines)
 
 
-async def skill_connector_warning(skill: dict) -> str | None:
+async def skill_connector_warning(skill: dict, org_id: str = "default") -> str | None:
     """Return a human-readable warning if required connectors are missing, else None."""
     required: list[str] = skill.get("requires_connectors") or []
     if not required:
         return None
-    availability = await _connectors_available(required)
+    availability = await _connectors_available(required, org_id=org_id)
     missing = [c for c, ok in availability.items() if not ok]
     if not missing:
         return None

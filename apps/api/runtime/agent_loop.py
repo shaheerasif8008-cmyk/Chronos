@@ -379,8 +379,16 @@ async def publish_activity(task_id: str, event: dict[str, Any]) -> None:
 
 async def _agent_system_message(tools: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     current_date = datetime.now(timezone.utc).date().isoformat()
-    is_sub_agent = tools == SUBAGENT_TOOLS
-    manifest = await generate_tool_manifest(sub_agent=is_sub_agent)
+    # Sub-agents get a bounded-loop prompt. Detected structurally (no
+    # spawn__subagent / start_task in the list) so it also holds for
+    # connector-filtered copies of SUBAGENT_TOOLS, not just the exact object.
+    tool_names = {
+        str(((tool or {}).get("function") or {}).get("name") or "")
+        for tool in (tools or [])
+        if isinstance(tool, dict)
+    }
+    is_sub_agent = bool(tool_names) and not (tool_names & {"spawn__subagent", "start_task"})
+    manifest = await generate_tool_manifest(sub_agent=is_sub_agent, tools=tools)
     orchestration_guidance = (
         "For large jobs with independent workstreams, spawn all useful sub-agents in the same "
         "assistant step so the tool calls run in parallel. Do not spawn one sub-agent, wait for it, "
@@ -505,7 +513,20 @@ async def _load_history(task: dict[str, Any], tools: list[dict[str, Any]] | None
             return list(history)
     # Fresh start. Sub-agents spawned with inherit_keys carry an opt-in snapshot of
     # parent state, injected here as a single context message before the goal.
-    seed = [await _agent_system_message(tools)]
+    system_msg = await _agent_system_message(tools)
+    # Connectors awareness: tell the model which apps are connected, which are
+    # available to connect, and which custom MCP servers are registered.
+    try:
+        from core.connector_tools import connectors_prompt_block
+
+        connectors_block = await connectors_prompt_block(
+            str(task.get("organization_id") or "default")
+        )
+        if connectors_block.strip():
+            system_msg = {**system_msg, "content": f"{system_msg['content']}\n\n{connectors_block}"}
+    except Exception:
+        logger.warning("Connectors context assembly failed for task %s", task.get("id"), exc_info=True)
+    seed = [system_msg]
     # Skills (progressive disclosure): always advertise the catalog and inline the
     # SKILL.md most relevant to the goal, so durable tasks are no longer skill-blind.
     try:
@@ -1642,6 +1663,7 @@ async def stream_chat_turn(
     reasoning_effort: str | None = None,
     emit_conversation: bool = True,
     user_content: str | list[dict] | None = None,
+    disabled_tools: list[str] | None = None,
 ):
     """Stream one chat turn inline.
 
@@ -1672,6 +1694,15 @@ async def stream_chat_turn(
     # message (always str) is kept for ack/grounding/memory/goal — user_content
     # only controls what the model receives as the user turn's content field.
     history.append({"role": "user", "content": user_content if user_content is not None else message})
+    # Connector-aware tool exposure: only connected SaaS connectors' tools reach
+    # the model; blocked tools are removed; per-conversation toggles honored.
+    from core.connector_tools import resolve_agent_tools
+
+    chat_tools = await resolve_agent_tools(
+        INLINE_CHAT_TOOLS,
+        org_id=str(requester_context.org_id),
+        disabled_tools=disabled_tools,
+    )
     effective_model = resolve_agent_model(model)
     task_id: str | None = None
     task: dict[str, Any] | None = None
@@ -1705,7 +1736,7 @@ async def stream_chat_turn(
             stream_kwargs: dict[str, str] = {}
             if reasoning_effort:
                 stream_kwargs["reasoning_effort"] = reasoning_effort
-            async for ev in stream_step(history, INLINE_CHAT_TOOLS, effective_model, **stream_kwargs):
+            async for ev in stream_step(history, chat_tools, effective_model, **stream_kwargs):
                 if ev["type"] == "token":
                     yield {"type": "token", "content": ev["content"]}
                 elif ev["type"] == "text_done":
@@ -1984,6 +2015,16 @@ async def run_loop(
     """
     task_id = task["id"]
     effective_tools = tools if tools is not None else ALL_TOOLS
+    # Capture sub-agent identity before connector filtering replaces the list object.
+    _is_sub_agent_loop = effective_tools is SUBAGENT_TOOLS or int(task.get("depth") or 0) > 0
+    # Connector-aware tool exposure (Anthropic model): the model only sees SaaS
+    # connector tools that are actually connected for this org, and never sees
+    # tools blocked in Settings → Connectors. Degrades to the static list on error.
+    from core.connector_tools import resolve_agent_tools
+
+    effective_tools = await resolve_agent_tools(
+        effective_tools, org_id=str(task.get("organization_id") or "default")
+    )
     # Precedence: explicit arg (sub-agents) > model chosen in the UI (stored in
     # agent_state) > default agent model.
     stored_model = (task.get("agent_state") or {}).get("model") if isinstance(task.get("agent_state"), dict) else None
@@ -2014,7 +2055,7 @@ async def run_loop(
     # All cognition degrades to the prior model-native behavior: light cognition
     # (budget/plan/progress directives) only fires under its own conditions, and
     # model cognition (planner/critic) needs a configured model.
-    is_sub_agent = effective_tools is SUBAGENT_TOOLS or int(task.get("depth") or 0) > 0
+    is_sub_agent = _is_sub_agent_loop
     light_cognition = settings.agent_cognition_enabled and not is_sub_agent
     model_cognition = _cognition_enabled(is_sub_agent)
     goal = str(task.get("goal") or "")

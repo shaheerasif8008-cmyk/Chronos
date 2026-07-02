@@ -221,6 +221,34 @@ async def tool_policy(org_id: str, provider: str) -> dict[str, Any]:
     return dict(policies.get(provider, {"enabled": True, "approval_required": False, "risk": "unknown"}))
 
 
+# Per-tool permissions (Anthropic-style connector tool permissions).
+# "default" keeps the broker's normal governance; "always_allow" skips the
+# settings/autonomy gate (never the hard approval floor); "require_approval"
+# forces an approval record; "blocked" removes the tool entirely.
+VALID_TOOL_PERMISSIONS: frozenset[str] = frozenset(
+    {"default", "always_allow", "require_approval", "blocked"}
+)
+
+
+async def tool_permissions(org_id: str) -> dict[str, str]:
+    """Return the org's per-tool permission overrides keyed by broker tool name."""
+    member = Member(id="system", organization_id=org_id, region=settings.region, email="system@local", role="admin")
+    doc = await get_settings_doc(member, "tool_permissions", scope="org", scope_id=org_id)
+    return {
+        str(tool): str(perm)
+        for tool, perm in doc.items()
+        if isinstance(perm, str) and perm in VALID_TOOL_PERMISSIONS
+    }
+
+
+async def set_tool_permission(member: Member, tool: str, permission: str) -> dict[str, str]:
+    """Persist one per-tool permission override for the member's org."""
+    if permission not in VALID_TOOL_PERMISSIONS:
+        raise ValueError(f"Invalid tool permission: {permission}")
+    await save_settings_doc(member, "tool_permissions", {tool: permission}, scope="org")
+    return await tool_permissions(member.organization_id)
+
+
 # Autonomy levels a workspace can run at. ``full_auto`` collapses settings-policy
 # approval gates (never the hard floor in tool_broker). Default is ``supervised``.
 AUTONOMY_LEVELS: frozenset[str] = frozenset({"supervised", "full_auto"})

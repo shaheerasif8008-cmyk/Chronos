@@ -37,16 +37,19 @@ async def generate_tool_manifest(
     persona_id: str | None = None,
     org_id: str = "default",
     sub_agent: bool = False,
+    tools: list[dict[str, Any]] | None = None,
 ) -> str:
     """Build the tool declaration block from the runtime tool schemas.
 
     This keeps prompt-visible capabilities aligned with the exact `tools` array
-    sent to the model. Provider connection and approval checks still happen in
-    the ToolBroker; the manifest is only routing guidance.
+    sent to the model — pass ``tools`` with the resolved (connector-filtered)
+    list so the manifest never advertises a tool the model cannot call.
+    Provider connection and approval checks still happen in the ToolBroker;
+    the manifest is only routing guidance.
     """
     del persona_id, org_id
     blocks = []
-    for schema in available_tool_schemas(sub_agent=sub_agent):
+    for schema in (tools if tools is not None else available_tool_schemas(sub_agent=sub_agent)):
         name = tool_name(schema)
         params = (schema.get("function") or {}).get("parameters", {}).get("properties", {})
         param_names = ", ".join(params.keys()) or "none"

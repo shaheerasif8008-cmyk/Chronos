@@ -14,7 +14,7 @@ test("connectors: directory renders catalog and reflects a connected app", async
   await page.goto("/connectors");
 
   // The directory loaded and rendered the catalog.
-  await expect(page.getByText("Integrations")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Connectors" })).toBeVisible();
   const gmailCard = page.getByText("Gmail", { exact: true }).first();
   await expect(gmailCard).toBeVisible();
 

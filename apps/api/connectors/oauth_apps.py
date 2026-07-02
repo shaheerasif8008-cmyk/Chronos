@@ -372,11 +372,22 @@ def get_client_credentials(app: OAuthApp) -> tuple[str, str]:
 
 
 def available_apps() -> list[dict]:
-    """Return catalog entries — each includes whether credentials are configured."""
+    """Return catalog entries — each includes whether credentials are configured.
+
+    An app counts as configured when EITHER its own OAuth client credentials are
+    present in the environment OR Composio managed auth covers the provider
+    (COMPOSIO_API_KEY set + provider is Composio-managed). With Composio, no
+    per-provider client id/secret is needed — Connect is one click.
+    """
+    from connectors import composio_client
+
+    composio_on = composio_client.is_configured()
     result = []
     for app in APPS.values():
         client_id = _env_value(app.client_id_env)
         client_secret = _env_value(app.client_secret_env)
+        direct_configured = bool(client_id and client_secret)
+        composio_managed = composio_on and composio_client.is_composio_provider(app.id)
         result.append({
             "id": app.id,
             "name": app.name,
@@ -384,6 +395,7 @@ def available_apps() -> list[dict]:
             "icon_svg": app.icon_svg,
             "category": app.category,
             "auth_type": app.auth_type,
+            "auth_mode": "composio" if composio_managed else ("direct" if direct_configured else "unconfigured"),
             "scopes": app.scopes,
             "actions": app.actions,
             "risk_levels": app.risk_levels,
@@ -391,6 +403,6 @@ def available_apps() -> list[dict]:
             "policy": app.policy,
             "client_id_env": app.client_id_env,
             "client_secret_env": app.client_secret_env,
-            "configured": bool(client_id and client_secret),
+            "configured": direct_configured or composio_managed,
         })
     return result
