@@ -12,7 +12,7 @@ import ResearchScreen from "../../components/research/ResearchScreen";
 import BrowserOperatorScreen from "../../components/browser/BrowserOperatorScreen";
 import ComputerScreen from "../../components/computer/ComputerScreen";
 import DesktopScreen from "../../components/desktop/DesktopScreen";
-import ConnectorGovernanceScreen from "../../components/connectors/ConnectorGovernanceScreen";
+import ConnectorsScreen from "../../components/connectors/ConnectorsScreen";
 import ContextSuggestionsScreen from "../../components/context/ContextSuggestionsScreen";
 import SSOConnectionsSettings from "../../components/settings/SSOConnectionsSettings";
 import DataScreen from "../../components/data/DataScreen";
@@ -271,6 +271,7 @@ type ActivityAction = {
 };
 
 const MODEL_STORAGE_KEY = "chronos.chat.selectedModel";
+const DISABLED_TOOLS_STORAGE_KEY = "chronos.chat.disabledTools";
 const DEFAULT_MODEL_ID = "auto";
 const REASONING_STORAGE_KEY = "chronos.chat.reasoningEffort";
 const REASONING_OPTIONS = [
@@ -1578,6 +1579,24 @@ function ChatScreen({
   const [recording, setRecording] = useState(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const [skillsList, setSkillsList] = useState<{ slug: string; name: string; description?: string | null }[] | null>(null);
+  // Claude-style "Search and tools": connected connectors + built-in tool
+  // families the user can toggle off for this browser (sent as disabled_tools).
+  const [connectorsList, setConnectorsList] = useState<{ id: string; name: string; connected: boolean }[] | null>(null);
+  const [disabledTools, setDisabledTools] = useState<string[]>(() => {
+    if (typeof window === "undefined") return [];
+    try {
+      const raw = window.localStorage.getItem(DISABLED_TOOLS_STORAGE_KEY);
+      const parsed = raw ? JSON.parse(raw) as unknown : [];
+      return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === "string") : [];
+    } catch { return []; }
+  });
+  const toggleTool = useCallback((family: string) => {
+    setDisabledTools(prev => {
+      const next = prev.includes(family) ? prev.filter(f => f !== family) : [...prev, family];
+      try { window.localStorage.setItem(DISABLED_TOOLS_STORAGE_KEY, JSON.stringify(next)); } catch { /* ignore */ }
+      return next;
+    });
+  }, []);
   const attachmentPreviewUrlsRef = useRef<Set<string>>(new Set());
   const isEmpty = !activeConvoId && messages.length === 0;
   const inlineApprovalIds = useMemo(() => {
@@ -1617,6 +1636,12 @@ function ChatScreen({
       .then((data: { slug: string; name: string; description?: string | null }[]) =>
         setSkillsList(Array.isArray(data) ? data : []))
       .catch(() => setSkillsList([]));
+    // Connected connectors for the "Search and tools" menu.
+    apiFetch("/connectors/catalog")
+      .then(r => r.json())
+      .then((data: { id: string; name: string; connected: boolean }[]) =>
+        setConnectorsList(Array.isArray(data) ? data.filter(a => a.connected) : []))
+      .catch(() => setConnectorsList([]));
   }, []);
 
   const loadOperations = useCallback(async () => {
@@ -2634,6 +2659,7 @@ function ChatScreen({
           reasoning_effort: selectedReasoningEffort,
           persona_id: activePersonaId,
           attachment_ids: pendingAttachmentIds,
+          disabled_tools: disabledTools,
         }),
         signal: ab.signal,
       });
@@ -3058,6 +3084,67 @@ function ChatScreen({
                             icon={<IC.Settings size={14}/>}
                             label="Manage skills"
                             onSelect={() => { close(); router.push("/skills"); }}
+                          />
+                        </div>
+                      </>
+                    )}
+                  </ComposerMenu>
+                  <ComposerMenu
+                    ariaLabel="Search and tools"
+                    title="Enable or disable tools for this chat"
+                    buttonContent={<>
+                      <IC.Connectors size={14}/>
+                      Tools{disabledTools.length ? ` · ${disabledTools.length} off` : ""}
+                    </>}
+                    menuWidth={300}
+                  >
+                    {close => (
+                      <>
+                        <div className="px-3 py-2 text-[11.5px] font-semibold uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>
+                          Built-in tools
+                        </div>
+                        <ComposerMenuItem
+                          icon={<IC.Search size={14}/>}
+                          label="Web search & browsing"
+                          description="Search the web and read pages"
+                          selected={!disabledTools.includes("browser")}
+                          onSelect={() => toggleTool("browser")}
+                        />
+                        <ComposerMenuItem
+                          icon={<IC.Clock size={14}/>}
+                          label="Past chats"
+                          description="Search your previous conversations"
+                          selected={!disabledTools.includes("chat_history")}
+                          onSelect={() => toggleTool("chat_history")}
+                        />
+                        <div className="px-3 py-2 mt-1 border-t border-soft text-[11.5px] font-semibold uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>
+                          Connectors
+                        </div>
+                        {connectorsList === null && (
+                          <div className="px-3 py-2 text-[12.5px]" style={{ color: "var(--text-dim)" }}>Loading connectors…</div>
+                        )}
+                        {connectorsList?.length === 0 && (
+                          <div className="px-3 py-2 text-[12.5px]" style={{ color: "var(--text-dim)" }}>No connectors connected yet.</div>
+                        )}
+                        {connectorsList && connectorsList.length > 0 && (
+                          <div className="max-h-[200px] overflow-y-auto">
+                            {connectorsList.map(connector => (
+                              <ComposerMenuItem
+                                key={connector.id}
+                                icon={<IC.Connectors size={14}/>}
+                                label={connector.name}
+                                description={disabledTools.includes(connector.id) ? "Off for new messages" : "Available to the model"}
+                                selected={!disabledTools.includes(connector.id)}
+                                onSelect={() => toggleTool(connector.id)}
+                              />
+                            ))}
+                          </div>
+                        )}
+                        <div className="mt-1 border-t border-soft pt-1">
+                          <ComposerMenuItem
+                            icon={<IC.Settings size={14}/>}
+                            label="Manage connectors"
+                            onSelect={() => { close(); router.push("/connectors"); }}
                           />
                         </div>
                       </>
@@ -5865,257 +5952,6 @@ function MemoryCard({ m, onDelete, onUpdate, onFlag, onChangeScope, onLoadUsage,
           </button>
         </div>
       </div>
-    </div>
-  );
-}
-
-// ─── Connectors Screen ────────────────────────────────────────────────────────
-// Agent tool health reported by core/connector_health.py
-// ─── Integrations Marketplace ─────────────────────────────────────────────────
-
-type CatalogApp = {
-  id: string;
-  name: string;
-  description: string;
-  icon_svg: string;
-  category?: string;
-  auth_type?: string;
-  scopes?: string[];
-  actions?: string[];
-  risk_levels?: string[];
-  sync_supported?: boolean;
-  policy?: string;
-  health_status?: string;
-  health_updated_at?: string | null;
-  last_used_at?: string;
-  client_id_env?: string;
-  client_secret_env?: string;
-  configured: boolean;
-  connected: boolean;
-  account_handle: string;
-};
-
-function AppIcon({ svg, name }: { svg: string; name: string }) {
-  return (
-    <div
-      className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0 border border-soft"
-      style={{ background: "var(--surface-2)" }}
-      dangerouslySetInnerHTML={{ __html: svg }}
-      title={name}
-    />
-  );
-}
-
-function connectorSetupLabel(app: CatalogApp) {
-  if (app.connected) return "Connected";
-  if (!app.configured) return "Needs setup";
-  if (app.auth_type === "oauth2") return "Ready to connect";
-  if (app.auth_type === "remote_mcp") return "Register server";
-  if (app.auth_type === "signing_secret") return "Signing secret";
-  if (app.auth_type === "api_key") return "API key ready";
-  return app.auth_type || "Configured";
-}
-
-function ConnectorsScreen() {
-  const [view, setView] = useState<"apps" | "governance">("apps");
-  const [apps, setApps] = useState<CatalogApp[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [connecting, setConnecting] = useState<string | null>(null);
-  const [disconnecting, setDisconnecting] = useState<string | null>(null);
-  const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
-
-  async function load() {
-    setLoading(true);
-    try {
-      const data = await apiFetch("/connectors/catalog").then(r => r.json()) as CatalogApp[];
-      setApps(data);
-    } catch {
-      setError("Could not load integrations.");
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  useEffect(() => { void load(); }, []);
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    const params = new URLSearchParams(window.location.search);
-    const callbackError = params.get("connector_error") || params.get("error");
-    const callbackSuccess = params.get("connector_success");
-    if (callbackError) {
-      setError(callbackError);
-    } else if (callbackSuccess) {
-      setNotice(`${callbackSuccess.replaceAll("_", " ")} connected.`);
-    }
-    if (callbackError || callbackSuccess) {
-      window.history.replaceState({}, "", window.location.pathname);
-    }
-  }, []);
-
-  async function connect(app: CatalogApp) {
-    if (app.auth_type && app.auth_type !== "oauth2") {
-      setError(`${app.name} uses ${app.auth_type} setup. Configure it from connector policy/schema settings before connecting live credentials.`);
-      return;
-    }
-    if (!app.configured) {
-      const idEnv = app.client_id_env || `${app.id.toUpperCase()}_CLIENT_ID`;
-      const secretEnv = app.client_secret_env || `${app.id.toUpperCase()}_CLIENT_SECRET`;
-      setError(`Set ${idEnv} and ${secretEnv} in your .env to enable ${app.name}.`);
-      return;
-    }
-    setConnecting(app.id);
-    setError("");
-    setNotice("");
-    try {
-      const endpoint = app.id === "gmail"
-        ? "/connectors/gmail/oauth-start"
-        : `/connectors/${app.id}/oauth-start`;
-      const res = await apiFetch(endpoint, { method: "POST" });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({})) as { detail?: string };
-        throw new Error(body.detail ?? `Error ${res.status}`);
-      }
-      const { url } = await res.json() as { url: string };
-      window.location.href = url;
-    } catch (err) {
-      setError(err instanceof Error ? err.message : `${app.name} connect failed`);
-      setConnecting(null);
-    }
-  }
-
-  async function disconnect(app: CatalogApp) {
-    if (!confirm(`Disconnect ${app.name}? Chronos will no longer be able to access it.`)) return;
-    setDisconnecting(app.id);
-    setError("");
-    setNotice("");
-    try {
-      const res = await apiFetch(`/connectors/${app.id}/disconnect`, { method: "DELETE" });
-      if (!res.ok) throw new Error(`Error ${res.status}`);
-      await load();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Disconnect failed");
-    } finally {
-      setDisconnecting(null);
-    }
-  }
-
-  return (
-    <div className="flex-1 flex flex-col min-w-0 overflow-y-auto">
-      <PageHeader
-        title="Integrations"
-        subtitle="Connect apps and custom tools so Chronos can act through governed credentials, policies, and audit logs."
-      />
-
-      <div className="px-10 pb-3 flex items-center gap-1 surface-0">
-        {([["apps", "Apps"], ["governance", "Governance"]] as const).map(([id, label]) => (
-          <button key={id} onClick={() => setView(id)}
-                  className="px-3 py-1.5 rounded-md text-[13px] font-medium smooth"
-                  style={{ background: view === id ? "var(--surface-2)" : "transparent", color: view === id ? "var(--text)" : "var(--text-muted)" }}>
-            {label}
-          </button>
-        ))}
-      </div>
-
-      {view === "governance" && (
-        <div className="px-10 pb-10"><ConnectorGovernanceScreen /></div>
-      )}
-
-      {view === "apps" && (
-      <div className="px-10 pb-10">
-        {notice && (
-          <div className="mb-5 rounded-xl border border-soft px-4 py-3 text-[13px]" style={{ color: "var(--ok)", background: "var(--surface-2)" }}>
-            {notice}
-            <button className="ml-3 underline" onClick={() => setNotice("")}>Dismiss</button>
-          </div>
-        )}
-
-        {error && (
-          <div className="mb-5 rounded-xl border border-soft px-4 py-3 text-[13px]" style={{ color: "var(--danger)", background: "var(--surface-2)" }}>
-            {error}
-            <button className="ml-3 underline" onClick={() => setError("")}>Dismiss</button>
-          </div>
-        )}
-
-        {loading && (
-          <div className="grid grid-cols-3 gap-4">
-            {[1,2,3,4,5,6].map(i => (
-              <div key={i} className="surface border border-soft rounded-2xl p-5 animate-pulse h-28" />
-            ))}
-          </div>
-        )}
-
-        {!loading && apps.length === 0 && (
-          <EmptyState icon={<IC.Connectors size={20}/>}
-            title="No integrations available"
-            sub="Configure provider credentials in your .env to enable integrations like Gmail, Slack, GitHub, Notion, custom HTTP, and MCP."/>
-        )}
-
-        {!loading && apps.length > 0 && (
-          <div className="grid grid-cols-3 gap-4">
-            {apps.map(app => (
-              <div
-                key={app.id}
-                className="surface border border-soft rounded-lg p-5 flex min-h-[170px] flex-col gap-3 transition-shadow hover:shadow-sm"
-              >
-                <div className="flex items-center gap-3 min-w-0">
-                  <AppIcon svg={app.icon_svg} name={app.name} />
-                  <div className="min-w-0">
-                    <div className="font-semibold text-[14.5px] leading-5 truncate">{app.name}</div>
-                    {app.connected && app.account_handle && (
-                      <div className="text-[11.5px] truncate" style={{ color: "var(--text-dim)" }}>
-                        {app.account_handle}
-                      </div>
-                    )}
-                  </div>
-                </div>
-
-                <p className="text-[12.5px] leading-[1.55] line-clamp-3" style={{ color: "var(--text-muted)" }}>
-                  {app.description}
-                </p>
-
-                <div className="flex flex-wrap gap-1.5">
-                  <Tag variant={app.connected ? "accent" : app.configured ? "info" : "warn"}>{connectorSetupLabel(app)}</Tag>
-                  <Tag>{app.auth_type || "none"}</Tag>
-                  {app.sync_supported && <Tag>Sync</Tag>}
-                  {(app.risk_levels || []).slice(0, 2).map(risk => (
-                    <Tag key={risk} variant={risk === "financial" || risk === "external_message" ? "danger" : "info"}>{risk}</Tag>
-                  ))}
-                </div>
-
-                <div className="mt-auto pt-1 flex gap-2">
-                  {!app.connected ? (
-                    <button
-                      onClick={() => void connect(app)}
-                      disabled={connecting === app.id}
-                      className="btn btn-accent btn-sm w-full disabled:opacity-50"
-                      title={!app.configured ? `Add ${app.client_id_env || `${app.id.toUpperCase()}_CLIENT_ID`} + ${app.client_secret_env || "CLIENT_SECRET"} to .env first` : undefined}
-                    >
-                      {connecting === app.id ? "Redirecting…" : app.auth_type !== "oauth2" ? "Configure" : app.configured ? "Connect" : "Configure first"}
-                    </button>
-                  ) : (
-                    <button
-                      onClick={() => void disconnect(app)}
-                      disabled={disconnecting === app.id}
-                      className="btn btn-danger-soft btn-sm w-full disabled:opacity-50"
-                    >
-                      {disconnecting === app.id ? "Disconnecting…" : "Disconnect"}
-                    </button>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-
-        {apps.length > 0 && (
-          <p className="mt-8 text-[12px]" style={{ color: "var(--text-dim)" }}>
-            OAuth apps use provider consent screens; API-key, webhook, custom HTTP, and MCP connectors use explicit setup credentials. Chronos never sees your password.
-          </p>
-        )}
-      </div>
-      )}
     </div>
   );
 }

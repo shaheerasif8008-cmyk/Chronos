@@ -141,10 +141,18 @@ async def assemble_context(
         out: list[tuple[str, str | None, str]] = []
         for skill_id in skill_ids:
             skill_meta = skill_index.get(skill_id, {})
-            warning = await skill_connector_warning(skill_meta)
+            warning = await skill_connector_warning(skill_meta, org_id=org_id)
             content = await load_skill_content(skill_id, progressive=True, org_id=org_id)
             out.append((skill_id, warning, content))
         return out
+
+    async def _fetch_connectors_block() -> str:
+        from core.connector_tools import connectors_prompt_block
+
+        try:
+            return await connectors_prompt_block(requester_context.org_id)
+        except Exception:
+            return ""
 
     async def _fetch_memory() -> list:
         try:
@@ -175,6 +183,7 @@ async def assemble_context(
     (
         org_context,
         tool_routing,
+        connectors_block,
         persona_prompt,
         project_instructions,
         skills_data,
@@ -188,6 +197,7 @@ async def assemble_context(
             org_id=requester_context.org_id,
             sub_agent=is_sub_agent,
         ),
+        _fetch_connectors_block(),
         get_persona_prompt(requester_context.persona_id),
         _fetch_project_instructions(),
         _fetch_skills(),
@@ -233,6 +243,10 @@ async def assemble_context(
     # ── Layer 2b: dynamic tool manifest ────────────────────────────────────
     if tool_routing:
         _append_layer("# Runtime Tool Routing", tool_routing.removeprefix("# Runtime Tool Routing\n"), cap_tokens=800)
+
+    # ── Layer 2c: connectors (connected apps, available apps, MCP servers) ──
+    if connectors_block:
+        _append_layer("# Connectors", connectors_block.removeprefix("# Connectors\n"), cap_tokens=600)
 
     # ── Layer 3: persona ────────────────────────────────────────────────────
     if persona_prompt:

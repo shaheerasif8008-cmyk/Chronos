@@ -203,10 +203,13 @@ async def list_agent_tool_health(member: Member = Depends(get_current_member)) -
 async def list_catalog(member: Member = Depends(get_current_member)) -> list[dict]:
     """Return the full app catalog with per-app configured + connected status."""
     from connectors.oauth_apps import available_apps
+    from core.connector_tools import provider_tool_specs
+    from core.settings_store import tool_permissions as org_tool_permissions
     from core.db import engine, reflect_table
     from sqlalchemy import select
 
     apps = available_apps()
+    permissions_map = await org_tool_permissions(str(member.organization_id))
 
     # Enrich with connection, health, and last-used state from the connector tables.
     connectors_table = await reflect_table("connectors")
@@ -259,7 +262,49 @@ async def list_catalog(member: Member = Depends(get_current_member)) -> list[dic
         app["health_status"] = app_health.get("status") or ("connected" if app["connected"] else "not_connected")
         app["health_updated_at"] = str(app_health.get("updated_at")) if app_health.get("updated_at") else None
         app["last_used_at"] = last_used.get(app["id"], "")
+        app["tools"] = [
+            {**spec, "permission": permissions_map.get(spec["broker_name"], "default")}
+            for spec in provider_tool_specs(app["id"])
+        ]
     return apps
+
+
+class ToolPermissionRequest(BaseModel):
+    permission: str = Field(pattern="^(default|always_allow|require_approval|blocked)$")
+
+
+@router.get("/tool-permissions")
+async def list_tool_permissions(member: Member = Depends(get_current_member)) -> dict[str, str]:
+    """Return the org's per-tool permission overrides (broker tool name → permission)."""
+    from core.settings_store import tool_permissions as org_tool_permissions
+
+    await permissions.check(member, "list_tool_permissions", member.organization_id)
+    return await org_tool_permissions(str(member.organization_id))
+
+
+@router.put("/tool-permissions/{tool_name}")
+async def set_tool_permission_route(
+    tool_name: str,
+    req: ToolPermissionRequest,
+    member: Member = Depends(get_current_member),
+) -> dict[str, str]:
+    """Set one tool's permission: default, always_allow, require_approval, or blocked.
+
+    ``tool_name`` accepts either registry (gmail__send) or broker (gmail.send)
+    form; permissions are stored under the broker name the ToolBroker enforces.
+    """
+    from core.settings_store import set_tool_permission
+
+    await permissions.check(member, "set_tool_permission", tool_name)
+    broker_name = tool_name.replace("__", ".", 1) if "__" in tool_name else tool_name
+    updated = await set_tool_permission(member, broker_name, req.permission)
+    await audit.log(
+        "tool_permission_change", str(member.id), f"{broker_name}.permission",
+        organization_id=member.organization_id,
+        resource_type="connector_tool", resource_id=broker_name,
+        payload={"permission": req.permission},
+    )
+    return updated
 
 
 @router.post("/gmail/oauth-start")

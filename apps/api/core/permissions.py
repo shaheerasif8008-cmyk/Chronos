@@ -115,6 +115,7 @@ _ADMIN_ACTIONS = {
     "disable_connector",
     "grant_connector_permission",
     "revoke_connector_permission",
+    "set_tool_permission",
 }
 _ADMIN_ROLES = {"admin", "owner"}
 _GENERIC_ALLOWED_PREFIXES = ("use_tool:", "connect_", "disconnect_")
@@ -221,6 +222,7 @@ _GENERIC_ALLOWED_ACTIONS = {
     "list_connectors",
     "list_connector_tools",
     "list_connector_actions",
+    "list_tool_permissions",
     "execute_connector_tool_call",
     "list_mcp_servers",
     "list_connector_policies",

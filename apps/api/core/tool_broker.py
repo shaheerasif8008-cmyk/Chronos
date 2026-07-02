@@ -409,6 +409,17 @@ class ToolBroker:
         # 5. Approval gate — the hard floor is absolute, even under full_auto.
         if tool in _ALWAYS_APPROVAL_TOOLS and not approved_by_gate:
             raise ApprovalRequired(tool, "tool requires an approval record (hard floor — never bypassable)")
+        # Per-tool permissions (Settings → Connectors): blocked tools never run,
+        # require_approval forces an approval record, always_allow skips only the
+        # settings/autonomy gate below (never the hard floor or safety limits).
+        from core.settings_store import tool_permissions as org_tool_permissions
+        tool_permission = (await org_tool_permissions(agent.org_id)).get(tool, "default")
+        if tool_permission == "blocked":
+            raise SafetyLimitViolation(
+                f"{tool} is blocked by connector tool permissions (Settings → Connectors)"
+            )
+        if tool_permission == "require_approval" and not approved_by_gate:
+            raise ApprovalRequired(tool, "tool requires approval by connector tool permissions")
         policy = await tool_policy(agent.org_id, tool.split(".")[0])
         if policy.get("enabled") is False:
             raise ApprovalRequired(tool, "tool is disabled in settings")
@@ -424,7 +435,7 @@ class ToolBroker:
         level = await trust.get_trust_level(agent.org_id, agent.workspace_id, provisional_class)
         novelty = trust.novelty_from_successes(level.successes)
         risk = risk_pricer.price(tool, args, novelty=novelty, overrides=overrides)
-        if not approved_by_gate:
+        if not approved_by_gate and tool_permission != "always_allow":
             gate = await autonomy.evaluate(
                 agent.org_id, agent.workspace_id, risk, args, policy, autonomy_level
             )

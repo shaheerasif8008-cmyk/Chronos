@@ -66,8 +66,10 @@ def broker_env(monkeypatch):
 
     async def _policy(*a, **kw): return dict(knobs.policy)
     async def _autonomy(*a, **kw): return knobs.autonomy
+    async def _tool_permissions(*a, **kw): return dict(getattr(knobs, "tool_permissions", {}))
     monkeypatch.setitem(sys.modules, "core.settings_store", _make_stub_module(
-        "core.settings_store", tool_policy=_policy, workspace_autonomy=_autonomy))
+        "core.settings_store", tool_policy=_policy, workspace_autonomy=_autonomy,
+        tool_permissions=_tool_permissions))
 
     monkeypatch.setitem(sys.modules, "core.untrusted_content", _make_stub_module(
         "core.untrusted_content", scan_untrusted_content=lambda *a, **kw: {}))
