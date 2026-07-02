@@ -2645,15 +2645,15 @@ function ChatScreen({
       } catch { /* bad JSON */ }
     }
 
-    const myConvoId = convoId;
+    let myConvoId = convoId;
 
-    try {
-      const resp = await apiFetch("/chat/message", {
+    async function openChatStream(targetConversationId: string | null) {
+      return apiFetch("/chat/message", {
         method: "POST",
         headers: { Accept: "text/event-stream" },
         body: JSON.stringify({
           message: text,
-          conversation_id: convoId,
+          conversation_id: targetConversationId,
           model: selectedModel,
           mode: selectedMode,
           reasoning_effort: selectedReasoningEffort,
@@ -2663,6 +2663,23 @@ function ChatScreen({
         }),
         signal: ab.signal,
       });
+    }
+
+    try {
+      let resp: Response;
+      try {
+        resp = await openChatStream(convoId);
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        if (convoId && detail.includes("Conversation not found")) {
+          convoId = null;
+          myConvoId = null;
+          onConversationMissing();
+          resp = await openChatStream(null);
+        } else {
+          throw err;
+        }
+      }
 
       const reader = resp.body?.getReader();
       if (!reader) return;
