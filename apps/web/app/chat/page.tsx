@@ -1407,6 +1407,113 @@ function AccountMenu({ onClose, onSettings, onSignOut }: { onClose: () => void; 
   );
 }
 
+// ─── Composer Dropdown Menu ───────────────────────────────────────────────────
+// Claude.ai-style control: a small trigger button that opens an upward dropdown
+// menu above the composer. Closes on outside click, Escape, or item selection.
+function ComposerMenu({
+  ariaLabel,
+  title,
+  disabled,
+  buttonClassName = "btn btn-ghost btn-sm",
+  buttonContent,
+  buttonData,
+  menuWidth = 260,
+  align = "left",
+  children,
+}: {
+  ariaLabel: string;
+  title?: string;
+  disabled?: boolean;
+  buttonClassName?: string;
+  buttonContent: ReactNode;
+  buttonData?: Record<string, string>;
+  menuWidth?: number;
+  align?: "left" | "right";
+  children: (close: () => void) => ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    function onDown(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setOpen(false);
+    }
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  return (
+    <div className="relative" ref={ref}>
+      <button
+        type="button"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-label={ariaLabel}
+        title={title}
+        disabled={disabled}
+        className={buttonClassName}
+        onClick={() => setOpen(o => !o)}
+        {...buttonData}
+      >
+        {buttonContent}
+      </button>
+      {open && (
+        <div
+          role="menu"
+          className={`absolute bottom-full mb-2 ${align === "right" ? "right-0" : "left-0"} z-50 surface border border-soft rounded-lg shadow-xl overflow-hidden py-1`}
+          style={{ width: menuWidth }}
+        >
+          {children(() => setOpen(false))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ComposerMenuItem({
+  icon,
+  label,
+  description,
+  selected,
+  disabled,
+  onSelect,
+}: {
+  icon?: ReactNode;
+  label: ReactNode;
+  description?: ReactNode;
+  selected?: boolean;
+  disabled?: boolean;
+  onSelect: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      role={selected === undefined ? "menuitem" : "menuitemradio"}
+      aria-checked={selected}
+      disabled={disabled}
+      onClick={onSelect}
+      className="w-full px-3 py-2 text-left flex items-start gap-2.5 smooth hover:bg-[var(--surface-2)] disabled:opacity-50"
+    >
+      {icon && <span className="mt-0.5 flex-shrink-0" style={{ color: "var(--text-dim)" }}>{icon}</span>}
+      <span className="flex-1 min-w-0">
+        <span className="flex items-center gap-2 text-[13px] font-medium" style={{ color: "var(--text)" }}>
+          <span className="truncate">{label}</span>
+          {selected && <IC.Check size={13} style={{ color: "var(--accent)", flexShrink: 0 }}/>}
+        </span>
+        {description && <span className="block text-[11.5px] mt-0.5 leading-snug" style={{ color: "var(--text-dim)" }}>{description}</span>}
+      </span>
+    </button>
+  );
+}
+
 // ─── Chat Screen ──────────────────────────────────────────────────────────────
 function ChatScreen({
   activeConvoId,
@@ -1464,9 +1571,13 @@ function ChatScreen({
   const bottomRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
   const voiceInputRef = useRef<HTMLInputElement>(null);
   const [voiceError, setVoiceError] = useState<string | null>(null);
   const [voiceBusy, setVoiceBusy] = useState(false);
+  const [recording, setRecording] = useState(false);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const [skillsList, setSkillsList] = useState<{ slug: string; name: string; description?: string | null }[] | null>(null);
   const attachmentPreviewUrlsRef = useRef<Set<string>>(new Set());
   const isEmpty = !activeConvoId && messages.length === 0;
   const inlineApprovalIds = useMemo(() => {
@@ -1488,7 +1599,24 @@ function ChatScreen({
     return () => {
       attachmentPreviewUrlsRef.current.forEach(url => URL.revokeObjectURL(url));
       attachmentPreviewUrlsRef.current.clear();
+      const recorder = mediaRecorderRef.current;
+      if (recorder) {
+        recorder.ondataavailable = null;
+        recorder.onstop = null;
+        try { if (recorder.state !== "inactive") recorder.stop(); } catch { /* already stopped */ }
+        recorder.stream.getTracks().forEach(track => track.stop());
+        mediaRecorderRef.current = null;
+      }
     };
+  }, []);
+
+  useEffect(() => {
+    // Skills shown in the composer dropdown; count appears on the button.
+    apiFetch("/skills")
+      .then(r => r.json())
+      .then((data: { slug: string; name: string; description?: string | null }[]) =>
+        setSkillsList(Array.isArray(data) ? data : []))
+      .catch(() => setSkillsList([]));
   }, []);
 
   const loadOperations = useCallback(async () => {
@@ -2026,14 +2154,13 @@ function ChatScreen({
     }
   }
 
-  async function uploadVoice(files: FileList) {
+  async function uploadVoice(file: File | undefined) {
     // Upload audio file via /attachments then call /chat/voice/transcribe.
     // On success, populate the composer draft with the transcript text.
     // On unavailable (no STT provider), show an honest degraded error message.
     const token = getToken();
     const base = apiBase();
     setVoiceError(null);
-    const file = files[0];
     if (!file) return;
     setVoiceBusy(true);
     try {
@@ -2075,6 +2202,44 @@ function ChatScreen({
     }
   }
 
+  async function startRecording() {
+    // Claude.ai-style dictation: record from the browser microphone, then send
+    // the audio through the same upload + transcribe path as file uploads.
+    setVoiceError(null);
+    if (typeof MediaRecorder === "undefined" || !navigator.mediaDevices?.getUserMedia) {
+      setVoiceError("Microphone recording is not supported in this browser — upload an audio file instead.");
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mimeType = MediaRecorder.isTypeSupported?.("audio/webm") ? "audio/webm" : undefined;
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      const chunks: BlobPart[] = [];
+      recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+      recorder.onstop = () => {
+        stream.getTracks().forEach(track => track.stop());
+        mediaRecorderRef.current = null;
+        setRecording(false);
+        const type = recorder.mimeType || "audio/webm";
+        const ext = type.includes("ogg") ? "ogg" : type.includes("mp4") ? "m4a" : "webm";
+        const blob = new Blob(chunks, { type });
+        if (blob.size > 0) void uploadVoice(new File([blob], `voice-note.${ext}`, { type }));
+      };
+      mediaRecorderRef.current = recorder;
+      recorder.start();
+      setRecording(true);
+    } catch (err) {
+      setVoiceError(err instanceof DOMException && (err.name === "NotAllowedError" || err.name === "SecurityError")
+        ? "Microphone access was denied. Allow microphone access or upload an audio file instead."
+        : "Could not start recording — upload an audio file instead.");
+    }
+  }
+
+  function stopRecording() {
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state !== "inactive") recorder.stop();
+  }
+
   function removeAttachment(id: string) {
     setAttachments(prev => {
       const removed = prev.find(attachment => attachment.id === id);
@@ -2098,13 +2263,15 @@ function ChatScreen({
     });
   }
 
-  function cycleReasoningEffort() {
-    setSelectedReasoningEffort(current => {
-      const index = REASONING_OPTIONS.findIndex(option => option.id === current);
-      const next = REASONING_OPTIONS[(index + 1) % REASONING_OPTIONS.length]?.id ?? DEFAULT_REASONING_EFFORT;
-      window.localStorage.setItem(REASONING_STORAGE_KEY, next);
-      return next;
-    });
+  function selectReasoningEffort(effort: ReasoningEffort) {
+    setSelectedReasoningEffort(effort);
+    window.localStorage.setItem(REASONING_STORAGE_KEY, effort);
+  }
+
+  function insertSkillIntoDraft(name: string) {
+    // Naming the skill in the message steers the relevance router to load it.
+    setDraft(prev => prev.trim() ? `${prev.trimEnd()}\n\nUse the "${name}" skill.` : `Use the "${name}" skill: `);
+    requestAnimationFrame(() => composerRef.current?.focus());
   }
 
   function replyToClarification(choice: string) {
@@ -2691,11 +2858,19 @@ function ChatScreen({
               onChange={e => { if (e.target.files) void uploadFiles(e.target.files); e.target.value = ""; }}
             />
             <input
+              ref={imageInputRef}
+              type="file"
+              accept="image/*"
+              multiple
+              className="hidden"
+              onChange={e => { if (e.target.files) void uploadFiles(e.target.files); e.target.value = ""; }}
+            />
+            <input
               ref={voiceInputRef}
               type="file"
               accept="audio/*"
               className="hidden"
-              onChange={e => { if (e.target.files) void uploadVoice(e.target.files); e.target.value = ""; }}
+              onChange={e => { void uploadVoice(e.target.files?.[0]); e.target.value = ""; }}
             />
             {memoryNotice && (
               <div
@@ -2786,63 +2961,173 @@ function ChatScreen({
               />
               <div className="flex items-center justify-between px-3 pb-2.5 pt-1">
                 <div className="flex items-center gap-1">
-                  <button type="button" aria-label="Attach files" className="btn btn-ghost btn-sm btn-icon" onClick={() => fileInputRef.current?.click()}><IC.Attach size={15}/></button>
-                  <button
-                    type="button"
-                    aria-label="Transcribe audio (upload audio file)"
-                    title="Upload an audio file to transcribe"
-                    disabled={voiceBusy}
-                    className={`btn btn-ghost btn-sm btn-icon${voiceBusy ? " opacity-50" : ""}`}
-                    onClick={() => voiceInputRef.current?.click()}
+                  <ComposerMenu
+                    ariaLabel="Attach"
+                    title="Attach files"
+                    buttonClassName="btn btn-ghost btn-sm btn-icon"
+                    buttonContent={<IC.Attach size={15}/>}
+                    menuWidth={220}
                   >
-                    {voiceBusy ? <IC.Refresh size={15} style={{ animation: "spin 1s linear infinite" }}/> : <IC.Mic size={15}/>}
-                  </button>
-                  <button
-                    type="button"
-                    className="btn btn-ghost btn-sm"
-                    onClick={() => router.push("/skills")}
-                    title="Open skills"
+                    {close => (
+                      <>
+                        <ComposerMenuItem
+                          icon={<IC.Folder size={14}/>}
+                          label="Upload files"
+                          description="Documents, spreadsheets, PDFs, and more"
+                          onSelect={() => { close(); fileInputRef.current?.click(); }}
+                        />
+                        <ComposerMenuItem
+                          icon={<IC.Eye size={14}/>}
+                          label="Upload photos"
+                          description="Images from your device"
+                          onSelect={() => { close(); imageInputRef.current?.click(); }}
+                        />
+                      </>
+                    )}
+                  </ComposerMenu>
+                  {recording ? (
+                    <button
+                      type="button"
+                      aria-label="Stop recording"
+                      className="btn btn-ghost btn-sm"
+                      style={{ color: "var(--danger)" }}
+                      onClick={stopRecording}
+                    >
+                      <span className="pulse-dot inline-block h-2 w-2 rounded-full" style={{ background: "var(--danger)" }}/>
+                      Stop
+                    </button>
+                  ) : (
+                    <ComposerMenu
+                      ariaLabel="Voice input"
+                      title="Dictate or transcribe audio"
+                      disabled={voiceBusy}
+                      buttonClassName={`btn btn-ghost btn-sm btn-icon${voiceBusy ? " opacity-50" : ""}`}
+                      buttonContent={voiceBusy ? <IC.Refresh size={15} style={{ animation: "spin 1s linear infinite" }}/> : <IC.Mic size={15}/>}
+                      menuWidth={250}
+                    >
+                      {close => (
+                        <>
+                          <ComposerMenuItem
+                            icon={<IC.Mic size={14}/>}
+                            label="Record voice"
+                            description="Dictate with your microphone; stops on click"
+                            onSelect={() => { close(); void startRecording(); }}
+                          />
+                          <ComposerMenuItem
+                            icon={<IC.Volume size={14}/>}
+                            label="Upload audio file"
+                            description="Transcribe an existing recording"
+                            onSelect={() => { close(); voiceInputRef.current?.click(); }}
+                          />
+                        </>
+                      )}
+                    </ComposerMenu>
+                  )}
+                  <ComposerMenu
+                    ariaLabel="Skills"
+                    title="Skills Chronos can use in this chat"
+                    buttonContent={<>
+                      <IC.Sparkles size={14} style={{ color: "var(--accent)" }}/>
+                      Skills{skillsList ? ` · ${skillsList.length}` : ""}
+                    </>}
+                    menuWidth={300}
                   >
-                    <IC.Sparkles size={14} style={{ color: "var(--accent)" }}/> Skills · 1
-                  </button>
-                  <button
-                    type="button"
-                    aria-label={`Reasoning effort: ${selectedReasoningEffort}`}
-                    aria-pressed={selectedReasoningEffort !== DEFAULT_REASONING_EFFORT}
-                    onClick={cycleReasoningEffort}
-                    disabled={streaming}
-                    className="btn btn-ghost btn-sm"
+                    {close => (
+                      <>
+                        {skillsList === null && (
+                          <div className="px-3 py-2 text-[12.5px]" style={{ color: "var(--text-dim)" }}>Loading skills…</div>
+                        )}
+                        {skillsList?.length === 0 && (
+                          <div className="px-3 py-2 text-[12.5px]" style={{ color: "var(--text-dim)" }}>No skills yet.</div>
+                        )}
+                        {skillsList && skillsList.length > 0 && (
+                          <div className="max-h-[260px] overflow-y-auto">
+                            {skillsList.map(skill => (
+                              <ComposerMenuItem
+                                key={skill.slug}
+                                icon={<IC.Sparkles size={14}/>}
+                                label={skill.name}
+                                description={skill.description || undefined}
+                                onSelect={() => { close(); insertSkillIntoDraft(skill.name); }}
+                              />
+                            ))}
+                          </div>
+                        )}
+                        <div className="mt-1 border-t border-soft pt-1">
+                          <ComposerMenuItem
+                            icon={<IC.Settings size={14}/>}
+                            label="Manage skills"
+                            onSelect={() => { close(); router.push("/skills"); }}
+                          />
+                        </div>
+                      </>
+                    )}
+                  </ComposerMenu>
+                  <ComposerMenu
+                    ariaLabel={`Reasoning effort: ${selectedReasoningEffort}`}
                     title={REASONING_OPTIONS.find(option => option.id === selectedReasoningEffort)?.title}
-                    data-reasoning-effort={selectedReasoningEffort}
+                    disabled={streaming}
+                    buttonData={{ "data-reasoning-effort": selectedReasoningEffort }}
+                    buttonContent={<>
+                      <IC.Lightbulb size={14}/>
+                      Reasoning · {REASONING_OPTIONS.find(option => option.id === selectedReasoningEffort)?.label ?? selectedReasoningEffort}
+                    </>}
+                    menuWidth={260}
                   >
-                    <IC.Lightbulb size={14}/>
-                    Reasoning · {REASONING_OPTIONS.find(option => option.id === selectedReasoningEffort)?.label ?? selectedReasoningEffort}
-                  </button>
-                  <label className="sr-only" htmlFor="chat-model-select">Model</label>
-                  <select
-                    id="chat-model-select"
-                    aria-label="Model"
-                    value={modelsLoadError ? "unavailable" : selectedModel}
-                    onChange={event => {
-                      setSelectedModel(event.target.value);
-                      window.localStorage.setItem(MODEL_STORAGE_KEY, event.target.value);
-                    }}
-                    disabled={streaming || !!modelsLoadError || chatModels.length === 0}
-                    className="surface border border-soft rounded-md px-2 py-1.5 text-[12.5px] outline-none disabled:opacity-60 max-w-[42vw]"
-                    data-selected-model={chatModels.find(model => model.id === selectedModel)?.model ?? selectedModel}
-                    data-selected-model-status={chatModels.find(model => model.id === selectedModel)?.status ?? "unknown"}
-                    style={{ color: "var(--text)" }}
+                    {close => (
+                      <>
+                        {REASONING_OPTIONS.map(option => (
+                          <ComposerMenuItem
+                            key={option.id}
+                            label={option.label}
+                            description={option.title}
+                            selected={option.id === selectedReasoningEffort}
+                            onSelect={() => { close(); selectReasoningEffort(option.id); }}
+                          />
+                        ))}
+                      </>
+                    )}
+                  </ComposerMenu>
+                  <ComposerMenu
+                    ariaLabel="Model"
                     title={modelsLoadError || modelOptionTitle(chatModels.find(model => model.id === selectedModel) ?? { id: selectedModel, label: selectedModel, model: selectedModel })}
+                    disabled={streaming || !!modelsLoadError || chatModels.length === 0}
+                    buttonClassName="surface border border-soft rounded-md px-2.5 py-1.5 text-[12.5px] flex items-center gap-1.5 smooth hover:bg-[var(--surface-2)] disabled:opacity-60 max-w-[42vw]"
+                    buttonData={{
+                      "data-selected-model": chatModels.find(model => model.id === selectedModel)?.model ?? selectedModel,
+                      "data-selected-model-status": chatModels.find(model => model.id === selectedModel)?.status ?? "unknown",
+                    }}
+                    buttonContent={<>
+                      <span className="truncate" style={{ color: "var(--text)" }}>
+                        {modelsLoadError
+                          ? "Models unavailable"
+                          : chatModels.length
+                          ? modelOptionText(chatModels.find(model => model.id === selectedModel) ?? chatModels[0])
+                          : "Loading models"}
+                      </span>
+                      <IC.ChevronDown size={12} style={{ color: "var(--text-dim)", flexShrink: 0 }}/>
+                    </>}
+                    menuWidth={280}
+                    align="left"
                   >
-                    {(modelsLoadError
-                      ? [{ id: "unavailable", label: "Models unavailable", model: "" }]
-                      : chatModels.length
-                      ? chatModels
-                      : [{ id: selectedModel, label: "Loading models", model: selectedModel }]
-                    ).map(model => (
-                      <option key={model.id} value={model.id}>{modelOptionText(model)}</option>
-                    ))}
-                  </select>
+                    {close => (
+                      <>
+                        {chatModels.map(model => (
+                          <ComposerMenuItem
+                            key={model.id}
+                            label={modelOptionText(model)}
+                            description={model.description || model.model}
+                            selected={model.id === selectedModel}
+                            onSelect={() => {
+                              close();
+                              setSelectedModel(model.id);
+                              window.localStorage.setItem(MODEL_STORAGE_KEY, model.id);
+                            }}
+                          />
+                        ))}
+                      </>
+                    )}
+                  </ComposerMenu>
                 </div>
                 <div className="flex items-center gap-2">
                   {streaming ? (

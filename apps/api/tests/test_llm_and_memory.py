@@ -795,6 +795,9 @@ async def test_tool_broker_live_browser_does_not_require_credential_record(monke
         assert provider == "browser"
         return "live"
 
+    async def fake_degraded_note(provider):
+        return None
+
     async def fake_route(agent, tool, args, vault_ref, tier="live"):
         calls.append((tool, vault_ref, tier))
         return ToolResult(data={"url": args["url"]}, summary="fetched")
@@ -807,6 +810,7 @@ async def test_tool_broker_live_browser_does_not_require_credential_record(monke
     monkeypatch.setattr(tool_broker, "_check_loop", noop_loop)
     monkeypatch.setattr(tool_broker, "tool_policy", fake_tool_policy)
     monkeypatch.setattr(tool_broker, "connector_tier", fake_connector_tier)
+    monkeypatch.setattr(tool_broker, "degraded_note", fake_degraded_note)
     monkeypatch.setattr(tool_broker, "_route", fake_route)
     monkeypatch.setattr(tool_broker.audit, "log", fake_audit_log)
 
