@@ -7,6 +7,7 @@ monkeypatched, so these run without composio-core installed.
 """
 from __future__ import annotations
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -113,9 +114,67 @@ def test_resolve_action_generic_passthrough_is_limited_to_api_tool():
     assert params == {"channel": "#general", "text": "hi"}
 
 
+def test_resolve_action_generic_passthrough_flattens_params_object():
+    slug, params = composio_client.resolve_action(
+        "notion.api",
+        {
+            "composio_action": "NOTION_SEARCH",
+            "params": {"query": "roadmap", "page_size": 5},
+            "__member_id": "user-1",
+        },
+    )
+    assert slug == "NOTION_SEARCH"
+    assert params == {"query": "roadmap", "page_size": 5}
+
+
 def test_resolve_action_raises_without_mapping_or_explicit_action():
     with pytest.raises(ValueError):
         composio_client.resolve_action("notion.search", {"query": "roadmap"})
+
+
+def test_composio_tools_are_visible_to_chat_and_map_to_broker_names():
+    from runtime.tool_registry import ALL_TOOLS, INLINE_CHAT_TOOLS, SUBAGENT_TOOLS, to_broker_name, tool_name
+
+    expected = {
+        "gmail__read_inbox",
+        "gmail__draft",
+        "gmail__send",
+        "gmail__search",
+        "slack__send",
+        "slack__read",
+        "slack__search",
+        "github__create_issue",
+        "github__read",
+        "github__search",
+        "google_drive__search",
+        "google_drive__read",
+        "google_drive__upload",
+        "google_calendar__api",
+        "notion__api",
+        "linear__api",
+        "hubspot__api",
+        "airtable__api",
+        "jira__api",
+        "outlook__api",
+        "teams__api",
+        "sharepoint_onedrive__api",
+        "salesforce__api",
+        "stripe__api",
+    }
+
+    assert expected <= {tool_name(tool) for tool in ALL_TOOLS}
+    assert expected <= {tool_name(tool) for tool in SUBAGENT_TOOLS}
+    assert expected <= {tool_name(tool) for tool in INLINE_CHAT_TOOLS}
+    assert to_broker_name("slack__send") == "slack.send"
+    assert to_broker_name("google_calendar__api") == "google_calendar.api"
+
+
+def test_composio_write_tools_keep_human_approval_floor():
+    from core.tool_broker import _ALWAYS_APPROVAL_TOOLS
+    from runtime.tool_registry import ALWAYS_APPROVAL_TOOL_NAMES
+
+    assert {"gmail__send", "slack__send", "github__create_issue", "google_drive__upload"} <= ALWAYS_APPROVAL_TOOL_NAMES
+    assert {"gmail.send", "slack.send", "github.create_issue", "google_drive.upload"} <= _ALWAYS_APPROVAL_TOOLS
 
 
 def test_managed_vault_ref_is_provider_and_entity_scoped():
@@ -130,6 +189,85 @@ def test_managed_connector_id_matches_entity_scope(monkeypatch):
     assert composio_client.managed_connector_id("slack", "acme", "user-1") == "slack:acme:user-1"
     monkeypatch.setattr(composio_client.settings, "composio_entity_scope", "org")
     assert composio_client.managed_connector_id("slack", "acme", "user-1") == "slack:acme"
+
+
+@pytest.mark.asyncio
+async def test_execute_action_uses_current_composio_tools_client(monkeypatch):
+    calls = {}
+
+    class FakeTools:
+        def execute(self, slug, arguments, *, user_id):
+            calls["execute"] = {"slug": slug, "arguments": arguments, "user_id": user_id}
+            return {"ok": True}
+
+    class FakeComposio:
+        def __init__(self, *, api_key):
+            calls["api_key"] = api_key
+            self.tools = FakeTools()
+
+    monkeypatch.setattr(composio_client.settings, "composio_api_key", "test-key")
+    monkeypatch.setitem(sys.modules, "composio", SimpleNamespace(Composio=FakeComposio))
+    composio_client._toolset.cache_clear()
+
+    result = await composio_client.execute_action(
+        "SLACK_SEARCH_MESSAGES",
+        {"query": "from:shaheer"},
+        entity="acme:user-1",
+    )
+
+    assert result == {"ok": True}
+    assert calls == {
+        "api_key": "test-key",
+        "execute": {
+            "slug": "SLACK_SEARCH_MESSAGES",
+            "arguments": {"query": "from:shaheer"},
+            "user_id": "acme:user-1",
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_initiate_connection_uses_current_connected_account_flow(monkeypatch):
+    calls = {}
+
+    class FakeToolkits:
+        def _get_auth_config_id(self, *, toolkit):
+            calls["toolkit"] = toolkit
+            return "ac_slack"
+
+    class FakeConnectedAccounts:
+        def initiate(self, *, user_id, auth_config_id, callback_url):
+            calls["initiate"] = {
+                "user_id": user_id,
+                "auth_config_id": auth_config_id,
+                "callback_url": callback_url,
+            }
+            return SimpleNamespace(redirect_url="https://connect.example", connected_account_id="ca_123")
+
+    class FakeComposio:
+        def __init__(self, *, api_key):
+            self.toolkits = FakeToolkits()
+            self.connected_accounts = FakeConnectedAccounts()
+
+    monkeypatch.setattr(composio_client.settings, "composio_api_key", "test-key")
+    monkeypatch.setitem(sys.modules, "composio", SimpleNamespace(Composio=FakeComposio))
+    composio_client._toolset.cache_clear()
+
+    result = await composio_client.initiate_connection(
+        "slack",
+        entity="acme:user-1",
+        redirect_url="http://localhost:8000/connectors/slack/composio-callback?state=s1",
+    )
+
+    assert result == {"redirect_url": "https://connect.example", "connection_id": "ca_123"}
+    assert calls == {
+        "toolkit": "slack",
+        "initiate": {
+            "user_id": "acme:user-1",
+            "auth_config_id": "ac_slack",
+            "callback_url": "http://localhost:8000/connectors/slack/composio-callback?state=s1",
+        },
+    }
 
 
 @pytest.mark.asyncio
@@ -328,11 +466,11 @@ async def test_broker_requires_active_managed_connector_for_composio_live_call(m
 
     monkeypatch.setattr(registry, "get", wrong_connector)
     with pytest.raises(ConnectorNotFound):
-        await tool_broker.tool_broker.execute(_agent(), "slack.send", {"channel": "C123", "text": "hi"})
+        await tool_broker.tool_broker.execute(_agent(), "slack.read", {"channel": "C123"})
 
     async def matching_connector(agent, tool):
         return SimpleNamespace(vault_ref="composio:slack:acme:user-1")
 
     monkeypatch.setattr(registry, "get", matching_connector)
-    result = await tool_broker.tool_broker.execute(_agent(), "slack.send", {"channel": "C123", "text": "hi"})
+    result = await tool_broker.tool_broker.execute(_agent(), "slack.read", {"channel": "C123"})
     assert result.data == {"vault_ref": "composio", "tier": "live"}

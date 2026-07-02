@@ -90,7 +90,7 @@ class ChatRequest(BaseModel):
 async def _create_conversation(member: Member, title: str, project_id: str | None = None) -> str:
     conversations = await reflect_table("conversations")
     values: dict = dict(
-        organization_id=settings.org_id,
+        organization_id=member.organization_id,
         region=settings.region,
         member_id=member.id,
         title=title[:80],
@@ -261,7 +261,10 @@ async def list_conversations(member: Member = Depends(get_current_member)) -> li
         rows = (
             await conn.execute(
                 select(conversations)
-                .where(conversations.c.member_id == member.id)
+                .where(
+                    conversations.c.member_id == member.id,
+                    conversations.c.organization_id == member.organization_id,
+                )
                 .order_by(conversations.c.updated_at.desc())
             )
         ).mappings().all()

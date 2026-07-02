@@ -633,7 +633,9 @@ const PALETTE_TYPE_LABELS: Record<string, string> = {
 
 // ─── Auth helpers ─────────────────────────────────────────────────────────────
 function getToken() {
-  return "";
+  // Auth now lives in an httpOnly `chronos_session` cookie. The client cannot
+  // read it directly, so API requests are the source of truth for session state.
+  return true;
 }
 
 async function apiFetch(path: string, init: RequestInit = {}) {
@@ -918,6 +920,16 @@ function ChronosAppInner() {
     void loadConversations(id);
   }
 
+  const handleConversationMissing = useCallback(() => {
+    setActiveConvoId(null);
+    setNewConversationOpen(true);
+    newConversationOpenRef.current = true;
+    setNewConversationNonce(n => n + 1);
+    router.replace("/chat");
+    void loadConversations();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [router]);
+
   async function loadConversations(selectId?: string) {
     setConversationsLoading(true);
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -1041,7 +1053,7 @@ function ChronosAppInner() {
       />
 
       <main className="flex-1 min-w-0 flex flex-col" style={{ background: "var(--bg)" }}>
-        {route === "chat"       && <ChatScreen key={activeConvoId ?? `new-${newConversationNonce}`} activeConvoId={activeConvoId} activePersonaId={activePersonaId} onPersonaChange={setActivePersonaId} onConvoCreated={(id) => { setNewConversationOpen(false); newConversationOpenRef.current = false; void loadConversations(id); }} onConvoSelected={openConversation} onApprovalsChanged={loadPendingApprovals} paletteOpen={searchPaletteOpen} onPaletteOpenChange={setSearchPaletteOpen} onOpenAgentMenu={() => setAgentMenuOpen(true)} />}
+        {route === "chat"       && <ChatScreen key={activeConvoId ?? `new-${newConversationNonce}`} activeConvoId={activeConvoId} activePersonaId={activePersonaId} onPersonaChange={setActivePersonaId} onConvoCreated={(id) => { setActiveConvoId(id); setNewConversationOpen(false); newConversationOpenRef.current = false; router.replace(`/chat?c=${encodeURIComponent(id)}`); void loadConversations(id); }} onConvoSelected={openConversation} onConversationMissing={handleConversationMissing} onApprovalsChanged={loadPendingApprovals} paletteOpen={searchPaletteOpen} onPaletteOpenChange={setSearchPaletteOpen} onOpenAgentMenu={() => setAgentMenuOpen(true)} />}
         {route === "activity"   && <ActivityScreen />}
         {route === "approvals"  && <ApprovalsScreen onDecision={loadPendingApprovals} />}
         {route === "memory"     && <MemoryScreen />}
@@ -1402,6 +1414,7 @@ function ChatScreen({
   onPersonaChange,
   onConvoCreated,
   onConvoSelected,
+  onConversationMissing,
   onApprovalsChanged,
   paletteOpen,
   onPaletteOpenChange,
@@ -1412,6 +1425,7 @@ function ChatScreen({
   onPersonaChange: (personaId: string) => void;
   onConvoCreated: (id: string) => void;
   onConvoSelected: (id: string) => void;
+  onConversationMissing: () => void;
   onApprovalsChanged: () => void;
   paletteOpen: boolean;
   onPaletteOpenChange: (open: boolean) => void;
@@ -1791,8 +1805,11 @@ function ChatScreen({
     setActiveTask(null);
     setActiveTaskEvents([]);
     setActiveTaskStreamError("");
-    void loadMessagesFromServer(activeConvoId).catch(() => {});
-  }, [activeConvoId, loadMessagesFromServer]);
+    void loadMessagesFromServer(activeConvoId).catch(() => {
+      setMessages([]);
+      onConversationMissing();
+    });
+  }, [activeConvoId, loadMessagesFromServer, onConversationMissing]);
 
   useEffect(() => {
     if (!activeTaskId) {

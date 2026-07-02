@@ -4,6 +4,8 @@ import { Suspense, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 
 const CONFIGURED_API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
+type CallbackResult = { ok: boolean; status: number; body: Record<string, unknown> };
+let activeCodeExchange: { code: string; promise: Promise<CallbackResult> } | null = null;
 
 function apiBase() {
   if (CONFIGURED_API_BASE) return CONFIGURED_API_BASE;
@@ -45,32 +47,31 @@ function CognitoCallbackInner() {
     }
 
     const redirectUri = `${window.location.origin}/login/callback`;
-    const controller = new AbortController();
 
     (async () => {
       try {
-        const res = await fetch(`${apiBase()}/auth/cognito/callback`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          credentials: "include",
-          body: JSON.stringify({ code, redirect_uri: redirectUri }),
-          signal: controller.signal,
-        });
-        if (!res.ok) {
-          const body = await res.json().catch(() => ({}));
-          setError(body.detail ?? `Sign-in failed (${res.status})`);
+        const existing = activeCodeExchange?.code === code ? activeCodeExchange.promise : null;
+        const promise = existing ?? fetch(`${apiBase()}/auth/cognito/callback`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            credentials: "include",
+            body: JSON.stringify({ code, redirect_uri: redirectUri }),
+          }).then(async (res) => ({
+            ok: res.ok,
+            status: res.status,
+            body: await res.json().catch(() => ({})),
+          }));
+        activeCodeExchange = { code, promise };
+        const result = await promise;
+        if (!result.ok) {
+          setError(typeof result.body.detail === "string" ? result.body.detail : `Sign-in failed (${result.status})`);
           return;
         }
-        await res.json();
         router.replace("/chat");
       } catch (err) {
-        if ((err as Error).name !== "AbortError") {
-          setError("Could not complete sign-in. Please try again.");
-        }
+        setError("Could not complete sign-in. Please try again.");
       }
     })();
-
-    return () => controller.abort();
   }, [params, router]);
 
   return (

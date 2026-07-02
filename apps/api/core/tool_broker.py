@@ -36,6 +36,9 @@ _ALWAYS_APPROVAL_TOOLS = {
     "linkedin.post",
     "website.publish",
     "gmail.send",   # Phase 1: no approval system yet → always blocked
+    "slack.send",
+    "github.create_issue",
+    "google_drive.upload",
     "local_computer.exec",
     "local_computer.open_app",
     "desktop.open_app",  # launching an app into the virtual desktop is risk-tiered

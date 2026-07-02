@@ -254,15 +254,19 @@ def parse_managed_vault_ref(vault_ref: str) -> tuple[str, str] | None:
 
 
 @lru_cache(maxsize=1)
-def _toolset():
-    """Return a cached ComposioToolSet. Raises if the SDK/key are unavailable."""
+def _client():
+    """Return a cached Composio v3 client. Raises if the SDK/key are unavailable."""
     if not settings.composio_api_key:
         raise RuntimeError("COMPOSIO_API_KEY is not set")
     try:
-        from composio import ComposioToolSet  # type: ignore[import-not-found]
+        from composio import Composio  # type: ignore[import-not-found]
     except ImportError as exc:  # pragma: no cover - exercised when SDK absent
         raise RuntimeError("composio SDK is not installed") from exc
-    return ComposioToolSet(api_key=settings.composio_api_key)
+    return Composio(api_key=settings.composio_api_key)
+
+
+# Backwards-compatible cache handle for older tests and local debug snippets.
+_toolset = _client
 
 
 def resolve_action(tool: str, args: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -285,11 +289,19 @@ def resolve_action(tool: str, args: dict[str, Any]) -> tuple[str, dict[str, Any]
             f"No Composio action mapping for '{tool}'. "
             "Pass a 'composio_action' arg with the Composio action slug."
         )
-    params = {
-        key: value
-        for key, value in args.items()
-        if not key.startswith(_INTERNAL_ARG_PREFIX) and key not in {"composio_action", "action"}
-    }
+    params: dict[str, Any] = {}
+    if isinstance(args.get("params"), dict):
+        params.update(args["params"])
+    params.update(
+        {
+            key: value
+            for key, value in args.items()
+            if (
+                not key.startswith(_INTERNAL_ARG_PREFIX)
+                and key not in {"composio_action", "action", "params"}
+            )
+        }
+    )
     return str(explicit), params
 
 
@@ -307,8 +319,8 @@ async def execute_action(
     import anyio
 
     def _call() -> dict[str, Any]:
-        toolset = _toolset()
-        return toolset.execute_action(action=action, params=params, entity_id=entity)
+        client = _client()
+        return client.tools.execute(action, arguments=params, user_id=entity)
 
     return await anyio.to_thread.run_sync(_call)
 
@@ -327,13 +339,20 @@ async def initiate_connection(
         raise ValueError(f"{provider} is not a Composio-managed provider")
 
     def _call() -> dict[str, Any]:
-        toolset = _toolset()
-        ent = toolset.get_entity(id=entity)
-        request = ent.initiate_connection(app_name=slug, redirect_url=redirect_url)
+        client = _client()
+        auth_config_id = client.toolkits._get_auth_config_id(toolkit=slug)
+        request = client.connected_accounts.initiate(
+            user_id=entity,
+            auth_config_id=auth_config_id,
+            callback_url=redirect_url,
+        )
         return {
-            "redirect_url": getattr(request, "redirectUrl", None) or getattr(request, "redirect_url", ""),
+            "redirect_url": getattr(request, "redirectUrl", None)
+            or getattr(request, "redirect_url", None)
+            or getattr(request, "redirectUrl", ""),
             "connection_id": getattr(request, "connectedAccountId", None)
-            or getattr(request, "connected_account_id", ""),
+            or getattr(request, "connected_account_id", None)
+            or getattr(request, "id", ""),
         }
 
     return await anyio.to_thread.run_sync(_call)
@@ -348,13 +367,25 @@ async def connection_status(provider: str, *, entity: str) -> str:
         return "inactive"
 
     def _call() -> str:
-        toolset = _toolset()
-        ent = toolset.get_entity(id=entity)
         try:
-            conn = ent.get_connection(app=slug)
+            client = _client()
+            response = client.connected_accounts.list(
+                toolkit_slugs=[slug],
+                user_ids=[entity],
+                limit=10,
+            )
         except Exception:
             return "inactive"
-        status = getattr(conn, "status", None) or ""
-        return "active" if str(status).lower() in {"active", "initiated_active", ""} else str(status).lower()
+        items = getattr(response, "items", None) or getattr(response, "data", None) or []
+        for conn in items:
+            status = getattr(conn, "status", None)
+            if isinstance(conn, dict):
+                status = conn.get("status")
+            normalized = str(status or "").lower()
+            if normalized == "active":
+                return "active"
+            if normalized:
+                return normalized
+        return "inactive"
 
     return await anyio.to_thread.run_sync(_call)

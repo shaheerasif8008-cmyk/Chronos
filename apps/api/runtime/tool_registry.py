@@ -156,6 +156,183 @@ GMAIL_SEARCH = _fn(
     ["query"],
 )
 
+GMAIL_READ_INBOX = _fn(
+    "gmail__read_inbox",
+    "Read recent messages from the connected Gmail inbox. Use for broad inbox summaries when no specific search query is known.",
+    {
+        "max_results": {
+            "type": "integer",
+            "description": "Maximum emails to return (default 10).",
+            "default": 10,
+        },
+    },
+    [],
+)
+
+GMAIL_SEND = _fn(
+    "gmail__send",
+    "Send an email from the connected Gmail account. This always requires explicit human approval before execution.",
+    {
+        "to": {"type": "string", "description": "Recipient email address."},
+        "subject": {"type": "string", "description": "Email subject line."},
+        "body": {"type": "string", "description": "Plain text email body."},
+        "cc": {"type": "string", "description": "Optional CC recipient.", "default": ""},
+    },
+    ["to", "subject", "body"],
+)
+
+# ── Composio-managed SaaS connectors ─────────────────────────────────────────
+
+SLACK_SEND = _fn(
+    "slack__send",
+    "Send a Slack message to a connected workspace channel. Requires approval before execution.",
+    {
+        "channel": {"type": "string", "description": "Channel id or name."},
+        "text": {"type": "string", "description": "Message text."},
+        "thread_ts": {"type": "string", "description": "Optional thread timestamp.", "default": ""},
+    },
+    ["channel", "text"],
+)
+
+SLACK_READ = _fn(
+    "slack__read",
+    "Read recent Slack conversation history from a connected workspace channel.",
+    {
+        "channel": {"type": "string", "description": "Channel id or name."},
+        "limit": {"type": "integer", "description": "Maximum messages to return (default 20).", "default": 20},
+    },
+    ["channel"],
+)
+
+SLACK_SEARCH = _fn(
+    "slack__search",
+    "Search messages in the connected Slack workspace.",
+    {
+        "query": {"type": "string", "description": "Slack message search query."},
+        "count": {"type": "integer", "description": "Maximum messages to return (default 20).", "default": 20},
+    },
+    ["query"],
+)
+
+GITHUB_CREATE_ISSUE = _fn(
+    "github__create_issue",
+    "Create a GitHub issue in a connected repository. Requires approval before execution.",
+    {
+        "owner": {"type": "string", "description": "Repository owner."},
+        "repo": {"type": "string", "description": "Repository name."},
+        "title": {"type": "string", "description": "Issue title."},
+        "body": {"type": "string", "description": "Issue body.", "default": ""},
+        "labels": {"type": "array", "items": {"type": "string"}, "description": "Optional labels.", "default": []},
+    },
+    ["owner", "repo", "title"],
+)
+
+GITHUB_READ = _fn(
+    "github__read",
+    "Read file content or metadata from a connected GitHub repository.",
+    {
+        "owner": {"type": "string", "description": "Repository owner."},
+        "repo": {"type": "string", "description": "Repository name."},
+        "path": {"type": "string", "description": "Repository file path."},
+        "ref": {"type": "string", "description": "Branch, tag, or commit SHA.", "default": ""},
+    },
+    ["owner", "repo", "path"],
+)
+
+GITHUB_SEARCH = _fn(
+    "github__search",
+    "Search connected GitHub repositories using GitHub search syntax.",
+    {
+        "query": {"type": "string", "description": "GitHub search query."},
+        "per_page": {"type": "integer", "description": "Maximum results to return (default 10).", "default": 10},
+    },
+    ["query"],
+)
+
+GOOGLE_DRIVE_SEARCH = _fn(
+    "google_drive__search",
+    "Search files in the connected Google Drive.",
+    {
+        "query": {"type": "string", "description": "Drive search query."},
+        "page_size": {"type": "integer", "description": "Maximum files to return (default 10).", "default": 10},
+    },
+    ["query"],
+)
+
+GOOGLE_DRIVE_READ = _fn(
+    "google_drive__read",
+    "Read metadata for a file in the connected Google Drive.",
+    {
+        "file_id": {"type": "string", "description": "Google Drive file id."},
+        "fields": {"type": "string", "description": "Optional Drive fields selector.", "default": ""},
+    },
+    ["file_id"],
+)
+
+GOOGLE_DRIVE_UPLOAD = _fn(
+    "google_drive__upload",
+    "Upload a file to the connected Google Drive. Requires approval before execution.",
+    {
+        "file_name": {"type": "string", "description": "Name for the uploaded file."},
+        "content": {"type": "string", "description": "Text content to upload."},
+        "mime_type": {"type": "string", "description": "MIME type.", "default": "text/plain"},
+        "parent_id": {"type": "string", "description": "Optional parent folder id.", "default": ""},
+    },
+    ["file_name", "content"],
+)
+
+
+def _composio_api_tool(provider: str, label: str) -> dict[str, Any]:
+    return _fn(
+        f"{provider}__api",
+        f"Invoke a Composio action for connected {label}. Use platform/action discovery or a known Composio action slug.",
+        {
+            "composio_action": {"type": "string", "description": "Composio action slug to execute."},
+            "params": {"type": "object", "description": "Parameters for the Composio action.", "default": {}},
+        },
+        ["composio_action"],
+    )
+
+
+GOOGLE_CALENDAR_API = _composio_api_tool("google_calendar", "Google Calendar")
+NOTION_API = _composio_api_tool("notion", "Notion")
+LINEAR_API = _composio_api_tool("linear", "Linear")
+HUBSPOT_API = _composio_api_tool("hubspot", "HubSpot")
+AIRTABLE_API = _composio_api_tool("airtable", "Airtable")
+JIRA_API = _composio_api_tool("jira", "Jira")
+OUTLOOK_API = _composio_api_tool("outlook", "Outlook")
+TEAMS_API = _composio_api_tool("teams", "Microsoft Teams")
+SHAREPOINT_ONEDRIVE_API = _composio_api_tool("sharepoint_onedrive", "SharePoint and OneDrive")
+SALESFORCE_API = _composio_api_tool("salesforce", "Salesforce")
+STRIPE_API = _composio_api_tool("stripe", "Stripe")
+
+COMPOSIO_CONNECTOR_TOOLS = [
+    GMAIL_READ_INBOX,
+    GMAIL_DRAFT,
+    GMAIL_SEND,
+    GMAIL_SEARCH,
+    SLACK_SEND,
+    SLACK_READ,
+    SLACK_SEARCH,
+    GITHUB_CREATE_ISSUE,
+    GITHUB_READ,
+    GITHUB_SEARCH,
+    GOOGLE_DRIVE_SEARCH,
+    GOOGLE_DRIVE_READ,
+    GOOGLE_DRIVE_UPLOAD,
+    GOOGLE_CALENDAR_API,
+    NOTION_API,
+    LINEAR_API,
+    HUBSPOT_API,
+    AIRTABLE_API,
+    JIRA_API,
+    OUTLOOK_API,
+    TEAMS_API,
+    SHAREPOINT_ONEDRIVE_API,
+    SALESFORCE_API,
+    STRIPE_API,
+]
+
 # ── Previous chat history ─────────────────────────────────────────────────────
 
 CHAT_HISTORY_SEARCH = _fn(
@@ -1040,8 +1217,7 @@ ALL_TOOLS: list[dict[str, Any]] = [
     BROWSER_FETCH,
     BROWSER_EXTRACT_CONTACTS,
     *BROWSER_OPERATOR_TOOLS,
-    GMAIL_DRAFT,
-    GMAIL_SEARCH,
+    *COMPOSIO_CONNECTOR_TOOLS,
     CHAT_HISTORY_SEARCH,
     CHAT_HISTORY_RECENT,
     FS_LIST,
@@ -1080,6 +1256,7 @@ SUBAGENT_TOOLS: list[dict[str, Any]] = [
     BROWSER_FETCH,
     BROWSER_EXTRACT_CONTACTS,
     *BROWSER_OPERATOR_TOOLS,
+    *COMPOSIO_CONNECTOR_TOOLS,
     CHAT_HISTORY_SEARCH,
     CHAT_HISTORY_RECENT,
     FS_LIST,
@@ -1113,7 +1290,18 @@ SUBAGENT_TOOLS: list[dict[str, Any]] = [
 
 #: Names that always need explicit human approval before execution.
 ALWAYS_APPROVAL_TOOL_NAMES: frozenset[str] = frozenset(
-    {"gmail__send", "twitter__post", "linkedin__post", "website__publish", "local_computer__exec", "local_computer__open_app", "desktop__open_app"}
+    {
+        "gmail__send",
+        "slack__send",
+        "github__create_issue",
+        "google_drive__upload",
+        "twitter__post",
+        "linkedin__post",
+        "website__publish",
+        "local_computer__exec",
+        "local_computer__open_app",
+        "desktop__open_app",
+    }
 )
 
 _SUBAGENT_TOOL_NAME = "spawn__subagent"
@@ -1125,8 +1313,7 @@ INLINE_CHAT_TOOLS: list[dict[str, Any]] = [
     BROWSER_FETCH,
     BROWSER_EXTRACT_CONTACTS,
     *BROWSER_OPERATOR_TOOLS,
-    GMAIL_DRAFT,
-    GMAIL_SEARCH,
+    *COMPOSIO_CONNECTOR_TOOLS,
     CHAT_HISTORY_SEARCH,
     CHAT_HISTORY_RECENT,
     FS_LIST,

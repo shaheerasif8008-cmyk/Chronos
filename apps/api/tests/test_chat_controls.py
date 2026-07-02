@@ -52,6 +52,127 @@ def test_retry_payload_for_assistant_message_regenerates_previous_user_turn():
     ]
 
 
+@pytest.mark.asyncio
+async def test_list_conversations_is_scoped_to_member_org(monkeypatch):
+    from routers import chat
+    from unittest.mock import AsyncMock
+
+    member = _make_member(member_id="member-1", org_id="org-1")
+    captured_where = []
+
+    class _Column:
+        def __init__(self, name):
+            self.name = name
+
+        def __eq__(self, other):
+            return (self.name, other)
+
+        def desc(self):
+            return ("desc", self.name)
+
+    class _Columns:
+        member_id = _Column("member_id")
+        organization_id = _Column("organization_id")
+        updated_at = _Column("updated_at")
+
+    class _Table:
+        c = _Columns()
+
+    class _Clause:
+        def where(self, *args):
+            captured_where.extend(args)
+            return self
+
+        def order_by(self, *args):
+            return self
+
+    class _FakeResult:
+        def mappings(self):
+            class M:
+                def all(self_inner):
+                    return []
+            return M()
+
+    class _FakeConn:
+        async def execute(self, stmt):
+            return _FakeResult()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            pass
+
+    class _FakeEngine:
+        def begin(self):
+            return _FakeConn()
+
+    async def fake_reflect_table(name):
+        assert name == "conversations"
+        return _Table()
+
+    monkeypatch.setattr(chat, "engine", _FakeEngine())
+    monkeypatch.setattr(chat, "reflect_table", fake_reflect_table)
+    monkeypatch.setattr(chat, "select", lambda *_: _Clause())
+    monkeypatch.setattr(chat.permissions, "check", AsyncMock(return_value=True))
+
+    assert await chat.list_conversations(member) == []
+    assert ("member_id", "member-1") in captured_where
+    assert ("organization_id", "org-1") in captured_where
+
+
+@pytest.mark.asyncio
+async def test_create_conversation_uses_member_org(monkeypatch):
+    from routers import chat
+
+    member = _make_member(member_id="member-1", org_id="org-1")
+    captured_values = {}
+
+    class _Clause:
+        def values(self, **kwargs):
+            captured_values.update(kwargs)
+            return self
+
+        def returning(self, *args):
+            return self
+
+    class _Columns:
+        id = object()
+
+    class _Table:
+        c = _Columns()
+
+    class _FakeResult:
+        def scalar_one(self):
+            return "conv-1"
+
+    class _FakeConn:
+        async def execute(self, stmt):
+            return _FakeResult()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            pass
+
+    class _FakeEngine:
+        def begin(self):
+            return _FakeConn()
+
+    async def fake_reflect_table(name):
+        assert name == "conversations"
+        return _Table()
+
+    monkeypatch.setattr(chat, "engine", _FakeEngine())
+    monkeypatch.setattr(chat, "reflect_table", fake_reflect_table)
+    monkeypatch.setattr(chat, "insert", lambda *_: _Clause())
+
+    assert await chat._create_conversation(member, "hello") == "conv-1"
+    assert captured_values["member_id"] == "member-1"
+    assert captured_values["organization_id"] == "org-1"
+
+
 def _fake_engine_factory(rows_by_call=None, returning_scalar=None):
     """Build a fake async SQLAlchemy engine.
 
