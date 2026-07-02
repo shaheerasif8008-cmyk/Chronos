@@ -80,6 +80,8 @@ def _patch_broker_deps(tmp_path, monkeypatch):
     # --- core.exceptions ---
     class ApprovalRequired(Exception):
         pass
+    class ConnectorNotFound(Exception):
+        pass
     class LoopDetected(Exception):
         pass
     class RateLimitExceeded(Exception):
@@ -90,6 +92,7 @@ def _patch_broker_deps(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "core.exceptions", _make_stub_module(
         "core.exceptions",
         ApprovalRequired=ApprovalRequired,
+        ConnectorNotFound=ConnectorNotFound,
         LoopDetected=LoopDetected,
         RateLimitExceeded=RateLimitExceeded,
         SafetyLimitViolation=SafetyLimitViolation,

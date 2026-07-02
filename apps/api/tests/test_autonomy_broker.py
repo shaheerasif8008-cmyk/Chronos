@@ -74,12 +74,14 @@ def broker_env(monkeypatch):
 
     class ApprovalRequired(Exception):
         def __init__(self, tool="", reason=""): super().__init__(reason); self.tool = tool
+    class ConnectorNotFound(Exception): pass
     class LoopDetected(Exception): pass
     class RateLimitExceeded(Exception): pass
     class SafetyLimitViolation(Exception): pass
 
     monkeypatch.setitem(sys.modules, "core.exceptions", _make_stub_module(
-        "core.exceptions", ApprovalRequired=ApprovalRequired, LoopDetected=LoopDetected,
+        "core.exceptions", ApprovalRequired=ApprovalRequired, ConnectorNotFound=ConnectorNotFound,
+        LoopDetected=LoopDetected,
         RateLimitExceeded=RateLimitExceeded, SafetyLimitViolation=SafetyLimitViolation))
 
     class Member:
