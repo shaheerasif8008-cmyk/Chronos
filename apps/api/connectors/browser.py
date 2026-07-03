@@ -125,6 +125,30 @@ class BrowserConnector:
             except Exception as exc:
                 log.warning("Tavily search failed; falling back to browser search: %s", exc)
 
+        if settings.browserbase_api_key:
+            try:
+                results = await _browserbase_search(query, max_results)
+                trimmed = [_normalize_browserbase_result(item) for item in results[:max_results]]
+                trimmed = [item for item in trimmed if item["title"] or item["url"] or item["snippet"]]
+                if not trimmed:
+                    direct = await _direct_navigation_fallback(query)
+                    if direct:
+                        return ToolResult(
+                            data={
+                                "query": query,
+                                "results": [direct],
+                                "provider": "direct_navigation",
+                                "fallback_reason": "Search provider returned zero results, so Chronos navigated directly.",
+                            },
+                            summary=f"Browserbase search '{query}' returned 0 results; direct navigation found {direct['url']}",
+                        )
+                return ToolResult(
+                    data={"query": query, "results": trimmed, "provider": "browserbase", "tier": "live"},
+                    summary=f"Browserbase search '{query}': {len(trimmed)} results",
+                )
+            except Exception as exc:
+                log.warning("Browserbase search failed; falling back to browser search: %s", exc)
+
         playwright = browser = context = None
         try:
             playwright, browser, context, page = await _new_page()
@@ -371,6 +395,26 @@ async def _tavily_search(query: str, max_results: int) -> list[dict[str, Any]]:
     return [item for item in results if isinstance(item, dict)]
 
 
+async def _browserbase_search(query: str, max_results: int) -> list[dict[str, Any]]:
+    if not query:
+        raise ValueError("browser.search requires 'query'")
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        response = await client.post(
+            settings.browserbase_search_url,
+            headers={"x-bb-api-key": settings.browserbase_api_key},
+            json={
+                "query": query,
+                "numResults": max(1, min(max_results, 20)),
+            },
+        )
+        response.raise_for_status()
+        payload = response.json()
+    results = payload.get("results") or payload.get("data") or payload.get("items") or []
+    if not isinstance(results, list):
+        return []
+    return [item for item in results if isinstance(item, dict)]
+
+
 def _normalize_tavily_result(item: dict[str, Any]) -> dict[str, Any]:
     result = {
         "title": str(item.get("title") or "").strip(),
@@ -379,6 +423,23 @@ def _normalize_tavily_result(item: dict[str, Any]) -> dict[str, Any]:
     }
     if item.get("score") is not None:
         result["score"] = item["score"]
+    return result
+
+
+def _normalize_browserbase_result(item: dict[str, Any]) -> dict[str, Any]:
+    result = {
+        "title": str(item.get("title") or item.get("name") or "").strip(),
+        "snippet": str(
+            item.get("text")
+            or item.get("snippet")
+            or item.get("description")
+            or item.get("content")
+            or ""
+        ).strip(),
+        "url": str(item.get("url") or item.get("link") or "").strip(),
+    }
+    if item.get("source") is not None:
+        result["source"] = item["source"]
     return result
 
 

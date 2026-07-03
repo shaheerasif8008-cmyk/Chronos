@@ -97,6 +97,8 @@ class Settings(BaseSettings):
     composio_entity_scope: str = "member"  # "member" (per-user connections) or "org" (one shared connection)
     composio_callback_base_url: str = "http://localhost:8000"
     tavily_api_key: str = ""
+    browserbase_api_key: str = ""
+    browserbase_search_url: str = "https://api.browserbase.com/v1/search"
     # Google OAuth2 — covers Gmail, Calendar, Drive
     google_client_id: str = ""
     google_client_secret: str = ""

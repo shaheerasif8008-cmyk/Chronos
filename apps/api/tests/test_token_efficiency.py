@@ -160,3 +160,90 @@ async def test_run_loop_saves_token_usage_when_daily_limit_disabled(monkeypatch)
     assert token_usage_saves[-1]["total_tokens"] == 200
     assert token_usage_saves[-1]["steps"][-1]["tokens"] == 80
     assert len(seen_history_lengths) == 2
+
+
+@pytest.mark.asyncio
+async def test_run_loop_finishes_with_last_answer_when_next_step_would_exceed_budget(monkeypatch):
+    from runtime import agent_loop
+
+    last_answer = "Best available answer from gathered evidence."
+    task = {
+        "id": "task-near-budget",
+        "organization_id": "org-budget",
+        "region": "us",
+        "triggered_by_member_id": "member-1",
+        "workspace_id": "default",
+        "persona_id": None,
+        "status": "pending",
+        "goal": "Research and summarize",
+        "plan": {},
+        "agent_state": {
+            "agent_history": [
+                {"role": "user", "content": "Research and summarize"},
+                {"role": "assistant", "content": last_answer},
+                {
+                    "role": "system",
+                    "content": "Controller self-check: answer needs more work.",
+                },
+            ],
+            "token_usage": {
+                "total_tokens": 187_000,
+                "steps": [
+                    {
+                        "iteration": 1,
+                        "model": "openrouter/openai/gpt-5.4-mini",
+                        "tokens": 16_000,
+                        "estimated_prompt_tokens": 7_500,
+                    },
+                    {
+                        "iteration": 2,
+                        "model": "openrouter/openai/gpt-5.4-mini",
+                        "tokens": 15_500,
+                        "estimated_prompt_tokens": 7_200,
+                    },
+                ],
+            },
+        },
+        "current_step": 0,
+        "result": {},
+        "iteration_count": 12,
+        "started_at": None,
+        "depth": 0,
+    }
+    emitted: list[dict] = []
+    persisted: list[str] = []
+
+    async def fail_llm_step(*args, **kwargs):
+        raise AssertionError("near-budget task must not call the model again")
+
+    async def fake_enforce_model_budget(org_id, *, model, estimated_tokens=0):
+        assert estimated_tokens >= 15_500
+        raise agent_loop.GovernanceLimitExceeded("daily token budget exhausted for org org-budget: 187000/200000")
+
+    async def fake_save_task(task_id, **values):
+        task.update(values)
+
+    async def fake_emit(task_id, event, actor_id="chronos"):
+        emitted.append(event)
+
+    async def fake_publish(task_id, event):
+        emitted.append(event)
+
+    async def fake_persist(task_arg, content, **kwargs):
+        persisted.append(content)
+        return "msg-budget"
+
+    monkeypatch.setattr(agent_loop.settings, "agent_cognition_enabled", False)
+    monkeypatch.setattr(agent_loop, "_llm_step", fail_llm_step)
+    monkeypatch.setattr(agent_loop, "enforce_model_budget", fake_enforce_model_budget)
+    monkeypatch.setattr(agent_loop, "save_task", fake_save_task)
+    monkeypatch.setattr(agent_loop, "emit_activity", fake_emit)
+    monkeypatch.setattr(agent_loop, "publish_activity", fake_publish)
+    monkeypatch.setattr(agent_loop, "_persist_to_conversation", fake_persist)
+
+    result = await agent_loop.run_loop(task)
+
+    assert result == {"answer": last_answer}
+    assert task["status"] == "complete"
+    assert persisted == [last_answer]
+    assert any(event.get("type") == "task_complete" for event in emitted)

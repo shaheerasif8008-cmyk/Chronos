@@ -42,6 +42,38 @@ async def test_browser_search_uses_tavily_when_api_key_is_configured(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_browser_search_uses_browserbase_when_api_key_is_configured(monkeypatch):
+    from connectors import browser
+
+    async def fail_new_page():
+        raise AssertionError("Browserbase search should not open local Playwright")
+
+    async def fake_browserbase_search(query: str, max_results: int):
+        assert query == "DHA Karachi rent"
+        assert max_results == 3
+        return [
+            {"title": "Listing one", "url": "https://example.com/one", "text": "First result"},
+            {"name": "Listing two", "link": "https://example.com/two", "snippet": "Second result"},
+        ]
+
+    monkeypatch.setattr(browser.settings, "demo_mode", False)
+    monkeypatch.setattr(browser.settings, "tavily_api_key", "")
+    monkeypatch.setattr(browser.settings, "browserbase_api_key", "bb-test")
+    monkeypatch.setattr(browser, "_new_page", fail_new_page)
+    monkeypatch.setattr(browser, "_browserbase_search", fake_browserbase_search)
+
+    result = await browser.browser_connector._search({"query": "DHA Karachi rent", "max_results": 3})
+
+    assert result.summary == "Browserbase search 'DHA Karachi rent': 2 results"
+    assert result.data["tier"] == "live"
+    assert result.data["provider"] == "browserbase"
+    assert result.data["results"] == [
+        {"title": "Listing one", "snippet": "First result", "url": "https://example.com/one"},
+        {"title": "Listing two", "snippet": "Second result", "url": "https://example.com/two"},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_browser_health_prefers_tavily_without_playwright(monkeypatch):
     from core import connector_health
 
@@ -53,3 +85,18 @@ async def test_browser_health_prefers_tavily_without_playwright(monkeypatch):
     assert health["browser"]["status"] == "live"
     assert health["browser"]["tier"] == "live"
     assert "Tavily" in health["browser"]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_browser_health_accepts_browserbase_without_playwright(monkeypatch):
+    from core import connector_health
+
+    monkeypatch.setattr(connector_health.settings, "tavily_api_key", "")
+    monkeypatch.setattr(connector_health.settings, "browserbase_api_key", "bb-test")
+    monkeypatch.setattr(connector_health, "_module_available", lambda name: False)
+
+    health = await connector_health.check_connectors(refresh=True)
+
+    assert health["browser"]["status"] == "live"
+    assert health["browser"]["tier"] == "live"
+    assert "Browserbase" in health["browser"]["reason"]

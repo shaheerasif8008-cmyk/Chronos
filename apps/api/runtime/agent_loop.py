@@ -620,6 +620,35 @@ def _append_step_token_usage(
     return {"total_tokens": sum(int(step.get("tokens") or 0) for step in steps), "steps": steps}
 
 
+def _project_next_step_tokens(token_usage: dict[str, Any], estimated_prompt_tokens: int) -> int:
+    """Estimate the full next model step, not just the prompt.
+
+    Governance checks run before the model call, while real usage is recorded
+    after it. Using prompt size alone lets long completions/tool-call payloads
+    overshoot a daily budget. Recent observed step totals are the best local
+    predictor we have for the same task shape.
+    """
+    recent = [
+        int(step.get("tokens") or 0)
+        for step in list(token_usage.get("steps") or [])[-3:]
+        if int(step.get("tokens") or 0) > 0
+    ]
+    if not recent:
+        return max(0, int(estimated_prompt_tokens))
+    recent_average = int(sum(recent) / len(recent))
+    return max(0, int(estimated_prompt_tokens), recent_average)
+
+
+def _latest_assistant_text(history: list[dict[str, Any]]) -> str | None:
+    for message in reversed(history):
+        if message.get("role") != "assistant":
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+    return None
+
+
 # ── LLM step ──────────────────────────────────────────────────────────────────
 
 async def _llm_step(
@@ -2154,10 +2183,11 @@ async def run_loop(
                 step_history = step_history + [{"role": "system", "content": "\n\n".join(_guidance)}]
         try:
             estimated_prompt_tokens = estimate_message_tokens(step_history)
+            projected_step_tokens = _project_next_step_tokens(token_usage, estimated_prompt_tokens)
             await enforce_model_budget(
                 task.get("organization_id", "default"),
                 model=effective_model,
-                estimated_tokens=estimated_prompt_tokens,
+                estimated_tokens=projected_step_tokens,
             )
             final_text, calls, step_tokens = await _llm_step(
                 step_history,
@@ -2168,6 +2198,36 @@ async def run_loop(
         except GovernanceLimitExceeded as exc:
             friendly = str(exc)
             logger.warning("Governance blocked agent loop for task %s: %s", task_id, friendly)
+            last_answer = _latest_assistant_text(history)
+            if last_answer:
+                result = {"answer": last_answer}
+                await publish_activity(task_id, {
+                    "type": "model_result",
+                    "iteration": iteration + 1,
+                    "summary": "Budget is nearly exhausted; finalizing from gathered evidence.",
+                })
+                await _checkpoint(
+                    task_id,
+                    history,
+                    iteration,
+                    model=effective_model,
+                    status="complete",
+                    result=result,
+                    current_step=current_plan_step if plan_steps else iteration,
+                    token_usage=token_usage,
+                    completed_at=datetime.now(timezone.utc),
+                )
+                message_id = await _persist_to_conversation(task, last_answer)
+                event: dict[str, Any] = {
+                    "type": "task_complete",
+                    "result": result,
+                    "budget_guard": True,
+                    "budget_message": friendly,
+                }
+                if message_id:
+                    event["message_id"] = message_id
+                await emit_activity(task_id, event)
+                return result
             await save_task(task_id, status="failed", error=friendly)
             failed_msg_id = await _persist_to_conversation(task, friendly)
             failed_event: dict[str, Any] = {"type": "task_failed", "error": friendly}

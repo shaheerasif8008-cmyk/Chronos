@@ -26,6 +26,8 @@ def _module_available(name: str) -> bool:
 async def _browser_available() -> tuple[bool, str]:
     if settings.tavily_api_key:
         return True, "Tavily API key is configured; browser.search uses Tavily for live web search."
+    if settings.browserbase_api_key:
+        return True, "Browserbase API key is configured; browser.search uses Browserbase for live web search."
     if not _module_available("playwright"):
         return False, "playwright is not installed; browser.search uses fixture results."
     try:
@@ -59,7 +61,7 @@ async def check_connectors(*, refresh: bool = False) -> ConnectorHealth:
             "status": browser_status,
             "tier": browser_status,
             "reason": browser_reason,
-            "setup": None if browser_status == "live" else "Set TAVILY_API_KEY or run: pip install playwright && playwright install chromium",
+            "setup": None if browser_status == "live" else "Set TAVILY_API_KEY, BROWSERBASE_API_KEY, or run: pip install playwright && playwright install chromium",
         },
         "fs": {
             "status": "live",
