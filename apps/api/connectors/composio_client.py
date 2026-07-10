@@ -340,12 +340,26 @@ async def initiate_connection(
 
     def _call() -> dict[str, Any]:
         client = _client()
-        auth_config_id = client.toolkits._get_auth_config_id(toolkit=slug)
-        request = client.connected_accounts.initiate(
-            user_id=entity,
-            auth_config_id=auth_config_id,
-            callback_url=redirect_url,
-        )
+        # The SDK raises provider-specific exception types (API errors, missing
+        # auth configs, network failures). Normalize them all to RuntimeError so
+        # the router can return an honest 502 instead of an unhandled 500.
+        try:
+            auth_config_id = client.toolkits._get_auth_config_id(toolkit=slug)
+        except Exception as exc:  # noqa: BLE001 — SDK exception types vary by version
+            raise RuntimeError(
+                f"Composio has no usable auth config for '{slug}'. Create one for this "
+                f"app in your Composio project (or verify COMPOSIO_API_KEY). ({exc})"
+            ) from exc
+        try:
+            request = client.connected_accounts.initiate(
+                user_id=entity,
+                auth_config_id=auth_config_id,
+                callback_url=redirect_url,
+            )
+        except Exception as exc:  # noqa: BLE001 — SDK exception types vary by version
+            raise RuntimeError(
+                f"Composio could not start the {slug} connection: {exc}"
+            ) from exc
         return {
             "redirect_url": getattr(request, "redirectUrl", None)
             or getattr(request, "redirect_url", None)

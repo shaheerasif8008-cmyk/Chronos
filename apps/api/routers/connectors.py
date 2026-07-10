@@ -65,7 +65,9 @@ async def _composio_oauth_start(provider: str, member: Member) -> dict[str, str]
         result = await composio_client.initiate_connection(
             provider, entity=entity, redirect_url=redirect_url
         )
-    except (RuntimeError, ValueError) as exc:
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 — any SDK/transport failure → honest 502
         raise HTTPException(status_code=502, detail=f"Composio connect failed: {exc}") from exc
 
     url = result.get("redirect_url")

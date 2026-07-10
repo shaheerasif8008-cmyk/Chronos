@@ -56,6 +56,21 @@ type McpServer = {
   created_at?: string;
 };
 
+// apiFetch throws Error(raw body text) for non-OK responses and a bare
+// TypeError ("Failed to fetch") when the request never got a readable
+// response. Turn both into something a human can act on.
+function errorMessage(err: unknown, fallback: string): string {
+  if (!(err instanceof Error) || !err.message) return fallback;
+  if (/failed to fetch|networkerror|load failed/i.test(err.message)) {
+    return `${fallback}: the Chronos API did not respond. Check that the backend is running and reachable, then check its logs.`;
+  }
+  try {
+    const parsed = JSON.parse(err.message) as { detail?: unknown };
+    if (typeof parsed.detail === "string" && parsed.detail) return `${fallback}: ${parsed.detail}`;
+  } catch { /* not JSON — fall through to the raw message */ }
+  return `${fallback}: ${err.message}`;
+}
+
 const PERMISSION_OPTIONS: Array<{ value: ToolSpec["permission"]; label: string }> = [
   { value: "default", label: "Default" },
   { value: "always_allow", label: "Always allow" },
@@ -243,10 +258,6 @@ function AddCustomConnectorModal({ onClose, onAdded }: { onClose: () => void; on
         method: "POST",
         body: JSON.stringify({ name: name.trim(), transport: "remote", server_url: url.trim() }),
       });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({})) as { detail?: string };
-        throw new Error(body.detail ?? `Error ${res.status}`);
-      }
       const server = await res.json() as { id?: string };
       if (server.id) {
         // Discover tools right away so the model can use it immediately.
@@ -255,7 +266,7 @@ function AddCustomConnectorModal({ onClose, onAdded }: { onClose: () => void; on
       await onAdded();
       onClose();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not add connector");
+      setError(errorMessage(err, "Could not add connector"));
     } finally {
       setBusy(false);
     }
@@ -312,8 +323,8 @@ export default function ConnectorsScreen() {
       ]);
       setApps(catalog);
       setMcpServers(mcp.servers || []);
-    } catch {
-      setError("Could not load connectors.");
+    } catch (err) {
+      setError(errorMessage(err, "Could not load connectors"));
     } finally {
       setLoading(false);
     }
@@ -341,14 +352,10 @@ export default function ConnectorsScreen() {
     try {
       const endpoint = app.id === "gmail" ? "/connectors/gmail/oauth-start" : `/connectors/${app.id}/oauth-start`;
       const res = await apiFetch(endpoint, { method: "POST" });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({})) as { detail?: string };
-        throw new Error(body.detail ?? `Error ${res.status}`);
-      }
       const { url } = await res.json() as { url: string };
       window.location.href = url;
     } catch (err) {
-      setError(err instanceof Error ? err.message : `${app.name} connect failed`);
+      setError(errorMessage(err, `Could not connect ${app.name}`));
       setBusy(null);
     }
   }
@@ -358,11 +365,10 @@ export default function ConnectorsScreen() {
     setBusy(app.id);
     setError("");
     try {
-      const res = await apiFetch(`/connectors/${app.id}/disconnect`, { method: "DELETE" });
-      if (!res.ok) throw new Error(`Error ${res.status}`);
+      await apiFetch(`/connectors/${app.id}/disconnect`, { method: "DELETE" });
       await load();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Disconnect failed");
+      setError(errorMessage(err, `Could not disconnect ${app.name}`));
     } finally {
       setBusy(null);
     }
@@ -370,17 +376,16 @@ export default function ConnectorsScreen() {
 
   async function setPermission(tool: ToolSpec, permission: ToolSpec["permission"]) {
     try {
-      const res = await apiFetch(`/connectors/tool-permissions/${tool.name}`, {
+      await apiFetch(`/connectors/tool-permissions/${tool.name}`, {
         method: "PUT",
         body: JSON.stringify({ permission }),
       });
-      if (!res.ok) throw new Error(`Error ${res.status}`);
       setApps(prev => prev.map(app => ({
         ...app,
         tools: app.tools.map(t => (t.name === tool.name ? { ...t, permission } : t)),
       })));
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not update tool permission");
+      setError(errorMessage(err, "Could not update tool permission"));
     }
   }
 
