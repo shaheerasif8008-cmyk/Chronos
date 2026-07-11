@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
@@ -273,7 +274,11 @@ async def receive_publication_message(
     x_chronos_agent_token: str | None = Header(default=None, alias="X-Chronos-Agent-Token"),
 ) -> dict[str, Any]:
     publication, agent = await agents.get_publication(publication_id)
-    if not x_chronos_agent_token or x_chronos_agent_token != publication.get("inbound_token"):
+    expected_token = publication.get("inbound_token") or ""
+    # Constant-time compare so a mismatch can't be found byte-by-byte via timing.
+    if not x_chronos_agent_token or not expected_token or not hmac.compare_digest(
+        str(x_chronos_agent_token), str(expected_token)
+    ):
         raise HTTPException(status_code=403, detail="Invalid publication token")
 
     member = Member(

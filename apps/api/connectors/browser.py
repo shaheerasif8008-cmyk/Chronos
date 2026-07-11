@@ -39,6 +39,39 @@ def _assert_fetchable(url: str) -> None:
         raise ValueError(f"refusing to fetch unsafe URL: {exc}") from exc
 
 
+async def _install_network_guard(context) -> None:
+    """Re-validate every request the page makes against the SSRF guard.
+
+    The one-time ``_assert_fetchable`` check on the entry URL is not enough:
+    Playwright follows HTTP 30x redirects and in-page (meta/JS) navigations
+    without re-checking, so a fetched page could redirect the browser to the
+    cloud metadata endpoint or a loopback/private host and the response body
+    would be read back to the model. Aborting unsafe requests at the context
+    level closes redirect- and subresource-based SSRF (mirrors the browser
+    operator's guard).
+    """
+    from core.ssrf import assert_safe_url, UnsafeURLError
+
+    route = getattr(context, "route", None)
+    if not callable(route):
+        return
+
+    async def _guard_request(playwright_route) -> None:
+        request_url = str(getattr(getattr(playwright_route, "request", None), "url", "") or "")
+        try:
+            assert_safe_url(request_url)
+        except UnsafeURLError:
+            await playwright_route.abort()
+            return
+        except Exception:
+            # Never fail-open on an unexpected guard error — abort the request.
+            await playwright_route.abort()
+            return
+        await playwright_route.continue_()
+
+    await route("**/*", _guard_request)
+
+
 _TIMEOUT_MS = 20_000   # 20-second hard page timeout
 _USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -75,6 +108,7 @@ async def _new_page():
         viewport={"width": 1280, "height": 800},
         java_script_enabled=True,
     )
+    await _install_network_guard(context)
     page = await context.new_page()
     page.set_default_timeout(_TIMEOUT_MS)
     return playwright, browser, context, page

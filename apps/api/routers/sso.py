@@ -90,7 +90,17 @@ async def sso_callback(
     redirect_path = claims_state.get("redirect") or "/chat"
     from urllib.parse import urlencode
 
-    safe_redirect = redirect_path if isinstance(redirect_path, str) and redirect_path.startswith("/") else "/chat"
+    # Only a same-site path is safe. A bare startswith("/") check still admits
+    # protocol-relative targets like "//evil.com" or "/\evil.com", which the web
+    # app would follow as an external navigation (open redirect). Require a single
+    # leading slash not followed by another slash or backslash.
+    safe_redirect = (
+        redirect_path
+        if isinstance(redirect_path, str)
+        and redirect_path.startswith("/")
+        and not redirect_path.startswith(("//", "/\\"))
+        else "/chat"
+    )
     target = f"{settings.frontend_base_url.rstrip('/')}/login/callback?{urlencode({'redirect': safe_redirect})}"
     response = RedirectResponse(url=target, status_code=302)
     set_session_cookie(response, token)

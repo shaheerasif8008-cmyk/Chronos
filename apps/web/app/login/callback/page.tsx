@@ -7,6 +7,14 @@ const CONFIGURED_API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
 type CallbackResult = { ok: boolean; status: number; body: Record<string, unknown> };
 let activeCodeExchange: { code: string; promise: Promise<CallbackResult> } | null = null;
 
+// A redirect target is only safe if it is a same-site path. Bare `startsWith("/")`
+// is not enough: `//evil.com` and `/\evil.com` are protocol-relative URLs that
+// the router treats as external navigations (open redirect). Require a single
+// leading slash followed by a non-slash, non-backslash character.
+function isSafeInternalPath(target: string): boolean {
+  return /^\/(?![/\\])/.test(target);
+}
+
 function apiBase() {
   if (CONFIGURED_API_BASE) return CONFIGURED_API_BASE;
   if (typeof window !== "undefined") {
@@ -31,7 +39,7 @@ function CognitoCallbackInner() {
 
     const redirect = params.get("redirect");
     if (redirect) {
-      router.replace(redirect.startsWith("/") ? redirect : "/chat");
+      router.replace(isSafeInternalPath(redirect) ? redirect : "/chat");
       return;
     }
 
