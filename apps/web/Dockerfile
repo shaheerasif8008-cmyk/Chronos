@@ -1,10 +1,10 @@
 # syntax=docker/dockerfile:1.7
-FROM node:24.17.0-bookworm-slim AS deps
+FROM node:26.5.0-bookworm-slim AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund
 
-FROM node:24.17.0-bookworm-slim AS builder
+FROM node:26.5.0-bookworm-slim AS builder
 WORKDIR /app
 ARG NEXT_PUBLIC_API_BASE_URL
 ARG NEXT_PUBLIC_CHRONOS_RELEASE
@@ -36,7 +36,7 @@ RUN --mount=type=secret,id=sentry_dsn \
     fi; \
     npm run build
 
-FROM node:24.17.0-bookworm-slim AS runner
+FROM node:26.5.0-bookworm-slim AS runner
 WORKDIR /app
 ENV NODE_ENV=production \
     NEXT_TELEMETRY_DISABLED=1 \
