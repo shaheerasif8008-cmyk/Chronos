@@ -16,6 +16,8 @@ ExecutionStatus = Literal[
     "approval_required",
     "queued",
     "cancelled",
+    "ambiguous",
+    "manual_review",
 ]
 
 

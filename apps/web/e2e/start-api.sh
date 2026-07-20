@@ -18,6 +18,7 @@ export REDIS_URL="${E2E_REDIS_URL:-redis://localhost:6379/3}"
 export OBJECT_STORAGE_BACKEND=s3
 export AWS_S3_BUCKET="${E2E_AWS_S3_BUCKET:-chronos-e2e-local-fallback}"
 export AWS_S3_REGION="${AWS_S3_REGION:-us-east-1}"
+export AWS_S3_ENDPOINT="${E2E_AWS_S3_ENDPOINT:-${AWS_S3_ENDPOINT:-}}"
 export VAULT_ENCRYPTION_KEY="${VAULT_ENCRYPTION_KEY:-$(printf '0%.0s' $(seq 1 64))}"
 
 LOG_DIR="$HERE/.artifacts"

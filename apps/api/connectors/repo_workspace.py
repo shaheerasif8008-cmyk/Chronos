@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from core.execution_boundary import blocks_api_host_tool, unavailable_host_execution_result
 from core.models import ToolResult
 from core.workspace import jailed_path, task_workspace_root_from_args
 
@@ -91,6 +92,10 @@ async def _run(
         "PATH": os.environ.get("PATH", ""),
         "PYTHONDONTWRITEBYTECODE": "1",
         "HOME": str(cwd),
+        "GIT_TERMINAL_PROMPT": "0",
+        "GCM_INTERACTIVE": "Never",
+        "GIT_ASKPASS": "/bin/false",
+        "SSH_ASKPASS": "/bin/false",
     }
     env.update(extra_env or {})
     process = await asyncio.create_subprocess_exec(
@@ -117,6 +122,13 @@ def _decode(raw: bytes) -> tuple[str, bool]:
 
 class RepoWorkspaceConnector:
     async def execute(self, tool: str, args: dict[str, Any]) -> ToolResult:
+        # Defense in depth: the ToolBroker applies the same gate before routing,
+        # but connector-level callers must not be able to bypass it. Every repo
+        # action is blocked, including read/write-only actions, because a host
+        # working tree would let a later tool execute cloned code with the API
+        # container's task-role credentials.
+        if blocks_api_host_tool(tool):
+            return unavailable_host_execution_result(tool)
         args.pop("__connector_tier", None)
         if tool == "repo.clone":
             return await self._clone(args)
@@ -364,7 +376,12 @@ class RepoWorkspaceConnector:
         body = str(args.get("body") or "").strip()
         base = _validate_branch_name(str(args.get("base") or "main"))
         head = _validate_branch_name(str(args.get("head") or ""))
-        approval_id = str(args.get("approval_id") or "").strip()
+        approval_id = str(
+            args.get("__approval_id")
+            if args.get("__approved_by_gate")
+            else args.get("approval_id")
+            or ""
+        ).strip()
         if not title:
             raise ValueError("PR title is required")
         if not approval_id:
@@ -462,4 +479,20 @@ class RepoWorkspaceConnector:
         return ToolResult(data=payload, summary=f"Code review produced {len(findings)} findings")
 
 
-repo_workspace_connector = RepoWorkspaceConnector()
+class RoutedRepoWorkspaceConnector:
+    """Keep the ergonomic host implementation local and E2B-only in production."""
+
+    def __init__(self) -> None:
+        self.local = RepoWorkspaceConnector()
+
+    async def execute(self, tool: str, args: dict[str, Any]) -> ToolResult:
+        from core.config import settings
+
+        if settings.is_production:
+            from connectors.repo_workspace_remote import production_repo_workspace_connector
+
+            return await production_repo_workspace_connector.execute(tool, args)
+        return await self.local.execute(tool, args)
+
+
+repo_workspace_connector = RoutedRepoWorkspaceConnector()

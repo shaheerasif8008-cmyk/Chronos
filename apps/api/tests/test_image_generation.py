@@ -224,7 +224,6 @@ async def test_image_generate_cross_org_isolation(monkeypatch):
 
     # Drive the REAL artifacts-router guard (routers.artifacts._require), not a local
     # copy — so a regression in the actual guard would fail this test.
-    import uuid as _uuid
     from fastapi import HTTPException
     from core.models import Member
     import routers.artifacts as artifacts_router
@@ -233,8 +232,8 @@ async def test_image_generate_cross_org_isolation(monkeypatch):
     # in _require is what we assert. Patch it True to isolate the tenant boundary.
     monkeypatch.setattr(artifacts_router.permissions, "check", lambda *a, **k: _async_true())
 
-    member_a = Member(id=str(_uuid.uuid4()), organization_id=org_a, email="a@example.com", role="user")
-    member_b = Member(id=str(_uuid.uuid4()), organization_id=org_b, email="b@example.com", role="user")
+    member_a = Member(id=agent_a.member_id, organization_id=org_a, email="a@example.com", role="user")
+    member_b = Member(id="peer-member", organization_id=org_b, email="b@example.com", role="user")
 
     # Org A can read it through the real guard.
     meta_as_a = await artifacts_router._require(member_a, "read_artifact", artifact_id)

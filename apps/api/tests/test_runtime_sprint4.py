@@ -1,9 +1,52 @@
 import pytest
 import os
 import json
+import uuid
 
 
 os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://chronos:chronos@localhost:5432/chronos")
+
+
+async def _async_none():
+    return None
+
+
+def test_agent_context_normalizes_asyncpg_uuid_identifiers():
+    from core.models import AgentContext
+
+    identifiers = {
+        name: uuid.uuid4()
+        for name in (
+            "id",
+            "organization_id",
+            "triggered_by_member_id",
+            "workspace_id",
+            "project_id",
+            "persona_id",
+        )
+    }
+
+    context = AgentContext.from_task(identifiers)
+
+    assert context.id == f"task:{identifiers['id']}"
+    assert context.task_id == str(identifiers["id"])
+    assert context.org_id == str(identifiers["organization_id"])
+    assert context.member_id == str(identifiers["triggered_by_member_id"])
+    assert context.workspace_id == str(identifiers["workspace_id"])
+    assert context.project_id == str(identifiers["project_id"])
+    assert context.persona_id == str(identifiers["persona_id"])
+
+
+def test_agent_context_preserves_optional_identifier_defaults():
+    from core.models import AgentContext
+
+    context = AgentContext.from_task({"id": uuid.uuid4()})
+
+    assert context.org_id == "default"
+    assert context.member_id == "chronos"
+    assert context.workspace_id is None
+    assert context.project_id is None
+    assert context.persona_id is None
 
 
 @pytest.mark.asyncio
@@ -206,6 +249,8 @@ async def test_agent_loop_uses_model_decisions_and_broker_checkpoint(monkeypatch
     monkeypatch.setattr(agent_loop, "_persist_to_conversation", fake_persist)
     monkeypatch.setattr(agent_loop, "_llm_step", fake_llm_step)
     monkeypatch.setattr(agent_loop.tool_broker, "execute", fake_execute)
+    monkeypatch.setattr(agent_loop, "_verify_answer", lambda *a, **k: _async_none())
+    monkeypatch.setattr(agent_loop, "_reflect", lambda *a, **k: _async_none())
 
     await agent_loop.run_loop(tasks["task-agent-loop"])
 
@@ -310,17 +355,17 @@ async def test_subagent_prompt_bounds_research_iterations():
     assert "do not keep retrying after rate limits" in prompt
 
 
-def test_observability_skips_langfuse_callback_when_package_missing(monkeypatch):
+def test_observability_warns_when_langfuse_package_missing_in_development(monkeypatch, caplog):
     import importlib.util
 
     import litellm
     import main
     from core.config import settings
 
-    litellm.success_callback = []
-    litellm.failure_callback = []
+    monkeypatch.setattr(litellm, "callbacks", [])
     monkeypatch.setattr(settings, "langfuse_public_key", "pk-test")
     monkeypatch.setattr(settings, "langfuse_secret_key", "sk-test")
+    monkeypatch.setattr(settings, "environment", "development")
     monkeypatch.delenv("LANGFUSE_PUBLIC_KEY", raising=False)
     monkeypatch.delenv("LANGFUSE_SECRET_KEY", raising=False)
     real_find_spec = importlib.util.find_spec
@@ -334,8 +379,73 @@ def test_observability_skips_langfuse_callback_when_package_missing(monkeypatch)
 
     main._init_observability()
 
-    assert "langfuse" not in litellm.success_callback
-    assert "langfuse" not in litellm.failure_callback
+    assert "langfuse_otel" not in litellm.callbacks
+    assert "Failed to initialize configured Langfuse observability" in caplog.text
+
+
+def test_observability_registers_langfuse_v4_otel_callback(monkeypatch):
+    import litellm
+    import main
+    from core.config import settings
+
+    monkeypatch.setattr(litellm, "callbacks", ["existing"])
+    monkeypatch.setattr(settings, "langfuse_public_key", "pk-test")
+    monkeypatch.setattr(settings, "langfuse_secret_key", "sk-test")
+    monkeypatch.setattr(settings, "langfuse_host", "https://langfuse.example/")
+    monkeypatch.setattr(settings, "sentry_dsn", "")
+
+    main._init_observability()
+    main._init_observability()
+
+    assert litellm.callbacks == ["existing", "langfuse_otel"]
+    assert os.environ["LANGFUSE_PUBLIC_KEY"] == "pk-test"
+    assert os.environ["LANGFUSE_SECRET_KEY"] == "sk-test"
+    assert os.environ["LANGFUSE_OTEL_HOST"] == "https://langfuse.example"
+    assert os.environ["LANGFUSE_HOST"] == "https://langfuse.example"
+
+
+def test_observability_fails_closed_when_configured_sdk_missing_in_production(monkeypatch):
+    import importlib.util
+
+    import main
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "langfuse_public_key", "pk-test")
+    monkeypatch.setattr(settings, "langfuse_secret_key", "sk-test")
+    monkeypatch.setattr(settings, "environment", "production")
+    monkeypatch.setattr(settings, "sentry_dsn", "")
+    real_find_spec = importlib.util.find_spec
+
+    def fake_find_spec(name: str, *args, **kwargs):
+        if name == "langfuse":
+            return None
+        return real_find_spec(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib.util, "find_spec", fake_find_spec)
+
+    with pytest.raises(RuntimeError, match="configured Langfuse"):
+        main._init_observability()
+
+
+def test_observability_initializes_sentry_with_environment_and_no_default_pii(monkeypatch):
+    import sentry_sdk
+
+    import main
+    from core.config import settings
+
+    captured: dict = {}
+    monkeypatch.setattr(settings, "langfuse_public_key", "")
+    monkeypatch.setattr(settings, "langfuse_secret_key", "")
+    monkeypatch.setattr(settings, "sentry_dsn", "https://public@example.invalid/1")
+    monkeypatch.setattr(settings, "environment", "staging")
+    monkeypatch.setattr(sentry_sdk, "init", lambda **kwargs: captured.update(kwargs))
+
+    main._init_observability()
+
+    assert captured["dsn"] == "https://public@example.invalid/1"
+    assert captured["environment"] == "staging"
+    assert captured["send_default_pii"] is False
+    assert captured["traces_sample_rate"] == 0.1
 
 
 @pytest.mark.asyncio
@@ -421,6 +531,7 @@ async def test_browser_search_degrades_truthfully_on_live_timeout(monkeypatch):
 
     monkeypatch.setattr(browser.settings, "demo_mode", False)
     monkeypatch.setattr(browser.settings, "tavily_api_key", "")
+    monkeypatch.setattr(browser.settings, "browserbase_api_key", "")
     monkeypatch.setattr(browser, "_new_page", fake_new_page)
 
     result = await browser.browser_connector._search({"query": "data observability market", "max_results": 2})

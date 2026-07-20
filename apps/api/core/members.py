@@ -50,11 +50,13 @@ async def provision_member(
     external_id: str | None = None,
     sso_subject: str | None = None,
     region: str | None = None,
+    reactivate: bool = False,
 ) -> Member:
     """Find-or-create a member in ``org_id`` and (re)bind external identity.
 
-    Idempotent JIT provisioning: matches on external_id first (stable across email
-    changes), then email. Reactivates a previously deactivated member on re-login.
+    Idempotent provisioning: matches on external_id first (stable across email
+    changes), then email. A normal login can never undo SCIM/admin
+    deprovisioning; only an explicit lifecycle-management caller may reactivate.
     """
     email = email.lower()
     existing = await get_member_in_org(org_id, external_id=external_id) if external_id else None
@@ -63,20 +65,26 @@ async def provision_member(
 
     members = await reflect_table("members")
     if existing is not None:
-        updates: dict = {"status": "active"}
+        if getattr(existing, "status", "active") != "active" and not reactivate:
+            raise PermissionError("Member account is deactivated")
+        updates: dict = {}
+        if reactivate:
+            updates["status"] = "active"
         if external_id and getattr(existing, "external_id", None) != external_id:
             updates["external_id"] = external_id
         if sso_subject:
             updates["sso_subject"] = sso_subject
         if name:
             updates["name"] = name
-        async with engine.begin() as conn:
-            row = (
-                await conn.execute(
-                    update(members).where(members.c.id == existing.id).values(**updates).returning(members)
-                )
-            ).mappings().one()
-        return Member(**dict(row))
+        if updates:
+            async with engine.begin() as conn:
+                row = (
+                    await conn.execute(
+                        update(members).where(members.c.id == existing.id).values(**updates).returning(members)
+                    )
+                ).mappings().one()
+            return Member(**dict(row))
+        return existing
 
     async with engine.begin() as conn:
         row = (

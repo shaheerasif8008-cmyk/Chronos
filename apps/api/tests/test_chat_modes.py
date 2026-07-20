@@ -8,43 +8,62 @@ Tests:
 2. create_task_record writes (normalized) mode to the task insert row.
 3. Fast-path send_message persists chosen mode on the assistant message.
 """
+
 import pytest
 from unittest.mock import AsyncMock
 
 
 # ── 1. normalize_mode unit ───────────────────────────────────────────────────
 
+
 def test_normalize_mode_none_becomes_default():
     from core.modes import normalize_mode
+
     assert normalize_mode(None) == "default"
 
 
 def test_normalize_mode_unknown_becomes_default():
     from core.modes import normalize_mode
+
     assert normalize_mode("xyz") == "default"
 
 
 def test_normalize_mode_empty_string_becomes_default():
     from core.modes import normalize_mode
+
     assert normalize_mode("") == "default"
 
 
-@pytest.mark.parametrize("mode", [
-    "default", "research", "agent", "browser", "computer",
-    "data", "image", "voice", "coding",
-])
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "default",
+        "chat",
+        "research",
+        "agent",
+        "browser",
+        "computer",
+        "data",
+        "image",
+        "voice",
+        "coding",
+    ],
+)
 def test_normalize_mode_valid_passes_through(mode):
     from core.modes import normalize_mode
+
     assert normalize_mode(mode) == mode
 
 
 def test_normalize_mode_lowercases():
     from core.modes import normalize_mode
+
     assert normalize_mode("Coding") == "coding"
 
 
 def test_normalize_mode_trims_whitespace():
     from core.modes import normalize_mode
+
     assert normalize_mode(" agent ") == "agent"
 
 
@@ -114,8 +133,13 @@ def test_model_accepts_reasoning_effort_gates_on_family_not_provider():
     assert model_accepts_reasoning_effort("openai/gpt-5.4-nano") is True
     assert model_accepts_reasoning_effort("openrouter/deepseek/deepseek-v4-pro") is True
     # Non-reasoning models do not.
-    assert model_accepts_reasoning_effort("openrouter/meta-llama/llama-3-8b-instruct") is False
-    assert model_accepts_reasoning_effort("openrouter/deepseek/deepseek-v4-flash") is False
+    assert (
+        model_accepts_reasoning_effort("openrouter/meta-llama/llama-3-8b-instruct")
+        is False
+    )
+    assert (
+        model_accepts_reasoning_effort("openrouter/deepseek/deepseek-v4-flash") is False
+    )
     assert model_accepts_reasoning_effort(None) is False
 
 
@@ -131,6 +155,7 @@ def test_model_kwargs_rejects_unknown_reasoning_effort():
 
 
 # ── 2. create_task_record writes mode to tasks insert ─────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_create_task_record_writes_mode(monkeypatch):
@@ -151,6 +176,7 @@ async def test_create_task_record_writes_mode(monkeypatch):
         def values(self, **kwargs):
             insert_values.update(kwargs)
             return self
+
         def returning(self, _col):
             return self
 
@@ -161,8 +187,10 @@ async def test_create_task_record_writes_mode(monkeypatch):
     class _FakeConn:
         async def execute(self, stmt):
             return _FakeScalar()
+
         async def __aenter__(self):
             return self
+
         async def __aexit__(self, *_):
             pass
 
@@ -193,6 +221,7 @@ async def test_create_task_record_writes_mode(monkeypatch):
 
     # Patch resolve_agent_model inside the lazy import
     import core.llm as llm_mod
+
     monkeypatch.setattr(llm_mod, "resolve_agent_model", fake_resolve_agent_model)
 
     task_id = await tasks_router.create_task_record(
@@ -232,6 +261,7 @@ async def test_create_task_record_normalizes_unknown_mode(monkeypatch):
         def values(self, **kwargs):
             insert_values.update(kwargs)
             return self
+
         def returning(self, _col):
             return self
 
@@ -242,8 +272,10 @@ async def test_create_task_record_normalizes_unknown_mode(monkeypatch):
     class _FakeConn:
         async def execute(self, stmt):
             return _FakeScalar()
+
         async def __aenter__(self):
             return self
+
         async def __aexit__(self, *_):
             pass
 
@@ -273,6 +305,7 @@ async def test_create_task_record_normalizes_unknown_mode(monkeypatch):
     monkeypatch.setattr(tasks_router.permissions, "check", fake_permission)
 
     import core.llm as llm_mod
+
     monkeypatch.setattr(llm_mod, "resolve_agent_model", fake_resolve_agent_model)
 
     task_id = await tasks_router.create_task_record(
@@ -289,6 +322,7 @@ async def test_create_task_record_normalizes_unknown_mode(monkeypatch):
 
 
 # ── 3. Fast-path send_message persists request mode on assistant message ──────
+
 
 @pytest.mark.asyncio
 async def test_send_message_threads_mode_into_inline_turn(monkeypatch):
@@ -327,13 +361,20 @@ async def test_send_message_threads_mode_into_inline_turn(monkeypatch):
         return [{"role": "user", "content": msg}]
 
     monkeypatch.setattr(chat.permissions, "check", fake_permissions_check)
+    monkeypatch.setattr(
+        chat.workspace_access,
+        "require_workspace_access",
+        AsyncMock(return_value={"id": "workspace-1", "status": "active"}),
+    )
     monkeypatch.setattr(chat, "_create_conversation", fake_create_conversation)
     monkeypatch.setattr(chat, "_save_message", fake_save_message)
     monkeypatch.setattr(chat, "assemble_context", fake_assemble_context)
     monkeypatch.setattr(chat, "extract_explicit_memory_content", lambda msg: None)
     monkeypatch.setattr(chat, "stream_chat_turn", fake_stream_chat_turn)
 
-    req = chat.ChatRequest(message="hi", model="gpt-5.4-mini", mode="coding", reasoning_effort="high")
+    req = chat.ChatRequest(
+        message="hi", model="gpt-5.4-mini", mode="coding", reasoning_effort="high"
+    )
 
     response = await chat.send_message(req, member)
     async for _ in response.body_iterator:
@@ -387,11 +428,27 @@ async def test_nontrivial_chat_uses_history_aware_inline_turn(monkeypatch):
         ]
 
     monkeypatch.setattr(chat.permissions, "check", fake_permissions_check)
+    monkeypatch.setattr(
+        chat.workspace_access,
+        "require_workspace_access",
+        AsyncMock(return_value={"id": "workspace-1", "status": "active"}),
+    )
     monkeypatch.setattr(chat, "_create_conversation", fake_create_conversation)
     monkeypatch.setattr(chat, "_save_message", fake_save_message)
     monkeypatch.setattr(chat, "assemble_context", fake_assemble_context)
     monkeypatch.setattr(chat, "extract_explicit_memory_content", lambda msg: None)
-    monkeypatch.setattr(chat, "classify_request", AsyncMock(return_value={"mode": "chat", "goal": None, "difficulty": "standard", "reasoning_effort": "medium"}))
+    monkeypatch.setattr(
+        chat,
+        "classify_request",
+        AsyncMock(
+            return_value={
+                "mode": "chat",
+                "goal": None,
+                "difficulty": "standard",
+                "reasoning_effort": "medium",
+            }
+        ),
+    )
     monkeypatch.setattr(chat, "stream_chat_turn", fake_stream_chat_turn)
     monkeypatch.setattr(chat, "_agent_loop_stream", fake_agent_loop_stream)
 
@@ -402,7 +459,70 @@ async def test_nontrivial_chat_uses_history_aware_inline_turn(monkeypatch):
         pass
 
     assert captured["message"] == "what email did you search"
-    assert any(m["content"] == "summarise my emails in the last 3 days" for m in captured["context_messages"])
+    assert any(
+        m["content"] == "summarise my emails in the last 3 days"
+        for m in captured["context_messages"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_explicit_chat_mode_skips_durable_task_classifier(monkeypatch):
+    from core.models import Member
+    from routers import chat
+
+    member = Member(
+        id="member-1",
+        organization_id="default",
+        email="admin@example.com",
+        role="admin",
+    )
+    classifier = AsyncMock(
+        side_effect=AssertionError("explicit chat mode must not invoke task routing")
+    )
+    captured: dict = {}
+
+    async def fake_stream_chat_turn(**kwargs):
+        captured.update(kwargs)
+        yield {"type": "done"}
+
+    async def fake_permissions_check(*_args, **_kwargs):
+        return True
+
+    async def fake_create_conversation(*_args, **_kwargs):
+        return "conv-direct"
+
+    async def fake_save_message(*_args, **_kwargs):
+        return None
+
+    async def fake_assemble_context(_conversation_id, message, _context):
+        return [{"role": "user", "content": message}]
+
+    monkeypatch.setattr(chat.permissions, "check", fake_permissions_check)
+    monkeypatch.setattr(
+        chat.workspace_access,
+        "require_workspace_access",
+        AsyncMock(return_value={"id": "workspace-1", "status": "active"}),
+    )
+    monkeypatch.setattr(chat, "_create_conversation", fake_create_conversation)
+    monkeypatch.setattr(chat, "_save_message", fake_save_message)
+    monkeypatch.setattr(chat, "assemble_context", fake_assemble_context)
+    monkeypatch.setattr(chat, "extract_explicit_memory_content", lambda _msg: None)
+    monkeypatch.setattr(chat, "classify_request", classifier)
+    monkeypatch.setattr(chat, "stream_chat_turn", fake_stream_chat_turn)
+
+    response = await chat.send_message(
+        chat.ChatRequest(
+            message="Analyze the supplied evidence without external actions.",
+            model="gpt-5.4-mini",
+            mode="chat",
+        ),
+        member,
+    )
+    async for _ in response.body_iterator:
+        pass
+
+    classifier.assert_not_awaited()
+    assert captured["mode"] == "chat"
 
 
 @pytest.mark.asyncio
@@ -420,7 +540,7 @@ async def test_task_route_preserves_original_message_for_execution(monkeypatch):
 
     async def fake_agent_loop_stream(**kwargs):
         captured.update(kwargs)
-        yield "data: {\"type\":\"done\"}\n\n"
+        yield 'data: {"type":"done"}\n\n'
 
     async def fake_permissions_check(*args, **kwargs):
         return True
@@ -440,24 +560,46 @@ async def test_task_route_preserves_original_message_for_execution(monkeypatch):
     )
 
     monkeypatch.setattr(chat.permissions, "check", fake_permissions_check)
+    monkeypatch.setattr(
+        chat.workspace_access,
+        "require_workspace_access",
+        AsyncMock(return_value={"id": "workspace-1", "status": "active"}),
+    )
     monkeypatch.setattr(chat, "_create_conversation", fake_create_conversation)
     monkeypatch.setattr(chat, "_save_message", fake_save_message)
     monkeypatch.setattr(chat, "assemble_context", fake_assemble_context)
     monkeypatch.setattr(chat, "extract_explicit_memory_content", lambda msg: None)
-    monkeypatch.setattr(chat, "classify_request", AsyncMock(return_value={
-        "mode": "task",
-        "goal": "Run the provided GitHub repository and analyze its strengths and weaknesses",
-        "difficulty": "hard",
-        "reasoning_effort": "high",
-    }))
+    monkeypatch.setattr(
+        chat,
+        "classify_request",
+        AsyncMock(
+            return_value={
+                "mode": "task",
+                "goal": "Run the provided GitHub repository and analyze its strengths and weaknesses",
+                "difficulty": "hard",
+                "reasoning_effort": "high",
+            }
+        ),
+    )
     monkeypatch.setattr(chat, "_agent_loop_stream", fake_agent_loop_stream)
 
-    response = await chat.send_message(chat.ChatRequest(message=original, model="gpt-5.4-mini"), member)
+    response = await chat.send_message(
+        chat.ChatRequest(message=original, model="gpt-5.4-mini"), member
+    )
     async for _ in response.body_iterator:
         pass
 
-    assert captured["goal"] == "Run the provided GitHub repository and analyze its strengths and weaknesses"
+    assert (
+        captured["goal"]
+        == "Run the provided GitHub repository and analyze its strengths and weaknesses"
+    )
     assert captured["original_message"] == original
     assert captured["conversation_context"] == [{"role": "system", "content": "sys"}]
-    assert captured["router_decision"]["ui_title"] == "Run the provided GitHub repository and analyze its strengths and weaknesses"
-    assert captured["router_decision"]["metadata"]["classifier"]["goal"] == "Run the provided GitHub repository and analyze its strengths and weaknesses"
+    assert (
+        captured["router_decision"]["ui_title"]
+        == "Run the provided GitHub repository and analyze its strengths and weaknesses"
+    )
+    assert (
+        captured["router_decision"]["metadata"]["classifier"]["goal"]
+        == "Run the provided GitHub repository and analyze its strengths and weaknesses"
+    )

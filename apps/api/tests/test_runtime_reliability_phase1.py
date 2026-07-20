@@ -45,6 +45,28 @@ async def test_task_runner_cancel_queued_task_marks_cancelled_without_execution(
 
 
 @pytest.mark.asyncio
+async def test_task_runner_pause_queued_task_preserves_it_without_execution():
+    from runtime.task_runner import TaskRunner
+
+    executed = []
+    paused = []
+
+    async def run_task(task_id: str):
+        executed.append(task_id)
+
+    async def mark_paused(task_id: str, reason: str):
+        paused.append((task_id, reason))
+
+    runner = TaskRunner(run_task=run_task, mark_paused=mark_paused)
+    await runner.enqueue("task-to-pause")
+    assert runner.pause("task-to-pause", reason="operator requested") is True
+    await runner.drain_once()
+
+    assert executed == []
+    assert paused == [("task-to-pause", "operator requested")]
+
+
+@pytest.mark.asyncio
 async def test_task_runner_retries_failed_task_before_marking_failed():
     from runtime.task_runner import TaskRunner
 
@@ -84,6 +106,57 @@ async def test_task_runner_marks_task_failed_after_timeout():
     await runner.drain_once()
 
     assert failed == [("task-timeout", "task_timeout")]
+
+
+@pytest.mark.asyncio
+async def test_task_runner_shutdown_waits_for_running_task_cleanup(monkeypatch):
+    from runtime import agent_loop, leases
+    from runtime.task_runner import TaskRunner
+
+    started = asyncio.Event()
+    cleaned_up = asyncio.Event()
+    requeued: list[tuple[str, str]] = []
+    released: list[str] = []
+
+    async def run_task(_task_id: str):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            # Prove stop() awaits the cancelled coroutine's cleanup rather than
+            # returning while it is still holding process-local resources.
+            await asyncio.sleep(0)
+            cleaned_up.set()
+
+    async def save_task(task_id: str, *, status: str, **_values):
+        requeued.append((task_id, status))
+
+    async def acquire(_task_id: str):
+        return True
+
+    async def release(task_id: str):
+        released.append(task_id)
+
+    async def heartbeat(_task_id: str):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(agent_loop, "save_task", save_task)
+    monkeypatch.setattr(leases, "acquire_task_lease", acquire)
+    monkeypatch.setattr(leases, "release_task_lease", release)
+
+    runner = TaskRunner(run_task=run_task)
+    monkeypatch.setattr(runner, "_heartbeat", heartbeat)
+    runner.start()
+    await runner.enqueue("task-running")
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    await runner.stop()
+
+    assert cleaned_up.is_set()
+    assert requeued == [("task-running", "queued")]
+    assert released == ["task-running"]
+    assert runner._running == {}
+    assert runner._worker_task is None
 
 
 @pytest.mark.asyncio
@@ -160,6 +233,40 @@ async def test_run_loop_stops_before_model_step_when_task_is_cancelled(monkeypat
     assert result == {"error": "task_cancelled"}
     assert task["status"] == "cancelled"
     assert events[-1]["type"] == "task_cancelled"
+
+
+@pytest.mark.asyncio
+async def test_run_loop_stops_before_model_step_when_task_is_paused(monkeypatch):
+    from runtime import agent_loop
+
+    task = {
+        "id": "task-paused",
+        "organization_id": "default",
+        "region": "us",
+        "triggered_by_member_id": "member-1",
+        "workspace_id": None,
+        "persona_id": None,
+        "status": "paused",
+        "goal": "do work",
+        "plan": {},
+        "agent_state": {},
+        "iteration_count": 0,
+        "started_at": None,
+        "depth": 0,
+    }
+
+    async def fake_is_paused(task_id):
+        return True
+
+    async def fail_llm_step(*args, **kwargs):
+        raise AssertionError("paused task must not call the model")
+
+    monkeypatch.setattr(agent_loop, "is_task_paused", fake_is_paused)
+    monkeypatch.setattr(agent_loop, "_llm_step", fail_llm_step)
+
+    result = await agent_loop.run_loop(task)
+
+    assert result == {"status": "paused"}
 
 
 def test_untrusted_content_scanner_flags_prompt_injection():
@@ -257,7 +364,7 @@ async def test_publish_activity_persists_replayable_model_trace(monkeypatch):
 @pytest.mark.asyncio
 async def test_tool_broker_reuses_idempotent_external_write_result(monkeypatch):
     from core import tool_broker
-    from core.models import AgentContext, Member, ToolResult
+    from core.models import AgentContext, ToolResult
 
     calls = []
     cache = {}
@@ -429,6 +536,62 @@ async def test_run_loop_gates_write_after_untrusted_prompt_injection(monkeypatch
     assert [call["name"] for call in approvals] == ["gmail__draft"]
 
 
+@pytest.mark.asyncio
+async def test_project_source_evidence_gates_external_write_even_without_known_phrase(monkeypatch):
+    from runtime import agent_loop
+
+    task = {
+        "id": "task-source-evidence",
+        "organization_id": "default",
+        "region": "us",
+        "triggered_by_member_id": "member-1",
+        "workspace_id": None,
+        "persona_id": None,
+        "status": "running",
+        "goal": "read project evidence then draft",
+        "plan": {},
+        "agent_state": {},
+        "iteration_count": 0,
+        "started_at": None,
+        "depth": 0,
+    }
+    approvals = []
+
+    async def load_history(*args, **kwargs):
+        return [
+            {
+                "role": "system",
+                "content": '<untrusted_source marker="S1">ordinary external evidence</untrusted_source>',
+            },
+            {"role": "user", "content": task["goal"]},
+        ]
+
+    async def save_task(_task_id, **values):
+        task.update(values)
+
+    async def never_cancelled(_task_id): return False
+    async def llm_step(*args, **kwargs):
+        return None, [{"id": "call-draft", "name": "gmail__draft", "args_str": "{}"}], 0
+    async def must_not_execute(*args, **kwargs):
+        raise AssertionError("external write sourced from untrusted evidence must pause")
+    async def open_gate(task_arg, calls, history, iteration, model=None):
+        approvals.extend(calls)
+        await save_task(task_arg["id"], status="awaiting_approval")
+    async def noop(*args, **kwargs): return None
+
+    monkeypatch.setattr(agent_loop, "_load_history", load_history)
+    monkeypatch.setattr(agent_loop, "save_task", save_task)
+    monkeypatch.setattr(agent_loop, "is_task_cancelled", never_cancelled)
+    monkeypatch.setattr(agent_loop, "_llm_step", llm_step)
+    monkeypatch.setattr(agent_loop, "_execute_tool", must_not_execute)
+    monkeypatch.setattr(agent_loop, "_open_approval_gate", open_gate)
+    monkeypatch.setattr(agent_loop, "emit_activity", noop)
+    monkeypatch.setattr(agent_loop, "publish_activity", noop)
+
+    assert await agent_loop.run_loop(task) == {"status": "awaiting_approval"}
+    assert [call["name"] for call in approvals] == ["gmail__draft"]
+
+
 # ─── Dead-letter state + failure taxonomy (Phase 1 completion) ────────────────
 import os  # noqa: E402
 import socket  # noqa: E402
@@ -594,3 +757,39 @@ async def test_retry_endpoint_requeues_failed_task(monkeypatch):
     result = await tasks_router.retry_task(tid, member=member)
     assert result == {"task_id": tid, "status": "queued", "retried": True}
     assert requeued == [tid]
+
+
+@_requires_db
+@pytest.mark.asyncio
+async def test_pause_and_resume_are_checkpointed_and_resume_exactly_once(monkeypatch):
+    from runtime import task_runner
+
+    _silence_activity(monkeypatch)
+    org = f"test-{uuid.uuid4().hex[:8]}"
+    tid = await _insert_task(org)
+    local_pauses: list[tuple[str, str]] = []
+    enqueued: list[tuple[str, int]] = []
+
+    monkeypatch.setattr(
+        task_runner.runner,
+        "pause",
+        lambda task_id, reason="operator_pause": local_pauses.append((task_id, reason)) or True,
+    )
+
+    async def fake_enqueue(task_id, *, priority=10):
+        enqueued.append((task_id, priority))
+
+    monkeypatch.setattr(task_runner.runner, "enqueue", fake_enqueue)
+
+    assert await task_runner.pause_task(tid, reason="maintenance") is True
+    paused = await _task_row(tid)
+    assert paused["status"] == "paused"
+    assert paused["agent_state"]["pause"]["reason"] == "maintenance"
+    assert local_pauses == [(tid, "maintenance")]
+
+    assert await task_runner.resume_task(tid) is True
+    assert await task_runner.resume_task(tid) is False
+    resumed = await _task_row(tid)
+    assert resumed["status"] == "queued"
+    assert "pause" not in resumed["agent_state"]
+    assert enqueued == [(tid, 5)]

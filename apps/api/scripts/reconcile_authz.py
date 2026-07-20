@@ -2,7 +2,7 @@
 
 Reconciles FGA tuples for one org or every org in the database so that
 enabling OpenFGA on a populated deployment does not lock out existing members,
-projects, or workspaces.
+projects, workspaces, tasks, or shared conversations.
 
 Usage::
 
@@ -42,12 +42,19 @@ async def _run(org_ids: list[str]) -> int:
         print("OpenFGA is not configured — nothing to reconcile.")
         return 1
 
-    total: dict[str, int] = {"members": 0, "projects": 0, "workspaces": 0}
+    total: dict[str, int] = {
+        "members": 0,
+        "projects": 0,
+        "workspaces": 0,
+        "tasks": 0,
+        "conversations": 0,
+    }
     for org_id in org_ids:
         counts = await permissions.reconcile_org_tuples(org_id)
         print(
             f"org={org_id}  members={counts['members']}"
             f"  projects={counts['projects']}  workspaces={counts['workspaces']}"
+            f"  tasks={counts['tasks']}  conversations={counts['conversations']}"
         )
         for k in total:
             total[k] += counts[k]
@@ -56,6 +63,7 @@ async def _run(org_ids: list[str]) -> int:
         print(
             f"\nTotal: members={total['members']}"
             f"  projects={total['projects']}  workspaces={total['workspaces']}"
+            f"  tasks={total['tasks']}  conversations={total['conversations']}"
         )
     return 0
 

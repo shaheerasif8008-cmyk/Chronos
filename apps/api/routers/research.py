@@ -7,32 +7,142 @@ publications from the executor (channel ``research:{run_id}``).
 from __future__ import annotations
 
 import json
+import re
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator, model_validator
 
-from core import audit, permissions, research
+from core import audit, permissions, research, tool_broker
+from core.artifacts import ArtifactStorageUnavailable
 from core.auth import get_current_member
-from core.config import settings
-from core.models import Member
+from core.db import engine, reflect_table
+from core.models import AgentContext, Member
+from core.project_access import visible_project_clause
+from core.research_exports import ResearchExportError, create_research_export
 from core.redis import redis_client
 from runtime.research_executor import start_research
 
 router = APIRouter(prefix="/research", tags=["research"])
 
 _VALID_DEPTHS = {"quick", "standard", "exhaustive", "trusted"}
+_VALID_CITATION_POLICIES = {"required", "best_effort"}
+_ORG_ADMIN_ROLES = {"admin", "owner"}
+_DOMAIN_PATTERN = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+
+
+async def _visible_project_ids(member: Member) -> list[str]:
+    projects = await reflect_table("projects")
+    project_members = await reflect_table("project_members")
+    async with engine.begin() as conn:
+        rows = (
+            await conn.execute(
+                projects.select()
+                .with_only_columns(projects.c.id)
+                .outerjoin(
+                    project_members,
+                    (project_members.c.project_id == projects.c.id)
+                    & (project_members.c.member_id == member.id)
+                    & (project_members.c.organization_id == member.organization_id),
+                )
+                .where(
+                    projects.c.organization_id == member.organization_id,
+                    visible_project_clause(projects, project_members, member),
+                )
+            )
+        ).all()
+    return [str(row[0]) for row in rows]
+
+
+async def _editable_project_ids(member: Member) -> list[str]:
+    project_members = await reflect_table("project_members")
+    async with engine.begin() as conn:
+        rows = (
+            await conn.execute(
+                project_members.select().with_only_columns(project_members.c.project_id).where(
+                    project_members.c.organization_id == member.organization_id,
+                    project_members.c.member_id == member.id,
+                )
+            )
+        ).all()
+    return [str(row[0]) for row in rows]
+
+
+class ResearchSourceScopes(BaseModel):
+    web: bool = True
+    project: bool = False
+    connector: bool = False
+    upload: bool = False
+    mcp: bool = False
+    mcp_tools: list["MCPResearchTool"] = Field(default_factory=list, max_length=5)
+    allowed_domains: list[str] = Field(default_factory=list, max_length=50)
+    disallowed_domains: list[str] = Field(default_factory=list, max_length=50)
+
+    @field_validator("allowed_domains", "disallowed_domains")
+    @classmethod
+    def normalize_domains(cls, domains: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for raw in domains:
+            domain = str(raw).strip().lower().rstrip(".")
+            if not _DOMAIN_PATTERN.fullmatch(domain):
+                raise ValueError(f"invalid research domain: {raw}")
+            normalized.append(domain)
+        return sorted(set(normalized))
+
+    @model_validator(mode="after")
+    def validate_sources(self) -> "ResearchSourceScopes":
+        if not (self.web or self.project or self.connector or self.upload or self.mcp):
+            raise ValueError("at least one research source is required")
+        if self.mcp != bool(self.mcp_tools):
+            raise ValueError("MCP research requires one or more selected read-only tools")
+        overlap = set(self.allowed_domains) & set(self.disallowed_domains)
+        if overlap:
+            raise ValueError(f"domains cannot be both allowed and blocked: {', '.join(sorted(overlap))}")
+        return self
+
+
+class MCPResearchTool(BaseModel):
+    server_id: str = Field(min_length=1, max_length=128)
+    tool_name: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
+    arguments: dict = Field(default_factory=dict)
+    query_argument: str | None = Field(default=None, max_length=64, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
+    title: str | None = Field(default=None, max_length=240)
+
+    @model_validator(mode="after")
+    def validate_argument_budget(self) -> "MCPResearchTool":
+        if len(json.dumps(self.arguments, default=str)) > 10_000:
+            raise ValueError("MCP research arguments exceed the 10,000 character limit")
+        if any(str(key).startswith("__") for key in self.arguments):
+            raise ValueError("MCP research arguments cannot use reserved Chronos keys")
+        if self.query_argument and self.query_argument.startswith("__"):
+            raise ValueError("MCP query argument cannot use a reserved Chronos key")
+        return self
 
 
 class ResearchRequest(BaseModel):
-    question: str
+    question: str = Field(min_length=3, max_length=10_000)
     depth: str = "standard"
-    source_scopes: dict = {}
+    source_scopes: ResearchSourceScopes = Field(default_factory=ResearchSourceScopes)
     project_id: str | None = None
     persona_id: str | None = None
     workspace_id: str | None = None
     citation_policy: str = "required"
-    time_budget_seconds: int | None = None
+    time_budget_seconds: int | None = Field(default=None, ge=15, le=3600)
+
+    @field_validator("question")
+    @classmethod
+    def normalize_question(cls, question: str) -> str:
+        return question.strip()
+
+    @model_validator(mode="after")
+    def validate_run_policy(self) -> "ResearchRequest":
+        if self.citation_policy not in _VALID_CITATION_POLICIES:
+            raise ValueError("citation_policy must be required or best_effort")
+        if self.depth == "trusted" and self.source_scopes.web and not self.source_scopes.allowed_domains:
+            raise ValueError("trusted research requires at least one allowed web domain")
+        if (self.source_scopes.project or self.source_scopes.connector or self.source_scopes.upload) and not self.project_id:
+            raise ValueError("project, connector, or uploaded-file research requires a project_id")
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -52,15 +162,17 @@ async def create_research_run(
     Returns:
         Dict with run_id and initial status "pending".
     """
-    await permissions.check(member, "create_research", settings.org_id)
+    await permissions.check(member, "create_research", member.organization_id)
     if req.depth not in _VALID_DEPTHS:
         raise HTTPException(status_code=422, detail="depth must be one of quick|standard|exhaustive|trusted")
 
+    if req.project_id is not None and req.project_id not in await _editable_project_ids(member):
+        raise HTTPException(status_code=404, detail="Project not found")
     run_id = await research.create_run(
         member,
         question=req.question,
         depth=req.depth,
-        source_scopes=req.source_scopes,
+        source_scopes=req.source_scopes.model_dump(),
         project_id=req.project_id,
         persona_id=req.persona_id,
         workspace_id=req.workspace_id,
@@ -85,7 +197,52 @@ async def list_research_runs(
     Returns:
         List of serialized run dicts, newest first.
     """
-    return await research.list_runs(member.organization_id, project_id=project_id)
+    visible_projects = [] if member.role in _ORG_ADMIN_ROLES else await _visible_project_ids(member)
+    if project_id is not None and member.role not in _ORG_ADMIN_ROLES and project_id not in visible_projects:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return await research.list_runs(
+        member.organization_id,
+        project_id=project_id,
+        member_id=member.id,
+        visible_project_ids=visible_projects,
+        include_org_wide=member.role in _ORG_ADMIN_ROLES,
+    )
+
+
+@router.get("/mcp-tools")
+async def list_research_mcp_tools(
+    server_id: str,
+    member: Member = Depends(get_current_member),
+) -> dict:
+    """Discover only MCP tools whose server declares them read-only.
+
+    Discovery crosses the governed platform broker seam. Tools with absent or
+    false ``readOnlyHint`` annotations are intentionally unavailable to
+    unattended research runs.
+    """
+    await permissions.check(member, "list_mcp_servers", member.organization_id)
+    agent = AgentContext(
+        id=f"research-discovery:{member.id}",
+        org_id=member.organization_id,
+        member_id=member.id,
+    )
+    result = await tool_broker.execute(
+        agent,
+        "platform.actions",
+        {"platform_id": f"mcp:{server_id}"},
+    )
+    actions = [
+        action
+        for action in result.data.get("actions") or []
+        if isinstance(action, dict)
+        and isinstance(action.get("annotations"), dict)
+        and action["annotations"].get("readOnlyHint") is True
+    ]
+    return {
+        "server_id": server_id,
+        "actions": actions,
+        "excluded_count": max(0, len(result.data.get("actions") or []) - len(actions)),
+    }
 
 
 @router.get("/{run_id}")
@@ -119,6 +276,51 @@ async def list_run_citations(
     """
     await _require_run(member, run_id)
     return await research.list_citations(run_id, member.organization_id)
+
+
+class ResearchExportRequest(BaseModel):
+    format: str = Field(pattern=r"^(docx|pdf)$")
+
+
+@router.post("/{run_id}/export")
+async def export_research_report(
+    run_id: str,
+    req: ResearchExportRequest,
+    member: Member = Depends(get_current_member),
+) -> dict:
+    """Create a durable DOCX or PDF child artifact for a completed report."""
+    run = await _require_run(member, run_id)
+    if not await permissions.check(member, "artifact.create", "artifact:new"):
+        raise HTTPException(status_code=403, detail="Not authorized")
+    citations = await research.list_citations(run_id, member.organization_id)
+    try:
+        artifact, reused = await create_research_export(
+            run,
+            citations,
+            req.format,  # type: ignore[arg-type]
+            org_id=member.organization_id,
+            created_by=f"member:{member.id}",
+        )
+    except ResearchExportError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    except ArtifactStorageUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    await audit.log(
+        "research_report_exported",
+        member.id,
+        "research.export",
+        organization_id=member.organization_id,
+        resource_type="research_runs",
+        resource_id=run_id,
+        payload={
+            "artifact_id": str(artifact["id"]),
+            "format": req.format,
+            "reused": reused,
+            "citation_count": len(citations),
+            "limitations_preserved": bool(run.get("limitations")),
+        },
+    )
+    return {"artifact": artifact, "reused": reused}
 
 
 @router.get("/{run_id}/events")
@@ -203,7 +405,7 @@ async def cancel_research_run(
         Dict with run_id, status, and cancelled bool.
     """
     await permissions.check(member, "cancel_research", run_id)
-    row = await _require_run(member, run_id)
+    row = await _require_run(member, run_id, write=True)
 
     if row["status"] in {"complete", "failed", "cancelled"}:
         return {"run_id": run_id, "status": row["status"], "cancelled": False}
@@ -224,7 +426,7 @@ async def cancel_research_run(
 # Helpers
 # ---------------------------------------------------------------------------
 
-async def _require_run(member: Member, run_id: str) -> dict:
+async def _require_run(member: Member, run_id: str, *, write: bool = False) -> dict:
     """Fetch a research run and 404 if not found or belongs to another org.
 
     Args:
@@ -240,4 +442,10 @@ async def _require_run(member: Member, run_id: str) -> dict:
     run = await research.get_run(run_id, member.organization_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Research run not found")
-    return run
+    if member.role in _ORG_ADMIN_ROLES:
+        return run
+    if str(run.get("member_id")) == str(member.id):
+        return run
+    if not write and run.get("project_id") and str(run["project_id"]) in await _visible_project_ids(member):
+        return run
+    raise HTTPException(status_code=404, detail="Research run not found")

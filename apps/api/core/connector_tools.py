@@ -26,14 +26,13 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from core.config import settings
-
 logger = logging.getLogger(__name__)
 
 # SaaS providers whose tools require a per-org/user connection before the
 # model should see them. Native/local tool families (browser, fs, code, doc,
 # computer, desktop, image, voice, data, chat_history, repo, platform, mcp)
-# are always available and never filtered here.
+# are ordinarily available without OAuth. Production execution-boundary rules
+# are still applied below, before any database-dependent filtering.
 SAAS_PROVIDER_LABELS: dict[str, str] = {
     "gmail": "Gmail",
     "google_calendar": "Google Calendar",
@@ -73,8 +72,43 @@ def tool_access(name: str) -> str:
     return "write" if any(marker in action for marker in _WRITE_MARKERS) else "read"
 
 
-async def connected_providers(org_id: str) -> dict[str, str]:
-    """Return {provider: account_handle} for every active connector row in *org_id*."""
+def _allowed_by_production_execution_boundary(schema: dict[str, Any]) -> bool:
+    """Hide host-only tool families that cannot execute safely in production.
+
+    Keep this pure and ahead of the connector/database lookup so an outage in
+    settings storage cannot make the model believe a blocked native tool is
+    available. The ToolBroker and connector retain their own hard gates.
+    """
+
+    # Repo tools now route to a persistent E2B workspace. Keep this seam for
+    # any future native family that lacks a production isolation boundary.
+    _ = schema
+    return True
+
+
+def member_connector_clause(connectors_table, org_id: str, member_id: str | None):
+    """Scope connector credentials to their owner plus explicit org-shared rows.
+
+    New databases use the dedicated member_id column. The ID fallback keeps a
+    rolling deployment safe while migration 0047 is being applied.
+    """
+    from sqlalchemy import false, or_
+
+    if "member_id" in connectors_table.c:
+        return or_(
+            connectors_table.c.member_id == str(member_id) if member_id else false(),
+            connectors_table.c.member_id.is_(None),
+        )
+    scoped_pattern = f"%:{org_id}:%"
+    own_pattern = f"%:{org_id}:{member_id}" if member_id else ""
+    return or_(
+        connectors_table.c.id.like(own_pattern) if member_id else false(),
+        ~connectors_table.c.id.like(scoped_pattern),
+    )
+
+
+async def connected_providers(org_id: str, member_id: str | None = None) -> dict[str, str]:
+    """Return active providers visible to one member (plus org-shared rows)."""
     from sqlalchemy import select
 
     from core.db import engine, reflect_table
@@ -89,6 +123,7 @@ async def connected_providers(org_id: str) -> dict[str, str]:
                 ).where(
                     (connectors_table.c.organization_id == str(org_id))
                     & (connectors_table.c.status == "active")
+                    & member_connector_clause(connectors_table, str(org_id), member_id)
                 )
             )
         ).mappings().all()
@@ -114,7 +149,9 @@ async def resolve_agent_tools(
     base_tools: list[dict[str, Any]],
     *,
     org_id: str,
+    member_id: str | None = None,
     disabled_tools: list[str] | None = None,
+    enabled_tools: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Filter a static tool list down to what is real for this org.
 
@@ -129,11 +166,22 @@ async def resolve_agent_tools(
     Degrades to the unfiltered list on any infrastructure error so a broken
     lookup can never take chat down.
     """
+    from core.project_access import tool_is_allowed
+
+    boundary_filtered = [
+        schema for schema in base_tools if _allowed_by_production_execution_boundary(schema)
+        and tool_is_allowed(enabled_tools, _tool_name(schema))
+    ]
+
     try:
         from core.connector_health import connector_tier
         from core.settings_store import tool_permissions as org_tool_permissions
 
-        connected = await connected_providers(org_id)
+        connected = (
+            await connected_providers(org_id, member_id)
+            if member_id
+            else await connected_providers(org_id)
+        )
         permissions = await org_tool_permissions(org_id)
         disabled = {d.strip() for d in (disabled_tools or []) if d and d.strip()}
 
@@ -145,7 +193,7 @@ async def resolve_agent_tools(
             return tier_cache[provider]
 
         resolved: list[dict[str, Any]] = []
-        for schema in base_tools:
+        for schema in boundary_filtered:
             name = _tool_name(schema)
             family = tool_family(name)
             broker_name = name.replace("__", ".", 1) if "__" in name else name
@@ -161,11 +209,18 @@ async def resolve_agent_tools(
             resolved.append(schema)
         return resolved
     except Exception as exc:  # noqa: BLE001 — never let filtering break the loop
-        logger.warning("Tool resolution degraded to static list: %s", exc)
-        return list(base_tools)
+        # Fail closed for credential-backed SaaS tools. Native tools remain
+        # usable, but a database/permission outage must never expose a
+        # colleague's connector or imply that an unavailable account is live.
+        logger.warning("Tool resolution failed closed for SaaS tools: %s", exc)
+        return [
+            schema
+            for schema in boundary_filtered
+            if tool_family(_tool_name(schema)) not in SAAS_PROVIDER_LABELS
+        ]
 
 
-async def connectors_prompt_block(org_id: str) -> str:
+async def connectors_prompt_block(org_id: str, member_id: str | None = None) -> str:
     """Build the "# Connectors" system-prompt section.
 
     Always present so the model knows the connectors system exists: which apps
@@ -174,7 +229,11 @@ async def connectors_prompt_block(org_id: str) -> str:
     MCP servers are registered (usable via the platform__ tools).
     """
     try:
-        connected = await connected_providers(org_id)
+        connected = (
+            await connected_providers(org_id, member_id)
+            if member_id
+            else await connected_providers(org_id)
+        )
         servers = await registered_mcp_servers(org_id)
     except Exception:  # noqa: BLE001 — the block is advisory
         return ""

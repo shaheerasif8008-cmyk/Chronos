@@ -8,7 +8,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import delete, func, insert, select, update
+from sqlalchemy import delete, func, insert, or_, select, update
 
 from core import audit
 from core.config import settings
@@ -189,6 +189,9 @@ async def list_runs(
     org_id: str,
     *,
     project_id: str | None = None,
+    member_id: str | None = None,
+    visible_project_ids: list[str] | None = None,
+    include_org_wide: bool = False,
     limit: int = 50,
 ) -> list[dict]:
     """List research runs for an org, newest first.
@@ -210,6 +213,11 @@ async def list_runs(
     )
     if project_id is not None:
         stmt = stmt.where(table.c.project_id == project_id)
+    if member_id and not include_org_wide:
+        visibility = [table.c.member_id == member_id]
+        if visible_project_ids:
+            visibility.append(table.c.project_id.in_(visible_project_ids))
+        stmt = stmt.where(or_(*visibility))
 
     async with engine.begin() as conn:
         rows = (await conn.execute(stmt)).mappings().all()

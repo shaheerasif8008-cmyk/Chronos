@@ -15,6 +15,20 @@ function isSafeInternalPath(target: string): boolean {
   return /^\/(?![/\\])/.test(target);
 }
 
+function isSafeTenantRedirect(target: string): boolean {
+  try {
+    const url = new URL(target);
+    const currentLabels = window.location.hostname.toLowerCase().split(".");
+    const baseDomain = currentLabels.slice(-2).join(".");
+    return url.protocol === "https:" && (
+      url.hostname.toLowerCase() === baseDomain
+      || url.hostname.toLowerCase().endsWith(`.${baseDomain}`)
+    );
+  } catch {
+    return false;
+  }
+}
+
 function apiBase() {
   if (CONFIGURED_API_BASE) return CONFIGURED_API_BASE;
   if (typeof window !== "undefined") {
@@ -24,6 +38,26 @@ function apiBase() {
     }
   }
   return "http://localhost:8000";
+}
+
+function CallbackStatus({ error = "" }: { error?: string }) {
+  return (
+    <main className="h-[100dvh] overflow-y-auto px-4 py-8 sm:px-6 sm:py-10" style={{ background: "var(--bg)", color: "var(--text)" }}>
+      <section className="mx-auto flex min-h-[calc(100dvh-4rem)] max-w-md flex-col justify-center sm:min-h-[calc(100dvh-5rem)]">
+        <div className="mb-6 flex items-center gap-2.5">
+          <div className="flex h-8 w-8 items-center justify-center rounded-xl" style={{ background: "var(--accent)", color: "white", fontFamily: "var(--font-serif), serif", fontWeight: 600 }}>C</div>
+          <span className="text-[24px]" style={{ fontFamily: "var(--font-serif), serif", fontWeight: 500 }}>Chronos</span>
+        </div>
+        <div className="surface rounded-2xl border border-soft p-5 sm:p-6" style={{ boxShadow: "var(--shadow-md)" }} role={error ? "alert" : "status"}>
+          <h1 className="h-page">{error ? "Sign-in could not be completed" : "Signing in…"}</h1>
+          <p className="mt-3 text-[14px] leading-6" style={{ color: error ? "var(--danger)" : "var(--text-dim)" }}>
+            {error || "Completing your secure organization sign-in."}
+          </p>
+          {error && <a className="btn btn-secondary mt-5 justify-center" href="/login">Return to sign in</a>}
+        </div>
+      </section>
+    </main>
+  );
 }
 
 function CognitoCallbackInner() {
@@ -44,6 +78,7 @@ function CognitoCallbackInner() {
     }
 
     const code = params.get("code");
+    const state = params.get("state");
     const oauthError = params.get("error_description") || params.get("error");
     if (oauthError) {
       setError(oauthError);
@@ -63,7 +98,7 @@ function CognitoCallbackInner() {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             credentials: "include",
-            body: JSON.stringify({ code, redirect_uri: redirectUri }),
+            body: JSON.stringify({ code, state, redirect_uri: redirectUri }),
           }).then(async (res) => ({
             ok: res.ok,
             status: res.status,
@@ -75,36 +110,24 @@ function CognitoCallbackInner() {
           setError(typeof result.body.detail === "string" ? result.body.detail : `Sign-in failed (${result.status})`);
           return;
         }
+        const tenantRedirect = typeof result.body.redirect_url === "string" ? result.body.redirect_url : "";
+        if (tenantRedirect && isSafeTenantRedirect(tenantRedirect)) {
+          window.location.replace(tenantRedirect);
+          return;
+        }
         router.replace("/chat");
-      } catch (err) {
+      } catch {
         setError("Could not complete sign-in. Please try again.");
       }
     })();
   }, [params, router]);
 
-  return (
-    <main className="min-h-screen bg-[#f6f7f9] px-6 py-10">
-      <section className="mx-auto flex min-h-[calc(100vh-5rem)] max-w-md flex-col justify-center">
-        <h1 className="text-3xl font-semibold tracking-normal text-[#15171a]">Signing in…</h1>
-        {error ? (
-          <p className="mt-4 text-sm text-[#b42318]">{error}</p>
-        ) : (
-          <p className="mt-3 text-sm leading-6 text-[#525866]">Completing Cognito sign-in.</p>
-        )}
-      </section>
-    </main>
-  );
+  return <CallbackStatus error={error}/>;
 }
 
 export default function CognitoCallbackPage() {
   return (
-    <Suspense fallback={
-      <main className="min-h-screen bg-[#f6f7f9] px-6 py-10">
-        <section className="mx-auto flex min-h-[calc(100vh-5rem)] max-w-md flex-col justify-center">
-          <h1 className="text-3xl font-semibold tracking-normal text-[#15171a]">Signing in…</h1>
-        </section>
-      </main>
-    }>
+    <Suspense fallback={<CallbackStatus/>}>
       <CognitoCallbackInner />
     </Suspense>
   );

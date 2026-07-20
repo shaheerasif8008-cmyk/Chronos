@@ -43,16 +43,38 @@ def load_base_system_prompt() -> str:
 
 async def load_org_context(org_id: str) -> str:
     context_dir = ROOT / "context" / org_id
-    if not context_dir.exists():
-        return ""
     parts: list[str] = []
-    for path in sorted(context_dir.glob("*.md")):
-        parts.append(f"## {path.name}\n{path.read_text()}")
+    if context_dir.exists():
+        for path in sorted(context_dir.glob("*.md")):
+            parts.append(f"## {path.name}\n{path.read_text()}")
+
+    # Approved context updates live in the database, not a container-local
+    # org.md file, so every API/worker replica observes the same durable state.
+    try:
+        documents = await reflect_table("settings_documents")
+        async with engine.begin() as conn:
+            row = (
+                await conn.execute(
+                    select(documents.c["values"]).where(
+                        documents.c.organization_id == org_id,
+                        documents.c.scope == "org",
+                        documents.c.scope_id == org_id,
+                        documents.c.section == "organization_context",
+                    )
+                )
+            ).first()
+        approved = str((row[0] or {}).get("approved_markdown") or "").strip() if row else ""
+        if approved:
+            parts.append(f"## approved-organization-context.md\n{approved}")
+    except Exception:
+        # Bootstrap/test schemas may not yet have settings_documents. Static
+        # context remains available; the write path itself still fails closed.
+        pass
     return "\n\n".join(parts)
 
 
 async def _compact_history(
-    conversation_id: str,
+    conversation_id: str | None,
     *,
     org_id: str | None = None,
     budget_tokens: int,
@@ -63,6 +85,8 @@ async def _compact_history(
     Always keeps the most recent `verbatim_turns` pairs verbatim.
     Summarizes older turns into a single synthetic 'assistant' entry.
     """
+    if conversation_id is None:
+        return []
     messages_table = await reflect_table("messages")
     async with engine.begin() as conn:
         stmt = select(messages_table.c.role, messages_table.c.content).where(
@@ -111,7 +135,7 @@ async def _compact_history(
 
 
 async def assemble_context(
-    conversation_id: str,
+    conversation_id: str | None,
     message: str,
     requester_context: RequesterContext,
 ) -> list[dict[str, str]]:
@@ -141,7 +165,9 @@ async def assemble_context(
         out: list[tuple[str, str | None, str]] = []
         for skill_id in skill_ids:
             skill_meta = skill_index.get(skill_id, {})
-            warning = await skill_connector_warning(skill_meta, org_id=org_id)
+            warning = await skill_connector_warning(
+                skill_meta, org_id=org_id, member_id=requester_context.member_id
+            )
             content = await load_skill_content(skill_id, progressive=True, org_id=org_id)
             out.append((skill_id, warning, content))
         return out
@@ -150,7 +176,9 @@ async def assemble_context(
         from core.connector_tools import connectors_prompt_block
 
         try:
-            return await connectors_prompt_block(requester_context.org_id)
+            return await connectors_prompt_block(
+                requester_context.org_id, requester_context.member_id
+            )
         except Exception:
             return ""
 

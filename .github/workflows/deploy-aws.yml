@@ -5,37 +5,81 @@ name: Deploy to AWS
 #      "Configure AWS credentials" step fails with "Could not load credentials".
 #      The role is created by Terraform when `github_org`/`github_repo` are set;
 #      its ARN is the `github_deploy_role_arn` output.
-#   2. (Optional) Repo variable AWS_REGION if your stack is not in us-east-2.
+#   2. (Optional) Repo variable AWS_REGION if your stack is not in us-east-1.
+#   3. Repo secret CHRONOS_EVAL_BEARER_TOKEN and repo variable
+#      CHRONOS_EVAL_ORG_ID identify a dedicated synthetic evaluation member and
+#      organization. Missing values fail the production release explicitly.
 
 on:
-  push:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
     branches: [main]
   workflow_dispatch:
     inputs:
-      run_migrations:
-        description: "Run Alembic migrations before deploying"
+      bootstrap_images_only:
+        description: "First-deploy only: build/push immutable SHA images, but do not migrate or start services"
         type: boolean
-        default: true
+        default: false
 
 concurrency:
   group: deploy-aws
   cancel-in-progress: false   # never cancel a running deploy mid-flight
 
 env:
+  PIP_VERSION: "26.1.2"
   # Must match the region your Terraform stack is deployed in. Override per-repo
   # with an AWS_REGION Actions *variable* without editing this file.
-  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-2' }}
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
   ECR_API_REPO: chronos-prod-api
   ECR_WEB_REPO: chronos-prod-web
   ECS_CLUSTER: chronos-prod-cluster
   ECS_API_SERVICE: chronos-prod-api
   ECS_WEB_SERVICE: chronos-prod-web
+  ECS_WORKER_SERVICE: chronos-prod-worker
+  ECS_OPENFGA_SERVICE: chronos-prod-openfga
   MIGRATE_TASK_FAMILY: chronos-prod-migrate
+  OPENFGA_MIGRATE_TASK_FAMILY: chronos-prod-openfga-migrate
+  PRODUCTION_API_URL: ${{ vars.NEXT_PUBLIC_API_BASE_URL || 'https://api.cognisiatech.com' }}
+  PRODUCTION_WEB_URL: ${{ vars.NEXT_PUBLIC_WEB_BASE_URL || 'https://app.cognisiatech.com' }}
+  PRODUCTION_TERMS_URL: ${{ vars.NEXT_PUBLIC_TERMS_URL }}
+  PRODUCTION_PRIVACY_URL: ${{ vars.NEXT_PUBLIC_PRIVACY_URL }}
+  PRODUCTION_SUPPORT_URL: ${{ vars.NEXT_PUBLIC_SUPPORT_URL }}
+  PRODUCTION_STATUS_URL: ${{ vars.NEXT_PUBLIC_STATUS_URL }}
+  PRODUCTION_SMOKE_TENANT: ${{ vars.PRODUCTION_SMOKE_TENANT }}
+  PRODUCTION_TENANT_WEB_URL: ${{ vars.PRODUCTION_TENANT_WEB_URL }}
+  SENTRY_SECRET_ID: chronos-prod/sentry_dsn
 
 jobs:
-  # ── 1. Build and push images ────────────────────────────────────────────────
+  release-gate:
+    name: Require reviewed main SHA and successful CI
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    outputs:
+      source_sha: ${{ steps.verify.outputs.source_sha }}
+      approved_pr: ${{ steps.verify.outputs.approved_pr }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: main
+          sparse-checkout: .github/scripts
+      - name: Verify reviewed main SHA and exact successful CI run
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          EXPECTED_CI_RUN_ID: ${{ github.event.workflow_run.id || '' }}
+          REQUIRE_BRANCH_HEAD: "true"
+        run: bash .github/scripts/verify-reviewed-ci-sha.sh
+
+  # ── 1. Build, scan, and push images ─────────────────────────────────────────
   build:
-    name: Build & push images
+    name: Build, scan & push images
+    needs: release-gate
     runs-on: ubuntu-latest
 
     permissions:
@@ -48,52 +92,165 @@ jobs:
       web_image: ${{ steps.push.outputs.web_image }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.release-gate.outputs.source_sha }}
+
+      - name: Validate public build configuration
+        run: |
+          test -n "$PRODUCTION_API_URL"
+          test -n "$PRODUCTION_WEB_URL"
+          test -n "$PRODUCTION_TERMS_URL"
+          test -n "$PRODUCTION_PRIVACY_URL"
+          test -n "$PRODUCTION_SUPPORT_URL"
+          test -n "$PRODUCTION_STATUS_URL"
+          test -n "$PRODUCTION_SMOKE_TENANT"
+          test -n "$PRODUCTION_TENANT_WEB_URL"
+          case "$PRODUCTION_API_URL" in https://*) ;; *) echo "Production API URL must use https://"; exit 1;; esac
+          case "$PRODUCTION_WEB_URL" in https://*) ;; *) echo "Production web URL must use https://"; exit 1;; esac
+          case "$PRODUCTION_TERMS_URL" in https://*) ;; *) echo "Production terms URL must use https://"; exit 1;; esac
+          case "$PRODUCTION_PRIVACY_URL" in https://*) ;; *) echo "Production privacy URL must use https://"; exit 1;; esac
+          case "$PRODUCTION_SUPPORT_URL" in https://*) ;; *) echo "Production support URL must use https://"; exit 1;; esac
+          case "$PRODUCTION_STATUS_URL" in https://*) ;; *) echo "Production status URL must use https://"; exit 1;; esac
+          case "$PRODUCTION_TENANT_WEB_URL" in https://*) ;; *) echo "Production tenant URL must use https://"; exit 1;; esac
+          case "$PRODUCTION_SMOKE_TENANT" in *[!a-z0-9-]*|'') echo "Production smoke tenant must be a lowercase DNS label"; exit 1;; esac
 
       - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Log in to ECR
         id: ecr-login
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@d539f0932e70871a027e9d5a9d8fc38589180a64 # v2
+
+      - name: Load web error-monitoring configuration
+        shell: bash
+        run: |
+          WEB_SENTRY_DSN="$(aws secretsmanager get-secret-value --secret-id "$SENTRY_SECRET_ID" --query SecretString --output text)"
+          test -n "$WEB_SENTRY_DSN"
+          test "$WEB_SENTRY_DSN" != "None"
+          echo "::add-mask::$WEB_SENTRY_DSN"
+          echo "WEB_SENTRY_DSN=$WEB_SENTRY_DSN" >> "$GITHUB_ENV"
 
       - name: Compute image tag
         id: meta
-        run: echo "tag=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+        env:
+          SOURCE_SHA: ${{ needs.release-gate.outputs.source_sha }}
+        run: echo "tag=${SOURCE_SHA::8}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Build & push API image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           context: apps/api
           file: apps/api/Dockerfile
           push: true
           tags: |
             ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_API_REPO }}:${{ steps.meta.outputs.tag }}
-            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_API_REPO }}:latest
           cache-from: type=gha,scope=api
           cache-to: type=gha,mode=max,scope=api
           build-args: |
-            INSTALL_PLAYWRIGHT=1
+            INSTALL_PLAYWRIGHT=0
 
       - name: Build & push web image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           context: apps/web
           file: apps/web/Dockerfile
           push: true
           tags: |
             ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_WEB_REPO }}:${{ steps.meta.outputs.tag }}
-            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_WEB_REPO }}:latest
           cache-from: type=gha,scope=web
           cache-to: type=gha,mode=max,scope=web
           build-args: |
-            NEXT_PUBLIC_API_BASE_URL=${{ vars.NEXT_PUBLIC_API_BASE_URL }}
+            NEXT_PUBLIC_API_BASE_URL=${{ env.PRODUCTION_API_URL }}
+            NEXT_PUBLIC_WEB_BASE_URL=${{ env.PRODUCTION_WEB_URL }}
+            NEXT_PUBLIC_TERMS_URL=${{ env.PRODUCTION_TERMS_URL }}
+            NEXT_PUBLIC_PRIVACY_URL=${{ env.PRODUCTION_PRIVACY_URL }}
+            NEXT_PUBLIC_SUPPORT_URL=${{ env.PRODUCTION_SUPPORT_URL }}
+            NEXT_PUBLIC_STATUS_URL=${{ env.PRODUCTION_STATUS_URL }}
+            NEXT_PUBLIC_CHRONOS_ENVIRONMENT=production
+            NEXT_PUBLIC_CHRONOS_RELEASE=${{ steps.meta.outputs.tag }}
+          secret-envs: |
+            sentry_dsn=WEB_SENTRY_DSN
+
+      - name: Wait for ECR scans and reject high or critical findings
+        env:
+          IMAGE_TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          SCAN_TYPE=$(aws ecr get-registry-scanning-configuration \
+            --query 'scanningConfiguration.scanType' --output text)
+          if [[ "$SCAN_TYPE" != "BASIC" && "$SCAN_TYPE" != "ENHANCED" ]]; then
+            echo "Unsupported ECR registry scan type: $SCAN_TYPE" >&2
+            exit 1
+          fi
+
+          wait_for_clean_scan() {
+            local repository="$1"
+            local result status high critical scan_error
+
+            if [[ "$SCAN_TYPE" == "BASIC" ]]; then
+              scan_error=$(mktemp)
+              if ! aws ecr start-image-scan \
+                --repository-name "$repository" \
+                --image-id "imageTag=$IMAGE_TAG" \
+                >/dev/null 2>"$scan_error"; then
+                status=$(aws ecr describe-image-scan-findings \
+                  --repository-name "$repository" \
+                  --image-id "imageTag=$IMAGE_TAG" \
+                  --query 'imageScanStatus.status' --output text 2>/dev/null || true)
+                if [[ "$status" != "IN_PROGRESS" && "$status" != "COMPLETE" ]]; then
+                  cat "$scan_error" >&2
+                  rm -f "$scan_error"
+                  return 1
+                fi
+              fi
+              rm -f "$scan_error"
+            fi
+
+            for attempt in $(seq 1 60); do
+              if result=$(aws ecr describe-image-scan-findings \
+                --repository-name "$repository" \
+                --image-id "imageTag=$IMAGE_TAG" \
+                --output json 2>/dev/null); then
+                status=$(jq -r '.imageScanStatus.status // empty' <<<"$result")
+                if [[ "$SCAN_TYPE" == "BASIC" && "$status" == "COMPLETE" ]]; then
+                  break
+                fi
+                if [[ "$SCAN_TYPE" == "ENHANCED" && "$status" == "ACTIVE" ]] && \
+                  jq -e '.imageScanFindings.imageScanCompletedAt != null and .imageScanFindings.vulnerabilitySourceUpdatedAt != null' \
+                    >/dev/null <<<"$result"; then
+                  break
+                fi
+                case "$status" in
+                  FAILED|UNSUPPORTED_IMAGE|SCAN_ELIGIBILITY_EXPIRED|FINDINGS_UNAVAILABLE|LIMIT_EXCEEDED|IMAGE_ARCHIVED)
+                    echo "ECR scan for $repository:$IMAGE_TAG failed with status $status" >&2
+                    return 1
+                    ;;
+                esac
+              fi
+              if [[ "$attempt" == "60" ]]; then
+                echo "Timed out waiting for $SCAN_TYPE ECR scan of $repository:$IMAGE_TAG" >&2
+                return 1
+              fi
+              sleep 10
+            done
+
+            high=$(jq -r '.imageScanFindings.findingSeverityCounts.HIGH // 0' <<<"$result")
+            critical=$(jq -r '.imageScanFindings.findingSeverityCounts.CRITICAL // 0' <<<"$result")
+            echo "$repository:$IMAGE_TAG scan=$SCAN_TYPE status=$status high=$high critical=$critical"
+            if (( high > 0 || critical > 0 )); then
+              echo "Blocking release because $repository:$IMAGE_TAG has HIGH or CRITICAL findings" >&2
+              return 1
+            fi
+          }
+
+          wait_for_clean_scan "$ECR_API_REPO"
+          wait_for_clean_scan "$ECR_WEB_REPO"
 
       - name: Set image output
         id: push
@@ -102,12 +259,18 @@ jobs:
           echo "api_image=${REGISTRY}/${{ env.ECR_API_REPO }}:${{ steps.meta.outputs.tag }}" >> "$GITHUB_OUTPUT"
           echo "web_image=${REGISTRY}/${{ env.ECR_WEB_REPO }}:${{ steps.meta.outputs.tag }}" >> "$GITHUB_OUTPUT"
 
+      - name: Bootstrap image summary
+        if: ${{ github.event.inputs.bootstrap_images_only == 'true' }}
+        run: |
+          echo "### Bootstrap images pushed" >> "$GITHUB_STEP_SUMMARY"
+          echo "Services and migrations were intentionally not changed." >> "$GITHUB_STEP_SUMMARY"
+
   # ── 2. Run database migrations ──────────────────────────────────────────────
   migrate:
     name: Run migrations
     needs: build
     runs-on: ubuntu-latest
-    if: github.event.inputs.run_migrations != 'false'
+    if: github.event.inputs.bootstrap_images_only != 'true'
 
     permissions:
       id-token: write
@@ -115,7 +278,7 @@ jobs:
 
     steps:
       - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
@@ -143,27 +306,71 @@ jobs:
             --query "taskDefinition.taskDefinitionArn" --output text)
           echo "updated_arn=$UPDATED_ARN" >> "$GITHUB_OUTPUT"
 
-      - name: Get VPC subnets and security groups
+      - name: Resolve migration networks from the managed services
         id: network
         run: |
-          SUBNETS=$(aws ec2 describe-subnets \
-            --filters "Name=tag:Application,Values=chronos" "Name=tag:Name,Values=*private*" \
-            --query "Subnets[*].SubnetId" --output text | tr '\t' ',')
-          SG=$(aws ec2 describe-security-groups \
-            --filters "Name=tag:Application,Values=chronos" "Name=group-name,Values=*api-sg*" \
-            --query "SecurityGroups[0].GroupId" --output text)
-          echo "subnets=$SUBNETS" >> "$GITHUB_OUTPUT"
-          echo "sg=$SG" >> "$GITHUB_OUTPUT"
+          resolve_network() {
+            local service="$1"
+            local prefix="$2"
+            local network subnets security_groups
+            network=$(aws ecs describe-services \
+              --cluster "${{ env.ECS_CLUSTER }}" \
+              --services "$service" \
+              --query 'services[0].networkConfiguration.awsvpcConfiguration' \
+              --output json)
+            subnets=$(jq -r '.subnets | join(",")' <<<"$network")
+            security_groups=$(jq -r '.securityGroups | join(",")' <<<"$network")
+            test -n "$subnets"
+            test -n "$security_groups"
+            echo "${prefix}_subnets=$subnets" >> "$GITHUB_OUTPUT"
+            echo "${prefix}_security_groups=$security_groups" >> "$GITHUB_OUTPUT"
+          }
+
+          resolve_network "${{ env.ECS_API_SERVICE }}" api
+          resolve_network "${{ env.ECS_OPENFGA_SERVICE }}" openfga
+
+      - name: Run pinned OpenFGA datastore migration
+        run: |
+          TASK_ARN=$(aws ecs run-task \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --task-definition "${{ env.OPENFGA_MIGRATE_TASK_FAMILY }}" \
+            --launch-type FARGATE \
+            --started-by "gha-${GITHUB_RUN_ID}" \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ steps.network.outputs.openfga_subnets }}],securityGroups=[${{ steps.network.outputs.openfga_security_groups }}],assignPublicIp=DISABLED}" \
+            --output json)
+          if ! jq -e '.failures | length == 0 and (.tasks | length == 1)' >/dev/null <<<"$TASK_ARN"; then
+            jq '{failures, tasks}' <<<"$TASK_ARN" >&2
+            exit 1
+          fi
+          TASK_ARN=$(jq -r '.tasks[0].taskArn' <<<"$TASK_ARN")
+          aws ecs wait tasks-stopped \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --tasks "$TASK_ARN"
+          RESULT=$(aws ecs describe-tasks \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --tasks "$TASK_ARN" \
+            --output json)
+          EXIT_CODE=$(jq -r '.tasks[0].containers[] | select(.name == "openfga-migrate") | .exitCode // empty' <<<"$RESULT")
+          if [[ "$EXIT_CODE" != "0" ]]; then
+            jq '{stoppedReason: .tasks[0].stoppedReason, containers: [.tasks[0].containers[] | {name, exitCode, reason}]}' <<<"$RESULT" >&2
+            exit 1
+          fi
 
       - name: Run migration task
         id: run-task
         run: |
-          TASK_ARN=$(aws ecs run-task \
+          RUN_RESULT=$(aws ecs run-task \
             --cluster "${{ env.ECS_CLUSTER }}" \
             --task-definition "${{ steps.task-def.outputs.updated_arn }}" \
             --launch-type FARGATE \
-            --network-configuration "awsvpcConfiguration={subnets=[${{ steps.network.outputs.subnets }}],securityGroups=[${{ steps.network.outputs.sg }}],assignPublicIp=DISABLED}" \
-            --query "tasks[0].taskArn" --output text)
+            --started-by "gha-${GITHUB_RUN_ID}" \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ steps.network.outputs.api_subnets }}],securityGroups=[${{ steps.network.outputs.api_security_groups }}],assignPublicIp=DISABLED}" \
+            --output json)
+          if ! jq -e '.failures | length == 0 and (.tasks | length == 1)' >/dev/null <<<"$RUN_RESULT"; then
+            jq '{failures, tasks}' <<<"$RUN_RESULT" >&2
+            exit 1
+          fi
+          TASK_ARN=$(jq -r '.tasks[0].taskArn' <<<"$RUN_RESULT")
           echo "task_arn=$TASK_ARN" >> "$GITHUB_OUTPUT"
           echo "Migration task started: $TASK_ARN"
 
@@ -174,31 +381,63 @@ jobs:
             --cluster "${{ env.ECS_CLUSTER }}" \
             --tasks "${{ steps.run-task.outputs.task_arn }}"
 
-          EXIT_CODE=$(aws ecs describe-tasks \
+          RESULT=$(aws ecs describe-tasks \
             --cluster "${{ env.ECS_CLUSTER }}" \
             --tasks "${{ steps.run-task.outputs.task_arn }}" \
-            --query "tasks[0].containers[0].exitCode" --output text)
+            --output json)
+          EXIT_CODE=$(jq -r '.tasks[0].containers[] | select(.name == "migrate") | .exitCode // empty' <<<"$RESULT")
 
           echo "Migration task exit code: $EXIT_CODE"
           if [ "$EXIT_CODE" != "0" ]; then
             echo "Migration failed — check CloudWatch logs: /ecs/chronos-prod/migrate"
+            jq '{stoppedReason: .tasks[0].stoppedReason, containers: [.tasks[0].containers[] | {name, exitCode, reason}]}' <<<"$RESULT" >&2
             exit 1
           fi
 
   # ── 3. Deploy services ──────────────────────────────────────────────────────
   deploy:
     name: Deploy services
-    needs: [build, migrate]
+    needs: [release-gate, build, migrate]
     runs-on: ubuntu-latest
-    if: always() && needs.build.result == 'success' && (needs.migrate.result == 'success' || needs.migrate.result == 'skipped')
+    if: always() && github.event.inputs.bootstrap_images_only != 'true' && needs.release-gate.result == 'success' && needs.build.result == 'success' && needs.migrate.result == 'success'
 
     permissions:
       id-token: write
       contents: read
 
     steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.release-gate.outputs.source_sha }}
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: apps/api/requirements.lock
+
+      - name: Install locked evaluation dependencies
+        run: |
+          python -m venv apps/api/.venv
+          apps/api/.venv/bin/python -m pip install --upgrade "pip==$PIP_VERSION"
+          apps/api/.venv/bin/pip install --require-hashes -r apps/api/requirements.lock
+
+      - name: Require live evaluation identity configuration
+        env:
+          CHRONOS_EVAL_BEARER_TOKEN: ${{ secrets.CHRONOS_EVAL_BEARER_TOKEN }}
+          CHRONOS_EVAL_EXPECTED_ORG_ID: ${{ vars.CHRONOS_EVAL_ORG_ID }}
+        run: |
+          if [[ -z "$CHRONOS_EVAL_BEARER_TOKEN" ]]; then
+            echo "External launch blocker: configure the CHRONOS_EVAL_BEARER_TOKEN repository secret." >&2
+            exit 1
+          fi
+          if [[ -z "$CHRONOS_EVAL_EXPECTED_ORG_ID" ]]; then
+            echo "External launch blocker: configure the CHRONOS_EVAL_ORG_ID repository variable." >&2
+            exit 1
+          fi
+
       - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
@@ -206,6 +445,11 @@ jobs:
       - name: Update API task definition with new image
         id: api-task-def
         run: |
+          PREVIOUS_ARN=$(aws ecs describe-services \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --services "${{ env.ECS_API_SERVICE }}" \
+            --query "services[0].taskDefinition" --output text)
+          echo "previous_arn=$PREVIOUS_ARN" >> "$GITHUB_OUTPUT"
           aws ecs describe-task-definition \
             --task-definition "${{ env.ECS_API_SERVICE }}" \
             --query "taskDefinition" \
@@ -222,11 +466,37 @@ jobs:
       - name: Update Web task definition with new image
         id: web-task-def
         run: |
+          PREVIOUS_ARN=$(aws ecs describe-services \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --services "${{ env.ECS_WEB_SERVICE }}" \
+            --query "services[0].taskDefinition" --output text)
+          echo "previous_arn=$PREVIOUS_ARN" >> "$GITHUB_OUTPUT"
           aws ecs describe-task-definition \
             --task-definition "${{ env.ECS_WEB_SERVICE }}" \
             --query "taskDefinition" \
             --output json | \
             jq --arg img "${{ needs.build.outputs.web_image }}" \
+               '.containerDefinitions[0].image = $img |
+                del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)' \
+            > task-definition.json
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://task-definition.json \
+            --query "taskDefinition.taskDefinitionArn" --output text)
+          echo "arn=$NEW_ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Update Worker task definition with new image
+        id: worker-task-def
+        run: |
+          PREVIOUS_ARN=$(aws ecs describe-services \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --services "${{ env.ECS_WORKER_SERVICE }}" \
+            --query "services[0].taskDefinition" --output text)
+          echo "previous_arn=$PREVIOUS_ARN" >> "$GITHUB_OUTPUT"
+          aws ecs describe-task-definition \
+            --task-definition "${{ env.ECS_WORKER_SERVICE }}" \
+            --query "taskDefinition" \
+            --output json | \
+            jq --arg img "${{ needs.build.outputs.api_image }}" \
                '.containerDefinitions[0].image = $img |
                 del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)' \
             > task-definition.json
@@ -251,6 +521,14 @@ jobs:
             --task-definition "${{ steps.web-task-def.outputs.arn }}" \
             --force-new-deployment
 
+      - name: Deploy Worker service
+        run: |
+          aws ecs update-service \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --service "${{ env.ECS_WORKER_SERVICE }}" \
+            --task-definition "${{ steps.worker-task-def.outputs.arn }}" \
+            --force-new-deployment
+
       - name: Wait for API service stability
         run: |
           echo "Waiting for API service to stabilize..."
@@ -265,6 +543,142 @@ jobs:
             --cluster "${{ env.ECS_CLUSTER }}" \
             --services "${{ env.ECS_WEB_SERVICE }}"
 
+      - name: Wait for Worker service stability
+        run: |
+          aws ecs wait services-stable \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --services "${{ env.ECS_WORKER_SERVICE }}"
+
+      - name: Verify requested task revisions are active
+        env:
+          API_TASK_ARN: ${{ steps.api-task-def.outputs.arn }}
+          WEB_TASK_ARN: ${{ steps.web-task-def.outputs.arn }}
+          WORKER_TASK_ARN: ${{ steps.worker-task-def.outputs.arn }}
+        run: |
+          verify_service() {
+            local service="$1"
+            local expected_arn="$2"
+            local service_json current_arn desired running rollout
+            service_json=$(aws ecs describe-services \
+              --cluster "${{ env.ECS_CLUSTER }}" \
+              --services "$service" \
+              --output json)
+            current_arn=$(jq -r '.services[0].taskDefinition // empty' <<<"$service_json")
+            desired=$(jq -r '.services[0].desiredCount // -1' <<<"$service_json")
+            running=$(jq -r '.services[0].runningCount // -1' <<<"$service_json")
+            rollout=$(jq -r --arg arn "$expected_arn" \
+              '[.services[0].deployments[] | select(.taskDefinition == $arn) | .rolloutState][0] // empty' \
+              <<<"$service_json")
+
+            if [[ "$current_arn" != "$expected_arn" || "$running" -lt "$desired" || "$rollout" != "COMPLETED" ]]; then
+              echo "Service $service did not activate requested revision" >&2
+              jq '{services: [.services[0] | {serviceName, taskDefinition, desiredCount, runningCount, pendingCount, deployments}]}' \
+                <<<"$service_json" >&2
+              return 1
+            fi
+          }
+
+          verify_service "${{ env.ECS_API_SERVICE }}" "$API_TASK_ARN"
+          verify_service "${{ env.ECS_WEB_SERVICE }}" "$WEB_TASK_ARN"
+          verify_service "${{ env.ECS_WORKER_SERVICE }}" "$WORKER_TASK_ARN"
+
+      - name: Smoke-test the production edge
+        run: |
+          for attempt in $(seq 1 20); do
+            HEALTH=$(curl --connect-timeout 5 --max-time 15 -fsS "$PRODUCTION_API_URL/health" || true)
+            if jq -e '.status == "ok"' >/dev/null 2>&1 <<<"$HEALTH"; then
+              break
+            fi
+            if [ "$attempt" = "20" ]; then
+              echo "API never reached healthy state: $HEALTH"
+              exit 1
+            fi
+            sleep 10
+          done
+
+          AUTH_CONFIG=$(curl --connect-timeout 5 --max-time 15 -fsS \
+            "$PRODUCTION_API_URL/auth/config?tenant=$PRODUCTION_SMOKE_TENANT")
+          jq -e '.provider == "cognito" and .devOtp == false and .cognito.enabled == true' \
+            >/dev/null <<<"$AUTH_CONFIG"
+          curl --connect-timeout 5 --max-time 20 -LfsS "$PRODUCTION_WEB_URL/login" >/dev/null
+          curl --connect-timeout 5 --max-time 20 -LfsS "$PRODUCTION_TENANT_WEB_URL/login" >/dev/null
+
+          for origin in "$PRODUCTION_WEB_URL" "$PRODUCTION_TENANT_WEB_URL"; do
+            HEADERS=$(mktemp)
+            curl --connect-timeout 5 --max-time 15 -fsS -D "$HEADERS" -o /dev/null \
+              -X OPTIONS "$PRODUCTION_API_URL/auth/me" \
+              -H "Origin: $origin" \
+              -H "Access-Control-Request-Method: GET"
+            grep -Fqi "access-control-allow-origin: $origin" "$HEADERS"
+            rm -f "$HEADERS"
+          done
+
+      - name: Require same-commit live cross-industry evaluation
+        working-directory: apps/api
+        env:
+          CHRONOS_EVAL_API_BASE: ${{ env.PRODUCTION_API_URL }}
+          CHRONOS_EVAL_BEARER_TOKEN: ${{ secrets.CHRONOS_EVAL_BEARER_TOKEN }}
+          CHRONOS_EVAL_EXPECTED_ORG_ID: ${{ vars.CHRONOS_EVAL_ORG_ID }}
+          CHRONOS_EVAL_RELEASE_SHA: ${{ needs.release-gate.outputs.source_sha }}
+        run: |
+          .venv/bin/python -m evals.cross_industry \
+            --live \
+            --acknowledge-test-data \
+            --expected-org-id "$CHRONOS_EVAL_EXPECTED_ORG_ID" \
+            --release-sha "$CHRONOS_EVAL_RELEASE_SHA" \
+            --timeout 300 \
+            --include-responses \
+            | tee cross-industry-result.json
+          RESULT_SHA=$(sha256sum cross-industry-result.json | awk '{print $1}')
+          {
+            echo "### Cross-industry release gate"
+            echo "- Source SHA: \`$CHRONOS_EVAL_RELEASE_SHA\`"
+            echo "- Result SHA-256: \`$RESULT_SHA\`"
+            echo "- Synthetic organization: \`$CHRONOS_EVAL_EXPECTED_ORG_ID\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload cross-industry evaluation evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cross-industry-${{ needs.release-gate.outputs.source_sha }}
+          path: apps/api/cross-industry-result.json
+          if-no-files-found: ignore
+          retention-days: 90
+
+      - name: Roll back services after a failed deployment
+        if: ${{ failure() }}
+        env:
+          PREVIOUS_API_ARN: ${{ steps.api-task-def.outputs.previous_arn }}
+          PREVIOUS_WEB_ARN: ${{ steps.web-task-def.outputs.previous_arn }}
+          PREVIOUS_WORKER_ARN: ${{ steps.worker-task-def.outputs.previous_arn }}
+        run: |
+          services=()
+          rollback_service() {
+            local service="$1"
+            local previous_arn="$2"
+            if [[ -z "$previous_arn" || "$previous_arn" == "None" || "$previous_arn" == "null" ]]; then
+              echo "No previous revision recorded for $service; skipping" >&2
+              return 0
+            fi
+            aws ecs update-service \
+              --cluster "${{ env.ECS_CLUSTER }}" \
+              --service "$service" \
+              --task-definition "$previous_arn" \
+              --force-new-deployment
+            services+=("$service")
+          }
+
+          rollback_service "${{ env.ECS_API_SERVICE }}" "$PREVIOUS_API_ARN"
+          rollback_service "${{ env.ECS_WEB_SERVICE }}" "$PREVIOUS_WEB_ARN"
+          rollback_service "${{ env.ECS_WORKER_SERVICE }}" "$PREVIOUS_WORKER_ARN"
+
+          if (( ${#services[@]} > 0 )); then
+            aws ecs wait services-stable \
+              --cluster "${{ env.ECS_CLUSTER }}" \
+              --services "${services[@]}"
+          fi
+
       - name: Deploy summary
         run: |
           echo "### Deploy complete" >> $GITHUB_STEP_SUMMARY
@@ -272,3 +686,4 @@ jobs:
           echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| API     | \`${{ needs.build.outputs.api_image }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Web     | \`${{ needs.build.outputs.web_image }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Worker  | \`${{ needs.build.outputs.api_image }}\` |" >> $GITHUB_STEP_SUMMARY

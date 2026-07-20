@@ -8,17 +8,21 @@ from __future__ import annotations
 
 import asyncio
 
+import httpx
 import pytest
 
+import main
 from core import scim, sso
 
 
 # ── SSO ───────────────────────────────────────────────────────────────────────
 
 def test_state_roundtrip_and_tamper():
-    token = sso.sign_state("conn-1", "/chat", "nonce-abc")
+    token = sso.sign_state("conn-1", "org-1", "/chat", "nonce-abc")
     claims = sso.verify_state(token)
     assert claims["cid"] == "conn-1"
+    assert claims["org"] == "org-1"
+    assert claims["nonce"] == "nonce-abc"
     assert claims["redirect"] == "/chat"
     with pytest.raises(sso.SSOError):
         sso.verify_state(token + "tamper")
@@ -31,7 +35,18 @@ def test_email_from_claims():
         sso.email_from_claims({"sub": "no-email"})
 
 
-def test_build_login_url_uses_configured_endpoints():
+def test_sso_client_secret_is_encrypted_and_tenant_bound(monkeypatch):
+    monkeypatch.setattr(sso.settings, "vault_encryption_key", "11" * 32)
+    protected = sso.protect_client_secret("super-secret", organization_id="org-a")
+    assert protected.startswith("enc:v1:")
+    assert "super-secret" not in protected
+    assert sso.reveal_client_secret(protected, organization_id="org-a") == "super-secret"
+    with pytest.raises(sso.SSOError, match="could not be decrypted"):
+        sso.reveal_client_secret(protected, organization_id="org-b")
+
+
+def test_build_login_url_uses_configured_endpoints(monkeypatch):
+    monkeypatch.setattr(sso, "assert_safe_url", lambda url: url)
     conn = sso.SSOConnection(
         id="c1", organization_id="default", issuer="https://idp.example.com",
         client_id="client-123", client_secret="s",
@@ -48,6 +63,80 @@ def test_build_login_url_uses_configured_endpoints():
     assert "client_id=client-123" in url
     assert "response_type=code" in url
     assert "state=" in url and "nonce=n1" in url
+
+
+def test_oidc_endpoint_rejects_private_target(monkeypatch):
+    from core.ssrf import UnsafeURLError
+
+    monkeypatch.setattr(
+        sso,
+        "assert_safe_url",
+        lambda _url: (_ for _ in ()).throw(UnsafeURLError("private")),
+    )
+    with pytest.raises(sso.SSOError, match="safe public endpoint"):
+        sso.validate_oidc_url("https://169.254.169.254/latest", label="OIDC token endpoint")
+
+
+def test_manually_configured_cross_host_endpoint_requires_allowlist(monkeypatch):
+    monkeypatch.setattr(sso, "assert_safe_url", lambda url: url)
+    monkeypatch.setattr(sso.settings, "sso_endpoint_host_allowlist", "")
+    conn = sso.SSOConnection(
+        id="c1", organization_id="org-1", issuer="https://idp.example.com",
+        client_id="client-123", client_secret="s",
+        authorize_url="https://idp.example.com/authorize",
+        token_url="https://tokens.other.example/token",
+        jwks_url="https://idp.example.com/jwks",
+        userinfo_url="", scopes="openid email", email_domain="acme.com",
+        default_role="viewer", enabled=True,
+    )
+    with pytest.raises(sso.SSOError, match="not allowlisted"):
+        asyncio.get_event_loop().run_until_complete(
+            sso.build_login_url(conn, redirect="/chat", nonce="n1")
+        )
+
+    monkeypatch.setattr(
+        sso.settings, "sso_endpoint_host_allowlist", "tokens.other.example"
+    )
+    url = asyncio.get_event_loop().run_until_complete(
+        sso.build_login_url(conn, redirect="/chat", nonce="n1")
+    )
+    assert url.startswith("https://idp.example.com/authorize?")
+
+
+def test_id_token_nonce_must_match(monkeypatch):
+    conn = sso.SSOConnection(
+        id="c1", organization_id="org-1", issuer="https://idp.example.com",
+        client_id="client-123", client_secret="s",
+        authorize_url="https://idp.example.com/authorize",
+        token_url="https://idp.example.com/token",
+        jwks_url="https://idp.example.com/jwks",
+        userinfo_url="", scopes="openid email", email_domain="acme.com",
+        default_role="viewer", enabled=True,
+    )
+    monkeypatch.setattr(sso, "_signing_key_from_jwks", lambda *_args: object())
+    monkeypatch.setattr(
+        sso.jwt,
+        "decode",
+        lambda *_args, **_kwargs: {
+            "sub": "u1", "nonce": "other", "exp": 9_999_999_999, "iat": 1,
+        },
+    )
+    with pytest.raises(sso.SSOError, match="nonce did not match"):
+        sso.verify_id_token(
+            conn, "header.payload.signature", jwks={"keys": []}, expected_nonce="expected"
+        )
+
+
+@pytest.mark.asyncio
+async def test_sso_callback_requires_state_bound_to_this_browser():
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=main.app), base_url="http://test"
+    ) as client:
+        response = await client.get(
+            "/auth/sso/callback", params={"code": "code", "state": "state"}
+        )
+    assert response.status_code == 400
+    assert "did not match this browser" in response.json()["detail"]
 
 
 # ── SCIM token auth ───────────────────────────────────────────────────────────

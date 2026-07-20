@@ -26,6 +26,7 @@ ACTION_EVENT_TYPES = {
     "task_complete",
     "task_failed",
     "task_cancelled",
+    "task_cleanup_requested",
 }
 
 
@@ -113,6 +114,8 @@ async def list_task_events(task_id: str, org_id: str, *, limit: int = 200, offse
 async def list_activity_actions(
     org_id: str,
     *,
+    member_id: str | None = None,
+    include_org_wide: bool = False,
     event_type: str | None = None,
     status: str | None = None,
     task_id: str | None = None,
@@ -122,8 +125,12 @@ async def list_activity_actions(
     offset: int = 0,
 ) -> list[dict[str, Any]]:
     from core.db import engine, reflect_table
+    from core.models import Member
+    from core.task_access import visibility_clause
+    from sqlalchemy import or_
 
     audit_log = await reflect_table("audit_log")
+    tasks = await reflect_table("tasks")
     async with engine.begin() as conn:
         stmt = (
             select(audit_log)
@@ -134,6 +141,23 @@ async def list_activity_actions(
         )
         if task_id:
             stmt = stmt.where(audit_log.c.resource_id == task_id)
+        if member_id and not include_org_wide:
+            scoped_member = Member(
+                id=member_id,
+                organization_id=org_id,
+                email="activity-reader@chronos.invalid",
+                role="user",
+            )
+            own_tasks = select(tasks.c.id).where(
+                tasks.c.organization_id == org_id,
+                visibility_clause(tasks, scoped_member),
+            )
+            stmt = stmt.where(
+                or_(
+                    audit_log.c.resource_id.in_(own_tasks),
+                    audit_log.c.actor_id == member_id,
+                )
+            )
         rows = (await conn.execute(stmt)).mappings().all()
 
     normalized = await _normalize_rows(

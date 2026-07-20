@@ -136,28 +136,67 @@ async def test_conflict_detection_and_resolution():
 @_requires_db
 @pytest.mark.asyncio
 async def test_privacy_disable_blocks_retrieval_and_is_scoped():
+    from sqlalchemy import delete, insert
+
     from core import memory as memory_mod
+    from core.db import engine, reflect_table
     from core.memory_control import is_memory_enabled, set_memory_policy
     from core.models import RequesterContext
 
     org = f"test-{uuid.uuid4().hex[:8]}"
     member = _member(org)
     project_id = str(uuid.uuid4())
+    other_project_id = str(uuid.uuid4())
+    members = await reflect_table("members")
+    projects = await reflect_table("projects")
+    project_members = await reflect_table("project_members")
+    settings_documents = await reflect_table("settings_documents")
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(members).values(
+                id=member.id,
+                organization_id=org,
+                region="us",
+                email=member.email,
+                role=member.role,
+            )
+        )
+        await conn.execute(
+            insert(projects),
+            [
+                {"id": project_id, "organization_id": org, "region": "us", "name": "Primary", "created_by": member.id},
+                {"id": other_project_id, "organization_id": org, "region": "us", "name": "Other", "created_by": member.id},
+            ],
+        )
+        await conn.execute(
+            insert(project_members),
+            [
+                {"organization_id": org, "region": "us", "project_id": project_id, "member_id": member.id, "role": "owner"},
+                {"organization_id": org, "region": "us", "project_id": other_project_id, "member_id": member.id, "role": "owner"},
+            ],
+        )
     await _add(member, "fact that should be hidden when memory is off")
 
-    ctx_project = RequesterContext(org_id=org, member_id=member.id, project_id=project_id, role="owner")
-    # Enabled by default.
-    assert await is_memory_enabled(org_id=org, project_id=project_id, member_id=member.id) is True
-    assert len(await memory_mod.retrieve("fact", ctx_project)) >= 1
+    try:
+        ctx_project = RequesterContext(org_id=org, member_id=member.id, project_id=project_id, role="owner")
+        # Enabled by default.
+        assert await is_memory_enabled(org_id=org, project_id=project_id, member_id=member.id) is True
+        assert len(await memory_mod.retrieve("fact", ctx_project)) >= 1
 
-    # Disable for the project -> retrieval returns nothing in that project context.
-    await set_memory_policy(member, scope="project", scope_id=project_id, enabled=False)
-    assert await is_memory_enabled(org_id=org, project_id=project_id, member_id=member.id) is False
-    assert await memory_mod.retrieve("fact", ctx_project) == []
+        # Disable for the owned project -> retrieval returns nothing in that project context.
+        await set_memory_policy(member, scope="project", scope_id=project_id, enabled=False)
+        assert await is_memory_enabled(org_id=org, project_id=project_id, member_id=member.id) is False
+        assert await memory_mod.retrieve("fact", ctx_project) == []
 
-    # A different project is unaffected (policy is scoped).
-    other_ctx = RequesterContext(org_id=org, member_id=member.id, project_id=str(uuid.uuid4()), role="owner")
-    assert await is_memory_enabled(org_id=org, project_id=other_ctx.project_id, member_id=member.id) is True
+        # A different owned project is unaffected (policy is scoped).
+        other_ctx = RequesterContext(org_id=org, member_id=member.id, project_id=other_project_id, role="owner")
+        assert await is_memory_enabled(org_id=org, project_id=other_ctx.project_id, member_id=member.id) is True
+    finally:
+        async with engine.begin() as conn:
+            await conn.execute(delete(settings_documents).where(settings_documents.c.organization_id == org))
+            await conn.execute(delete(project_members).where(project_members.c.organization_id == org))
+            await conn.execute(delete(projects).where(projects.c.organization_id == org))
+            await conn.execute(delete(members).where(members.c.organization_id == org))
 
 
 @_requires_db
@@ -220,6 +259,67 @@ async def test_control_flags_are_tenant_scoped():
 
 @_requires_db
 @pytest.mark.asyncio
+async def test_sensitive_memory_stays_in_control_center_but_never_reaches_model_context():
+    from core import memory as memory_mod
+    from core.memory_control import list_memories, set_sensitive
+
+    org = f"test-{uuid.uuid4().hex[:8]}"
+    member = _member(org)
+    marker = f"provider-secret-{uuid.uuid4().hex}"
+    memory_id = await _add(member, marker)
+    assert await set_sensitive(memory_id, member, sensitive=True) is True
+
+    rows = await list_memories(member, query=marker)
+    assert [row["id"] for row in rows] == [memory_id]
+    assert rows[0]["is_sensitive"] is True
+    assert memory_id not in {row.id for row in await memory_mod.retrieve(marker, _ctx(member))}
+
+
+@_requires_db
+@pytest.mark.asyncio
+async def test_autonomous_memory_undo_is_owner_only_single_use_and_time_bounded():
+    from sqlalchemy import func, insert, text
+
+    from core.db import engine, reflect_table
+    from core.memory_writes import undo_autonomous_memory
+
+    org = f"test-{uuid.uuid4().hex[:8]}"
+    owner = _member(org)
+    peer = _member(org)
+    memories = await reflect_table("memory_entries")
+    async with engine.begin() as conn:
+        current_id = str((await conn.execute(
+            insert(memories).values(
+                organization_id=org,
+                region="us",
+                scope="personal",
+                scope_id=owner.id,
+                content="current autonomous fact",
+                source="autonomous",
+                created_by=owner.id,
+            ).returning(memories.c.id)
+        )).scalar_one())
+        expired_id = str((await conn.execute(
+            insert(memories).values(
+                organization_id=org,
+                region="us",
+                scope="personal",
+                scope_id=owner.id,
+                content="expired autonomous fact",
+                source="autonomous",
+                created_by=owner.id,
+                created_at=func.now() - text("INTERVAL '61 seconds'"),
+            ).returning(memories.c.id)
+        )).scalar_one())
+
+    assert await undo_autonomous_memory(current_id, peer) is False
+    assert await undo_autonomous_memory(expired_id, owner) is False
+    assert await undo_autonomous_memory(current_id, owner) is True
+    assert await undo_autonomous_memory(current_id, owner) is False
+
+
+@_requires_db
+@pytest.mark.asyncio
 async def test_disabled_memory_blocks_explicit_write():
     import pytest as _pytest
     from fastapi import HTTPException
@@ -238,23 +338,67 @@ async def test_disabled_memory_blocks_explicit_write():
 
 @_requires_db
 @pytest.mark.asyncio
+async def test_member_policy_status_reflects_persisted_effective_state():
+    from core.memory_control import get_memory_policy, set_memory_policy
+
+    org = f"test-{uuid.uuid4().hex[:8]}"
+    member = _member(org)
+    initial = await get_memory_policy(member, scope="member", scope_id=None)
+    assert initial == {
+        "scope": "member",
+        "scope_id": member.id,
+        "enabled": True,
+        "effective_enabled": True,
+    }
+
+    await set_memory_policy(member, scope="member", scope_id=None, enabled=False)
+    disabled = await get_memory_policy(member, scope="member", scope_id=None)
+    assert disabled["enabled"] is False
+    assert disabled["effective_enabled"] is False
+
+
+@_requires_db
+@pytest.mark.asyncio
 async def test_disabled_memory_blocks_autonomous_extraction_write(monkeypatch):
+    from sqlalchemy import delete, insert
+
     from memory import extraction as extraction_mod
+    from core.db import engine, reflect_table
     from core.memory_control import list_memories, set_memory_policy
+    from tests.workspace_fixtures import ensure_default_workspace
 
     org = f"test-{uuid.uuid4().hex[:8]}"
     member = _member(org)
     conversation_id = str(uuid.uuid4())
+    conversations = await reflect_table("conversations")
+    settings_documents = await reflect_table("settings_documents")
+    workspace_id = await ensure_default_workspace(org, [member.id])
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(conversations).values(
+                id=conversation_id,
+                organization_id=org,
+                region="us",
+                member_id=member.id,
+                title="Memory-disabled conversation",
+                workspace_id=workspace_id,
+            )
+        )
 
     async def _should_not_run(*a, **k):  # extraction must return before any model call
         raise AssertionError("complete_json should not be called when memory is disabled")
 
     monkeypatch.setattr(extraction_mod, "complete_json", _should_not_run)
 
-    await set_memory_policy(member, scope="conversation", scope_id=conversation_id, enabled=False)
-    # Returns early (no write, no model call) — no exception raised.
-    await extraction_mod.extract_and_save(conversation_id, "u", "a", _ctx(member))
-    assert await list_memories(member, include_archived=True, include_superseded=True) == []
+    try:
+        await set_memory_policy(member, scope="conversation", scope_id=conversation_id, enabled=False)
+        # Returns early (no write, no model call) — no exception raised.
+        await extraction_mod.extract_and_save(conversation_id, "u", "a", _ctx(member))
+        assert await list_memories(member, include_archived=True, include_superseded=True) == []
+    finally:
+        async with engine.begin() as conn:
+            await conn.execute(delete(settings_documents).where(settings_documents.c.organization_id == org))
+            await conn.execute(delete(conversations).where(conversations.c.organization_id == org))
 
 
 @_requires_db

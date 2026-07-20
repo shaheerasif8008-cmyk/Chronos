@@ -1,0 +1,63 @@
+{
+  "baseline_live": {
+    "passed": false,
+    "passed_cases": 2,
+    "case_count": 10,
+    "critical_pass": false,
+    "mean_score": 0.6734,
+    "minimum_score": 0.125,
+    "fixture_sha256": "afb56f066256ef3f0afd31d0673f0cc20ae8e40f3f9172e00130f6de4c5a83f3",
+    "total_duration_ms": 303103
+  },
+  "baseline_hardened_rescore": {
+    "passed": false,
+    "passed_cases": 3,
+    "case_count": 10,
+    "critical_pass": false,
+    "mean_score": 0.702,
+    "minimum_score": 0.125,
+    "fixture_sha256": "bf03166a620a975f651cf66cad815c704d76c46ed3035c2a4597d733840f4161"
+  },
+  "v4_live_before_precision_correction": {
+    "passed": false,
+    "passed_cases": 5,
+    "case_count": 10,
+    "critical_pass": false,
+    "mean_score": 0.7838,
+    "minimum_score": 0.5,
+    "fixture_sha256": "bf03166a620a975f651cf66cad815c704d76c46ed3035c2a4597d733840f4161",
+    "total_duration_ms": 77526
+  },
+  "v4_precision_rescore": {
+    "passed": false,
+    "passed_cases": 9,
+    "case_count": 10,
+    "critical_pass": false,
+    "mean_score": 0.9507,
+    "minimum_score": 0.75,
+    "fixture_sha256": "c5ff2b51eb0856c0e2278f49de2b55ceff30dad36a15fc6d539e09a7c0be125c"
+  },
+  "final_merged_release_gate": {
+    "passed": true,
+    "passed_cases": 10,
+    "case_count": 10,
+    "critical_pass": true,
+    "mean_score": 0.9757,
+    "minimum_score": 0.8571,
+    "fixture_sha256": "c5ff2b51eb0856c0e2278f49de2b55ceff30dad36a15fc6d539e09a7c0be125c",
+    "release_sha": "e86e842155ea6d78e15f5d80c347dd4daae34008",
+    "capture_count": 10,
+    "digest_count": 10,
+    "forbidden_tool_event_count": 0
+  },
+  "token_budget": {
+    "organization_id": "e0e6202e-514b-427e-a99d-aefea344f751",
+    "metered": true,
+    "tokens_today": 73269,
+    "daily_limit": 200000,
+    "enforced": true,
+    "warning": false,
+    "headroom_tokens": 126731,
+    "headroom_percent": 63.37
+  }
+}

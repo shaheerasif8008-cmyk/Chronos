@@ -1,30 +1,48 @@
 # Copy to terraform.tfvars and fill in values.
 # NEVER commit terraform.tfvars — it contains secrets.
 
-aws_region         = "us-east-2"
-availability_zones = ["us-east-2a", "us-east-2b"]
+aws_region         = "us-east-1"
+availability_zones = ["us-east-1a", "us-east-1b"]
 environment        = "prod"
 app_name           = "chronos"
 
 # ── Domain (REQUIRED for Cognito) ────────────────────────────────────────────
 # Cognito only accepts https:// callback URLs (except localhost), so the web app
-# must be served over HTTPS — i.e. domain_name + an ACM cert in us-east-2.
+# must be served over HTTPS. ACM certificates must exist in aws_region and must
+# cover the exact web/API hostnames.
 # After applying, create CNAME records:
 #   api.cognisiatech.com  → <api_alb_dns output>
 #   app.cognisiatech.com  → <web_alb_dns output>
-domain_name         = "cognisiatech.com"
-acm_certificate_arn = "arn:aws:acm:us-east-2:544294779377:certificate/REPLACE_ME"
+domain_name    = "cognisiatech.com"
+web_domain_name = "app.cognisiatech.com"
+api_domain_name = "api.cognisiatech.com"
+# Publish these owner-approved destinations before production apply. Do not use
+# placeholder legal copy or an unmonitored inbox.
+terms_url   = "https://www.cognisiatech.com/terms"
+privacy_url = "https://www.cognisiatech.com/privacy"
+support_url = "https://www.cognisiatech.com/support"
+status_url  = "https://status.cognisiatech.com"
+artifact_share_ttl_hours = 168
+# Must cover *.cognisiatech.com so every documented tenant workspace terminates
+# TLS on the web ALB. Request/validate it before the first apply.
+web_acm_certificate_arn = "arn:aws:acm:us-east-1:544294779377:certificate/2e20d7ea-64d8-4aaf-a26e-25a3cb672e77"
+api_acm_certificate_arn = "arn:aws:acm:us-east-1:544294779377:certificate/a0b43744-338b-4239-9791-befeecbb3aec"
 
 # ── Authentication: Amazon Cognito ───────────────────────────────────────────
-auth_provider             = "cognito"             # or "both" to keep OTP fallback
+auth_provider             = "cognito"
+cognito_region            = "us-east-2"
 cognito_user_pool_id      = "us-east-2_Q8sCGVkk9"
 cognito_app_client_id     = "3mlgdb31a2ecri90mk4ld2oebs"
 cognito_domain            = "us-east-2q8scgvkk9"  # hosted-UI prefix
+cognito_issuer_url        = "" # optional custom-domain/multi-region token issuer
+cognito_jwks_url          = "" # optional JWKS override; blank derives from issuer
+sso_endpoint_host_allowlist = "" # extra hosts for manually configured cross-host OIDC endpoints
 cognito_app_client_secret = ""                    # from Cognito app client; "" if none
 
 # ── GitHub OIDC deploy role ───────────────────────────────────────────────────
 github_org  = "shaheerasif8008-cmyk"
 github_repo = "Chronos"
+github_oidc_provider_arn = "arn:aws:iam::544294779377:oidc-provider/token.actions.githubusercontent.com"
 
 # ── Secrets — REQUIRED (reuse the values you already deployed with) ───────────
 # Generate fresh ones with: openssl rand -hex 32
@@ -32,22 +50,158 @@ jwt_secret           = ""
 vault_encryption_key = ""
 admin_email          = "shaheer8092@gmail.com"
 sendgrid_api_key     = ""
+sendgrid_inbound_public_key = "" # PEM ECDSA verification key from SendGrid Inbound Parse
 openrouter_api_key   = ""
+# Direct Anthropic key; production requires this independent OpenRouter fallback.
 backup_api_key       = ""
 tavily_api_key       = ""
 langfuse_public_key  = ""
 langfuse_secret_key  = ""
 sentry_dsn           = ""
+e2b_api_key          = ""
+e2b_template_id      = ""
+composio_api_key     = ""
+slack_client_id      = ""
+slack_client_secret  = ""
+slack_signing_secret = ""
+microsoft_client_id     = ""
+microsoft_client_secret = ""
+teams_bot_app_id        = ""
+# Direct GitHub OAuth is additionally required for secure private-repository
+# snapshot import; tokens stay in the vault and never enter E2B.
+github_client_id     = ""
+github_client_secret = ""
+# Canva is intentionally a dedicated connector rather than a Composio route.
+# Register the callback https://api.cognisiatech.com/connectors/canva/oauth-callback.
+canva_client_id      = ""
+canva_client_secret  = ""
+browserbase_api_key  = ""
+browserbase_project_id = ""
+browserbase_region = "us-east-1"
+browserbase_session_timeout_seconds = 14400
+stripe_secret_key    = ""
+stripe_webhook_secret = ""
+
+# Billing stays visibly disabled until real recurring Price IDs and the webhook
+# endpoint secret are configured together. Register /billing/webhook for
+# checkout.session.completed and customer.subscription.{created,updated,deleted}.
+stripe_price_pro        = ""
+stripe_price_enterprise = ""
+notification_from_email = ""
+
+# Must be a monitored 24x7 mailbox or paging bridge. Applying creates an SNS
+# email subscription; launch is blocked until a human confirms it.
+operations_alarm_email = "ops@cognisiatech.com"
+monthly_cost_budget_usd = 1000
+
+# Production policy: no fixtures, real authorization, finite tenant budget, and
+# isolated execution with outbound internet disabled by the ECS task settings.
+demo_mode                    = false
+permissions_enforce          = true
+per_org_daily_token_limit    = 2000000
+e2b_sandbox_timeout_seconds  = 1800
+e2b_computer_allow_internet_access = true
+e2b_computer_egress_allowlist      = "github.com,api.github.com,pypi.org,files.pythonhosted.org,registry.npmjs.org"
+e2b_computer_template_id            = ""
+e2b_computer_idle_timeout_seconds   = 900
+e2b_computer_max_session_seconds    = 14400
+e2b_computer_max_active_per_member  = 2
+e2b_computer_max_active_per_org     = 20
+e2b_computer_screen_width           = 1280
+e2b_computer_screen_height          = 800
+e2b_repo_enabled                       = true
+e2b_repo_template_id                   = ""
+e2b_repo_allow_internet_access         = true
+e2b_repo_egress_allowlist              = "github.com,api.github.com,codeload.github.com,objects.githubusercontent.com,raw.githubusercontent.com,pypi.org,files.pythonhosted.org,registry.npmjs.org"
+e2b_repo_timeout_seconds               = 21600
+e2b_repo_command_timeout_seconds       = 300
+e2b_repo_max_snapshot_bytes            = 52428800
+e2b_repo_max_workspaces_per_org        = 50
+e2b_repo_max_workspaces_per_task       = 3
+
+# OpenRouter-backed multimodal capabilities. These are non-secret model IDs;
+# the shared OPENROUTER_API_KEY is injected through Secrets Manager.
+vision_model = "openrouter/openai/gpt-4o-mini"
+image_model  = "openrouter/google/gemini-3.1-flash-image"
+stt_model    = "openrouter/openai/gpt-4o-mini-transcribe"
+tts_model    = "openrouter/x-ai/grok-voice-tts-1.0"
 
 # ── Scale (defaults are fine for prod; adjust as needed) ─────────────────────
 api_cpu    = 1024
-api_memory = 2048
+api_memory = 3072 # includes a 1.5 GiB reservation for the required ClamAV sidecar
+clamav_image = "clamav/clamav:1.4.5-debian13-slim"
 api_desired_count = 2
-api_min_count     = 1
+api_min_count     = 2
 api_max_count     = 10
+
+web_desired_count = 2
+web_min_count     = 2
+web_max_count     = 6
+
+worker_cpu          = 512
+worker_memory       = 1024
+worker_desired_count = 2
+worker_min_count     = 2
+worker_max_count     = 10
+openfga_desired_count = 2
+openfga_image         = "openfga/openfga:v1.15.1"
+# Set true only for the documented first infrastructure apply. It holds all ECS
+# services at zero while images and datastore migrations are installed. Run the
+# migrations, then immediately restore false and apply the reviewed final plan.
+platform_bootstrap_mode = false
+# Outside bootstrap mode production applies reject floating tags. Set both to
+# the immutable short Git SHA pushed by the bootstrap-images workflow.
+api_image_tag = "REPLACE_WITH_8_CHAR_GIT_SHA"
+web_image_tag = "REPLACE_WITH_8_CHAR_GIT_SHA"
 
 db_instance_class = "db.t3.medium"
 db_multi_az       = true
+db_engine_version = "15"
+db_backup_retention_days = 35
+
+# OpenFGA intentionally uses its own Multi-AZ RDS instance. This is additional
+# monthly cost, but prevents application load/schema changes from taking down
+# the authorization control plane.
+openfga_db_instance_class    = "db.t4g.small"
+openfga_db_allocated_storage = 20
+openfga_db_multi_az           = true
 
 redis_node_type          = "cache.t3.medium"
 redis_num_cache_clusters = 2
+redis_automatic_failover_enabled = true
+redis_multi_az_enabled            = true
+redis_snapshot_retention_days     = 35
+
+# ── Edge, observability, and recovery ────────────────────────────────────────
+waf_enabled        = true
+waf_api_rate_limit  = 6000
+waf_auth_rate_limit = 1000
+waf_web_rate_limit  = 10000
+
+application_log_retention_days = 90
+web_log_retention_days         = 30
+waf_log_retention_days         = 90
+
+# Account-level security is part of the production gate, not an optional
+# after-deploy checklist. CloudTrail records global management events plus
+# object access to the artifact bucket into a one-year COMPLIANCE-locked bucket.
+account_security_services_enabled = true
+audit_log_retention_days           = 365
+cloudtrail_s3_data_events_enabled  = true
+cloudtrail_insights_enabled        = true
+
+backups_enabled                  = true
+backup_copy_region              = "us-west-2"
+backup_pitr_retention_days      = 35
+backup_copy_retention_days      = 365
+automated_restore_testing_enabled = true
+
+# Restore rehearsal inputs stay disabled in the production tfvars. Use
+# plan-restore-rehearsal.sh, a separate restore-* environment, and a distinct
+# backend key. The script writes a short-lived protected tfvars file for the
+# quarantine; never point these inputs at the production state.
+restore_rehearsal_mode                   = false
+restore_app_db_snapshot_identifier       = ""
+restore_openfga_db_snapshot_identifier   = ""
+restore_redis_snapshot_name              = ""
+restore_rehearsal_ingress_cidrs          = []

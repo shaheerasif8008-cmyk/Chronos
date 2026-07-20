@@ -1,5 +1,7 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono, Source_Serif_4 } from "next/font/google";
+import { NetworkStatus } from "../components/system/NetworkStatus";
+import { publicWebBaseUrl } from "../lib/public-config";
 import "./globals.css";
 
 const geist = Geist({
@@ -27,8 +29,24 @@ const serif = Source_Serif_4({
 });
 
 export const metadata: Metadata = {
-  title: "Chronos",
-  description: "Chronos — AI Operations Platform",
+  metadataBase: new URL(publicWebBaseUrl),
+  applicationName: "Chronos",
+  title: { default: "Chronos", template: "%s · Chronos" },
+  description: "Secure AI operations for teams",
+  category: "business",
+  manifest: "/manifest.webmanifest",
+  robots: { index: false, follow: false, nocache: true },
+  referrer: "no-referrer",
+};
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  viewportFit: "cover",
+  themeColor: [
+    { media: "(prefers-color-scheme: light)", color: "oklch(0.974 0.008 84)" },
+    { media: "(prefers-color-scheme: dark)", color: "oklch(0.215 0.007 70)" },
+  ],
 };
 
 interface RootLayoutProps {
@@ -38,7 +56,7 @@ interface RootLayoutProps {
 export default function RootLayout({ children }: RootLayoutProps) {
   return (
     <html lang="en" className={`${geist.variable} ${geistMono.variable} ${serif.variable}`}>
-      <body>{children}</body>
+      <body><NetworkStatus />{children}</body>
     </html>
   );
 }

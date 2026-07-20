@@ -41,6 +41,7 @@ class _Clause:
     def where(self, *a, **kw): return self
     def order_by(self, *a): return self
     def limit(self, *a): return self
+    def offset(self, *a): return self
     def join(self, *a, **kw): return self
     def select_from(self, *a, **kw): return self
 
@@ -83,7 +84,6 @@ async def test_source_detail_returns_metadata_and_chunk_preview(monkeypatch):
     from routers import projects
 
     member = _make_member()
-    mem_row = {"id": "pm-1", "project_id": "proj-1", "member_id": "member-1", "role": "owner"}
     source_row = {
         "id": "src-1", "project_id": "proj-1", "organization_id": "default",
         "title": "Report", "source_type": "upload", "uri": None,
@@ -93,17 +93,23 @@ async def test_source_detail_returns_metadata_and_chunk_preview(monkeypatch):
         {"chunk_index": 0, "content": "first chunk", "token_count": 3},
         {"chunk_index": 1, "content": "second chunk", "token_count": 3},
     ]
-    # _require_member(select), _require_source(select), count(scalar), preview(select).
-    engine = _build_engine([mem_row, source_row, 2, chunk_rows])
+    engine = _build_engine([source_row, 2, chunk_rows])
 
     monkeypatch.setattr(projects, "engine", engine)
     monkeypatch.setattr(projects, "reflect_table", _fake_reflect())
     monkeypatch.setattr(projects, "select", _noop_select)
+    monkeypatch.setattr(
+        projects,
+        "project_access_role",
+        AsyncMock(return_value=({"id": "proj-1"}, "owner")),
+    )
     monkeypatch.setattr(projects.permissions, "check", AsyncMock(return_value=True))
 
     out = await projects.get_source_detail("proj-1", "src-1", member)
     assert out["id"] == "src-1"
-    assert out["artifact_id"] == "att-1"
+    assert out["has_original"] is True
+    assert out["download_url"] == "/projects/proj-1/sources/src-1/content"
+    assert "artifact_id" not in out
     assert out["parse_status"] == "parsed"
     assert out["index_status"] == "indexed"
     assert out["warning"] is None
@@ -117,17 +123,21 @@ async def test_source_detail_surfaces_parse_warning(monkeypatch):
     from routers import projects
 
     member = _make_member()
-    mem_row = {"id": "pm-1", "project_id": "proj-1", "member_id": "member-1", "role": "owner"}
     source_row = {
         "id": "src-1", "project_id": "proj-1", "organization_id": "default",
         "title": "Scan", "source_type": "upload", "uri": None,
         "artifact_id": "att-1", "parse_status": "unparseable", "index_status": "failed",
     }
-    engine = _build_engine([mem_row, source_row, 0, []])
+    engine = _build_engine([source_row, 0, []])
 
     monkeypatch.setattr(projects, "engine", engine)
     monkeypatch.setattr(projects, "reflect_table", _fake_reflect())
     monkeypatch.setattr(projects, "select", _noop_select)
+    monkeypatch.setattr(
+        projects,
+        "project_access_role",
+        AsyncMock(return_value=({"id": "proj-1"}, "owner")),
+    )
     monkeypatch.setattr(projects.permissions, "check", AsyncMock(return_value=True))
 
     out = await projects.get_source_detail("proj-1", "src-1", member)
@@ -138,15 +148,76 @@ async def test_source_detail_surfaces_parse_warning(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_source_download_uses_source_acl_without_exposing_artifact_id(monkeypatch):
+    from routers import projects
+
+    member = _make_member()
+    source = {
+        "id": "src-1",
+        "project_id": "proj-1",
+        "organization_id": "default",
+        "title": "Customer report.txt",
+        "artifact_id": "private-artifact-id",
+        "permissions": {},
+        "created_by": "owner-1",
+    }
+    engine = _build_engine([source])
+    monkeypatch.setattr(projects, "engine", engine)
+    monkeypatch.setattr(projects, "reflect_table", _fake_reflect())
+    monkeypatch.setattr(projects, "select", _noop_select)
+    monkeypatch.setattr(
+        projects,
+        "project_access_role",
+        AsyncMock(return_value=({"id": "proj-1"}, "member")),
+    )
+    monkeypatch.setattr(projects.permissions, "check", AsyncMock(return_value=True))
+    monkeypatch.setattr(projects, "get_artifact", AsyncMock(return_value={"organization_id": "default", "mime_type": "text/plain"}))
+    monkeypatch.setattr(projects, "read_artifact_content", AsyncMock(return_value=b"authorized source bytes"))
+
+    response = await projects.download_source_content("proj-1", "src-1", member)
+    assert response.body == b"authorized source bytes"
+    assert response.headers["content-disposition"].startswith("attachment;")
+
+
+@pytest.mark.asyncio
+async def test_private_source_download_denies_other_project_member(monkeypatch):
+    from routers import projects
+
+    member = _make_member(member_id="viewer-1")
+    private_source = {
+        "id": "src-private",
+        "project_id": "proj-1",
+        "organization_id": "default",
+        "artifact_id": "private-artifact-id",
+        "permissions": {"visibility": "private"},
+        "created_by": "owner-1",
+    }
+    engine = _build_engine([private_source])
+    monkeypatch.setattr(projects, "engine", engine)
+    monkeypatch.setattr(projects, "reflect_table", _fake_reflect())
+    monkeypatch.setattr(projects, "select", _noop_select)
+    monkeypatch.setattr(
+        projects,
+        "project_access_role",
+        AsyncMock(return_value=({"id": "proj-1"}, "member")),
+    )
+    monkeypatch.setattr(projects.permissions, "check", AsyncMock(return_value=True))
+
+    with pytest.raises(HTTPException) as exc:
+        await projects.download_source_content("proj-1", "src-private", member)
+    assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_source_detail_non_member_404(monkeypatch):
     from routers import projects
 
     member = _make_member(member_id="outsider")
-    engine = _build_engine([None])  # _require_member finds nothing
-
-    monkeypatch.setattr(projects, "engine", engine)
-    monkeypatch.setattr(projects, "reflect_table", _fake_reflect())
-    monkeypatch.setattr(projects, "select", _noop_select)
+    monkeypatch.setattr(
+        projects,
+        "project_access_role",
+        AsyncMock(return_value=(None, None)),
+    )
     monkeypatch.setattr(projects.permissions, "check", AsyncMock(return_value=True))
 
     with pytest.raises(HTTPException) as exc:
@@ -159,13 +230,16 @@ async def test_source_detail_404_when_source_not_in_project(monkeypatch):
     from routers import projects
 
     member = _make_member()
-    mem_row = {"id": "pm-1", "project_id": "proj-1", "member_id": "member-1", "role": "owner"}
-    # _require_member ok; _require_source returns None.
-    engine = _build_engine([mem_row, None])
+    engine = _build_engine([None])
 
     monkeypatch.setattr(projects, "engine", engine)
     monkeypatch.setattr(projects, "reflect_table", _fake_reflect())
     monkeypatch.setattr(projects, "select", _noop_select)
+    monkeypatch.setattr(
+        projects,
+        "project_access_role",
+        AsyncMock(return_value=({"id": "proj-1"}, "owner")),
+    )
     monkeypatch.setattr(projects.permissions, "check", AsyncMock(return_value=True))
 
     with pytest.raises(HTTPException) as exc:

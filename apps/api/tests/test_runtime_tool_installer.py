@@ -28,6 +28,7 @@ async def test_browser_operator_installs_missing_chromium_and_retries(monkeypatc
     from connectors.browser_operator import BrowserOperator
     from core.tool_installer import ToolInstallResult
 
+    monkeypatch.setattr(browser_module.settings, "browserbase_operator_enabled", False)
     operator = BrowserOperator()
     calls = {"launch": 0, "install": 0}
     session = {
@@ -77,6 +78,7 @@ async def test_browser_operator_degrades_when_chromium_install_fails(monkeypatch
     from connectors.browser_operator import BrowserOperator, _MetadataOnlyPage
     from core.tool_installer import ToolInstallResult
 
+    monkeypatch.setattr(browser_module.settings, "browserbase_operator_enabled", False)
     operator = BrowserOperator()
     session = {
         "id": "browser-runtime-install-fail-test",

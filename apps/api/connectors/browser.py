@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import re
 import secrets
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlparse
 
@@ -82,7 +82,7 @@ async def _save_screenshot(page, label: str) -> str | None:
     """Capture screenshot and upload to object storage. Returns the object path, or None on failure."""
     try:
         png = await page.screenshot(full_page=False)
-        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         object_name = f"browser-screenshots/{ts}-{label}-{secrets.token_hex(4)}.png"
         put_object_sync(object_name, png, "image/png")
         return object_name

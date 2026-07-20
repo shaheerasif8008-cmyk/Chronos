@@ -17,6 +17,7 @@ import main
 from core.auth import create_access_token
 from core.db import engine, reflect_table
 from routers.approvals import approval_summary
+from tests.workspace_fixtures import ensure_default_workspace
 
 
 def test_approval_summary_email_actions_are_plain_english():
@@ -58,12 +59,14 @@ async def _make_org_member_token(role: str = "user") -> tuple[str, str, str]:
                 id=member_id, organization_id=org_id, email=f"{member_id[:8]}@t.io", role=role
             )
         )
+    await ensure_default_workspace(org_id, [member_id])
     return org_id, member_id, create_access_token(member_id)
 
 
 async def _seed_conversation(org_id: str, member_id: str, title: str = "First message") -> str:
     conversation_id = str(uuid.uuid4())
     conversations = await reflect_table("conversations")
+    workspace_id = await ensure_default_workspace(org_id, [member_id])
     async with engine.begin() as conn:
         await conn.execute(
             conversations.insert().values(
@@ -72,6 +75,7 @@ async def _seed_conversation(org_id: str, member_id: str, title: str = "First me
                 region="us",
                 member_id=member_id,
                 title=title,
+                workspace_id=workspace_id,
             )
         )
     return conversation_id

@@ -1,7 +1,7 @@
 """W2.2 — task resource scoping via OpenFGA.
 
 With ``openfga_api_url`` empty (the default test env) all mapped task actions
-return ``granted_stub`` and relationship checks are never exercised.
+return ``granted_allowlist`` and relationship checks are never exercised.
 
 The FGA-enabled tests (test_task_owner_*, test_non_owner_denied_*, etc.) skip
 gracefully when no OpenFGA server is reachable at OPENFGA_TEST_URL, so the
@@ -22,11 +22,20 @@ from core.exceptions import PermissionDenied
 from core.models import Member
 
 OPENFGA_URL = os.environ.get("OPENFGA_TEST_URL", "http://localhost:8080")
+OPENFGA_TOKEN = os.environ.get("OPENFGA_TEST_TOKEN", "")
+
+
+def _openfga_headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {OPENFGA_TOKEN}"} if OPENFGA_TOKEN else {}
 
 
 def _openfga_reachable(url: str) -> bool:
     try:
-        resp = httpx.get(f"{url.rstrip('/')}/stores", timeout=2.0)
+        resp = httpx.get(
+            f"{url.rstrip('/')}/stores",
+            headers=_openfga_headers(),
+            timeout=2.0,
+        )
     except httpx.HTTPError:
         return False
     return resp.status_code < 500
@@ -52,6 +61,7 @@ def enforced_fga(monkeypatch):
         pytest.skip(f"OpenFGA not reachable at {OPENFGA_URL}")
 
     monkeypatch.setattr(authz.settings, "openfga_api_url", OPENFGA_URL)
+    monkeypatch.setattr(authz.settings, "openfga_api_token", OPENFGA_TOKEN)
     monkeypatch.setattr(authz.settings, "permissions_enforce", True)
     monkeypatch.setattr(authz.settings, "openfga_store_id", "")
     monkeypatch.setattr(authz.settings, "openfga_model_id", "")
@@ -80,6 +90,11 @@ def test_resource_for_retry_task_returns_can_manage_task():
     assert permissions._resource_for("retry_task") == ("can_manage", "task")
 
 
+def test_resource_for_pause_and_resume_task_returns_can_manage_task():
+    assert permissions._resource_for("pause_task") == ("can_manage", "task")
+    assert permissions._resource_for("resume_task") == ("can_manage", "task")
+
+
 def test_resource_for_view_task_returns_can_view_task():
     assert permissions._resource_for("view_task") == ("can_view", "task")
 
@@ -90,6 +105,19 @@ def test_resource_for_view_task_events_returns_can_view_task():
 
 def test_resource_for_stream_task_returns_can_view_task():
     assert permissions._resource_for("stream_task") == ("can_view", "task")
+
+
+def test_task_assignment_actions_map_to_view_edit_and_manage():
+    assert permissions._resource_for("view_task_assignment") == ("can_view", "task")
+    assert permissions._resource_for("handoff_task") == ("can_edit", "task")
+    assert permissions._resource_for("assign_task") == ("can_manage", "task")
+    assert permissions._resource_for("unassign_task") == ("can_manage", "task")
+
+
+def test_conversation_acl_actions_map_to_relationship_roles():
+    assert permissions._resource_for("view_conversation") == ("can_view", "conversation")
+    assert permissions._resource_for("rename_conversation") == ("can_edit", "conversation")
+    assert permissions._resource_for("share_conversation") == ("can_manage", "conversation")
 
 
 # ── FGA-enabled tests (skip when server is down) ─────────────────────────────

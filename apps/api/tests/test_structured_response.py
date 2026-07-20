@@ -1,6 +1,7 @@
 import pytest
 from sqlalchemy import insert, select
 from core.config import settings
+from tests.workspace_fixtures import ensure_default_workspace
 
 
 @pytest.mark.asyncio
@@ -13,12 +14,13 @@ async def test_messages_table_has_structured_response_column():
     )
 
     conversations = await reflect_table("conversations")
+    workspace_id = await ensure_default_workspace(settings.org_id, ["member-1"])
     async with engine.begin() as conn:
         conv_id = (
             await conn.execute(
                 insert(conversations)
                 .values(organization_id=settings.org_id, region=settings.region,
-                        member_id="member-1", title="t")
+                        member_id="member-1", title="t", workspace_id=workspace_id)
                 .returning(conversations.c.id)
             )
         ).scalar_one()
@@ -206,12 +208,13 @@ async def test_save_message_persists_envelope_and_api_returns_it():
     from routers import chat as chat_router
 
     conversations = await reflect_table("conversations")
+    workspace_id = await ensure_default_workspace(settings.org_id, ["member-1"])
     async with engine.begin() as conn:
         conv_id = (
             await conn.execute(
                 insert(conversations).values(
                     organization_id=settings.org_id, region=settings.region,
-                    member_id="member-1", title="t",
+                    member_id="member-1", title="t", workspace_id=workspace_id,
                 ).returning(conversations.c.id)
             )
         ).scalar_one()
@@ -255,12 +258,13 @@ async def test_persist_to_conversation_stores_envelope(monkeypatch):
 
     conversations = await reflect_table("conversations")
     messages = await reflect_table("messages")
+    workspace_id = await ensure_default_workspace(settings.org_id, ["member-1"])
     async with engine.begin() as conn:
         conv_id = (
             await conn.execute(
                 insert(conversations).values(
                     organization_id=settings.org_id, region=settings.region,
-                    member_id="member-1", title="t",
+                    member_id="member-1", title="t", workspace_id=workspace_id,
                 ).returning(conversations.c.id)
             )
         ).scalar_one()

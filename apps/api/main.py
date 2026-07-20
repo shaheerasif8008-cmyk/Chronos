@@ -1,7 +1,10 @@
 import importlib.util
 import logging
 import os
+import re
 import ssl
+from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
 
 import certifi
 
@@ -25,15 +28,37 @@ from core.auth import get_current_member
 from core.scim import SCIMError as _SCIMError
 from core.tenancy import resolve_org_id
 
-from jobs import context_update, profile_synthesis, scheduled_tasks
+from jobs import admin_lifecycle as admin_lifecycle_jobs
+from jobs import computer_sessions as computer_session_jobs
+from jobs import task_cleanup as task_cleanup_jobs
+from jobs import connector_write_ledger, context_update, monitor_polling, notification_delivery, profile_synthesis, retention, scheduled_tasks
 from core.db import engine, reflect_table
 from core.leader import LeaderElection
 from core.redis import redis_client
 from runtime import task_runner
 from runtime.research_executor import start_research
-from routers import activity, admin, agents, approvals, artifact_share, artifacts, attachments, auth, autonomy, billing, browser_sessions, chat, comments, computer_sessions, connectors, context, data, desktop_sessions, domains, memory, monitors, notifications, projects, research, schedules, scim, search, settings, skills, sso, tasks, workflows
+from routers import activity, admin, admin_lifecycle, agents, approvals, artifact_share, artifacts, attachments, auth, autonomy, billing, browser_sessions, chat, comments, compliance, computer_sessions, connectors, context, custom_integrations, data, desktop_devices, desktop_sessions, domains, file_security, memory, monitors, notifications, projects, research, schedules, scim, search, settings, skills, sso, tasks, workflows
 
-app = FastAPI(title="Chronos API", version="0.1.0")
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """Own process startup/shutdown using FastAPI's supported lifespan API."""
+
+    await start_schedulers()
+    try:
+        yield
+    finally:
+        await stop_schedulers()
+
+
+app = FastAPI(
+    title="Chronos API",
+    version="0.1.0",
+    docs_url=None if app_settings.is_production else "/docs",
+    redoc_url=None if app_settings.is_production else "/redoc",
+    openapi_url=None if app_settings.is_production else "/openapi.json",
+    lifespan=_lifespan,
+)
 
 
 # Catch-all error boundary. Registered BEFORE CORSMiddleware so it sits INSIDE
@@ -53,12 +78,102 @@ async def _json_error_boundary(request: Request, call_next):
         )
 
 
+_UNSAFE_BROWSER_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+def _allowed_browser_origin(origin: str) -> bool:
+    """Return whether ``origin`` is one of Chronos's controlled web origins."""
+
+    try:
+        parsed = urlsplit(origin)
+        port = parsed.port
+    except ValueError:
+        return False
+    if parsed.username or parsed.password or parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        return False
+    normalized = origin.rstrip("/").lower()
+    if normalized == app_settings.frontend_base_url.rstrip("/").lower():
+        return True
+    host = (parsed.hostname or "").rstrip(".").lower()
+    if app_settings.is_production:
+        base = app_settings.base_domain.rstrip(".").lower()
+        if parsed.scheme.lower() != "https" or not base or not host.endswith(f".{base}"):
+            return False
+        label = host[: -(len(base) + 1)]
+        return bool(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label))
+    return (
+        parsed.scheme.lower() == "http"
+        and host in {"localhost", "127.0.0.1"}
+        and port is not None
+        and 3000 <= port <= 3099
+    )
+
+
+@app.middleware("http")
+async def _csrf_cookie_guard(request: Request, call_next):
+    """Reject unsafe cookie-authenticated requests from untrusted origins.
+
+    Bearer-token clients and unauthenticated provider webhooks do not rely on
+    browser cookies and are outside this CSRF boundary. Browser mutations must
+    carry an Origin matching the configured app or a controlled tenant host.
+    """
+
+    if (
+        request.method.upper() in _UNSAFE_BROWSER_METHODS
+        and request.cookies.get("chronos_session")
+        and not request.headers.get("authorization")
+    ):
+        origin = request.headers.get("origin", "")
+        if not _allowed_browser_origin(origin):
+            logger.warning(
+                "Rejected cookie-authenticated request with untrusted origin: method=%s path=%s",
+                request.method,
+                request.url.path,
+            )
+            return JSONResponse(status_code=403, content={"detail": "CSRF validation failed"})
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault(
+        "Permissions-Policy",
+        "camera=(), geolocation=(), microphone=(), payment=(), usb=()",
+    )
+    response.headers.setdefault("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+    if request.url.path.startswith("/shared/"):
+        # A public share URL contains a bearer credential in its path. Never
+        # cache or index it, and never allow the full URL to escape as a referrer.
+        response.headers["Cache-Control"] = "private, no-store, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["X-Robots-Tag"] = "noindex, nofollow, noarchive"
+    if app_settings.is_production:
+        response.headers.setdefault(
+            "Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload"
+        )
+    return response
+
+
 # CORS: in production, pin to the configured frontend origin only. The broad
 # localhost regex is dev-only attack surface (any local app on port 30xx could
 # otherwise drive credentialed requests), so it is not registered in production.
 _cors_origins = [app_settings.frontend_base_url.rstrip("/")]
 _cors_kwargs: dict = {"allow_origins": _cors_origins}
-if not app_settings.is_production:
+if app_settings.is_production and app_settings.base_domain:
+    # The same web deployment serves app.<domain> and the documented
+    # <tenant>.<domain> workspaces. DNS is platform-controlled; requests still
+    # authenticate with an org-bound cookie and the API cross-checks its signed
+    # tenant claim against the member row.
+    label = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    _cors_kwargs["allow_origin_regex"] = (
+        rf"https://{label}\.{re.escape(app_settings.base_domain.rstrip('.').lower())}"
+    )
+else:
     _cors_origins.extend([
         "http://localhost:3000",
         "http://127.0.0.1:3000",
@@ -99,12 +214,14 @@ app.include_router(scim.router)
 app.include_router(agents.router)
 app.include_router(browser_sessions.router)
 app.include_router(computer_sessions.router)
+app.include_router(desktop_devices.router)
 app.include_router(desktop_sessions.router)
 app.include_router(attachments.router)
 app.include_router(chat.router)
 app.include_router(memory.router)
 app.include_router(search.router)
 app.include_router(connectors.router)
+app.include_router(custom_integrations.router)
 app.include_router(context.router)
 app.include_router(tasks.router)
 app.include_router(projects.router)
@@ -115,9 +232,11 @@ app.include_router(comments.router)
 app.include_router(autonomy.router)
 app.include_router(artifact_share.router)
 app.include_router(artifacts.router)
-app.include_router(attachments.router)
 app.include_router(settings.router)
+app.include_router(admin_lifecycle.router)
 app.include_router(admin.router)
+app.include_router(file_security.router)
+app.include_router(compliance.router)
 app.include_router(billing.router)
 app.include_router(workflows.router)
 app.include_router(schedules.router)
@@ -128,30 +247,52 @@ app.include_router(skills.router)
 
 
 def _init_observability() -> None:
-    """Wire Langfuse callback and Sentry SDK if keys are configured (Category 10)."""
+    """Wire configured production observability providers.
+
+    Observability is optional for local development, but a configured provider
+    must never fail silently in production.  Keeping that distinction here
+    makes packaging/configuration failures visible before the process accepts
+    traffic instead of discovering them during an incident.
+    """
     from core.config import settings as cfg
 
-    # Langfuse — LiteLLM has a built-in Langfuse callback.
-    if (
-        cfg.langfuse_public_key
-        and cfg.langfuse_secret_key
-        and importlib.util.find_spec("langfuse") is not None
-    ):
+    def provider_failure(provider: str, exc: Exception) -> None:
+        message = f"Failed to initialize configured {provider} observability"
+        if cfg.is_production:
+            raise RuntimeError(message) from exc
+        logger.warning("%s: %s", message, exc)
+
+    # Langfuse v4 uses LiteLLM's OpenTelemetry callback.  Set credentials before
+    # registering the callback so the exporter is initialized with the correct
+    # endpoint on its first request.
+    langfuse_configured = bool(cfg.langfuse_public_key or cfg.langfuse_secret_key)
+    if langfuse_configured:
         try:
+            if not (cfg.langfuse_public_key and cfg.langfuse_secret_key):
+                raise ValueError("both LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY are required")
+            if importlib.util.find_spec("langfuse") is None:
+                raise ModuleNotFoundError("the langfuse SDK is not installed")
+
             import litellm
 
-            litellm.success_callback = list(set(getattr(litellm, "success_callback", []) + ["langfuse"]))
-            litellm.failure_callback = list(set(getattr(litellm, "failure_callback", []) + ["langfuse"]))
-            import os
-            os.environ.setdefault("LANGFUSE_PUBLIC_KEY", cfg.langfuse_public_key)
-            os.environ.setdefault("LANGFUSE_SECRET_KEY", cfg.langfuse_secret_key)
-            os.environ.setdefault("LANGFUSE_HOST", cfg.langfuse_host)
-        except Exception:
-            pass  # Langfuse is optional
+            os.environ["LANGFUSE_PUBLIC_KEY"] = cfg.langfuse_public_key
+            os.environ["LANGFUSE_SECRET_KEY"] = cfg.langfuse_secret_key
+            os.environ["LANGFUSE_OTEL_HOST"] = cfg.langfuse_host.rstrip("/")
+            # Retain LANGFUSE_HOST for direct SDK consumers and older provider
+            # helpers while LiteLLM v4 reads LANGFUSE_OTEL_HOST.
+            os.environ["LANGFUSE_HOST"] = cfg.langfuse_host.rstrip("/")
+            callbacks = list(getattr(litellm, "callbacks", []) or [])
+            if "langfuse_otel" not in callbacks:
+                callbacks.append("langfuse_otel")
+            litellm.callbacks = callbacks
+        except Exception as exc:  # noqa: BLE001 - converted into startup policy
+            provider_failure("Langfuse", exc)
 
     # Sentry
     if cfg.sentry_dsn:
         try:
+            if importlib.util.find_spec("sentry_sdk") is None:
+                raise ModuleNotFoundError("the Sentry SDK is not installed")
             import sentry_sdk  # type: ignore[import]
             from sentry_sdk.integrations.fastapi import FastApiIntegration  # type: ignore[import]
             from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration  # type: ignore[import]
@@ -160,10 +301,11 @@ def _init_observability() -> None:
                 dsn=cfg.sentry_dsn,
                 integrations=[FastApiIntegration(), SqlalchemyIntegration()],
                 traces_sample_rate=0.1,
-                environment=getattr(cfg, "forge_env", "development"),
+                environment=cfg.environment,
+                send_default_pii=False,
             )
-        except Exception:
-            pass  # Sentry is optional
+        except Exception as exc:  # noqa: BLE001 - converted into startup policy
+            provider_failure("Sentry", exc)
 
 
 _init_observability()
@@ -184,11 +326,21 @@ async def _scim_error_handler(_request: Request, exc: _SCIMError) -> JSONRespons
 # Schedulers that must run on exactly one instance (cron-like jobs would
 # otherwise fire once per replica). They are started PAUSED and only the elected
 # leader resumes them.
-_SCHEDULERS = (profile_synthesis.scheduler, context_update.scheduler, scheduled_tasks.scheduler)
+_SCHEDULERS = (
+    admin_lifecycle_jobs.scheduler,
+    profile_synthesis.scheduler,
+    context_update.scheduler,
+    scheduled_tasks.scheduler,
+    monitor_polling.scheduler,
+    retention.scheduler,
+    notification_delivery.scheduler,
+    computer_session_jobs.scheduler,
+    task_cleanup_jobs.scheduler,
+    connector_write_ledger.scheduler,
+)
 _scheduler_leader: LeaderElection | None = None
 
 
-@app.on_event("startup")
 async def start_schedulers() -> None:
     await _bootstrap_authz()
     await _bootstrap_skills()
@@ -209,9 +361,11 @@ async def start_schedulers() -> None:
                 scheduler.resume()
         # Recovery is leader-only so N instances don't each re-recover every run.
         for label, recover in (
+            ("Task cancellation cleanup", task_cleanup_jobs.reap_task_cleanups),
             ("Task", recover_incomplete_tasks),
             ("Workflow", recover_incomplete_workflows),
             ("Research", recover_incomplete_research),
+            ("Project source", recover_pending_project_sources),
         ):
             try:
                 await recover()
@@ -331,7 +485,12 @@ async def recover_incomplete_workflows() -> list[str]:
     return recovered
 
 
-@app.on_event("shutdown")
+async def recover_pending_project_sources() -> list[str]:
+    from memory.source_indexing import recover_pending_sources
+
+    return await recover_pending_sources()
+
+
 async def stop_schedulers() -> None:
     global _scheduler_leader
     if _scheduler_leader is not None:
@@ -385,6 +544,36 @@ async def _core_health_checks() -> dict[str, str]:
         log.exception("health check: object storage")
         checks[storage_health_name] = "error"
 
+    # OpenFGA is a core authorization dependency in production. Its documented
+    # /healthz endpoint tests the authorization datastore without mutating state.
+    try:
+        from core import authz
+        from core.config import settings as cfg
+
+        if cfg.is_production or authz.is_enabled():
+            checks["openfga"] = "ok" if await authz.healthcheck() else "error"
+    except Exception:
+        log.exception("health check: OpenFGA")
+        checks["openfga"] = "error"
+
+    # A live Redis-backed connector worker is required for queued executions.
+    # Each replica publishes an expiring unique key; stale/dead workers vanish
+    # automatically without a cleanup race during rolling deployments.
+    try:
+        from connectors.worker_main import WORKER_HEARTBEAT_PREFIX
+        from core.config import settings as cfg
+        from core.redis import redis_client
+
+        if cfg.is_production:
+            found = False
+            async for _key in redis_client.scan_iter(match=f"{WORKER_HEARTBEAT_PREFIX}*", count=10):
+                found = True
+                break
+            checks["connector_worker"] = "ok" if found else "error"
+    except Exception:
+        log.exception("health check: connector worker heartbeat")
+        checks["connector_worker"] = "error"
+
     return checks
 
 
@@ -402,6 +591,41 @@ async def health() -> dict:
     checks = await _core_health_checks()
     overall = "ok" if all(v == "ok" for v in checks.values()) else "degraded"
     return {"status": overall, "checks": checks, "ts": time.time()}
+
+
+@app.get("/health/live")
+async def health_live() -> dict:
+    """Process liveness probe.
+
+    This endpoint deliberately avoids dependency checks. ECS should restart a
+    wedged process, but it should not churn every task during a temporary RDS,
+    Redis, or S3 incident.
+    """
+    import time
+
+    return {"status": "ok", "ts": time.time()}
+
+
+@app.get("/ready")
+async def readiness() -> JSONResponse:
+    """Traffic readiness probe with an honest HTTP status.
+
+    The compatibility ``/health`` endpoint keeps its historical 200 response
+    and structured degraded status for operators. ALB uses this endpoint so a
+    task with unavailable core storage is removed from request routing.
+    """
+    import time
+
+    checks = await _core_health_checks()
+    ready = all(value == "ok" for value in checks.values())
+    return JSONResponse(
+        status_code=200 if ready else 503,
+        content={
+            "status": "ok" if ready else "degraded",
+            "checks": checks,
+            "ts": time.time(),
+        },
+    )
 
 
 @app.get("/health/deep")

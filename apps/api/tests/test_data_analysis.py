@@ -98,7 +98,9 @@ async def _make_org_and_member() -> tuple[str, str, str]:
     return org_id, member_id, create_access_token(member_id)
 
 
-async def _save_csv_artifact(org_id: str, content: bytes = _SAMPLE_CSV) -> str:
+async def _save_csv_artifact(
+    org_id: str, content: bytes = _SAMPLE_CSV, *, created_by: str = "test"
+) -> str:
     """Save a CSV as an artifact and return its id."""
     from core.artifacts import save_artifact
     return await save_artifact(
@@ -107,7 +109,7 @@ async def _save_csv_artifact(org_id: str, content: bytes = _SAMPLE_CSV) -> str:
         title="test_data.csv",
         org_id=org_id,
         mime_type="text/csv",
-        created_by="test",
+        created_by=created_by,
     )
 
 
@@ -165,7 +167,7 @@ async def test_dataset_create_http():
     from httpx import AsyncClient, ASGITransport
 
     org_id, member_id, token = await _make_org_and_member()
-    artifact_id = await _save_csv_artifact(org_id)
+    artifact_id = await _save_csv_artifact(org_id, created_by=member_id)
 
     async with AsyncClient(transport=ASGITransport(app=main.app), base_url="http://test", follow_redirects=True) as client:
         resp = await client.post(
@@ -202,6 +204,126 @@ async def test_dataset_create_http():
     assert isinstance(schema_in_db, dict), f"Schema in DB is not a dict: {type(schema_in_db)}"
     db_col_names = [c["name"] for c in schema_in_db["columns"]]
     assert "name" in db_col_names, f"'name' column not persisted in JSONB; got: {db_col_names}"
+
+
+@pytest.mark.asyncio
+@_requires_db
+async def test_project_dataset_list_is_membership_scoped():
+    """Project Data never exposes a client project's datasets to non-members."""
+    from httpx import ASGITransport, AsyncClient
+
+    org_id, member_id, token = await _make_org_and_member()
+    outsider_id = str(uuid.uuid4())
+    project_id = str(uuid.uuid4())
+    members = await reflect_table("members")
+    projects = await reflect_table("projects")
+    project_members = await reflect_table("project_members")
+    async with engine.begin() as conn:
+        await conn.execute(
+            members.insert().values(
+                id=outsider_id,
+                organization_id=org_id,
+                email=f"{outsider_id[:8]}@t.io",
+                role="user",
+            )
+        )
+        await conn.execute(
+            projects.insert().values(
+                id=project_id,
+                organization_id=org_id,
+                name="Client Alpha",
+                created_by=member_id,
+            )
+        )
+        await conn.execute(
+            project_members.insert().values(
+                organization_id=org_id,
+                project_id=project_id,
+                member_id=member_id,
+                role="owner",
+            )
+        )
+
+    artifact_id = await _save_csv_artifact(org_id, created_by=member_id)
+    outsider_token = create_access_token(outsider_id)
+    async with AsyncClient(
+        transport=ASGITransport(app=main.app),
+        base_url="http://test",
+        follow_redirects=True,
+    ) as client:
+        created = await client.post(
+            "/datasets/",
+            json={
+                "source_artifact_id": artifact_id,
+                "name": "Alpha metrics",
+                "project_id": project_id,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        visible = await client.get(
+            f"/datasets/?project_id={project_id}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        hidden = await client.get(
+            f"/datasets/?project_id={project_id}",
+            headers={"Authorization": f"Bearer {outsider_token}"},
+        )
+
+    assert created.status_code == 200, created.text
+    assert created.json()["project_id"] == project_id
+    assert visible.status_code == 200, visible.text
+    assert [row["id"] for row in visible.json()] == [created.json()["id"]]
+    assert hidden.status_code == 404
+
+
+@pytest.mark.asyncio
+@_requires_db
+@pytest.mark.parametrize("file_type", ["json", "xlsx"])
+async def test_materialize_normalizes_advertised_formats_to_csv(tmp_path, file_type):
+    """JSON and XLSX uploads satisfy the stable data.csv sandbox contract."""
+    import pandas as pd
+
+    from connectors.data_analysis import _materialize_dataset
+    from core.artifacts import save_artifact
+
+    frame = pd.DataFrame([{"city": "Paris", "score": 7}, {"city": "Rome", "score": 9}])
+    if file_type == "json":
+        content = frame.to_json(orient="records").encode()
+        mime_type = "application/json"
+    else:
+        buffer = io.BytesIO()
+        frame.to_excel(buffer, index=False)
+        content = buffer.getvalue()
+        mime_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+    org_id = _unique_org()
+    artifact_id = await save_artifact(
+        content,
+        kind="file",
+        title=f"metrics.{file_type}",
+        org_id=org_id,
+        mime_type=mime_type,
+        created_by="format-test",
+    )
+    dataset_id = str(uuid.uuid4())
+    datasets = await reflect_table("datasets")
+    async with engine.begin() as conn:
+        await conn.execute(
+            datasets.insert().values(
+                id=dataset_id,
+                organization_id=org_id,
+                source_artifact_id=artifact_id,
+                name=f"metrics.{file_type}",
+                created_by="format-test",
+            )
+        )
+
+    materialized = await _materialize_dataset(dataset_id, org_id, tmp_path)
+    assert materialized is not None
+    path, filename = materialized
+    assert filename == "data.csv"
+    normalized = pd.read_csv(path)
+    assert normalized.to_dict(orient="records") == frame.to_dict(orient="records")
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +395,7 @@ plt.close()
         meta = await get_artifact(aid)
         assert meta is not None, f"Artifact {aid} not found"
         assert str(meta["organization_id"]) == str(org_id), "Artifact belongs to wrong org"
+        assert str(meta["created_by"]) == str(agent.member_id)
         content = await read_artifact_content(aid)
         assert content is not None and len(content) > 0, f"Artifact {aid} has no content"
         kinds[meta["kind"]] = aid
@@ -284,6 +407,35 @@ plt.close()
     from core.artifacts import read_artifact_content as rac
     chart_bytes = await rac(kinds["image"])
     assert chart_bytes and chart_bytes[:4] == b"\x89PNG", "Chart artifact is not a PNG"
+
+
+@pytest.mark.asyncio
+async def test_analysis_result_preserves_direct_connector_creator_fallback(monkeypatch):
+    """Legacy connector calls without broker metadata keep a truthful system creator."""
+    saved: list[dict] = []
+
+    async def fake_save(content, **kwargs):
+        saved.append(kwargs)
+        return f"artifact-{len(saved)}"
+
+    monkeypatch.setattr("core.artifacts.save_artifact", fake_save)
+
+    from connectors.data_analysis import _analysis_result
+
+    result = await _analysis_result(
+        exec_status="success",
+        returncode=0,
+        stdout_str="analysis complete",
+        stderr_str="",
+        charts=[("chart.png", b"png")],
+        task_id=None,
+        org_id="org-direct",
+        isolated=False,
+    )
+
+    assert result.data["status"] == "success"
+    assert len(saved) == 2
+    assert {entry["created_by"] for entry in saved} == {"data_analysis_connector"}
 
 
 # ---------------------------------------------------------------------------
@@ -420,7 +572,7 @@ async def test_cross_org_http_get_404():
     org_a_id2, member_a_id2, token_a2 = await _make_org_and_member()
     org_b_id, member_b_id, token_b = await _make_org_and_member()
 
-    artifact_id2 = await _save_csv_artifact(org_a_id2)
+    artifact_id2 = await _save_csv_artifact(org_a_id2, created_by=member_a_id2)
 
     async with AsyncClient(transport=ASGITransport(app=main.app), base_url="http://test", follow_redirects=True) as client:
         # Org A creates a dataset.
@@ -452,7 +604,7 @@ async def test_analyze_endpoint_http(monkeypatch):
     from httpx import AsyncClient, ASGITransport
 
     org_id, member_id, token = await _make_org_and_member()
-    artifact_id = await _save_csv_artifact(org_id)
+    artifact_id = await _save_csv_artifact(org_id, created_by=member_id)
 
     # Patch broker infra so the test DB/redis doesn't need rate-limit warmth.
     # Note: monkeypatch on the module-level objects works with ASGI too because

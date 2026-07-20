@@ -1,36 +1,34 @@
 #!/usr/bin/env bash
-# post-apply.sh — writes the computed DATABASE_URL and REDIS_URL secrets into
-# Secrets Manager after `terraform apply` has created the RDS and Redis resources.
-# Run from the infra/ directory after every `terraform apply`.
+# post-apply.sh — read-only verification for Terraform-managed connection
+# secrets. Terraform creates the AWSCURRENT versions atomically; this script
+# must never reconstruct or print credentials outside state/Secrets Manager.
 set -euo pipefail
 
-REGION="${1:-us-east-1}"
-PREFIX="chronos-prod"
+REGION="${AWS_REGION:-$(terraform output -raw aws_region)}"
 
-echo "==> Reading Terraform outputs"
-RDS_HOST=$(terraform output -raw rds_endpoint)
-REDIS_HOST=$(terraform output -raw redis_primary_endpoint)
-DB_PASS=$(aws secretsmanager get-secret-value \
-  --secret-id "${PREFIX}/rds/password" \
-  --region "$REGION" \
-  --query SecretString --output text)
-DB_PASS_ENCODED=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$DB_PASS")
+verify_current_version() {
+  local output_name="$1"
+  local arn
+  arn="$(terraform output -raw "$output_name")"
+  aws secretsmanager describe-secret \
+    --secret-id "$arn" \
+    --region "$REGION" \
+    --query '{ARN:ARN,DeletedDate:DeletedDate}' \
+    --output json >/dev/null
+  if ! aws secretsmanager list-secret-version-ids \
+    --secret-id "$arn" \
+    --region "$REGION" \
+    --query 'Versions[?contains(VersionStages, `AWSCURRENT`)] | length(@)' \
+    --output text | grep -qx '1'; then
+    echo "$output_name does not have exactly one AWSCURRENT version" >&2
+    return 1
+  fi
+  echo "Verified Terraform-managed AWSCURRENT version: $output_name"
+}
 
-DATABASE_URL="postgresql+asyncpg://chronos:${DB_PASS_ENCODED}@${RDS_HOST}:5432/chronos"
-REDIS_URL="rediss://${REDIS_HOST}:6379/0"
-
-echo "==> Writing DATABASE_URL secret"
-aws secretsmanager put-secret-value \
-  --secret-id "${PREFIX}/database_url" \
-  --secret-string "$DATABASE_URL" \
-  --region "$REGION"
-
-echo "==> Writing REDIS_URL secret"
-aws secretsmanager put-secret-value \
-  --secret-id "${PREFIX}/redis_url" \
-  --secret-string "$REDIS_URL" \
-  --region "$REGION"
+verify_current_version database_url_secret_arn
+verify_current_version redis_url_secret_arn
+verify_current_version openfga_database_url_secret_arn
 
 echo ""
-echo "==> Done. Run the migration task now or let the next deploy trigger it."
-echo "    aws ecs run-task --cluster ${PREFIX}-cluster --task-definition ${PREFIX}-migrate ..."
+echo "==> Connection secrets exist; no secret material was read or written."

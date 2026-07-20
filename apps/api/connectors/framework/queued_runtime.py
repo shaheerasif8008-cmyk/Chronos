@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import uuid
 from typing import Any
 
 from connectors.framework.approvals import ApprovalService
@@ -9,6 +10,13 @@ from connectors.framework.models import ConnectorResult
 from connectors.framework.policy import PolicyEngine
 from connectors.framework.schema import SchemaValidationError, validate_json_schema
 from core.models import AgentContext
+from core.connector_write_ledger import (
+    ConnectorWriteLedger,
+    WriteOperationConflict,
+    provider_supports_idempotency,
+    secret_sha256,
+    utcnow,
+)
 
 
 class QueuedConnectorExecutionService:
@@ -39,6 +47,7 @@ class QueuedConnectorExecutionService:
         metadata: dict[str, Any] | None = None,
     ) -> ConnectorResult:
         started = time.perf_counter()
+        metadata = dict(metadata or {})
         tenant_id = context.org_id
         workspace_id = context.workspace_id or "default"
         employee_id = context.id
@@ -107,9 +116,10 @@ class QueuedConnectorExecutionService:
         )
         if policy.decision == "deny":
             return await finish(ConnectorResult(status="permission_denied", error=policy.reason))
-        if policy.decision == "require_approval":
+        if policy.decision == "require_approval" and not metadata.get("approval_id"):
             approval = await self.approval_service.request_approval(
                 tenant_id=tenant_id,
+                task_id=context.task_id,
                 workspace_id=workspace_id,
                 employee_id=employee_id,
                 user_id=user_id,
@@ -121,6 +131,7 @@ class QueuedConnectorExecutionService:
                 approval_mode=policy.approval_mode,
                 execution_payload={
                     "tenant_id": tenant_id,
+                    "task_id": context.task_id,
                     "workspace_id": workspace_id,
                     "employee_id": employee_id,
                     "user_id": user_id,
@@ -140,20 +151,19 @@ class QueuedConnectorExecutionService:
                 )
             )
 
-        job = await self.repo.create_execution_job(
-            tenant_id=tenant_id,
-            workspace_id=workspace_id,
-            employee_id=employee_id,
-            user_id=user_id,
-            connector_id=connector_id,
-            action_name=action_name,
-            arguments=arguments,
-            max_attempts=max_attempts,
-            timeout_ms=timeout_ms,
+        job_id = str(uuid.uuid4())
+        task_id = str(
+            context.task_id
+            or (
+                f"connector-request:{secret_sha256(str(metadata['idempotency_key']))}"
+                if metadata.get("idempotency_key")
+                else f"connector-job:{job_id}"
+            )
         )
         payload = {
-            "id": job["id"],
+            "id": job_id,
             "tenant_id": tenant_id,
+            "task_id": task_id,
             "workspace_id": workspace_id,
             "employee_id": employee_id,
             "user_id": user_id,
@@ -163,7 +173,139 @@ class QueuedConnectorExecutionService:
             "max_attempts": max_attempts,
             "timeout_ms": timeout_ms,
             "actor": context.model_dump(),
-            **(metadata or {}),
+            **metadata,
         }
-        await self.queue.enqueue(payload)
-        return await finish(ConnectorResult(status="queued", output={"job_id": job["id"]}))
+        write_operation: dict[str, Any] | None = None
+        approval_id = str(metadata.get("approval_id") or "")
+        if action.get("risk_level") != "read":
+            capabilities = (
+                await self.repo.get_write_capabilities(
+                    connector_id, action_name, tenant_id=tenant_id
+                )
+                if hasattr(self.repo, "get_write_capabilities")
+                else {"provider": connector.get("provider") or connector_id}
+            )
+            provider = str(capabilities.get("provider") or connector_id)
+            idempotency_key = str(
+                metadata.get("idempotency_key")
+                or approval_id
+                or (
+                    f"workflow:{metadata['workflow_run_id']}:{metadata['workflow_step_id']}"
+                    if metadata.get("workflow_run_id")
+                    and metadata.get("workflow_step_id")
+                    else job_id
+                )
+            )
+            try:
+                write_operation = await ConnectorWriteLedger(self.repo).prepare(
+                    organization_id=tenant_id,
+                    member_id=str(user_id or employee_id),
+                    task_id=task_id,
+                    channel="framework",
+                    tool=f"{connector_id}.{action_name}",
+                    provider=provider,
+                    risk_level=str(action.get("risk_level") or "write"),
+                    payload=arguments,
+                    approval_binding=approval_id or "autonomy-policy",
+                    idempotency_key=idempotency_key,
+                    connector_job_id=job_id,
+                    provider_idempotency=provider_supports_idempotency(
+                        provider,
+                        header=capabilities.get("idempotency_header"),
+                    ),
+                    supports_reconciliation=bool(
+                        capabilities.get("supports_reconciliation")
+                    ),
+                    outbox_payload=payload,
+                )
+            except WriteOperationConflict as exc:
+                return await finish(ConnectorResult(status="failure", error=str(exc)))
+
+            if not write_operation.get("_created"):
+                status = str(write_operation.get("status") or "")
+                if status == "complete":
+                    durable = write_operation.get("result") or {}
+                    return await finish(
+                        ConnectorResult(
+                            status="success",
+                            output=durable.get("output") or durable,
+                        )
+                    )
+                if status in {"manual_review", "failed", "cancelled"}:
+                    return await finish(
+                        ConnectorResult(
+                            status="manual_review" if status == "manual_review" else "failure",
+                            error=write_operation.get("last_error")
+                            or f"Connector write is {status}",
+                        )
+                    )
+                return await finish(
+                    ConnectorResult(
+                        status="queued",
+                        output={
+                            "job_id": write_operation.get("connector_job_id"),
+                            "write_operation_id": str(write_operation["id"]),
+                            "idempotency_replayed": True,
+                        },
+                    )
+                )
+            payload["write_operation_id"] = str(write_operation["id"])
+            payload["provider_idempotency_key"] = write_operation[
+                "provider_idempotency_key"
+            ]
+            payload["provider_supports_idempotency"] = bool(
+                write_operation["provider_supports_idempotency"]
+            )
+            payload["idempotency_header"] = capabilities.get("idempotency_header")
+
+        job = await self.repo.create_execution_job(
+            id=job_id,
+            tenant_id=tenant_id,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            employee_id=employee_id,
+            user_id=user_id,
+            connector_id=connector_id,
+            action_name=action_name,
+            arguments=arguments,
+            max_attempts=max_attempts,
+            timeout_ms=timeout_ms,
+            write_operation_id=str(write_operation["id"]) if write_operation else None,
+            approval_id=approval_id or None,
+        )
+        try:
+            await self.queue.enqueue(payload)
+        except Exception:
+            # The encrypted Postgres outbox is authoritative.  Recovery will
+            # repopulate Redis after a transient queue outage or total loss.
+            if not write_operation:
+                raise
+            return await finish(
+                ConnectorResult(
+                    status="queued",
+                    output={
+                        "job_id": job["id"],
+                        "write_operation_id": str(write_operation["id"])
+                        if write_operation
+                        else None,
+                        "durable_outbox": bool(write_operation),
+                    },
+                )
+            )
+        if write_operation:
+            await self.repo.mark_write_operation_enqueued(
+                str(write_operation["id"]),
+                organization_id=tenant_id,
+                enqueued_at=utcnow(),
+            )
+        return await finish(
+            ConnectorResult(
+                status="queued",
+                output={
+                    "job_id": job["id"],
+                    "write_operation_id": str(write_operation["id"])
+                    if write_operation
+                    else None,
+                },
+            )
+        )

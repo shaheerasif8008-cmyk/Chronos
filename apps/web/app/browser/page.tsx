@@ -1,5 +1,5 @@
 import { redirect } from "next/navigation";
 
 export default function BrowserPage() {
-  redirect("/activity");
+  redirect("/activity?tab=browser");
 }

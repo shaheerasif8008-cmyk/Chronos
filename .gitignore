@@ -5,12 +5,17 @@ __pycache__/
 
 node_modules/
 .next/
+.next-mobile/
 dist/
 build/
+apps/desktop-macos/.build/
+apps/desktop-macos/dist/
+apps/desktop-macos/Assets/AppIcon.iconset/
 
 # Playwright E2E artifacts
 test-results/
 playwright-report/
+apps/web/output/
 
 .DS_Store
 dump.rdb
@@ -21,7 +26,6 @@ apps/api/context/
 
 # Terraform
 infra/.terraform/
-infra/.terraform.lock.hcl
 infra/terraform.tfvars
 infra/tfplan
 infra/*.tfstate

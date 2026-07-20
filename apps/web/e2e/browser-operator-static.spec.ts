@@ -15,7 +15,14 @@ test("browser operator: live feed in chat, full session view in Activity", async
   expect(pageSrc).not.toContain('route === "browser"');
   expect(pageSrc).not.toContain('{ id: "browser"    as Route');
 
-  // The standalone /browser route redirects into Activity.
+  const operatorSrc = fs.readFileSync(path.join(process.cwd(), "components/browser/BrowserOperatorScreen.tsx"), "utf8");
+  expect(operatorSrc).toContain("active?.screenshot_url");
+  expect(operatorSrc).toContain("download.download_url");
+  expect(operatorSrc).toContain("/live-view");
+  expect(operatorSrc).toContain('active.takeover_state === "requested"');
+  expect(operatorSrc).not.toContain("download.path");
+
+  // The standalone /browser route deep-links the matching Activity tab.
   const routeSrc = fs.readFileSync(path.join(process.cwd(), "app/browser/page.tsx"), "utf8");
-  expect(routeSrc).toContain('redirect("/activity")');
+  expect(routeSrc).toContain('redirect("/activity?tab=browser")');
 });

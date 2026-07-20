@@ -88,6 +88,8 @@ async def test_native_loop_adds_controller_replan_instruction_after_tool_error(m
     monkeypatch.setattr(agent_loop, "_persist_to_conversation", fake_persist)
     monkeypatch.setattr(agent_loop, "_llm_step", fake_llm_step)
     monkeypatch.setattr(agent_loop, "_execute_tool", fake_execute_tool)
+    monkeypatch.setattr(agent_loop, "_verify_answer", lambda *a, **k: _async_none())
+    monkeypatch.setattr(agent_loop, "_reflect", lambda *a, **k: _async_none())
 
     result = await agent_loop.run_loop(task)
 
@@ -97,3 +99,7 @@ async def test_native_loop_adds_controller_replan_instruction_after_tool_error(m
     assert state["mode"] == "model_native"
     assert state["needs_replan"] is True
     assert state["last_tool_errors"] == [{"tool": "browser__search", "error": "temporary search failure"}]
+
+
+async def _async_none():
+    return None

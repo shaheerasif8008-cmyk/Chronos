@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { type KeyboardEvent as ReactKeyboardEvent, useCallback, useEffect, useState } from "react";
 import { apiFetch } from "../../lib/api";
 
 type Row = Record<string, unknown>;
@@ -54,7 +54,6 @@ export default function ConnectorGovernanceScreen() {
 
   // MCP register form
   const [mcpName, setMcpName] = useState("");
-  const [mcpTransport, setMcpTransport] = useState<"local" | "remote">("remote");
   const [mcpTarget, setMcpTarget] = useState("");
 
   // Policy create form
@@ -83,6 +82,7 @@ export default function ConnectorGovernanceScreen() {
   useEffect(() => { void load(tab); }, [tab, load]);
 
   async function resolveApproval(id: string, approved: boolean) {
+    if (!window.confirm(`${approved ? "Approve" : "Deny"} this connector action? This decision is audited and cannot be undone.`)) return;
     setBusy(id);
     setError(null);
     try {
@@ -99,6 +99,7 @@ export default function ConnectorGovernanceScreen() {
   }
 
   async function deletePolicy(id: string) {
+    if (!window.confirm("Delete this connector policy? Effective access may change immediately.")) return;
     setBusy(id);
     setError(null);
     try {
@@ -120,8 +121,8 @@ export default function ConnectorGovernanceScreen() {
         method: "POST",
         body: JSON.stringify({
           name: mcpName.trim(),
-          transport: mcpTransport,
-          ...(mcpTransport === "local" ? { command: mcpTarget.trim() } : { server_url: mcpTarget.trim() }),
+          transport: "remote",
+          server_url: mcpTarget.trim(),
         }),
       });
       setMcpName("");
@@ -135,6 +136,10 @@ export default function ConnectorGovernanceScreen() {
   }
 
   async function createPolicy() {
+    if (
+      policyDecision === "allow"
+      && !window.confirm("Create an allow policy? Matching connector actions may run without an approval prompt, subject to hard policy floors.")
+    ) return;
     setBusy("policy-create");
     setError(null);
     try {
@@ -157,6 +162,7 @@ export default function ConnectorGovernanceScreen() {
   }
 
   async function cancelJob(id: string) {
+    if (!window.confirm("Cancel this connector job? In-flight provider work may already have started.")) return;
     setBusy(id);
     setError(null);
     try {
@@ -182,34 +188,57 @@ export default function ConnectorGovernanceScreen() {
     }
   }
 
+  function handleTabKeyDown(event: ReactKeyboardEvent<HTMLDivElement>) {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    const tabs = [...event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]')];
+    if (tabs.length === 0) return;
+    event.preventDefault();
+    const current = tabs.indexOf(document.activeElement as HTMLButtonElement);
+    const next = event.key === "Home"
+      ? tabs[0]
+      : event.key === "End"
+        ? tabs[tabs.length - 1]
+        : event.key === "ArrowRight"
+          ? tabs[(current + 1 + tabs.length) % tabs.length]
+          : tabs[(current - 1 + tabs.length) % tabs.length];
+    next.focus();
+    next.click();
+  }
+
   return (
     <div className="flex flex-col min-w-0">
-      <div role="tablist" className="flex gap-0.5 border-b hairline mb-4">
-        {GOV_TABS.map(t => (
-          <button
-            key={t.id}
-            role="tab"
-            aria-selected={tab === t.id}
-            onClick={() => setTab(t.id)}
-            className="px-3.5 py-2 text-[13px] font-medium transition-colors"
-            style={{
-              color: tab === t.id ? "var(--text)" : "var(--text-dim)",
-              borderBottom: tab === t.id ? "2px solid var(--accent)" : "2px solid transparent",
-              marginBottom: -1,
-            }}
-          >
-            {t.label}
-          </button>
-        ))}
-        <button className="btn btn-ghost btn-sm ml-auto" onClick={() => void load(tab)} disabled={loading}>Refresh</button>
+      <div className="mb-4 flex items-end gap-2 border-b hairline">
+        <div role="tablist" aria-label="Connector governance sections" onKeyDown={handleTabKeyDown} className="no-scrollbar flex min-w-0 flex-1 gap-0.5 overflow-x-auto">
+          {GOV_TABS.map(t => (
+            <button
+              key={t.id}
+              id={`connector-governance-tab-${t.id}`}
+              role="tab"
+              aria-selected={tab === t.id}
+              aria-controls={`connector-governance-panel-${t.id}`}
+              tabIndex={tab === t.id ? 0 : -1}
+              onClick={() => setTab(t.id)}
+              className="flex-shrink-0 px-3.5 py-2 text-[13px] font-medium transition-colors"
+              style={{
+                color: tab === t.id ? "var(--text)" : "var(--text-dim)",
+                borderBottom: tab === t.id ? "2px solid var(--accent)" : "2px solid transparent",
+                marginBottom: -1,
+              }}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+        <button className="btn btn-ghost btn-sm mb-1 flex-shrink-0" onClick={() => void load(tab)} disabled={loading}>Refresh</button>
       </div>
 
+      <div id={`connector-governance-panel-${tab}`} role="tabpanel" aria-labelledby={`connector-governance-tab-${tab}`} tabIndex={0} aria-busy={loading}>
       {error && (
-        <div className="mb-3 rounded-lg border px-3 py-2 text-[12.5px]" style={{ borderColor: "var(--danger)", background: "var(--surface-2)", color: "var(--danger)" }}>
+        <div role="alert" className="mb-3 rounded-lg border px-3 py-2 text-[12.5px]" style={{ borderColor: "var(--danger)", background: "var(--surface-2)", color: "var(--danger)" }}>
           {error}
         </div>
       )}
-      {loading && <div className="text-[13px] py-4" style={{ color: "var(--text-dim)" }}>Loading…</div>}
+      {loading && <div role="status" className="text-[13px] py-4" style={{ color: "var(--text-dim)" }}>Loading connector governance…</div>}
 
       {!loading && tab === "logs" && (
         <div className="surface border border-soft rounded-lg divide-y" style={{ borderColor: "var(--border-soft)" }}>
@@ -251,14 +280,14 @@ export default function ConnectorGovernanceScreen() {
             const id = field(row, "id");
             return (
               <div key={id || i} className="surface border border-soft rounded-lg p-3">
-                <div className="flex items-start justify-between gap-3">
+                <div className="flex flex-col items-stretch justify-between gap-3 sm:flex-row sm:items-start">
                   <div className="min-w-0">
                     <div className="text-[13px] font-medium truncate">{field(row, "action_name", "action") || "Connector action"} · {field(row, "connector_id", "provider")}</div>
                     <div className="text-[11.5px]" style={{ color: "var(--text-faint)" }}>{labelTime(row.created_at)}</div>
                   </div>
                   <div className="flex gap-2 flex-shrink-0">
-                    <button className="btn btn-accent btn-sm" disabled={busy === id} onClick={() => void resolveApproval(id, true)}>Approve</button>
-                    <button className="btn btn-danger-soft btn-sm" disabled={busy === id} onClick={() => void resolveApproval(id, false)}>Deny</button>
+                    <button aria-label={`Approve ${field(row, "action_name", "action") || "connector action"}`} className="btn btn-accent btn-sm" disabled={busy === id} onClick={() => void resolveApproval(id, true)}>Approve</button>
+                    <button aria-label={`Deny ${field(row, "action_name", "action") || "connector action"}`} className="btn btn-danger-soft btn-sm" disabled={busy === id} onClick={() => void resolveApproval(id, false)}>Deny</button>
                   </div>
                 </div>
               </div>
@@ -272,11 +301,11 @@ export default function ConnectorGovernanceScreen() {
           <div className="surface border border-soft rounded-lg p-3">
             <div className="text-[13px] font-medium mb-2">New policy</div>
             <div className="flex flex-wrap gap-2">
-              <input value={policyConnector} onChange={e => setPolicyConnector(e.target.value)} placeholder="Connector id (blank = any)"
-                     className="surface border border-soft rounded-md px-3 py-1.5 text-[12.5px] outline-none w-52" />
-              <input value={policyAction} onChange={e => setPolicyAction(e.target.value)} placeholder="Action name (blank = any)"
-                     className="surface border border-soft rounded-md px-3 py-1.5 text-[12.5px] outline-none w-52" />
-              <select value={policyDecision} onChange={e => setPolicyDecision(e.target.value as typeof policyDecision)}
+              <input aria-label="Policy connector ID" value={policyConnector} onChange={e => setPolicyConnector(e.target.value)} placeholder="Connector id (blank = any)"
+                     className="surface w-full rounded-md border border-soft px-3 py-1.5 text-[12.5px] outline-none sm:w-52" />
+              <input aria-label="Policy action name" value={policyAction} onChange={e => setPolicyAction(e.target.value)} placeholder="Action name (blank = any)"
+                     className="surface w-full rounded-md border border-soft px-3 py-1.5 text-[12.5px] outline-none sm:w-52" />
+              <select aria-label="Policy decision" value={policyDecision} onChange={e => setPolicyDecision(e.target.value as typeof policyDecision)}
                       className="surface border border-soft rounded-md px-3 py-1.5 text-[12.5px] outline-none">
                 <option value="allow">allow</option>
                 <option value="require_approval">require_approval</option>
@@ -289,7 +318,7 @@ export default function ConnectorGovernanceScreen() {
           {policies.map((row, i) => {
             const id = field(row, "id");
             return (
-              <div key={id || i} className="surface border border-soft rounded-lg p-3 flex items-start justify-between gap-3">
+              <div key={id || i} className="surface flex flex-col items-stretch justify-between gap-3 rounded-lg border border-soft p-3 sm:flex-row sm:items-start">
                 <div className="min-w-0">
                   <div className="text-[13px] font-medium">
                     {field(row, "decision") || "policy"} · {field(row, "connector_id") || "any connector"} · {field(row, "action_name") || "any action"}
@@ -350,16 +379,12 @@ export default function ConnectorGovernanceScreen() {
           <div className="surface border border-soft rounded-lg p-3">
             <div className="text-[13px] font-medium mb-2">Register MCP server</div>
             <div className="flex flex-wrap gap-2">
-              <input value={mcpName} onChange={e => setMcpName(e.target.value)} placeholder="Name"
-                     className="surface border border-soft rounded-md px-3 py-1.5 text-[12.5px] outline-none w-40" />
-              <select value={mcpTransport} onChange={e => setMcpTransport(e.target.value as "local" | "remote")}
-                      className="surface border border-soft rounded-md px-3 py-1.5 text-[12.5px] outline-none">
-                <option value="remote">remote</option>
-                <option value="local">local</option>
-              </select>
-              <input value={mcpTarget} onChange={e => setMcpTarget(e.target.value)}
-                     placeholder={mcpTransport === "local" ? "command (e.g. npx my-mcp)" : "server URL"}
-                     className="surface border border-soft rounded-md px-3 py-1.5 text-[12.5px] outline-none flex-1 min-w-[200px]" />
+              <input aria-label="MCP server name" value={mcpName} onChange={e => setMcpName(e.target.value)} placeholder="Name"
+                     className="surface w-full rounded-md border border-soft px-3 py-1.5 text-[12.5px] outline-none sm:w-40" />
+              <input aria-label="Remote MCP server URL" value={mcpTarget} onChange={e => setMcpTarget(e.target.value)}
+                     type="url" inputMode="url" autoCapitalize="none" autoCorrect="off"
+                     placeholder="https://mcp.example.com/sse"
+                     className="surface min-w-0 flex-1 rounded-md border border-soft px-3 py-1.5 text-[12.5px] outline-none sm:min-w-[200px]" />
               <button className="btn btn-accent btn-sm" disabled={busy === "mcp-register" || !mcpName.trim() || !mcpTarget.trim()} onClick={() => void registerMcp()}>Register</button>
             </div>
           </div>
@@ -369,7 +394,7 @@ export default function ConnectorGovernanceScreen() {
             {mcp.servers.map((row, i) => {
               const id = field(row, "id");
               return (
-                <div key={id || i} className="surface border border-soft rounded-lg p-3 flex items-start justify-between gap-3">
+                <div key={id || i} className="surface flex flex-col items-stretch justify-between gap-3 rounded-lg border border-soft p-3 sm:flex-row sm:items-start">
                   <div className="min-w-0">
                     <div className="text-[13px] font-medium truncate">{field(row, "name")} <span className="tag ml-1">{field(row, "transport")}</span></div>
                     <div className="text-[11.5px] truncate" style={{ color: "var(--text-dim)" }}>{field(row, "server_url", "command")}</div>
@@ -382,6 +407,7 @@ export default function ConnectorGovernanceScreen() {
           </div>
         </div>
       )}
+      </div>
     </div>
   );
 }

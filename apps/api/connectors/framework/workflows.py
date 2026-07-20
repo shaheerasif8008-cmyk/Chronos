@@ -5,7 +5,9 @@ from typing import Any
 
 from connectors.framework.compression import compress_connector_output
 from connectors.framework.queued_runtime import QueuedConnectorExecutionService
-from core.models import AgentContext
+from connectors.framework.repository import InMemoryConnectorRepository
+from core.models import AgentContext, Member
+from core.workspace_access import require_workspace_access
 
 
 TERMINAL_STEP_STATES = {"success", "failed", "skipped"}
@@ -20,6 +22,23 @@ class WorkflowRuntime:
     def __init__(self, repo: Any, queue: Any) -> None:
         self.repo = repo
         self.queue = queue
+        self._enforce_workspace_lifecycle = not isinstance(
+            repo, InMemoryConnectorRepository
+        )
+
+    async def _require_live_workspace(self, tenant_id: str, workspace_id: str) -> None:
+        if not self._enforce_workspace_lifecycle:
+            return
+        await require_workspace_access(
+            Member(
+                id="system",
+                organization_id=tenant_id,
+                email="workflow-runtime@chronos.internal",
+                role="system",
+            ),
+            workspace_id,
+            access="write",
+        )
 
     async def create_workflow(
         self,
@@ -33,6 +52,7 @@ class WorkflowRuntime:
         description: str = "",
         triggers: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        await self._require_live_workspace(tenant_id, workspace_id)
         workflow = await self.repo.create_workflow(
             tenant_id=tenant_id,
             workspace_id=workspace_id,
@@ -63,10 +83,12 @@ class WorkflowRuntime:
         trigger_source: str = "manual",
         trigger_event_type: str | None = None,
         trigger_payload: dict[str, Any] | None = None,
+        trigger_idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         workflow = await self.repo.get_workflow(workflow_id, tenant_id=tenant_id)
         if not workflow:
             raise ValueError("Workflow not found")
+        await self._require_live_workspace(tenant_id, str(workflow["workspace_id"]))
         run = await self.repo.create_workflow_run(
             tenant_id=tenant_id,
             workflow_id=workflow_id,
@@ -78,7 +100,10 @@ class WorkflowRuntime:
             trigger_source=trigger_source,
             trigger_event_type=trigger_event_type,
             trigger_payload=trigger_payload or {},
+            trigger_idempotency_key=trigger_idempotency_key,
         )
+        if run.pop("_idempotency_replayed", False):
+            return run
         await self._record_run_event(run, "run_started", {"trigger_source": trigger_source, "trigger_event_type": trigger_event_type})
         for step in workflow["definition"].get("steps", []):
             await self.repo.create_workflow_step(
@@ -111,6 +136,8 @@ class WorkflowRuntime:
         source: str,
         event_type: str,
         payload: dict[str, Any],
+        persisted_payload: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
     ) -> list[dict[str, Any]]:
         dispatched: list[dict[str, Any]] = []
         triggers = await self.repo.list_workflow_triggers(tenant_id=tenant_id, status="active")
@@ -128,7 +155,10 @@ class WorkflowRuntime:
                 tenant_id=tenant_id,
                 trigger_source=source,
                 trigger_event_type=event_type,
-                trigger_payload=payload,
+                trigger_payload=persisted_payload if persisted_payload is not None else payload,
+                trigger_idempotency_key=(
+                    f"{idempotency_key}:{trigger['id']}" if idempotency_key else None
+                ),
             )
             await self.tick(run["id"], tenant_id=tenant_id)
             dispatched.append(run)
@@ -236,7 +266,7 @@ class WorkflowRuntime:
             connector_id=connector_id,
             action_name=action_name,
             arguments=step.get("arguments") or {},
-            context=AgentContext(id=run["employee_id"], org_id=tenant_of(run), member_id=run.get("user_id"), workspace_id=run["workspace_id"]),
+            context=AgentContext(id=run["employee_id"], org_id=tenant_of(run), member_id=run.get("user_id"), workspace_id=run["workspace_id"], task_id=f"workflow:{run['id']}:{step['id']}"),
             metadata={"workflow_run_id": run["id"], "workflow_step_id": step["id"], "correlation_id": run["correlation_id"]},
         )
         if result.status == "queued":

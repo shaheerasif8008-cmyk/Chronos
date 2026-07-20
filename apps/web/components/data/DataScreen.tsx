@@ -1,7 +1,6 @@
 "use client";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { apiFetch, apiBase, getToken } from "../../lib/api";
-// apiBase and getToken are used for the file upload helper below
+import { apiFetch } from "../../lib/api";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -12,6 +11,7 @@ type Dataset = {
   name: string;
   organization_id: string;
   source_artifact_id: string;
+  project_id?: string | null;
   schema: { columns: ColumnSchema[] } | null;
   row_count: number | null;
   status: string;
@@ -36,30 +36,28 @@ type ArtifactMeta = {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-async function uploadCsvFile(file: File): Promise<string> {
+async function uploadCsvFile(file: File, projectId?: string): Promise<string> {
   const form = new FormData();
   form.append("file", file);
-  const token = getToken();
-  const headers: Record<string, string> = {};
-  if (token) headers["Authorization"] = `Bearer ${token}`;
+  if (projectId) form.append("project_id", projectId);
   // POST /attachments (no trailing slash — route is mounted at "")
-  const res = await fetch(`${apiBase()}/attachments`, { method: "POST", body: form, headers });
-  if (!res.ok) throw new Error(await res.text());
+  const res = await apiFetch("/attachments", { method: "POST", body: form });
   const data = await res.json();
   // Response key is attachment_id (same UUID as the artifact)
   return (data.attachment_id ?? data.artifact_id) as string;
 }
 
-async function createDataset(artifactId: string, name?: string): Promise<Dataset> {
+async function createDataset(artifactId: string, name?: string, projectId?: string): Promise<Dataset> {
   const res = await apiFetch("/datasets/", {
     method: "POST",
-    body: JSON.stringify({ source_artifact_id: artifactId, name }),
+    body: JSON.stringify({ source_artifact_id: artifactId, name, project_id: projectId }),
   });
   return res.json() as Promise<Dataset>;
 }
 
-async function listDatasets(): Promise<Dataset[]> {
-  const res = await apiFetch("/datasets/");
+async function listDatasets(projectId?: string): Promise<Dataset[]> {
+  const query = projectId ? `?project_id=${encodeURIComponent(projectId)}` : "";
+  const res = await apiFetch(`/datasets/${query}`);
   return res.json() as Promise<Dataset[]>;
 }
 
@@ -164,7 +162,7 @@ function ArtifactCard({ artifactId }: { artifactId: string }) {
       revoked = true;
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+
   }, [artifactId]);
 
   if (err) return <div style={{ color: "var(--danger)", fontSize: 12 }}>Failed to load artifact {artifactId.slice(0, 8)}</div>;
@@ -180,7 +178,7 @@ function ArtifactCard({ artifactId }: { artifactId: string }) {
       </div>
       <div style={{ padding: 12 }}>
         {isImage && blobUrl ? (
-          // eslint-disable-next-line @next/next/no-img-element
+
           <img src={blobUrl} alt={meta.title ?? "chart"} style={{ maxWidth: "100%", borderRadius: 6 }} />
         ) : isImage ? (
           <div style={{ color: "var(--text-dim)", fontSize: 12 }}>Loading image…</div>
@@ -198,7 +196,7 @@ function ArtifactCard({ artifactId }: { artifactId: string }) {
 
 // ─── Main Component ───────────────────────────────────────────────────────────
 
-export default function DataScreen() {
+export default function DataScreen({ projectId }: { projectId?: string }) {
   const [datasets, setDatasets] = useState<Dataset[]>([]);
   const [loadingList, setLoadingList] = useState(true);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -215,14 +213,14 @@ export default function DataScreen() {
   const refreshList = useCallback(async () => {
     setLoadingList(true);
     try {
-      const data = await listDatasets();
+      const data = await listDatasets(projectId);
       setDatasets(data.sort((a, b) => (b.created_at ?? "").localeCompare(a.created_at ?? "")));
     } catch {
       // silent — list stays empty
     } finally {
       setLoadingList(false);
     }
-  }, []);
+  }, [projectId]);
 
   useEffect(() => { void refreshList(); }, [refreshList]);
 
@@ -234,8 +232,8 @@ export default function DataScreen() {
     setUploading(true);
     setUploadError(null);
     try {
-      const artifactId = await uploadCsvFile(file);
-      const ds = await createDataset(artifactId, file.name);
+      const artifactId = await uploadCsvFile(file, projectId);
+      const ds = await createDataset(artifactId, file.name, projectId);
       await refreshList();
       setSelectedId(ds.id);
     } catch (err: unknown) {
@@ -262,9 +260,9 @@ export default function DataScreen() {
   }
 
   return (
-    <div style={{ display: "flex", height: "100%", minHeight: 0, fontFamily: "var(--font-geist, sans-serif)" }}>
+    <div className="data-workspace" style={{ display: "flex", height: "100%", minHeight: 0, fontFamily: "var(--font-geist, sans-serif)" }}>
       {/* ─── Sidebar ───────────────────────────────────────────────────────── */}
-      <aside style={{ width: 280, flexShrink: 0, borderRight: "1px solid var(--border)", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+      <aside className="data-workspace-sidebar" style={{ width: 280, flexShrink: 0, borderRight: "1px solid var(--border)", display: "flex", flexDirection: "column", overflow: "hidden" }}>
         <div style={{ padding: "12px 14px", borderBottom: "1px solid var(--border)" }}>
           <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 10 }}>Data Workspace</div>
           <button
@@ -274,12 +272,12 @@ export default function DataScreen() {
           >
             {uploading ? "Uploading…" : "+ Upload CSV / XLSX / JSON"}
           </button>
-          <input ref={fileRef} type="file" accept=".csv,.xlsx,.json,text/csv,application/json" style={{ display: "none" }} onChange={handleFileSelect} />
-          {uploadError && <div style={{ marginTop: 6, fontSize: 12, color: "var(--danger)" }}>{uploadError}</div>}
+          <input ref={fileRef} aria-label="Upload dataset" type="file" accept=".csv,.xlsx,.json,text/csv,application/json" style={{ display: "none" }} onChange={handleFileSelect} />
+          {uploadError && <div role="alert" style={{ marginTop: 6, fontSize: 12, color: "var(--danger)" }}>{uploadError}</div>}
         </div>
 
         <div style={{ flex: 1, overflowY: "auto", padding: "8px 8px" }}>
-          {loadingList && <div style={{ padding: "12px 6px", fontSize: 13, color: "var(--text-dim)" }}>Loading…</div>}
+          {loadingList && <div role="status" style={{ padding: "12px 6px", fontSize: 13, color: "var(--text-dim)" }}>Loading datasets…</div>}
           {!loadingList && datasets.length === 0 && (
             <div style={{ padding: "12px 6px", fontSize: 13, color: "var(--text-dim)" }}>No datasets yet. Upload a CSV to start.</div>
           )}
@@ -287,6 +285,7 @@ export default function DataScreen() {
             <button
               key={ds.id}
               onClick={() => { setSelectedId(ds.id); setAnalysisResult(null); setAnalysisError(null); }}
+              aria-pressed={selectedId === ds.id}
               style={{ width: "100%", textAlign: "left", padding: "8px 10px", borderRadius: 8, marginBottom: 2, background: selectedId === ds.id ? "var(--accent-soft)" : "transparent", border: "none", cursor: "pointer" }}
             >
               <div style={{ fontSize: 13.5, fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{ds.name}</div>
@@ -300,7 +299,7 @@ export default function DataScreen() {
       </aside>
 
       {/* ─── Main panel ────────────────────────────────────────────────────── */}
-      <main style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0, overflow: "hidden" }}>
+      <main className="data-workspace-main" style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0, overflow: "hidden" }}>
         {!selected ? (
           <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-dim)", fontSize: 14 }}>
             Select or upload a dataset to begin.
@@ -318,9 +317,9 @@ export default function DataScreen() {
               </div>
             </div>
 
-            <div style={{ flex: 1, display: "flex", minHeight: 0, overflow: "hidden" }}>
+            <div className="data-workspace-body" style={{ flex: 1, display: "flex", minHeight: 0, overflow: "hidden" }}>
               {/* Left: schema + code editor */}
-              <div style={{ width: "50%", borderRight: "1px solid var(--border)", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+              <div className="data-workspace-editor" style={{ width: "50%", borderRight: "1px solid var(--border)", display: "flex", flexDirection: "column", overflow: "hidden" }}>
                 {/* Schema */}
                 <div style={{ padding: "12px 16px", borderBottom: "1px solid var(--border)" }}>
                   <div style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.06em", color: "var(--text-dim)", marginBottom: 8 }}>Schema</div>
@@ -331,6 +330,7 @@ export default function DataScreen() {
                 <div style={{ flex: 1, display: "flex", flexDirection: "column", padding: "12px 16px", overflow: "hidden" }}>
                   <div style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.06em", color: "var(--text-dim)", marginBottom: 8 }}>Analysis Code</div>
                   <textarea
+                    aria-label="Analysis code"
                     value={code}
                     onChange={e => setCode(e.target.value)}
                     spellCheck={false}
@@ -344,7 +344,7 @@ export default function DataScreen() {
                     {analyzing ? "Running…" : "Run Analysis"}
                   </button>
                   {analysisError && (
-                    <div style={{ marginTop: 8, padding: "8px 10px", borderRadius: 8, background: "var(--danger-soft)", color: "var(--danger)", fontSize: 12.5 }}>
+                    <div role="alert" style={{ marginTop: 8, padding: "8px 10px", borderRadius: 8, background: "var(--danger-soft)", color: "var(--danger)", fontSize: 12.5 }}>
                       {analysisError}
                     </div>
                   )}
@@ -352,7 +352,7 @@ export default function DataScreen() {
               </div>
 
               {/* Right: results */}
-              <div style={{ flex: 1, overflow: "auto", padding: "12px 16px" }}>
+              <div className="data-workspace-results" style={{ flex: 1, overflow: "auto", padding: "12px 16px" }}>
                 {!analysisResult && !analyzing && (
                   <div style={{ color: "var(--text-dim)", fontSize: 13.5, paddingTop: 20 }}>
                     Run analysis to see charts and tables here.

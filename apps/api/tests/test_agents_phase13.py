@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
+import time
 import uuid
 from unittest.mock import AsyncMock
 
 import httpx
 import pytest
-from sqlalchemy import select
+from sqlalchemy import insert, select
 
 import main
 from core.auth import create_access_token
@@ -17,6 +21,8 @@ async def _make_org_member(role: str = "user") -> tuple[str, str, str]:
     member_id = str(uuid.uuid4())
     orgs = await reflect_table("organizations")
     members = await reflect_table("members")
+    workspaces = await reflect_table("workspaces")
+    workspace_members = await reflect_table("workspace_members")
     async with engine.begin() as conn:
         await conn.execute(orgs.insert().values(id=org_id, slug=f"org-{org_id[:8]}", name="Agent Org"))
         await conn.execute(
@@ -25,6 +31,29 @@ async def _make_org_member(role: str = "user") -> tuple[str, str, str]:
                 organization_id=org_id,
                 email=f"{member_id[:8]}@agents.test",
                 role=role,
+            )
+        )
+        workspace_id = str(uuid.uuid4())
+        await conn.execute(
+            insert(workspaces).values(
+                id=workspace_id,
+                organization_id=org_id,
+                region="us",
+                name="Default workspace",
+                slug="default",
+                legacy_key="default",
+                status="active",
+                created_by=member_id,
+            )
+        )
+        await conn.execute(
+            insert(workspace_members).values(
+                organization_id=org_id,
+                region="us",
+                workspace_id=workspace_id,
+                member_id=member_id,
+                role="owner",
+                added_by=member_id,
             )
         )
     return org_id, member_id, create_access_token(member_id)
@@ -62,8 +91,8 @@ async def _make_project(org_id: str, member_id: str) -> str:
 
 @pytest.mark.asyncio
 async def test_agent_profile_create_attach_project_tool_run_and_tenant_scope(monkeypatch):
-    org_a, member_a, token_a = await _make_org_member()
-    _, _, token_b = await _make_org_member()
+    org_a, member_a, token_a = await _make_org_member(role="manager")
+    _, _, token_b = await _make_org_member(role="manager")
     project_id = await _make_project(org_a, member_a)
 
     monkeypatch.setattr("routers.agents.task_runner.enqueue_task", AsyncMock())
@@ -132,7 +161,7 @@ async def test_agent_profile_create_attach_project_tool_run_and_tenant_scope(mon
 
 @pytest.mark.asyncio
 async def test_agent_command_creates_distinct_assistant_and_clarifies_agent_requirements():
-    _, _, token = await _make_org_member()
+    _, _, token = await _make_org_member(role="manager")
 
     transport = httpx.ASGITransport(app=main.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -173,9 +202,28 @@ async def test_agent_command_creates_distinct_assistant_and_clarifies_agent_requ
 
 @pytest.mark.asyncio
 async def test_agent_publication_external_fixture_creates_audited_chronos_task(monkeypatch):
-    org_id, member_id, token = await _make_org_member()
+    org_id, member_id, token = await _make_org_member(role="admin")
     project_id = await _make_project(org_id, member_id)
     monkeypatch.setattr("routers.agents.task_runner.enqueue_task", AsyncMock())
+    monkeypatch.setattr("routers.agents.settings.slack_signing_secret", "slack-signing-test")
+    monkeypatch.setattr("routers.agents.settings.teams_bot_app_id", "teams-test-app")
+    monkeypatch.setattr("core.agent_publications.vault.store", AsyncMock(return_value="vlt-publication-test"))
+
+    connectors = await reflect_table("connectors")
+    async with engine.begin() as conn:
+        for provider in ("slack", "teams"):
+            await conn.execute(
+                insert(connectors).values(
+                    id=f"{provider}:{org_id}:{member_id}",
+                    organization_id=org_id,
+                    member_id=member_id,
+                    provider=provider,
+                    status="active",
+                    vault_ref=f"vlt-{provider}-test",
+                    scopes=[],
+                    region="us",
+                )
+            )
 
     transport = httpx.ASGITransport(app=main.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -200,13 +248,41 @@ async def test_agent_publication_external_fixture_creates_audited_chronos_task(m
         assert created.status_code == 200, created.text
         agent_id = created.json()["id"]
 
+        slack_binding_response = await client.post(
+            "/agents/publication-bindings",
+            json={
+                "provider": "slack",
+                "connector_id": f"slack:{org_id}:{member_id}",
+                "external_tenant_id": "T-support",
+                "external_channel_id": "C-support",
+                "display_name": "Support",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert slack_binding_response.status_code == 200, slack_binding_response.text
+        slack_binding = slack_binding_response.json()
+
+        teams_binding_response = await client.post(
+            "/agents/publication-bindings",
+            json={
+                "provider": "teams",
+                "connector_id": f"teams:{org_id}:{member_id}",
+                "external_tenant_id": "team-support",
+                "external_channel_id": "channel-support",
+                "display_name": "Support",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert teams_binding_response.status_code == 200, teams_binding_response.text
+        teams_binding = teams_binding_response.json()
+
         published = await client.post(
             f"/agents/{agent_id}/publications",
             json={
                 "target": "slack",
                 "display_name": "Support Triage",
-                "external_channel_id": "C-support",
-                "config": {"reply_mode": "threaded", "allowed_team": "support"},
+                "binding_id": slack_binding["id"],
+                "config": {"reply_mode": "threaded"},
             },
             headers={"Authorization": f"Bearer {token}"},
         )
@@ -216,35 +292,92 @@ async def test_agent_publication_external_fixture_creates_audited_chronos_task(m
         assert publication["status"] == "active"
         assert publication["approval_policy"]["external_replies"] == "require_approval"
 
-        for target in ["teams", "email", "web", "api"]:
+        fixtures = {
+            "teams": {"binding_id": teams_binding["id"]},
+            "email": {"external_channel_id": "support@example.com"},
+            "web": {"config": {"allowed_origins": ["https://example.com"]}},
+            "api": {},
+        }
+        for target, fixture in fixtures.items():
             target_pub = await client.post(
                 f"/agents/{agent_id}/publications",
                 json={
                     "target": target,
                     "display_name": f"Support Triage {target}",
-                    "external_channel_id": f"{target}-fixture",
-                    "config": {"fixture": True},
+                    **fixture,
                 },
                 headers={"Authorization": f"Bearer {token}"},
             )
             assert target_pub.status_code == 200, target_pub.text
             assert target_pub.json()["target"] == target
 
-        inbound = await client.post(
-            f"/agents/publications/{publication['id']}/inbound",
-            json={
-                "external_conversation_id": "slack-thread-1",
-                "external_message_id": "msg-1",
-                "sender": {"id": "U123", "name": "Customer"},
+        slack_payload = {
+            "type": "event_callback",
+            "team_id": "T-support",
+            "event_id": "Ev-support-1",
+            "event": {
+                "type": "message",
+                "channel": "C-support",
+                "thread_ts": "slack-thread-1",
+                "ts": "msg-1",
+                "user": "U123",
                 "text": "Can this agent summarize our refund policy?",
             },
-            headers={"X-Chronos-Agent-Token": publication["inbound_token"]},
+        }
+        raw = json.dumps(slack_payload, separators=(",", ":")).encode()
+        timestamp = str(int(time.time()))
+        signature = "v0=" + hmac.new(
+            b"slack-signing-test", b"v0:" + timestamp.encode() + b":" + raw, hashlib.sha256
+        ).hexdigest()
+        inbound = await client.post(
+            f"/agents/publications/{publication['id']}/slack/events",
+            content=raw,
+            headers={
+                "Content-Type": "application/json",
+                "X-Slack-Request-Timestamp": timestamp,
+                "X-Slack-Signature": signature,
+            },
         )
         assert inbound.status_code == 200, inbound.text
         body = inbound.json()
         assert body["task_id"]
         assert body["agent_id"] == agent_id
         assert body["publication_id"] == publication["id"]
+
+        replay = await client.post(
+            f"/agents/publications/{publication['id']}/slack/events",
+            content=raw,
+            headers={
+                "Content-Type": "application/json",
+                "X-Slack-Request-Timestamp": timestamp,
+                "X-Slack-Signature": signature,
+            },
+        )
+        assert replay.status_code == 200, replay.text
+        assert replay.json() == {
+            "accepted": True,
+            "duplicate": True,
+            "task_id": body["task_id"],
+            "publication_id": publication["id"],
+        }
+
+        wrong_tenant_payload = {**slack_payload, "team_id": "T-other", "event_id": "Ev-other"}
+        wrong_raw = json.dumps(wrong_tenant_payload, separators=(",", ":")).encode()
+        wrong_signature = "v0=" + hmac.new(
+            b"slack-signing-test",
+            b"v0:" + timestamp.encode() + b":" + wrong_raw,
+            hashlib.sha256,
+        ).hexdigest()
+        wrong_tenant = await client.post(
+            f"/agents/publications/{publication['id']}/slack/events",
+            content=wrong_raw,
+            headers={
+                "Content-Type": "application/json",
+                "X-Slack-Request-Timestamp": timestamp,
+                "X-Slack-Signature": wrong_signature,
+            },
+        )
+        assert wrong_tenant.status_code == 403
 
         tasks = await reflect_table("tasks")
         events = await reflect_table("agent_profile_events")
@@ -267,7 +400,7 @@ async def test_agent_publication_external_fixture_creates_audited_chronos_task(m
             ).mappings().all()
 
         assert task is not None
-        assert task["triggered_by"] == f"agent_publication:{publication['id']}"
+        assert task["triggered_by"] == body["conversation_id"]
         assert task["agent_state"]["agent_publication"]["target"] == "slack"
         assert task["agent_state"]["agent_profile"]["approval_policy"]["external_replies"] == "require_approval"
         assert "slack-thread-1" in task["agent_state"]["agent_publication"]["external_conversation_id"]
@@ -275,3 +408,21 @@ async def test_agent_publication_external_fixture_creates_audited_chronos_task(m
             row["event_type"] for row in event_rows
         }
         assert "agent_publication_task_created" in {row["event_type"] for row in audit_rows}
+
+        unpublished = await client.post(
+            f"/agents/publications/{publication['id']}/lifecycle",
+            json={"action": "unpublish"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert unpublished.status_code == 200, unpublished.text
+        assert unpublished.json()["status"] == "disabled"
+        rejected_after_unpublish = await client.post(
+            f"/agents/publications/{publication['id']}/slack/events",
+            content=raw,
+            headers={
+                "Content-Type": "application/json",
+                "X-Slack-Request-Timestamp": timestamp,
+                "X-Slack-Signature": signature,
+            },
+        )
+        assert rejected_after_unpublish.status_code == 404

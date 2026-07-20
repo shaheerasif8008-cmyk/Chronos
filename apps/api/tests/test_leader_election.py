@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 import pytest
@@ -70,3 +71,37 @@ def test_leader_election_rejects_ttl_not_exceeding_poll():
 
     with pytest.raises(ValueError):
         LeaderElection(redis_client, "k", ttl_seconds=5, poll_seconds=5)
+
+
+@pytest.mark.asyncio
+async def test_leader_stop_is_bounded_when_release_callback_stalls(monkeypatch):
+    from core import leader as leader_module
+
+    class FakeRedis:
+        async def set(self, *_args, **_kwargs):
+            return True
+
+        async def eval(self, *_args, **_kwargs):
+            return 1
+
+    release_started = asyncio.Event()
+
+    async def stalled_release():
+        release_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(leader_module, "_STOP_WAIT_SECONDS", 0.01)
+    election = leader_module.LeaderElection(
+        FakeRedis(),
+        "test:bounded-stop",
+        ttl_seconds=5,
+        poll_seconds=1,
+        on_release=stalled_release,
+    )
+    await election.start()
+
+    await asyncio.wait_for(election.stop(), timeout=0.25)
+
+    assert release_started.is_set()
+    assert election._task is None
+    assert election.is_leader is False

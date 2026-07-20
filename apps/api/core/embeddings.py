@@ -37,7 +37,7 @@ async def _openrouter_embedding(text: str) -> dict:
             headers={
                 "Authorization": f"Bearer {settings.openrouter_api_key}",
                 "Content-Type": "application/json",
-                "HTTP-Referer": "http://127.0.0.1:3000",
+                "HTTP-Referer": settings.frontend_base_url.rstrip("/"),
                 "X-Title": "Chronos",
             },
             json={"model": model, "input": text, "dimensions": settings.embedding_dimensions},

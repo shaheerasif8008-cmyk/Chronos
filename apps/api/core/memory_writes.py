@@ -1,16 +1,24 @@
 from __future__ import annotations
-from datetime import datetime, timezone
 
-from sqlalchemy import delete, insert, select, update
+from sqlalchemy import insert, select, text, update
 from sqlalchemy.sql import func
 
 from core import audit
 from core.config import settings
 from core.db import engine, reflect_table
 from core.embeddings import embed
+from core.memory_access import (
+    get_memory_for_member,
+    memory_access_condition,
+    normalize_entry_scope,
+)
 from core.models import Member, RequesterContext
 
 EXPECTED_EMBEDDING_DIMENSIONS = 1536
+
+
+class MemoryCaptureDisabled(PermissionError):
+    """Raised when the canonical memory privacy policy blocks a write."""
 
 
 def vector_literal(vector: list[float]) -> str:
@@ -61,6 +69,53 @@ async def create_memory_entry(
     conversation_id: str | None = None,
     created_by: str | None = None,
 ) -> str:
+    from core.memory_control import is_memory_enabled
+
+    # Keep the authorization boundary at the durable write primitive. API
+    # routes validate for friendly errors, but jobs and future callers cannot
+    # bypass shared-scope ownership merely by calling this helper directly.
+    writer = Member(
+        id=requester_context.member_id,
+        organization_id=requester_context.org_id,
+        email="memory-writer@chronos.invalid",
+        role=requester_context.role,
+    )
+    scope, canonical_scope_id = await normalize_entry_scope(
+        writer, scope, scope_id
+    )
+    scope_id = canonical_scope_id
+
+    effective_project_id = (
+        str(scope_id)
+        if scope == "project" and scope_id is not None
+        else requester_context.project_id
+    )
+    effective_conversation_id = (
+        str(scope_id)
+        if scope == "conversation" and scope_id is not None
+        else conversation_id or requester_context.conversation_id
+    )
+    if not await is_memory_enabled(
+        org_id=requester_context.org_id,
+        project_id=effective_project_id,
+        member_id=requester_context.member_id,
+        conversation_id=effective_conversation_id,
+    ):
+        await audit.log(
+            "memory_write_blocked",
+            requester_context.member_id,
+            f"memory.{source}",
+            organization_id=requester_context.org_id,
+            resource_type="memory",
+            payload={
+                "scope": scope,
+                "project_id": effective_project_id,
+                "conversation_id": effective_conversation_id,
+            },
+            decision="memory_disabled",
+        )
+        raise MemoryCaptureDisabled("Memory is disabled for this context")
+
     embedding = await embedding_literal_for_memory(
         content,
         actor_id=requester_context.member_id,
@@ -75,7 +130,7 @@ async def create_memory_entry(
                 organization_id=requester_context.org_id,
                 region=settings.region,
                 scope=scope,
-                scope_id=scope_id or requester_context.org_id,
+                scope_id=scope_id,
                 content=content,
                 embedding=embedding,
                 source=source,
@@ -100,6 +155,7 @@ async def create_memory_entry(
 
 async def list_memory_records(member: Member, *, limit: int = 50, offset: int = 0) -> list[dict]:
     memory_entries = await reflect_table("memory_entries")
+    visible = await memory_access_condition(memory_entries, member)
     async with engine.begin() as conn:
         rows = (
             await conn.execute(
@@ -117,6 +173,7 @@ async def list_memory_records(member: Member, *, limit: int = 50, offset: int = 
                 .where(
                     memory_entries.c.organization_id == member.organization_id,
                     memory_entries.c.is_deleted.is_(False),
+                    visible,
                 )
                 .order_by(memory_entries.c.created_at.desc())
                 .limit(limit)
@@ -127,6 +184,9 @@ async def list_memory_records(member: Member, *, limit: int = 50, offset: int = 
 
 
 async def update_memory_entry(memory_id: str, content: str, member: Member, *, importance_score: float | None = None) -> bool:
+    memory = await get_memory_for_member(memory_id, member, mutate=True)
+    if memory is None:
+        return False
     embedding = await embedding_literal_for_memory(
         content,
         actor_id=member.id,
@@ -143,6 +203,8 @@ async def update_memory_entry(memory_id: str, content: str, member: Member, *, i
             .where(
                 memory_entries.c.id == memory_id,
                 memory_entries.c.organization_id == member.organization_id,
+                memory_entries.c.scope == memory["scope"],
+                memory_entries.c.scope_id == memory["scope_id"],
                 memory_entries.c.is_deleted.is_(False),
             )
             .values(**values)
@@ -152,6 +214,9 @@ async def update_memory_entry(memory_id: str, content: str, member: Member, *, i
 
 
 async def soft_delete_memory_entry(memory_id: str, member: Member) -> bool:
+    memory = await get_memory_for_member(memory_id, member, mutate=True)
+    if memory is None:
+        return False
     memory_entries = await reflect_table("memory_entries")
     async with engine.begin() as conn:
         result = await conn.execute(
@@ -159,6 +224,8 @@ async def soft_delete_memory_entry(memory_id: str, member: Member) -> bool:
             .where(
                 memory_entries.c.id == memory_id,
                 memory_entries.c.organization_id == member.organization_id,
+                memory_entries.c.scope == memory["scope"],
+                memory_entries.c.scope_id == memory["scope_id"],
                 memory_entries.c.is_deleted.is_(False),
             )
             .values(is_deleted=True, updated_at=func.now())
@@ -168,31 +235,17 @@ async def soft_delete_memory_entry(memory_id: str, member: Member) -> bool:
 
 
 async def replace_synthesized_memory_entry(*, org_id: str, content: str, embedding: str | None) -> str:
-    memory_entries = await reflect_table("memory_entries")
-    async with engine.begin() as conn:
-        await conn.execute(
-            delete(memory_entries).where(
-                memory_entries.c.organization_id == org_id,
-                memory_entries.c.scope == "org",
-                memory_entries.c.source == "synthesized",
-            )
-        )
-        result = await conn.execute(
-            insert(memory_entries)
-            .values(
-                organization_id=org_id,
-                region=settings.region,
-                scope="org",
-                scope_id=org_id,
-                content=content,
-                embedding=embedding,
-                source="synthesized",
-                importance_score=0.9,
-                created_by="chronos",
-            )
-            .returning(memory_entries.c.id)
-        )
-        return str(result.scalar_one())
+    """Reject the retired direct-to-organization synthesis path.
+
+    Organization context derived by a model must be staged through the pending
+    context-suggestion workflow and explicitly approved. Keeping this guard at
+    the old persistence seam prevents a future caller from silently restoring
+    the pre-review behavior.
+    """
+    del org_id, content, embedding
+    raise RuntimeError(
+        "direct synthesized organization memory is disabled; create a reviewed context suggestion"
+    )
 
 
 def extract_explicit_memory_content(message: str) -> str | None:
@@ -213,44 +266,33 @@ def extract_explicit_memory_content(message: str) -> str | None:
 
 
 async def undo_autonomous_memory(memory_id: str, member: Member) -> bool:
+    memory = await get_memory_for_member(memory_id, member, mutate=True)
+    if memory is None:
+        return False
     memory_entries = await reflect_table("memory_entries")
     async with engine.begin() as conn:
         row = (
             await conn.execute(
                 select(
                     memory_entries.c.id,
-                    memory_entries.c.created_at,
                 ).where(
                     memory_entries.c.id == memory_id,
                     memory_entries.c.organization_id == member.organization_id,
+                    memory_entries.c.scope == memory["scope"],
+                    memory_entries.c.scope_id == memory["scope_id"],
                     memory_entries.c.source == "autonomous",
                     memory_entries.c.is_deleted.is_(False),
+                    memory_entries.c.created_at
+                    >= func.now() - text("INTERVAL '60 seconds'"),
                 )
             )
         ).mappings().first()
         if row is None:
             return False
 
-        created_at = row["created_at"]
-        if created_at.tzinfo is None:
-            created_at = created_at.replace(tzinfo=timezone.utc)
-        age_seconds = (datetime.now(timezone.utc) - created_at).total_seconds()
-        if age_seconds > 60:
-            return False
+    from core import retention
 
-        result = await conn.execute(
-            update(memory_entries)
-            .where(
-                memory_entries.c.id == memory_id,
-                memory_entries.c.organization_id == member.organization_id,
-                memory_entries.c.source == "autonomous",
-                memory_entries.c.is_deleted.is_(False),
-            )
-            .values(is_deleted=True)
-            .returning(memory_entries.c.id)
-        )
-        undone = result.scalar_one_or_none()
-    if undone is None:
+    if not await retention.soft_delete_memory_if_allowed(memory_id, member):
         return False
     await audit.log(
         "memory_undo",

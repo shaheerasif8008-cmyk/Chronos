@@ -6,14 +6,22 @@ import io
 import json
 import uuid as _uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import func, select, update
 
-from core import audit, billing, invitations, notification_delivery, permissions
+from core import (
+    audit,
+    billing,
+    invitations,
+    notification_delivery,
+    permissions,
+    retention,
+    runtime_health,
+)
 from core.plans import get_entitlements
 from core.auth import get_current_member
 from core.connector_health import check_connectors
@@ -23,9 +31,12 @@ from core.models import Member
 from core.memory_control import export_memories
 from core.settings_store import (
     ADMIN_ROLES,
+    AI_EMPLOYEE_SETTING_KEYS,
     AUTONOMY_LEVELS,
     DEFAULTS,
+    MEMORY_SETTING_KEYS,
     ROLE_ORDER,
+    RUNTIME_SETTING_KEYS,
     get_settings_doc,
     require_admin,
     save_settings_doc,
@@ -72,6 +83,17 @@ class MemoryPurgeRequest(BaseModel):
     confirmation: str
 
 
+class RetentionRunRequest(BaseModel):
+    dry_run: bool = True
+    confirmation: str | None = None
+
+
+class RetentionHoldCreate(BaseModel):
+    resource_type: Literal["organization", "memory", "artifact", "workspace"]
+    resource_id: str = Field(min_length=1, max_length=200)
+    reason: str = Field(min_length=5, max_length=2000)
+
+
 async def _safe_token_usage_summary(org_id: str) -> dict[str, Any]:
     try:
         return await token_usage_summary(org_id)
@@ -91,15 +113,98 @@ def _validate_section(section: str, values: dict[str, Any]) -> None:
             raise HTTPException(status_code=400, detail="Invalid default landing page")
         if values.get("theme") and values["theme"] not in {"light", "dark", "system"}:
             raise HTTPException(status_code=400, detail="Invalid theme")
+        if values.get("accent") and values["accent"] not in {"coral", "forest", "indigo", "slate"}:
+            raise HTTPException(status_code=400, detail="Invalid accent color")
     if section == "profile":
         if values.get("preferred_response_length") and values["preferred_response_length"] not in {"short", "medium", "long"}:
             raise HTTPException(status_code=400, detail="Invalid response length")
+    if section == "notifications":
+        allowed = {
+            "email",
+            "slack",
+            "teams",
+            "in_app",
+            "desktop",
+            "runtime_failure_alerts",
+            "approval_request_alerts",
+            "task_completion_alerts",
+            "weekly_digest",
+            "security_alerts",
+        }
+        unsupported = set(values) - allowed
+        if unsupported:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported notification settings: {', '.join(sorted(unsupported))}",
+            )
+        if any(not isinstance(value, bool) for value in values.values()):
+            raise HTTPException(
+                status_code=400, detail="Notification settings must be boolean"
+            )
     if section == "runtime":
-        if int(values.get("max_task_queue_size", 1)) < 1:
+        unsupported = set(values) - RUNTIME_SETTING_KEYS
+        if unsupported:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported runtime settings: {', '.join(sorted(unsupported))}",
+            )
+        try:
+            queue_size = int(values.get("max_task_queue_size", 1))
+            token_budget = int(values.get("token_budget_daily", 0))
+            cost_budget = float(values.get("cost_budget_daily_usd", 0))
+            request_rate = int(values.get("request_rate_per_minute", 0))
+            connector_rate = int(values.get("connector_rate_per_minute", 0))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Runtime limits must be numeric")
+        if queue_size < 1:
             raise HTTPException(status_code=400, detail="Task queue size must be positive")
+        if min(token_budget, cost_budget, request_rate, connector_rate) < 0:
+            raise HTTPException(status_code=400, detail="Runtime limits cannot be negative")
+    if section == "memory":
+        unsupported = set(values) - MEMORY_SETTING_KEYS
+        if unsupported:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported memory settings: {', '.join(sorted(unsupported))}",
+            )
+        if "retention_enabled" in values and not isinstance(
+            values["retention_enabled"], bool
+        ):
+            raise HTTPException(
+                status_code=400, detail="retention_enabled must be a boolean"
+            )
+        for key in (
+            "retention_days",
+            "deleted_retention_days",
+            "deleted_artifact_retention_days",
+        ):
+            if key not in values:
+                continue
+            try:
+                days = int(values[key])
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail=f"{key} must be a number")
+            if not 1 <= days <= 3650:
+                raise HTTPException(
+                    status_code=400, detail=f"{key} must be between 1 and 3650 days"
+                )
     if section == "ai_employee":
-        if int(values.get("max_sub_agent_depth", 1)) > 3 and not values.get("sub_agent_spawning"):
-            raise HTTPException(status_code=400, detail="Sub-agent depth above 3 requires spawning to be enabled")
+        unsupported = set(values) - AI_EMPLOYEE_SETTING_KEYS
+        if unsupported:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported AI employee settings: {', '.join(sorted(unsupported))}",
+            )
+        try:
+            max_runtimes = int(values.get("max_concurrent_runtimes", 1))
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400, detail="Max concurrent runtimes must be numeric"
+            )
+        if max_runtimes < 1:
+            raise HTTPException(
+                status_code=400, detail="Max concurrent runtimes must be positive"
+            )
 
 
 async def _current_org(member: Member) -> dict[str, Any]:
@@ -110,8 +215,25 @@ async def _current_org(member: Member) -> dict[str, Any]:
             await conn.execute(select(organizations).where(organizations.c.id == member.organization_id))
         ).mappings().first()
         member_count = (
-            await conn.execute(select(func.count()).select_from(members).where(members.c.organization_id == member.organization_id))
+            await conn.execute(
+                select(func.count()).select_from(members).where(
+                    members.c.organization_id == member.organization_id,
+                    members.c.status == "active",
+                )
+            )
         ).scalar_one()
+        owner = (
+            await conn.execute(
+                select(members.c.name, members.c.email)
+                .where(
+                    members.c.organization_id == member.organization_id,
+                    members.c.role == "owner",
+                    members.c.status == "active",
+                )
+                .order_by(members.c.created_at.asc())
+                .limit(1)
+            )
+        ).mappings().first()
     data = dict(org or {})
     org_settings = await get_settings_doc(member, "organization")
     return {
@@ -122,7 +244,7 @@ async def _current_org(member: Member) -> dict[str, Any]:
         "logo": org_settings.get("logo", ""),
         "plan": org_settings.get("plan") or data.get("plan", "trial"),
         "seats": member_count,
-        "owner": "Owner/Admin",
+        "owner": (owner.get("name") or owner.get("email")) if owner else None,
         "can_edit": member.role in ADMIN_ROLES,
         "default_workspace_creation": org_settings.get("default_workspace_creation", "admins"),
     }
@@ -133,7 +255,10 @@ async def _members(member: Member) -> list[dict[str, Any]]:
     async with engine.begin() as conn:
         rows = (
             await conn.execute(
-                select(members).where(members.c.organization_id == member.organization_id).order_by(members.c.created_at.asc())
+                select(members).where(
+                    members.c.organization_id == member.organization_id,
+                    *([] if member.role in ADMIN_ROLES else [members.c.id == member.id]),
+                ).order_by(members.c.created_at.asc())
             )
         ).mappings().all()
     return [
@@ -142,7 +267,7 @@ async def _members(member: Member) -> list[dict[str, Any]]:
             "name": row.get("name") or row["email"],
             "email": row["email"],
             "role": row["role"],
-            "status": "active",
+            "status": row.get("status", "active"),
             "created_at": str(row["created_at"]) if row.get("created_at") else None,
             "is_self": row["id"] == member.id,
         }
@@ -151,11 +276,20 @@ async def _members(member: Member) -> list[dict[str, Any]]:
 
 
 async def _connectors(member: Member) -> list[dict[str, Any]]:
+    from core.connector_tools import member_connector_clause
+
     connectors = await reflect_table("connectors")
     tool_settings = await get_settings_doc(member, "tool_settings")
     async with engine.begin() as conn:
         rows = (
-            await conn.execute(select(connectors).where(connectors.c.organization_id == member.organization_id))
+            await conn.execute(
+                select(connectors).where(
+                    connectors.c.organization_id == member.organization_id,
+                    member_connector_clause(
+                        connectors, str(member.organization_id), str(member.id)
+                    ),
+                )
+            )
         ).mappings().all()
     return [
         {
@@ -197,29 +331,53 @@ async def _memory_stats(member: Member) -> dict[str, Any]:
 @router.get("/")
 async def overview(member: Member = Depends(get_current_member)) -> dict[str, Any]:
     await permissions.check(member, "read_settings", member.organization_id)
+    is_admin = member.role in ADMIN_ROLES
+    section_names = [
+        "general",
+        "profile",
+        "notifications",
+        "response_format",
+    ]
+    if is_admin:
+        section_names.extend(
+            [
+                "permissions",
+                "ai_employee",
+                "runtime",
+                "memory",
+                "tool_settings",
+                "approval",
+                "developer",
+            ]
+        )
     sections = {
         name: await get_settings_doc(member, name)
-        for name in [
-            "general",
-            "profile",
-            "permissions",
-            "ai_employee",
-            "runtime",
-            "memory",
-            "tool_settings",
-            "approval",
-            "notifications",
-            "developer",
-            "response_format",
-        ]
+        for name in section_names
     }
+    # UI preferences are user-scoped even though workspace defaults live in
+    # the organization-scoped general document.
+    sections["general"].update(sections["profile"].get("ui_preferences") or {})
     sections["profile"]["email"] = member.email
     sections["profile"]["role"] = member.role
     sections["profile"]["display_name"] = sections["profile"].get("display_name") or member.name or ""
     org = await _current_org(member)
-    sections["organization"] = {**DEFAULTS["organization"], **org}
+    if is_admin:
+        sections["organization"] = {**DEFAULTS["organization"], **org}
+    else:
+        # A normal member needs workspace identity and plan context, but must
+        # not receive another member's identity, seat counts, verified domain,
+        # logo configuration, or administrative creation policy.
+        org = {
+            key: org[key]
+            for key in ("id", "name", "slug", "plan", "can_edit")
+            if key in org
+        }
     try:
-        usage = await usage_summary(member.organization_id)
+        usage = await usage_summary(member.organization_id) if is_admin else {
+            "tokens": {"metered": False},
+            "cost": {"metered": False},
+            "suspended": False,
+        }
     except Exception:
         usage = {
             "tokens": await _safe_token_usage_summary(member.organization_id),
@@ -229,35 +387,106 @@ async def overview(member: Member = Depends(get_current_member)) -> dict[str, An
     else:
         # Preserve the old token-summary seam so existing tests and callers that
         # patch it still control the token portion of the overview.
-        usage["tokens"] = await _safe_token_usage_summary(member.organization_id)
+        if is_admin:
+            usage["tokens"] = await _safe_token_usage_summary(member.organization_id)
     return {
         "member": {"id": member.id, "email": member.email, "name": member.name, "role": member.role, "can_admin": member.role in ADMIN_ROLES},
         "organization": org,
         "sections": sections,
         "members": await _members(member),
         "connectors": await _connectors(member),
-        "memory_stats": await _memory_stats(member),
+        "memory_stats": await _memory_stats(member) if is_admin else {"active": 0, "deleted": 0},
         "usage": usage,
         "runtime_health": {
-            "status": "ok",
-            "mode": sections["runtime"]["runtime_mode"],
+            # Reaching this authenticated overview proves the API is online; it
+            # does not prove every worker/provider is healthy. Connector checks
+            # below carry their own verified/configured/error states.
+            "status": "api_online",
+            "environment": settings.environment,
+            "execution_mode": "platform_managed",
+            "isolation": (
+                "container" if settings.is_production else "local_process"
+            ),
+            "task_lease_heartbeat_seconds": settings.task_lease_heartbeat_seconds,
+            "task_lease_ttl_seconds": settings.task_lease_ttl_seconds,
+            "recovery_policy": "automatic_resume",
+            "log_retention": "deployment_managed",
             "incomplete_task_recovery": "enabled",
-            "connectors": await check_connectors(),
+            "connectors": await check_connectors() if is_admin else {},
         },
         "capabilities": {
             "email_edit": _unsupported("OTP auth does not support email changes."),
             "profile_photo_upload": _unsupported("No file upload service is configured."),
-            "invitations": {"supported": True, "delivery": "manual_token"},
+            "invitations": ({
+                "supported": True,
+                "delivery": (
+                    "email" if notification_delivery.email_is_configured() else "manual_link"
+                ),
+            } if is_admin else _unsupported("Admin role required.")),
             "sessions": _unsupported("JWT sessions are stateless and not persisted."),
             "password": _unsupported("OTP auth has no password credential."),
             "two_factor": _unsupported("OTP login is the configured second factor."),
-            "api_keys": _unsupported("API key authentication is not implemented."),
+            "api_keys": ({"supported": True, "delivery": "one_time_plaintext"} if is_admin else _unsupported("Admin role required.")),
             "billing": ({"supported": True} if billing.is_configured() else _unsupported("No billing provider is configured.")),
-            "webhooks": _unsupported("Webhook dispatcher is not implemented."),
+            "webhooks": ({
+                "supported": True,
+                "delivery": "timestamped_hmac",
+                "max_payload_bytes": 1_048_576,
+                "public_base_url": settings.oauth_callback_base_url.rstrip("/"),
+            } if is_admin else _unsupported("Admin role required.")),
             "notification_email_dispatch": ({"supported": True} if notification_delivery.email_is_configured() else _unsupported("Email notification delivery service is not configured.")),
-            "delete_workspace": _unsupported("Workspace deletion has no archival workflow yet."),
-            "transfer_ownership": _unsupported("Ownership transfer is not implemented."),
+            "delete_workspace": ({"supported": True, "delivery": "retention_delayed_tombstone"} if is_admin else _unsupported("Admin role required.")),
+            "transfer_ownership": ({"supported": True} if member.role == "owner" else _unsupported("Organization owner role required.")),
         },
+    }
+
+
+@router.get("/member-directory")
+async def member_directory(
+    member: Member = Depends(get_current_member),
+) -> dict[str, list[dict[str, str | None]]]:
+    """Return the minimal teammate directory needed by collaboration controls.
+
+    Sharing and task handoff APIs accept immutable member ids. Ordinary members
+    therefore need a safe way to resolve a teammate's visible identity without
+    receiving administrative account metadata, invitation state, auth ids, or
+    inactive/foreign-tenant records.
+    """
+
+    await permissions.check(
+        member, "list_collaboration_members", member.organization_id
+    )
+    members = await reflect_table("members")
+    async with engine.begin() as conn:
+        rows = (
+            await conn.execute(
+                select(
+                    members.c.id,
+                    members.c.name,
+                    members.c.email,
+                    members.c.role,
+                )
+                .where(
+                    members.c.organization_id == member.organization_id,
+                    members.c.status == "active",
+                )
+                .order_by(
+                    func.lower(func.coalesce(members.c.name, members.c.email)),
+                    func.lower(members.c.email),
+                    members.c.id,
+                )
+            )
+        ).mappings().all()
+    return {
+        "members": [
+            {
+                "id": str(row["id"]),
+                "name": row.get("name") or row["email"],
+                "email": str(row["email"]),
+                "role": str(row["role"]),
+            }
+            for row in rows
+        ]
     }
 
 
@@ -271,9 +500,125 @@ async def get_onboarding(member: Member = Depends(get_current_member)) -> dict:
     return {"state": state or "new"}
 
 
+@router.get("/onboarding/guide")
+async def get_onboarding_guide(
+    member: Member = Depends(get_current_member),
+) -> dict[str, Any]:
+    """Return server-derived progress for the first successful client workflow.
+
+    The guide is advisory and never weakens runtime readiness. Completion is
+    derived from durable tenant records, so refreshes and different browsers
+    show the same truthful state instead of a local-only tour.
+    """
+    await permissions.check(member, "read_settings", member.organization_id)
+    connectors = await reflect_table("connectors")
+    projects = await reflect_table("projects")
+    project_sources = await reflect_table("project_sources")
+    research_runs = await reflect_table("research_runs")
+    approvals = await reflect_table("approvals")
+    scheduled_tasks = await reflect_table("scheduled_tasks")
+
+    async with engine.begin() as conn:
+        async def count(table, *conditions) -> int:
+            return int(
+                (
+                    await conn.execute(
+                        select(func.count()).select_from(table).where(
+                            table.c.organization_id == member.organization_id,
+                            *conditions,
+                        )
+                    )
+                ).scalar_one()
+            )
+
+        counts = {
+            "connector": await count(connectors, connectors.c.status == "active"),
+            "project": await count(projects),
+            "source": await count(project_sources),
+            "research": await count(research_runs),
+            "approval": await count(approvals, approvals.c.decided_at.is_not(None)),
+            "schedule": await count(scheduled_tasks),
+        }
+
+    definitions = [
+        ("connector", "Connect a work account", "Authorize one provider with the least scopes needed.", "/connectors?onboarding=connector"),
+        ("project", "Create a project", "Set the goal, visibility, instructions, and tool defaults.", "/projects?onboarding=project"),
+        ("source", "Add a trusted source", "Upload or sync source material into that project.", "/projects?onboarding=source"),
+        ("research", "Run the first research task", "Produce a cited result grounded in the project sources.", "/research?onboarding=research"),
+        ("approval", "Review a sensitive action", "Approve or reject one governed external action.", "/approvals?onboarding=approval"),
+        ("schedule", "Create a scheduled task", "Set a recurring workflow and verify its next run.", "/workflows?onboarding=schedule"),
+    ]
+    steps = [
+        {
+            "id": step_id,
+            "label": label,
+            "description": description,
+            "href": href,
+            "complete": counts[step_id] > 0,
+            "evidence_count": counts[step_id],
+        }
+        for step_id, label, description, href in definitions
+    ]
+    complete = sum(1 for step in steps if step["complete"])
+    return {"complete": complete, "total": len(steps), "steps": steps}
+
+
+@router.get("/runtime-health")
+async def get_runtime_health(
+    refresh: bool = Query(False),
+    member: Member = Depends(get_current_member),
+) -> dict[str, Any]:
+    """Return authenticated, redacted platform readiness for this workspace.
+
+    Every member can see whether required services are available so an optional
+    provider outage never masquerades as a broken workspace. Only admins can
+    force external credential verification or receive remediation instructions.
+    """
+
+    await permissions.check(member, "read_settings", member.organization_id)
+    is_admin = member.role in ADMIN_ROLES
+    if refresh and not is_admin:
+        raise HTTPException(
+            status_code=403,
+            detail="Only organization administrators can refresh provider verification.",
+        )
+    report = await runtime_health.build_runtime_health_report(
+        can_admin=is_admin,
+        refresh_providers=refresh,
+    )
+    if refresh:
+        await audit.log(
+            "runtime_health_refreshed",
+            member.id,
+            "settings.runtime_health",
+            organization_id=member.organization_id,
+            resource_type="organization",
+            resource_id=member.organization_id,
+            payload={"status": report["status"]},
+        )
+    return report
+
+
 @router.post("/onboarding/complete")
 async def complete_onboarding(member: Member = Depends(get_current_member)) -> dict:
     require_admin(member)
+    readiness = await runtime_health.build_runtime_health_report(
+        can_admin=True,
+        refresh_providers=True,
+    )
+    if not readiness["can_complete_onboarding"]:
+        labels = ", ".join(item["label"] for item in readiness["blockers"])
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": (
+                    "Required runtime services are not ready. Resolve the listed "
+                    f"blockers and check again: {labels}."
+                ),
+                "code": "runtime_not_ready",
+                "blockers": readiness["blockers"],
+            },
+        )
     organizations = await reflect_table("organizations")
     async with engine.begin() as conn:
         await conn.execute(update(organizations).where(
@@ -337,6 +682,23 @@ async def update_section(section: str, req: SettingsPatch, member: Member = Depe
         raise HTTPException(status_code=404, detail="Unknown settings section")
     if section in ADMIN_SECTIONS:
         require_admin(member)
+    if section == "general" and member.role not in ADMIN_ROLES:
+        personal_keys = {
+            "theme",
+            "language",
+            "time_zone",
+            "date_time_format",
+            "default_landing_page",
+            "accent",
+        }
+        personal = {key: value for key, value in req.values.items() if key in personal_keys}
+        _validate_section(section, personal)
+        profile = await save_settings_doc(
+            member, "profile", {"ui_preferences": personal}, scope="user", scope_id=member.id
+        )
+        general = await get_settings_doc(member, "general")
+        general.update(profile.get("ui_preferences") or {})
+        return {"section": section, "values": general}
     _validate_section(section, req.values)
     saved = await save_settings_doc(member, section, req.values)
     return {"section": section, "values": saved}
@@ -385,22 +747,37 @@ async def update_member_role(member_id: str, req: MemberRolePatch, member: Membe
     async with engine.begin() as conn:
         target = (
             await conn.execute(
-                select(members).where(members.c.id == member_id, members.c.organization_id == member.organization_id)
+                select(members).where(
+                    members.c.id == member_id,
+                    members.c.organization_id == member.organization_id,
+                ).with_for_update()
             )
         ).mappings().first()
         if not target:
             raise HTTPException(status_code=404, detail="Member not found")
+        if req.role == "owner" and target["role"] != "owner":
+            raise HTTPException(
+                status_code=409,
+                detail="Use the confirmation-protected ownership transfer action",
+            )
         owner_count = (
             await conn.execute(
                 select(func.count()).select_from(members).where(
                     members.c.organization_id == member.organization_id,
-                    members.c.role.in_(["owner", "admin"]),
+                    members.c.role == "owner",
+                    members.c.status == "active",
                 )
             )
         ).scalar_one()
-        if target["role"] in ADMIN_ROLES and req.role not in ADMIN_ROLES and owner_count <= 1:
-            raise HTTPException(status_code=400, detail="Cannot demote the last owner/admin")
+        if target["role"] == "owner" and req.role != "owner":
+            if member.role != "owner":
+                raise HTTPException(status_code=403, detail="Only an owner can change another owner's role")
+            if owner_count <= 1:
+                raise HTTPException(status_code=409, detail="Cannot demote the last organization owner")
         await conn.execute(update(members).where(members.c.id == member_id).values(role=req.role))
+    await permissions.sync_org_membership(
+        member_id, member.organization_id, role=req.role, active=True
+    )
     await audit.log("settings_change", member.id, "settings.members.role_update", organization_id=member.organization_id, resource_type="members", resource_id=member_id, payload={"role": req.role})
     return {"id": member_id, "role": req.role}
 
@@ -483,10 +860,15 @@ async def deactivate_member(member_id: str, member: Member = Depends(get_current
     if member_id == member.id:
         raise HTTPException(status_code=400, detail="Cannot remove your own account")
     members = await reflect_table("members")
+    api_keys = await reflect_table("organization_api_keys")
     async with engine.begin() as conn:
         target = (
             await conn.execute(
-                select(members).where(members.c.id == member_id, members.c.organization_id == member.organization_id)
+                select(members).where(
+                    members.c.id == member_id,
+                    members.c.organization_id == member.organization_id,
+                    members.c.status == "active",
+                ).with_for_update()
             )
         ).mappings().first()
         if not target:
@@ -495,15 +877,38 @@ async def deactivate_member(member_id: str, member: Member = Depends(get_current
             await conn.execute(
                 select(func.count()).select_from(members).where(
                     members.c.organization_id == member.organization_id,
-                    members.c.role.in_(["owner", "admin"]),
+                    members.c.role == "owner",
+                    members.c.status == "active",
                 )
             )
         ).scalar_one()
-        if target["role"] in ADMIN_ROLES and owner_count <= 1:
-            raise HTTPException(status_code=400, detail="Cannot remove the last owner/admin")
-        await conn.execute(delete(members).where(members.c.id == member_id))
+        if target["role"] == "owner":
+            if member.role != "owner":
+                raise HTTPException(status_code=403, detail="Only an owner can deactivate another owner")
+            if owner_count <= 1:
+                raise HTTPException(status_code=409, detail="Cannot deactivate the last organization owner")
+        await conn.execute(
+            update(members).where(members.c.id == member_id).values(status="deactivated")
+        )
+        await conn.execute(
+            update(api_keys)
+            .where(
+                api_keys.c.organization_id == member.organization_id,
+                api_keys.c.created_by_member_id == member_id,
+                api_keys.c.status == "active",
+            )
+            .values(
+                status="revoked",
+                revoked_at=func.now(),
+                revoked_by=member.id,
+                updated_at=func.now(),
+            )
+        )
+    await permissions.sync_org_membership(
+        member_id, member.organization_id, role=str(target["role"]), active=False
+    )
     await audit.log("settings_change", member.id, "settings.members.remove", organization_id=member.organization_id, resource_type="members", resource_id=member_id)
-    return {"id": member_id, "removed": True}
+    return {"id": member_id, "removed": True, "status": "deactivated"}
 
 
 @router.post("/memory/purge")
@@ -511,21 +916,93 @@ async def purge_memory(req: MemoryPurgeRequest, member: Member = Depends(get_cur
     require_admin(member)
     if req.confirmation != "PURGE MEMORY":
         raise HTTPException(status_code=400, detail='Type "PURGE MEMORY" to confirm')
-    memory_entries = await reflect_table("memory_entries")
-    async with engine.begin() as conn:
-        result = await conn.execute(
-            update(memory_entries)
-            .where(memory_entries.c.organization_id == member.organization_id, memory_entries.c.is_deleted.is_(False))
-            .values(is_deleted=True, updated_at=func.now())
+    return await retention.soft_delete_all_memory(
+        member.organization_id, actor_id=member.id
+    )
+
+
+@router.get("/retention/holds")
+async def get_retention_holds(
+    active_only: bool = Query(True),
+    member: Member = Depends(get_current_member),
+) -> dict[str, Any]:
+    require_admin(member)
+    return {
+        "holds": await retention.list_holds(
+            member.organization_id, active_only=active_only
         )
-    await audit.log("settings_change", member.id, "settings.memory.purge", organization_id=member.organization_id, resource_type="memory", payload={"deleted": result.rowcount}, decision="confirmed")
-    return {"deleted": result.rowcount}
+    }
+
+
+@router.post("/retention/holds")
+async def add_retention_hold(
+    req: RetentionHoldCreate,
+    member: Member = Depends(get_current_member),
+) -> dict[str, Any]:
+    require_admin(member)
+    resource_id = req.resource_id.strip()
+    reason = req.reason.strip()
+    if len(reason) < 5:
+        raise HTTPException(
+            status_code=400, detail="Retention hold reason must be at least 5 characters"
+        )
+    try:
+        return await retention.create_hold(
+            org_id=member.organization_id,
+            region=member.region,
+            resource_type=req.resource_type,
+            resource_id=resource_id,
+            reason=reason,
+            actor_id=member.id,
+        )
+    except retention.RetentionResourceNotFound:
+        # Non-enumerating across tenants: a foreign id and a missing id are the
+        # same response.
+        raise HTTPException(
+            status_code=404, detail="Retention resource not found"
+        ) from None
+
+
+@router.delete("/retention/holds/{hold_id}")
+async def remove_retention_hold(
+    hold_id: str,
+    member: Member = Depends(get_current_member),
+) -> dict[str, Any]:
+    require_admin(member)
+    if not await retention.release_hold(member.organization_id, hold_id, member.id):
+        raise HTTPException(status_code=404, detail="Active retention hold not found")
+    return {"id": hold_id, "released": True}
+
+
+@router.post("/retention/run")
+async def run_retention_now(
+    req: RetentionRunRequest,
+    member: Member = Depends(get_current_member),
+) -> dict[str, Any]:
+    require_admin(member)
+    if not req.dry_run and req.confirmation != "RUN RETENTION":
+        raise HTTPException(
+            status_code=400,
+            detail='Type "RUN RETENTION" to execute irreversible retention',
+        )
+    return await retention.run_retention(
+        member.organization_id,
+        dry_run=req.dry_run,
+        actor_id=member.id,
+    )
 
 
 @router.get("/memory/export.json")
 async def export_memory(member: Member = Depends(get_current_member)) -> JSONResponse:
     require_admin(member)
-    items = await export_memories(member)
+    # This is explicitly an organization export. Never include the requesting
+    # admin's personal/restricted memories (or private project memories) merely
+    # because they are otherwise visible in that member's control center.
+    items = [
+        item
+        for item in await export_memories(member)
+        if item.get("scope") == "org" and item.get("scope_id") == member.organization_id
+    ]
     return JSONResponse(
         {
             "format": "json",
@@ -634,6 +1111,13 @@ def _audit_json_default(value: Any) -> str:
     return str(value)
 
 
+def _redacted_audit_row(row: Any) -> dict[str, Any]:
+    """Redact both current and historical rows at the export boundary."""
+    from core.audit_redaction import redact
+
+    return redact(dict(row))
+
+
 @router.get("/audit/export")
 async def export_audit(
     format: str = Query(default="csv", pattern="^(csv|json)$"),
@@ -716,7 +1200,7 @@ async def export_audit(
             if not rows:
                 return
             for row in rows:
-                yield dict(row)
+                yield _redacted_audit_row(row)
             if len(rows) < _AUDIT_EXPORT_BATCH:
                 return
             offset += _AUDIT_EXPORT_BATCH

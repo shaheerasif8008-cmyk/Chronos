@@ -17,7 +17,12 @@ from core.models import Member
 def _no_db_audit(monkeypatch):
     async def _noop(*a, **k):
         return "audit-id"
+    async def _allow_workspace(*a, **k):
+        return {"id": "res", "status": "active"}
     monkeypatch.setattr(permissions.audit, "log", _noop)
+    monkeypatch.setattr(
+        "core.workspace_access.require_workspace_access", _allow_workspace
+    )
     # Real is_enabled() is False by default (openfga_api_url empty), so only the
     # deterministic role gates run unless a test opts into FGA explicitly.
 

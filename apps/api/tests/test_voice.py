@@ -154,6 +154,7 @@ async def test_voice_transcribe_creates_artifact_and_audits(monkeypatch):
     assert meta is not None
     assert meta["kind"] == "transcript"
     assert str(meta["organization_id"]) == org
+    assert str(meta["created_by"]) == str(agent.member_id)
     assert meta["mime_type"] == "text/plain"
 
     content = await read_artifact_content(transcript_art_id)
@@ -204,6 +205,7 @@ async def test_voice_speak_creates_artifact_and_audits(monkeypatch):
     assert meta is not None
     assert meta["kind"] == "audio"
     assert str(meta["organization_id"]) == org
+    assert str(meta["created_by"]) == str(agent.member_id)
     assert meta["mime_type"] == "audio/mpeg"
 
     content = await read_artifact_content(audio_art_id)
@@ -218,6 +220,31 @@ async def test_voice_speak_creates_artifact_and_audits(monkeypatch):
     # --- Audit trail ---
     assert "tool_call" in audited
     assert "tool_result" in audited
+
+
+@pytest.mark.asyncio
+async def test_voice_direct_connector_preserves_legacy_creator_fallback(monkeypatch):
+    """Direct connector callers without broker metadata remain supported."""
+    import core.artifacts as artifacts
+    from connectors.voice import VoiceConnector
+
+    _force_voice_models(monkeypatch)
+    _stub_tts(monkeypatch)
+    saved: list[dict] = []
+
+    async def fake_save(content, **kwargs):
+        saved.append(kwargs)
+        return "artifact-direct"
+
+    monkeypatch.setattr(artifacts, "save_artifact", fake_save)
+
+    result = await VoiceConnector().execute(
+        "voice.speak",
+        {"__org_id": "org-direct", "text": "Legacy direct call"},
+    )
+
+    assert result.data["status"] == "success"
+    assert saved[0]["created_by"] == "voice_connector"
 
 
 # ---------------------------------------------------------------------------
@@ -459,9 +486,12 @@ async def test_voice_transcribe_endpoint_rejects_cross_org_conversation(monkeypa
     from core.db import engine, reflect_table
     from core.models import Member
     import routers.chat as chat_router
+    from tests.workspace_fixtures import ensure_default_workspace
 
     org_a = _unique_org()
     org_b = _unique_org()
+    owner_id = str(uuid.uuid4())
+    workspace_id = await ensure_default_workspace(org_a, [owner_id])
 
     # A conversation owned by org A.
     conversations = await reflect_table("conversations")
@@ -472,8 +502,9 @@ async def test_voice_transcribe_endpoint_rejects_cross_org_conversation(monkeypa
                 .values(
                     organization_id=org_a,
                     region="us",
-                    member_id=str(uuid.uuid4()),
+                    member_id=owner_id,
                     title="org A private convo",
+                    workspace_id=workspace_id,
                 )
                 .returning(conversations.c.id)
             )

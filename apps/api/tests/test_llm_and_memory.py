@@ -35,7 +35,9 @@ async def test_stream_chat_completion_uses_selected_gpt_mini_model(monkeypatch):
     monkeypatch.setattr(llm.settings, "openrouter_api_key", "or-test-key")
 
     tokens = []
-    async for token in llm.stream_completion([{"role": "user", "content": "hi"}], model_id="gpt-5.4-mini"):
+    async for token in llm.stream_completion(
+        [{"role": "user", "content": "hi"}], model_id="gpt-5.4-mini"
+    ):
         tokens.append(token)
 
     assert tokens == ["agent ", "works"]
@@ -70,7 +72,9 @@ async def test_stream_chat_completion_uses_each_selected_model(monkeypatch):
     }
     for selector_id, model_string in expected.items():
         tokens = []
-        async for token in llm.stream_completion([{"role": "user", "content": "hi"}], model_id=selector_id):
+        async for token in llm.stream_completion(
+            [{"role": "user", "content": "hi"}], model_id=selector_id
+        ):
             tokens.append(token)
 
         assert tokens == ["fast"]
@@ -100,7 +104,9 @@ def test_available_chat_models_include_configured_options(monkeypatch):
     assert by_id["gpt-5.4-mini"]["model"] == "openrouter/openai/gpt-5.4-mini"
     assert by_id["gpt-5.4-nano"]["model"] == "openrouter/openai/gpt-5.4-nano"
     assert by_id["deepseek-v4-pro"]["model"] == "openrouter/deepseek/deepseek-v4-pro"
-    assert by_id["deepseek-v4-flash"]["model"] == "openrouter/deepseek/deepseek-v4-flash"
+    assert (
+        by_id["deepseek-v4-flash"]["model"] == "openrouter/deepseek/deepseek-v4-flash"
+    )
     assert llm.normalize_chat_model("gpt-5.4-mini") == "gpt-5.4-mini"
     with pytest.raises(ValueError):
         llm.normalize_chat_model(None)
@@ -137,13 +143,75 @@ async def test_stream_chat_completion_reports_provider_unavailable(monkeypatch):
         raise RuntimeError("provider unavailable")
 
     monkeypatch.setattr(llm.litellm, "acompletion", fake_completion)
+    monkeypatch.setattr(llm.settings, "backup_api_key", "")
 
     tokens = []
-    async for token in llm.stream_completion([{"role": "user", "content": "hi"}], model_id="gpt-5.4-mini"):
+    async for token in llm.stream_completion(
+        [{"role": "user", "content": "hi"}], model_id="gpt-5.4-mini"
+    ):
         tokens.append(token)
 
     assert tokens == [
-        "Chronos is connected, but the selected AI provider is unavailable right now. Choose another model in the selector."
+        "Chronos is connected, but both the selected AI provider and its independent backup are unavailable right now."
+    ]
+
+
+def test_backup_kwargs_are_independent_from_openrouter(monkeypatch):
+    from core import llm
+
+    monkeypatch.setattr(llm.settings, "openrouter_api_key", "or-key")
+    monkeypatch.setattr(llm.settings, "backup_api_key", "anthropic-key")
+    monkeypatch.setattr(llm.settings, "backup_model", "anthropic/claude-sonnet-5")
+
+    kwargs = llm.backup_completion_kwargs([{"role": "user", "content": "hi"}])
+
+    assert kwargs["model"] == "anthropic/claude-sonnet-5"
+    assert kwargs["api_key"] == "anthropic-key"
+    assert "api_base" not in kwargs
+    assert llm.independent_backup_available("openrouter/openai/gpt-5.4-mini") is True
+
+
+def test_non_openrouter_model_does_not_receive_openrouter_credentials(monkeypatch):
+    from core import llm
+
+    monkeypatch.setattr(llm.settings, "openrouter_api_key", "or-key")
+    monkeypatch.setattr(llm.settings, "backup_api_key", "anthropic-key")
+    monkeypatch.setattr(llm.settings, "backup_model", "anthropic/claude-sonnet-5")
+
+    kwargs = llm.model_kwargs(
+        "anthropic/claude-sonnet-5",
+        messages=[{"role": "user", "content": "hi"}],
+    )
+
+    assert kwargs["api_key"] == "anthropic-key"
+    assert "api_base" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_complete_text_uses_independent_backup_after_openrouter_models_fail(
+    monkeypatch,
+):
+    from core import llm
+
+    calls = []
+
+    async def fake_completion(**kwargs):
+        calls.append(kwargs)
+        if kwargs["model"].startswith("openrouter/"):
+            raise RuntimeError("openrouter unavailable")
+        return {"choices": [{"message": {"content": "backup response"}}]}
+
+    monkeypatch.setattr(llm.litellm, "acompletion", fake_completion)
+    monkeypatch.setattr(llm.settings, "fast_model", "openrouter/openai/gpt-5.4-nano")
+    monkeypatch.setattr(llm.settings, "agent_model", "openrouter/openai/gpt-5.4-mini")
+    monkeypatch.setattr(llm.settings, "backup_api_key", "anthropic-key")
+    monkeypatch.setattr(llm.settings, "backup_model", "anthropic/claude-sonnet-5")
+
+    assert await llm.complete_text("hi") == "backup response"
+    assert [call["model"] for call in calls] == [
+        "openrouter/openai/gpt-5.4-nano",
+        "openrouter/openai/gpt-5.4-mini",
+        "anthropic/claude-sonnet-5",
     ]
 
 
@@ -164,8 +232,12 @@ async def test_complete_json_falls_back_to_main_model_after_fast_failure(monkeyp
         return {"choices": [{"message": {"content": '{"mode":"chat"}'}}]}
 
     monkeypatch.setattr(llm.litellm, "acompletion", fake_completion)
-    monkeypatch.setattr(llm.settings, "fast_model", "openrouter/minimax/minimax-m2.5:free")
-    monkeypatch.setattr(llm.settings, "agent_model", "openrouter/deepseek/deepseek-v4-flash:free")
+    monkeypatch.setattr(
+        llm.settings, "fast_model", "openrouter/minimax/minimax-m2.5:free"
+    )
+    monkeypatch.setattr(
+        llm.settings, "agent_model", "openrouter/deepseek/deepseek-v4-flash:free"
+    )
     monkeypatch.setattr(llm.settings, "openrouter_api_key", "or-test-key")
 
     result = await llm.complete_json("Return JSON")
@@ -181,6 +253,7 @@ async def test_embed_uses_redis_cache(monkeypatch):
     from core import embeddings
 
     store = {}
+
     class FakeRedis:
         async def get(self, key):
             return store.get(key)
@@ -191,6 +264,7 @@ async def test_embed_uses_redis_cache(monkeypatch):
 
     monkeypatch.setattr(embeddings, "_redis", FakeRedis())
     kwargs = {}
+
     async def fake_openrouter_embedding(text):
         kwargs["model"] = embeddings.settings.embedding_model
         kwargs["api_key"] = embeddings.settings.openrouter_api_key
@@ -241,9 +315,14 @@ async def test_openrouter_embedding_requests_configured_dimensions(monkeypatch):
             return FakeResponse()
 
     monkeypatch.setattr(embeddings.httpx, "AsyncClient", FakeClient)
-    monkeypatch.setattr(embeddings.settings, "embedding_model", "google/gemini-embedding-2")
+    monkeypatch.setattr(
+        embeddings.settings, "embedding_model", "google/gemini-embedding-2"
+    )
     monkeypatch.setattr(embeddings.settings, "embedding_dimensions", 1536)
     monkeypatch.setattr(embeddings.settings, "openrouter_api_key", "or-test-key")
+    monkeypatch.setattr(
+        embeddings.settings, "frontend_base_url", "https://app.cognisiatech.com/"
+    )
 
     response = await embeddings._openrouter_embedding("remember this")
 
@@ -253,6 +332,7 @@ async def test_openrouter_embedding_requests_configured_dimensions(monkeypatch):
         "input": "remember this",
         "dimensions": 1536,
     }
+    assert captured["headers"]["HTTP-Referer"] == "https://app.cognisiatech.com"
 
 
 @pytest.mark.asyncio
@@ -296,16 +376,26 @@ async def test_extract_and_save_filters_embeds_and_publishes(monkeypatch):
     assert saved[0]["content"] == "Keep this"
     assert saved[0]["source"] == "autonomous"
     assert saved[0]["conversation_id"] == "conversation-1"
-    assert saved[0]["created_by"] == "chronos"
-    assert published[0][0] == "memories:conversation-1"
+    assert saved[0]["created_by"] == "member-1"
+    assert saved[0]["scope"] == "personal"
+    assert saved[0]["scope_id"] == "member-1"
+    assert published[0][0] == "memories:conversation-1:member-1"
     assert published[0][1]["type"] == "memory_saved"
 
 
 def test_extract_explicit_memory_content_handles_supported_phrases():
     from core.memory_writes import extract_explicit_memory_content
 
-    assert extract_explicit_memory_content("remember that ACME uses HubSpot") == "ACME uses HubSpot"
-    assert extract_explicit_memory_content("Please remember: Alex hates pricing-first outbound") == "Alex hates pricing-first outbound"
+    assert (
+        extract_explicit_memory_content("remember that ACME uses HubSpot")
+        == "ACME uses HubSpot"
+    )
+    assert (
+        extract_explicit_memory_content(
+            "Please remember: Alex hates pricing-first outbound"
+        )
+        == "Alex hates pricing-first outbound"
+    )
     assert extract_explicit_memory_content("what do you remember?") is None
 
 
@@ -339,15 +429,26 @@ def test_memory_scope_authorization_and_hybrid_rerank():
 
     pairs = memory._authorized_scope_pairs(context)
     assert ("org", "default") in pairs
-    assert ("workspace", "workspace-1") in pairs
+    assert ("workspace", "default") in pairs
+    assert ("workspace", "workspace-1") not in pairs
     assert ("persona", "persona-1") in pairs
     assert ("personal", "member-a") in pairs
     assert ("personal", "member-b") not in pairs
 
     now = datetime.now(timezone.utc)
     rows = [
-        {"id": "close-stale", "distance": 0.05, "importance_score": 0.1, "created_at": now - timedelta(days=365)},
-        {"id": "important-recent", "distance": 0.20, "importance_score": 1.0, "created_at": now},
+        {
+            "id": "close-stale",
+            "distance": 0.05,
+            "importance_score": 0.1,
+            "created_at": now - timedelta(days=365),
+        },
+        {
+            "id": "important-recent",
+            "distance": 0.20,
+            "importance_score": 1.0,
+            "created_at": now,
+        },
     ]
     ranked = memory._rank_memory_rows(rows, now=now)
     assert ranked[0]["id"] == "important-recent"
@@ -384,7 +485,9 @@ def test_memory_rerank_weights_source_authority_and_deduplicates():
         },
     ]
 
-    ranked = memory._dedupe_ranked_rows(memory._rank_memory_rows(rows, now=now), limit=10)
+    ranked = memory._dedupe_ranked_rows(
+        memory._rank_memory_rows(rows, now=now), limit=10
+    )
 
     assert [row["id"] for row in ranked] == ["explicit-authority", "distinct"]
 
@@ -486,7 +589,9 @@ async def test_task_scratchpad_memory_is_returned_before_long_term(monkeypatch):
     monkeypatch.setattr(memory, "engine", FakeEngine())
     monkeypatch.setattr(memory.audit, "log", fake_audit_log)
 
-    results = await memory.retrieve("continue the task", RequesterContext(member_id="member-1", task_id="task-1"))
+    results = await memory.retrieve(
+        "continue the task", RequesterContext(member_id="member-1", task_id="task-1")
+    )
 
     assert [entry.source for entry in results] == ["scratchpad", "explicit"]
     assert results[0].content == "Temporary lead list from step 1."
@@ -500,7 +605,12 @@ async def test_filesystem_connector_jails_task_workspace(tmp_path, monkeypatch):
 
     write = await filesystem.filesystem_connector.execute(
         "fs.write",
-        {"path": "notes/result.txt", "content": "hello", "__org_id": "default", "__task_id": "task-1"},
+        {
+            "path": "notes/result.txt",
+            "content": "hello",
+            "__org_id": "default",
+            "__task_id": "task-1",
+        },
     )
     assert write.data["bytes"] == 5
 
@@ -533,7 +643,11 @@ async def test_code_connector_runs_restricted_python(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="unsafe"):
         await code_connector_module.code_connector.execute(
             "code.python",
-            {"code": "import socket\nprint('no')", "__org_id": "default", "__task_id": "task-1"},
+            {
+                "code": "import socket\nprint('no')",
+                "__org_id": "default",
+                "__task_id": "task-1",
+            },
         )
 
     # Dynamic-import bypasses must be rejected too (they evade the static blocklist).
@@ -552,7 +666,9 @@ async def test_code_connector_runs_restricted_python(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_task_workspace_root_is_shared_by_fs_code_and_doc_tools(tmp_path, monkeypatch):
+async def test_task_workspace_root_is_shared_by_fs_code_and_doc_tools(
+    tmp_path, monkeypatch
+):
     from connectors import code as code_connector_module
     from connectors import filesystem
     from parsing import tool as doc_tool
@@ -567,7 +683,10 @@ async def test_task_workspace_root_is_shared_by_fs_code_and_doc_tools(tmp_path, 
 
     code_result = await code_connector_module.code_connector.execute(
         "code.python",
-        {"code": "from pathlib import Path\nprint(Path('notes/shared.txt').read_text())", **scope},
+        {
+            "code": "from pathlib import Path\nprint(Path('notes/shared.txt').read_text())",
+            **scope,
+        },
     )
     assert code_result.data["status"] == "success"
     assert code_result.data["stdout"].strip() == "shared workspace file"
@@ -586,7 +705,7 @@ async def test_mcp_discovery_uses_real_stdio_protocol(tmp_path):
 
     server_script = tmp_path / "mcp_server.py"
     server_script.write_text(
-        r'''
+        r"""
 import json, sys
 
 def read_message():
@@ -619,7 +738,7 @@ while True:
         send({"jsonrpc": "2.0", "id": msg["id"], "result": {"tools": [{"name": "echo", "inputSchema": {"type": "object"}}]}})
     else:
         send({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
-''',
+""",
         encoding="utf-8",
     )
     repo = InMemoryConnectorRepository()
@@ -659,11 +778,19 @@ async def test_connector_proof_uses_internal_echo_runtime(monkeypatch):
     result = await connectors.execute_connector_proof(
         connector_id="connector-1",
         provider="internal",
-        member=Member(id="member-1", organization_id="default", email="admin@example.com"),
+        member=Member(
+            id="member-1", organization_id="default", email="admin@example.com"
+        ),
     )
 
-    assert result == {"status": "success", "detail": {"message": "Chronos connector proof"}, "tool": "internal_echo.echo"}
-    logs = await repository.list_execution_logs(tenant_id="default", connector_id="internal_echo")
+    assert result == {
+        "status": "success",
+        "detail": {"message": "Chronos connector proof"},
+        "tool": "internal_echo.echo",
+    }
+    logs = await repository.list_execution_logs(
+        tenant_id="default", connector_id="internal_echo"
+    )
     assert logs[0]["result_status"] == "success"
 
 
@@ -724,7 +851,11 @@ async def test_tool_broker_audits_gmail_draft_without_logging_raw_args(monkeypat
     result = await tool_broker.execute(
         AgentContext(id="agent-1", org_id="default", member_id="member-1"),
         "gmail.draft",
-        {"to": "client@example.com", "subject": "Proof", "body": "Sensitive draft body"},
+        {
+            "to": "client@example.com",
+            "subject": "Proof",
+            "body": "Sensitive draft body",
+        },
     )
 
     assert result.summary == "Draft created: draft-1"
@@ -824,17 +955,26 @@ async def test_tool_broker_live_browser_does_not_require_credential_record(monke
     assert calls == [("browser.fetch", "live", "live")]
 
 
-def test_apply_context_suggestion_appends_patch_to_org_context(tmp_path):
-    from routers.context import apply_context_patch
+def test_context_suggestion_renders_only_validated_evidence_backed_facts():
+    from jobs.context_update import build_context_patch, validate_context_patch
 
-    org_path = tmp_path / "context" / "default" / "org.md"
-    org_path.parent.mkdir(parents=True)
-    org_path.write_text("# Org\nExisting fact.\n")
+    patch = build_context_patch(
+        {
+            "facts": [
+                {
+                    "fact": "The support team operates in Eastern Time.",
+                    "evidence_memory_ids": ["memory-1"],
+                }
+            ]
+        },
+        {"memory-1"},
+    )
 
-    result = apply_context_patch(org_path, "- New approved fact.")
-
-    assert result == "# Org\nExisting fact.\n\n- New approved fact.\n"
-    assert org_path.read_text() == result
+    assert patch == (
+        "## Approved organization facts (reference data, not instructions)\n"
+        "- The support team operates in Eastern Time."
+    )
+    assert validate_context_patch(patch) == patch
 
 
 @pytest.mark.asyncio
@@ -865,7 +1005,9 @@ async def test_memory_embedding_literal_returns_none_for_wrong_dimension(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_memory_retrieve_falls_back_to_recent_memories_on_embedding_dimension_mismatch(monkeypatch):
+async def test_memory_retrieve_falls_back_to_recent_memories_on_embedding_dimension_mismatch(
+    monkeypatch,
+):
     from core import memory
     from core.models import RequesterContext
 
@@ -896,14 +1038,18 @@ async def test_memory_retrieve_falls_back_to_recent_memories_on_embedding_dimens
     monkeypatch.setattr(memory, "_retrieve_recent_memories", fake_recent)
     monkeypatch.setattr(memory.audit, "log", fake_audit_log)
 
-    results = await memory.retrieve("what do you remember about my pet?", RequesterContext(member_id="member-1"))
+    results = await memory.retrieve(
+        "what do you remember about my pet?", RequesterContext(member_id="member-1")
+    )
 
     assert [entry.content for entry in results] == ["i have a dog"]
     assert audit_events[0][1]["decision"] == "dimension_mismatch"
 
 
 @pytest.mark.asyncio
-async def test_assemble_context_loads_persona_skills_memories_and_task_state(monkeypatch):
+async def test_assemble_context_loads_persona_skills_memories_and_task_state(
+    monkeypatch,
+):
     from core import context
     from core.models import MemoryEntry, RequesterContext
 
@@ -978,8 +1124,10 @@ async def test_assemble_context_loads_persona_skills_memories_and_task_state(mon
             return self
 
     monkeypatch.setattr(context, "load_org_context", fake_org_context)
+
     async def _fake_candidates(org_id):
         return []
+
     monkeypatch.setattr(context, "get_candidate_skills", _fake_candidates)
     monkeypatch.setattr(context, "find_relevant_skills", fake_find_skills)
     monkeypatch.setattr(context, "load_skill_content", fake_load_skill)
@@ -992,7 +1140,9 @@ async def test_assemble_context_loads_persona_skills_memories_and_task_state(mon
     assembled = await context.assemble_context(
         "conversation-1",
         "draft outreach to leads",
-        RequesterContext(member_id="member-1", persona_id="sdr-outreach", task_id="task-1"),
+        RequesterContext(
+            member_id="member-1", persona_id="sdr-outreach", task_id="task-1"
+        ),
     )
 
     system = assembled[0]["content"]
@@ -1017,7 +1167,9 @@ async def test_assemble_context_deduplicates_current_saved_user_message(monkeypa
     async def fake_retrieve(message, requester_context):
         return []
 
-    async def fake_compact_history(conversation_id, *, org_id=None, budget_tokens, verbatim_turns=6):
+    async def fake_compact_history(
+        conversation_id, *, org_id=None, budget_tokens, verbatim_turns=6  # gitleaks:allow - parameter name, not a credential
+    ):
         return [
             {"role": "user", "content": "previous prompt"},
             {"role": "assistant", "content": "previous answer"},
@@ -1025,8 +1177,10 @@ async def test_assemble_context_deduplicates_current_saved_user_message(monkeypa
         ]
 
     monkeypatch.setattr(context, "load_org_context", fake_org_context)
+
     async def _fake_candidates(org_id):
         return []
+
     monkeypatch.setattr(context, "get_candidate_skills", _fake_candidates)
     monkeypatch.setattr(context, "find_relevant_skills", fake_find_skills)
     monkeypatch.setattr(context.memory, "retrieve", fake_retrieve)
@@ -1105,8 +1259,10 @@ async def test_assemble_context_injects_compact_tool_routing_guidance(monkeypatc
             return self
 
     monkeypatch.setattr(context, "load_org_context", fake_org_context)
+
     async def _fake_candidates(org_id):
         return []
+
     monkeypatch.setattr(context, "get_candidate_skills", _fake_candidates)
     monkeypatch.setattr(context, "find_relevant_skills", fake_find_skills)
     monkeypatch.setattr(context.memory, "retrieve", fake_retrieve)

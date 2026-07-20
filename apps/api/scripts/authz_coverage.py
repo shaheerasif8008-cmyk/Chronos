@@ -6,7 +6,7 @@ four enforcement categories:
     role-gated          deterministic role gate (admin / approval-decision),
                         enforced regardless of OpenFGA configuration
     relationship-mapped checked against OpenFGA (project/workspace relations)
-    generic-allowed     passes through as ``granted_stub`` (low-risk org-wide)
+    generic-allowed     passes through as ``granted_allowlist`` (low-risk org-wide)
     unmapped-denied     not in any set → ``denied_unmapped`` (fail closed)
 
 The first three are enumerable from the static action sets. The fourth is the
@@ -64,9 +64,9 @@ def collect() -> dict[str, list[tuple[str, str]]]:
         )
     ]
 
-    generic = [(action, "granted_stub") for action in sorted(p._GENERIC_ALLOWED_ACTIONS)]
+    generic = [(action, "granted_allowlist") for action in sorted(p._GENERIC_ALLOWED_ACTIONS)]
     generic += [
-        (f"{prefix}*", "granted_stub (prefix)")
+        (f"{prefix}*", "granted_allowlist (prefix)")
         for prefix in sorted(p._GENERIC_ALLOWED_PREFIXES)
     ]
 
@@ -108,7 +108,7 @@ def render(inventory: dict[str, list[tuple[str, str]]]) -> str:
     )
     lines.append(
         f"| generic-allowed | {totals['generic-allowed']} | "
-        "allowlist pass-through (`granted_stub`) — W2.2 scoping candidates |"
+        "allowlist pass-through (`granted_allowlist`) — W2.2 scoping candidates |"
     )
     lines.append(
         "| unmapped-denied | (catch-all) | default deny (`denied_unmapped`) — "

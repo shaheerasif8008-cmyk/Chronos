@@ -57,6 +57,17 @@ async def _call_stt(audio_bytes: bytes, mime: str) -> str:
     Raises:
         RuntimeError: When the provider returns an empty or unexpected response.
     """
+    from connectors.openrouter_multimodal import is_openrouter_model, transcribe_audio
+
+    if is_openrouter_model(settings.stt_model):
+        return await transcribe_audio(
+            model=settings.stt_model,
+            audio_bytes=audio_bytes,
+            mime=mime,
+            api_key=settings.openrouter_api_key,
+            api_base=settings.openrouter_api_base,
+        )
+
     import io
     import litellm  # type: ignore[import]
 
@@ -104,6 +115,17 @@ async def _call_tts(text: str, voice: str) -> bytes:
     Raises:
         RuntimeError: When the provider returns empty content.
     """
+    from connectors.openrouter_multimodal import is_openrouter_model, synthesize_speech
+
+    if is_openrouter_model(settings.tts_model):
+        return await synthesize_speech(
+            model=settings.tts_model,
+            text=text,
+            voice=voice,
+            api_key=settings.openrouter_api_key,
+            api_base=settings.openrouter_api_base,
+        )
+
     import litellm  # type: ignore[import]
 
     response = await litellm.aspeech(
@@ -130,7 +152,8 @@ class VoiceConnector:
         Args:
             tool: "voice.transcribe" or "voice.speak".
             args: Tool arguments including broker-injected keys
-                ``__connector_tier``, ``__org_id``, ``__task_id``.
+                ``__connector_tier``, ``__org_id``, ``__task_id``, and
+                ``__member_id``.
 
         Returns:
             ToolResult with data containing artifact id(s) and metadata, and an
@@ -140,18 +163,34 @@ class VoiceConnector:
         args.pop("__connector_tier", None)
         org_id: str = str(args.pop("__org_id", "default") or "default")
         task_id: str | None = args.pop("__task_id", None)
+        member_id = str(args.pop("__member_id", "voice_connector") or "voice_connector")
 
         if tool == "voice.transcribe":
-            return await self._execute_transcribe(args, org_id=org_id, task_id=task_id)
+            return await self._execute_transcribe(
+                args,
+                org_id=org_id,
+                task_id=task_id,
+                member_id=member_id,
+            )
         elif tool == "voice.speak":
-            return await self._execute_speak(args, org_id=org_id, task_id=task_id)
+            return await self._execute_speak(
+                args,
+                org_id=org_id,
+                task_id=task_id,
+                member_id=member_id,
+            )
         else:
             raise ValueError(f"Unknown voice tool: {tool!r}")
 
     # ── voice.transcribe ────────────────────────────────────────────────────
 
     async def _execute_transcribe(
-        self, args: dict[str, Any], *, org_id: str, task_id: str | None
+        self,
+        args: dict[str, Any],
+        *,
+        org_id: str,
+        task_id: str | None,
+        member_id: str = "voice_connector",
     ) -> ToolResult:
         """Handle ``voice.transcribe`` (speech-to-text).
 
@@ -182,6 +221,19 @@ class VoiceConnector:
                 summary=(
                     "Speech-to-text is not available: no STT provider is configured. "
                     "Set STT_MODEL in your environment to enable transcription."
+                ),
+            )
+        from connectors.openrouter_multimodal import is_openrouter_model
+
+        if is_openrouter_model(settings.stt_model) and not settings.openrouter_api_key.strip():
+            return ToolResult(
+                data={
+                    "status": "unavailable",
+                    "fallback_reason": "OpenRouter STT credentials are not configured",
+                },
+                summary=(
+                    "Speech-to-text is not available: STT_MODEL selects OpenRouter, "
+                    "but OPENROUTER_API_KEY is not configured."
                 ),
             )
 
@@ -261,7 +313,7 @@ class VoiceConnector:
             task_id=task_id,
             org_id=org_id,
             mime_type="text/plain",
-            created_by="voice_connector",
+            created_by=member_id,
         )
 
         return ToolResult(
@@ -278,7 +330,12 @@ class VoiceConnector:
     # ── voice.speak ─────────────────────────────────────────────────────────
 
     async def _execute_speak(
-        self, args: dict[str, Any], *, org_id: str, task_id: str | None
+        self,
+        args: dict[str, Any],
+        *,
+        org_id: str,
+        task_id: str | None,
+        member_id: str = "voice_connector",
     ) -> ToolResult:
         """Handle ``voice.speak`` (text-to-speech).
 
@@ -319,6 +376,19 @@ class VoiceConnector:
                     "Set TTS_MODEL in your environment to enable speech synthesis."
                 ),
             )
+        from connectors.openrouter_multimodal import is_openrouter_model
+
+        if is_openrouter_model(settings.tts_model) and not settings.openrouter_api_key.strip():
+            return ToolResult(
+                data={
+                    "status": "unavailable",
+                    "fallback_reason": "OpenRouter TTS credentials are not configured",
+                },
+                summary=(
+                    "Text-to-speech is not available: TTS_MODEL selects OpenRouter, "
+                    "but OPENROUTER_API_KEY is not configured."
+                ),
+            )
 
         # Call the TTS provider (stubbed in tests via monkeypatch). Any provider or
         # network error must degrade honestly — never propagate into the broker stream.
@@ -355,7 +425,7 @@ class VoiceConnector:
             task_id=task_id,
             org_id=org_id,
             mime_type="audio/mpeg",
-            created_by="voice_connector",
+            created_by=member_id,
         )
 
         tts_meta: dict[str, Any] = {
@@ -364,6 +434,12 @@ class VoiceConnector:
             "voice": voice,
             "model": model_name,
         }
+        from connectors.openrouter_multimodal import resolve_openrouter_tts_voice
+
+        if is_openrouter_model(model_name):
+            provider_voice = resolve_openrouter_tts_voice(model_name, voice)
+            if provider_voice != voice:
+                tts_meta["provider_voice"] = provider_voice
 
         return ToolResult(
             data={

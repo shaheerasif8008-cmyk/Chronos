@@ -119,6 +119,7 @@ async def create_schedule(req: ScheduleRequest, member: Member = Depends(get_cur
 
 @router.get("/")
 async def list_schedules(member: Member = Depends(get_current_member)) -> list[dict]:
+    await permissions.check(member, "list_schedules", settings.org_id)
     scheduled = await reflect_table("scheduled_tasks")
     async with engine.begin() as conn:
         rows = (

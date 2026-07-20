@@ -76,8 +76,13 @@ def _gmail_draft_params(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _gmail_send_params(args: dict[str, Any]) -> dict[str, Any]:
-    params = _gmail_draft_params(args)
-    return params
+    """Map only a provider draft identifier to the irreversible send action.
+
+    ``ComposioConnector`` owns the full create-draft -> persist evidence -> send
+    workflow. Keeping this resolver draft-only prevents future generic callers
+    from accidentally returning to the direct ``GMAIL_SEND_EMAIL`` action.
+    """
+    return {"draft_id": args.get("draft_id", "")}
 
 
 def _as_int(value: Any, default: int) -> int:
@@ -179,7 +184,7 @@ _ACTION_MAP: dict[str, tuple[str, Callable[[dict[str, Any]], dict[str, Any]]]] =
     "gmail.read_inbox": ("GMAIL_FETCH_EMAILS", _gmail_fetch_params),
     "gmail.search": ("GMAIL_FETCH_EMAILS", _gmail_search_params),
     "gmail.draft": ("GMAIL_CREATE_EMAIL_DRAFT", _gmail_draft_params),
-    "gmail.send": ("GMAIL_SEND_EMAIL", _gmail_send_params),
+    "gmail.send": ("GMAIL_SEND_DRAFT", _gmail_send_params),
     "slack.send": ("SLACK_CHAT_POST_MESSAGE", _slack_send_params),
     "slack.read": ("SLACK_FETCH_CONVERSATION_HISTORY", _slack_read_params),
     "slack.search": ("SLACK_SEARCH_MESSAGES", _slack_search_params),
@@ -204,9 +209,14 @@ def app_slug(provider: str) -> str | None:
 
 
 def _sdk_available() -> bool:
-    import importlib.util
-
-    return importlib.util.find_spec("composio") is not None
+    # ``find_spec`` alone can return true for a broken/partial namespace install.
+    # Verify the exact runtime symbol Chronos uses so health never promotes an API
+    # key to configured when every action would fail at client construction.
+    try:
+        from composio import Composio  # type: ignore[import-not-found]
+    except (ImportError, AttributeError):
+        return False
+    return callable(Composio)
 
 
 def is_configured() -> bool:

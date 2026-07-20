@@ -1,5 +1,5 @@
 import { redirect } from "next/navigation";
 
 export default function ComputerPage() {
-  redirect("/activity");
+  redirect("/activity?tab=computer");
 }

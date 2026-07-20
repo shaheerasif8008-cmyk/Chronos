@@ -12,6 +12,9 @@ class Member(BaseModel):
     role: str = "user"
     name: str | None = None
     status: str = "active"
+    auth_type: str = "session"
+    api_key_id: str | None = None
+    api_key_scopes: list[str] = Field(default_factory=list)
 
 
 class RequesterContext(BaseModel):
@@ -21,6 +24,7 @@ class RequesterContext(BaseModel):
     persona_id: str | None = None
     task_id: str | None = None
     project_id: str | None = None
+    conversation_id: str | None = None
     role: str = "user"
     memory_context: str = "chat"
     surfaced_citations: list = Field(default_factory=list)
@@ -36,18 +40,25 @@ class AgentContext(BaseModel):
     org_id: str = "default"
     member_id: str
     workspace_id: str | None = None
+    project_id: str | None = None
     persona_id: str | None = None
     task_id: str | None = None
 
     @classmethod
     def from_task(cls, task_dict: dict) -> "AgentContext":
+        def optional_id(name: str) -> str | None:
+            value = task_dict.get(name)
+            return None if value is None else str(value)
+
+        task_id = str(task_dict["id"])
         return cls(
-            id=f"task:{task_dict['id']}",
-            org_id=task_dict.get("organization_id", "default"),
-            member_id=task_dict.get("triggered_by_member_id") or "chronos",
-            workspace_id=task_dict.get("workspace_id"),
-            persona_id=task_dict.get("persona_id"),
-            task_id=task_dict["id"],
+            id=f"task:{task_id}",
+            org_id=str(task_dict.get("organization_id") or "default"),
+            member_id=str(task_dict.get("triggered_by_member_id") or "chronos"),
+            workspace_id=optional_id("workspace_id"),
+            project_id=optional_id("project_id"),
+            persona_id=optional_id("persona_id"),
+            task_id=task_id,
         )
 
     def as_member(self) -> Member:

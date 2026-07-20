@@ -22,6 +22,30 @@ def _db_reachable() -> bool:
 _requires_db = pytest.mark.skipif(not _db_reachable(), reason="Postgres not reachable")
 
 
+@pytest.mark.asyncio
+async def test_production_storage_failure_creates_no_ephemeral_artifact(monkeypatch):
+    from core import artifacts
+
+    async def storage_down(*args, **kwargs):
+        raise RuntimeError("s3 unavailable")
+
+    async def should_not_reflect(*args, **kwargs):
+        raise AssertionError("metadata must not be inserted after a storage failure")
+
+    monkeypatch.setattr(artifacts, "put_object", storage_down)
+    monkeypatch.setattr(artifacts, "reflect_table", should_not_reflect)
+    monkeypatch.setattr(
+        type(artifacts.settings),
+        "is_production",
+        property(lambda _settings: True),
+    )
+
+    with pytest.raises(artifacts.ArtifactStorageUnavailable):
+        await artifacts.save_artifact(
+            "customer data", kind="attachment", org_id="tenant-a"
+        )
+
+
 @_requires_db
 @pytest.mark.asyncio
 async def test_save_artifact_writes_head_and_initial_version():
@@ -103,6 +127,38 @@ async def test_publish_then_unpublish_revokes_token():
 
 @_requires_db
 @pytest.mark.asyncio
+async def test_public_share_expires_and_can_be_reissued():
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import select, update
+
+    from core.artifacts import save_artifact
+    from core.artifact_shares import create_share, get_active_share_by_token
+    from core.db import engine, reflect_table
+
+    org = f"expiry-{uuid.uuid4().hex[:8]}"
+    aid = await save_artifact("temporary public doc", kind="markdown", title="TTL", org_id=org)
+    original = await create_share(aid, org_id=org, expires_in_hours=1)
+    shares = await reflect_table("artifact_shares")
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(shares)
+            .where(shares.c.id == original["id"])
+            .values(expires_at=datetime.now(timezone.utc) - timedelta(seconds=1))
+        )
+
+    assert await get_active_share_by_token(original["token"]) is None
+    async with engine.begin() as conn:
+        status = await conn.scalar(select(shares.c.status).where(shares.c.id == original["id"]))
+    assert status == "expired"
+
+    replacement = await create_share(aid, org_id=org, expires_in_hours=1)
+    assert replacement["token"] != original["token"]
+    assert replacement["expires_at"] > datetime.now(timezone.utc)
+
+
+@_requires_db
+@pytest.mark.asyncio
 async def test_revoke_when_not_published_is_false():
     from core.artifacts import save_artifact
     from core.artifact_shares import revoke_share
@@ -164,7 +220,38 @@ def _member(org_id: str):
     """Build a Member for direct router-handler calls (auth dependency bypassed)."""
     from core.models import Member
 
-    return Member(id=str(uuid.uuid4()), organization_id=org_id, email="t@t.io", role="user")
+    return Member(id=str(uuid.uuid4()), organization_id=org_id, email="t@t.io", role="owner")
+
+
+@_requires_db
+@pytest.mark.asyncio
+async def test_private_artifact_is_creator_scoped_inside_one_org():
+    """An org peer must not list, read, or mutate another member's private artifact."""
+    import pytest as _pytest
+    from fastapi import HTTPException
+
+    from core.artifacts import save_artifact
+    from core.models import Member
+    from routers.artifacts import EditBody, edit_artifact, get_artifact_metadata, list_artifacts
+
+    org = f"test-{uuid.uuid4().hex[:8]}"
+    creator = Member(id=str(uuid.uuid4()), organization_id=org, email="creator@t.io", role="operator")
+    peer = Member(id=str(uuid.uuid4()), organization_id=org, email="peer@t.io", role="manager")
+    aid = await save_artifact(
+        "private", kind="markdown", title="Private", org_id=org,
+        created_by=f"member:{creator.id}",
+    )
+
+    assert str((await get_artifact_metadata(aid, member=creator))["id"]) == aid
+    assert any(str(row["id"]) == aid for row in await list_artifacts(member=creator))
+    assert all(str(row["id"]) != aid for row in await list_artifacts(member=peer))
+
+    with _pytest.raises(HTTPException) as read_error:
+        await get_artifact_metadata(aid, member=peer)
+    assert read_error.value.status_code == 404
+    with _pytest.raises(HTTPException) as edit_error:
+        await edit_artifact(aid, EditBody(content="stolen"), member=peer)
+    assert edit_error.value.status_code == 404
 
 
 @_requires_db

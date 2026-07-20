@@ -373,6 +373,7 @@ async def test_task_stream_catch_up_includes_replay_events(monkeypatch):
         MetaData(),
         Column("id", String),
         Column("organization_id", String),
+        Column("triggered_by_member_id", String),
     )
 
     class FakeResult:
@@ -380,7 +381,7 @@ async def test_task_stream_catch_up_includes_replay_events(monkeypatch):
             return self
 
         def first(self):
-            return {"id": "task-1", "organization_id": "default", "goal": "research", "status": "running"}
+            return {"id": "task-1", "organization_id": "default", "triggered_by_member_id": "member-1", "goal": "research", "status": "running"}
 
     class FakeConn:
         async def execute(self, _stmt):
@@ -404,11 +405,21 @@ async def test_task_stream_catch_up_includes_replay_events(monkeypatch):
     async def fake_check(*_args, **_kwargs):
         return True
 
+    async def fake_visible_task(_member, task_id):
+        return {
+            "id": task_id,
+            "organization_id": "default",
+            "triggered_by_member_id": "member-1",
+            "goal": "research",
+            "status": "running",
+        }
+
     async def fake_events(task_id, org_id, limit=200, offset=0):
         return [{"type": "tool_call", "task_id": task_id, "summary": "Calling browser.search", "created_at": "2026-06-01T12:00:00Z"}]
 
     monkeypatch.setattr(tasks, "engine", FakeEngine())
     monkeypatch.setattr(tasks, "reflect_table", fake_reflect_table)
+    monkeypatch.setattr(tasks, "visible_task", fake_visible_task)
     monkeypatch.setattr(tasks.permissions, "check", fake_check)
     monkeypatch.setattr(tasks, "list_task_events", fake_events)
 

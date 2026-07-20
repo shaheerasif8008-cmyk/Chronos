@@ -30,6 +30,8 @@ def cognito_settings(monkeypatch):
     monkeypatch.setattr(settings, "cognito_user_pool_id", "us-east-1_TestPool")
     monkeypatch.setattr(settings, "cognito_app_client_id", "test-client-id")
     monkeypatch.setattr(settings, "cognito_domain", "chronos-dev")
+    monkeypatch.setattr(settings, "cognito_issuer_url", "")
+    monkeypatch.setattr(settings, "cognito_jwks_url", "")
     cognito._jwks_client.cache_clear()
 
 
@@ -84,3 +86,11 @@ def test_build_authorize_url(cognito_settings):
     assert "oauth2/authorize" in url
     assert settings.cognito_app_client_id in url
     assert "redirect_uri=" in url
+
+
+def test_custom_token_issuer_and_jwks_are_configurable(monkeypatch, cognito_settings):
+    monkeypatch.setattr(settings, "cognito_issuer_url", "https://identity.example.com/pool")
+    monkeypatch.setattr(settings, "cognito_jwks_url", "https://keys.example.com/jwks.json")
+    monkeypatch.setattr(cognito, "assert_safe_url", lambda url: url)
+    assert cognito.issuer() == "https://identity.example.com/pool"
+    assert cognito.jwks_url() == "https://keys.example.com/jwks.json"

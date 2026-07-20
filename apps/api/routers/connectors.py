@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlencode
 
@@ -99,6 +100,7 @@ class ExecuteConnectorRequest(BaseModel):
     arguments: dict[str, Any] = Field(default_factory=dict)
     workspace_id: str = "default"
     employee_id: str | None = None
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=256)
 
 
 class ToolCallRequest(BaseModel):
@@ -190,7 +192,10 @@ def clean_action(row: dict[str, Any]) -> dict[str, Any]:
 
 
 @router.get("/agent-tools")
-async def list_agent_tool_health(member: Member = Depends(get_current_member)) -> dict[str, Any]:
+async def list_agent_tool_health(
+    refresh: bool = Query(default=False),
+    member: Member = Depends(get_current_member),
+) -> dict[str, Any]:
     """Return live health/tier for the agent-loop connectors (gmail, browser, fs, code, mcp).
 
     This is separate from the framework registry health — it reports on the connectors
@@ -198,20 +203,33 @@ async def list_agent_tool_health(member: Member = Depends(get_current_member)) -
     """
     await permissions.check(member, "list_connector_health", member.organization_id)
     from core.connector_health import check_connectors
-    return await check_connectors()
+    return await check_connectors(refresh=refresh)
+
+
+def _health_timestamp_is_stale(value: Any, *, max_age_seconds: int = 300) -> bool:
+    if not isinstance(value, datetime):
+        return True
+    timestamp = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - timestamp).total_seconds() > max_age_seconds
 
 
 @router.get("/catalog")
-async def list_catalog(member: Member = Depends(get_current_member)) -> list[dict]:
+async def list_catalog(
+    refresh_health: bool = Query(default=False),
+    member: Member = Depends(get_current_member),
+) -> list[dict]:
     """Return the full app catalog with per-app configured + connected status."""
     from connectors.oauth_apps import available_apps
     from core.connector_tools import provider_tool_specs
+    from core.connector_tools import member_connector_clause
+    from core.connector_health import check_connectors
     from core.settings_store import tool_permissions as org_tool_permissions
     from core.db import engine, reflect_table
     from sqlalchemy import select
 
     apps = available_apps()
     permissions_map = await org_tool_permissions(str(member.organization_id))
+    runtime_health = await check_connectors(refresh=refresh_health)
 
     # Enrich with connection, health, and last-used state from the connector tables.
     connectors_table = await reflect_table("connectors")
@@ -221,22 +239,34 @@ async def list_catalog(member: Member = Depends(get_current_member)) -> list[dic
         rows = (
             await conn.execute(
                 select(
+                    connectors_table.c.id,
                     connectors_table.c.provider,
                     connectors_table.c.account_handle,
                     connectors_table.c.status,
                 ).where(
                     (connectors_table.c.organization_id == str(member.organization_id))
                     & (connectors_table.c.status == "active")
+                    & member_connector_clause(
+                        connectors_table, str(member.organization_id), str(member.id)
+                    )
                 )
             )
         ).mappings().all()
+        visible_connector_ids = {str(row["id"]) for row in rows}
+        visible_providers = {str(row["provider"]) for row in rows}
         health_rows = (
             await conn.execute(
                 select(
                     health_table.c.connector_id,
                     health_table.c.status,
+                    health_table.c.latency_ms,
+                    health_table.c.last_success_at,
+                    health_table.c.last_failure_at,
                     health_table.c.updated_at,
-                ).where(health_table.c.organization_id == str(member.organization_id))
+                ).where(
+                    health_table.c.organization_id == str(member.organization_id),
+                    health_table.c.connector_id.in_(visible_connector_ids | visible_providers),
+                )
             )
         ).mappings().all()
         log_rows = (
@@ -245,12 +275,16 @@ async def list_catalog(member: Member = Depends(get_current_member)) -> list[dic
                     logs_table.c.connector_id,
                     logs_table.c.created_at,
                 )
-                .where(logs_table.c.organization_id == str(member.organization_id))
+                .where(
+                    logs_table.c.organization_id == str(member.organization_id),
+                    logs_table.c.connector_id.in_(visible_connector_ids),
+                )
                 .order_by(logs_table.c.created_at.desc())
             )
         ).mappings().all()
 
     connected: dict[str, str] = {row["provider"]: row["account_handle"] or "" for row in rows}
+    connector_id_by_provider = {str(row["provider"]): str(row["id"]) for row in rows}
     health: dict[str, dict[str, Any]] = {row["connector_id"]: dict(row) for row in health_rows}
     last_used: dict[str, str] = {}
     for row in log_rows:
@@ -260,10 +294,72 @@ async def list_catalog(member: Member = Depends(get_current_member)) -> list[dic
     for app in apps:
         app["connected"] = app["id"] in connected
         app["account_handle"] = connected.get(app["id"], "")
-        app_health = health.get(app["id"]) or {}
-        app["health_status"] = app_health.get("status") or ("connected" if app["connected"] else "not_connected")
-        app["health_updated_at"] = str(app_health.get("updated_at")) if app_health.get("updated_at") else None
-        app["last_used_at"] = last_used.get(app["id"], "")
+        connector_id = connector_id_by_provider.get(app["id"], "")
+        # Stable credential row id used when binding a project source feed.
+        # This is safe to expose only because the query above already applies
+        # the member credential ACL (owner plus explicitly org-shared rows).
+        app["connector_id"] = connector_id or None
+        app_health = health.get(connector_id) or health.get(app["id"]) or {}
+        provider_health = runtime_health.get(app["id"], {})
+        execution_status = str(app_health.get("status") or "")
+        last_success_at = app_health.get("last_success_at")
+        execution_stale = _health_timestamp_is_stale(last_success_at)
+
+        if app["connected"]:
+            if execution_status == "healthy" and not execution_stale:
+                overall_status = "verified"
+                overall_reason = "A recent real connector action completed successfully."
+            elif execution_status == "healthy":
+                overall_status = "stale"
+                overall_reason = "The last successful connector action is older than five minutes."
+            elif execution_status in {"degraded", "rate_limited"}:
+                overall_status = execution_status
+                overall_reason = (
+                    "Recent connector executions are degraded."
+                    if execution_status == "degraded"
+                    else "The connector was recently rate-limited."
+                )
+            elif provider_health.get("status") in {"error", "degraded", "unavailable"}:
+                overall_status = "degraded"
+                overall_reason = str(provider_health.get("reason") or "Provider verification is degraded.")
+            else:
+                overall_status = "connected_unverified"
+                overall_reason = (
+                    "The account is connected, but no recent successful action has verified the user grant."
+                )
+        else:
+            overall_status = str(provider_health.get("status") or "not_connected")
+            overall_reason = str(
+                provider_health.get("reason")
+                or "Connect an account before Chronos can verify provider access."
+            )
+
+        app["health_status"] = overall_status
+        app["health_reason"] = overall_reason
+        app["health_checked_at"] = (
+            str(app_health.get("updated_at"))
+            if app_health.get("updated_at")
+            else provider_health.get("checked_at")
+        )
+        app["health_verified_at"] = (
+            str(last_success_at) if last_success_at else provider_health.get("verified_at")
+        )
+        app["health_stale"] = (
+            execution_stale
+            if app["connected"] and execution_status == "healthy"
+            else bool(provider_health.get("stale", True))
+        )
+        app["health_error_code"] = provider_health.get("error_code")
+        app["provider_health_status"] = provider_health.get("status") or "unknown"
+        app["connection_health_status"] = execution_status or None
+        app["health_latency_ms"] = (
+            app_health.get("latency_ms")
+            if app_health.get("latency_ms") is not None
+            else provider_health.get("latency_ms")
+        )
+        # Backwards-compatible alias retained for older clients.
+        app["health_updated_at"] = app["health_checked_at"]
+        app["last_used_at"] = last_used.get(connector_id, "")
         app["tools"] = [
             {**spec, "permission": permissions_map.get(spec["broker_name"], "default")}
             for spec in provider_tool_specs(app["id"])
@@ -353,7 +449,6 @@ async def gmail_oauth_callback(
     We verify the signature here to prevent CSRF and to avoid a DB lookup just to
     reconstruct the member context.
     """
-    import uuid
     from connectors.vault import store as vault_store
     from core.db import engine, reflect_table
     from sqlalchemy import insert, select, update
@@ -415,6 +510,7 @@ async def gmail_oauth_callback(
                     insert(connectors_table).values(
                         id=connector_id,
                         organization_id=org_id,
+                        **({"member_id": member_id} if "member_id" in connectors_table.c else {}),
                         provider="gmail",
                         account_handle=credential_data.get("email", ""),
                         vault_ref=vault_ref,
@@ -466,7 +562,15 @@ async def generic_oauth_start(
     await permissions.check(member, f"connect_{provider}", str(member.organization_id))
 
     from connectors import composio_client
-    if composio_client.is_configured() and composio_client.is_composio_provider(provider):
+    # GitHub uses Chronos's direct member-scoped OAuth vault for private repo
+    # archive import and PR publication. A Composio managed reference cannot
+    # provide the short-lived API-side bearer needed by that isolated coding
+    # path, so never redirect GitHub setup to Composio.
+    if (
+        provider != "github"
+        and composio_client.is_configured()
+        and composio_client.is_composio_provider(provider)
+    ):
         return await _composio_oauth_start(provider, member)
 
     client_id, client_secret = get_client_credentials(app)
@@ -511,7 +615,6 @@ async def generic_oauth_callback(
     error: str | None = Query(default=None),
 ) -> RedirectResponse:
     """Exchange the OAuth2 code for tokens and store them in the vault."""
-    import uuid
     import time
     from connectors.oauth_apps import get_app, get_client_credentials
     from connectors.vault import store as vault_store
@@ -655,6 +758,7 @@ async def generic_oauth_callback(
                     insert(connectors_table).values(
                         id=connector_id,
                         organization_id=org_id,
+                        **({"member_id": member_id} if "member_id" in connectors_table.c else {}),
                         provider=provider,
                         account_handle=account_handle,
                         vault_ref=vault_ref,
@@ -742,6 +846,11 @@ async def composio_oauth_callback(
                 insert(connectors_table).values(
                     id=connector_id,
                     organization_id=org_id,
+                    **({
+                        "member_id": member_id
+                        if getattr(settings, "composio_entity_scope", "member") == "member"
+                        else None
+                    } if "member_id" in connectors_table.c else {}),
                     provider=provider,
                     account_handle=entity,
                     vault_ref=vault_ref,
@@ -1186,6 +1295,9 @@ async def execute_connector_action(
             member_id=member.id,
             workspace_id=req.workspace_id,
         ),
+        metadata={"idempotency_key": req.idempotency_key}
+        if req.idempotency_key
+        else None,
     )
     return {
         "status": result.status,

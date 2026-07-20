@@ -2,7 +2,7 @@
 
 Chronos is an enterprise AI agent platform targeting total practical parity with the combined capability set of ChatGPT, Claude.ai, and Manus.ai. The product goal is a polished platform for governed autonomous execution, persistent organizational memory, projects, artifacts, deep research, multimodal work, connectors, browser/computer operation, coding, scheduled work, collaboration, and enterprise admin.
 
-The canonical product goal is documented in [`CHRONOS_TOTAL_PARITY_GOAL.md`](CHRONOS_TOTAL_PARITY_GOAL.md), and the controlling parity acceptance matrix is [`docs/chronos_total_parity_matrix.md`](docs/chronos_total_parity_matrix.md). The current checkout contains the foundation for that goal: OTP auth, chat-triggered task execution, activity, approvals, connector seams, scoped memory, browser/search tooling, artifacts, and governed draft workflows. It is not yet complete parity.
+The canonical product goal is documented in [`CHRONOS_TOTAL_PARITY_GOAL.md`](CHRONOS_TOTAL_PARITY_GOAL.md), and the controlling parity acceptance matrix is [`docs/chronos_total_parity_matrix.md`](docs/chronos_total_parity_matrix.md). The current checkout contains substantial implementations across that program, including Cognito/SSO/SCIM, governed task execution, projects and knowledge, memory, artifacts, research, connectors, Browserbase browser sessions, E2B computer/repository workspaces, workflows, collaboration, compliance export, notifications, Stripe billing, and a macOS bridge. It is still not complete parity or a production certificate; see the matrix and launch runbook for the remaining product and live-evidence blockers.
 
 ## Local Setup
 
@@ -11,7 +11,7 @@ cp .env.example .env
 docker-compose up -d
 
 cd apps/api
-python3.12 -m venv .venv  # Python 3.11 also works
+python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 alembic upgrade head
@@ -25,6 +25,25 @@ If `npm` is not available but dependencies are already installed, run `bash scri
 Open `http://localhost:3000/chat`. If you are not signed in, the app redirects to `/login`. Use `admin@example.com`; the OTP prints in the API terminal.
 
 Foundation proof path: after login, send `operator workflow proof: research leads, draft outreach, and request approval`. Chronos should create a task, use deterministic fixture leads, and stop with pending drafts in `/approvals` without live search or provider keys.
+
+## Production Operations
+
+The supported production path is Terraform-managed AWS infrastructure. Start
+with the operator documentation before changing an account or routing traffic:
+
+- [`docs/PRODUCTION_CONFIGURATION.md`](docs/PRODUCTION_CONFIGURATION.md) —
+  complete external/runtime configuration inventory and launch evidence;
+- [`docs/TERRAFORM_STATE_ADOPTION.md`](docs/TERRAFORM_STATE_ADOPTION.md) — safe
+  state bootstrap, adoption, migration, and recovery;
+- [`docs/PRODUCTION_OPERATIONS.md`](docs/PRODUCTION_OPERATIONS.md) — zero-task
+  first deployment, routine releases, monitoring, incidents, and client
+  onboarding; and
+- [`docs/DISASTER_RECOVERY.md`](docs/DISASTER_RECOVERY.md) — backups, restores,
+  regional disaster response, and rehearsal requirements.
+
+Infrastructure declarations and tests are not live launch proof. Do not route
+real clients until the launch-blocking checklist in the operations runbook has
+current evidence for the exact deployed Git SHA.
 
 ### Gmail OAuth
 
@@ -40,7 +59,8 @@ Then set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `GOOGLE_REDIRECT_URI` i
 
 ```text
 apps/api     FastAPI backend, migrations, auth, chat, and core seams
-apps/web     Next.js frontend for login, chat, activity, approvals, settings, memory, and connectors
+apps/web     Next.js frontend for the unified product shell and client/admin surfaces
+apps/desktop-macos  Sandboxed native macOS local-computer bridge
 context      Local organization context folder
 skills       Seed skill packs
 packages     Shared TypeScript types

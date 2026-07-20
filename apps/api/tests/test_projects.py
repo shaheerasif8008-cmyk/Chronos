@@ -25,6 +25,7 @@ class _FakeCol:
     def is_(self, v): return True
     def in_(self, v): return True
     def ilike(self, v): return True
+    def label(self, _name): return self
 
 
 class _FakeTable:
@@ -60,6 +61,8 @@ class _Clause:
     def limit(self, *a): return self
     def offset(self, *a): return self
     def join(self, *a, **kw): return self
+    def outerjoin(self, *a, **kw): return self
+    def distinct(self, *a, **kw): return self
     def with_for_update(self, *a, **kw): return self
 
 
@@ -116,6 +119,15 @@ def _build_engine(rows_by_call=None, scalar_val=None):
         def begin(self): return _FakeConn()
 
     return _FakeEngine()
+
+
+def _mock_project_access(monkeypatch, projects, *, role="owner", project_id="proj-1"):
+    project = None if role is None else {"id": project_id, "organization_id": "default"}
+    monkeypatch.setattr(
+        projects,
+        "project_access_role",
+        AsyncMock(return_value=(project, role)),
+    )
 
 
 # ─── Create project ───────────────────────────────────────────────────────────
@@ -196,6 +208,112 @@ async def test_list_projects_returns_only_member_projects(monkeypatch):
     assert len(result) == 2
 
 
+def test_project_visibility_and_tool_policy_are_bounded():
+    from core.project_access import (
+        normalize_default_tools,
+        normalize_visibility,
+        tool_is_allowed,
+    )
+
+    assert normalize_visibility("ORGANIZATION") == "organization"
+    assert normalize_default_tools(["browser", "browser", "gmail.search"]) == [
+        "browser",
+        "gmail.search",
+    ]
+    assert tool_is_allowed(["browser"], "browser__search") is True
+    assert tool_is_allowed(["browser"], "gmail__search") is False
+    assert tool_is_allowed(["browser"], "start_task") is True
+    with pytest.raises(ValueError):
+        normalize_visibility("public")
+    with pytest.raises(ValueError):
+        normalize_default_tools(["*"])
+
+
+@pytest.mark.asyncio
+async def test_organization_viewer_cannot_mutate_project(monkeypatch):
+    from routers import projects
+
+    monkeypatch.setattr(
+        projects,
+        "_require_member",
+        AsyncMock(return_value={"id": "proj-org", "role": "viewer"}),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await projects._require_editor(_make_member(member_id="org-viewer"), "proj-org")
+
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.detail == "Project membership required"
+
+
+@pytest.mark.asyncio
+async def test_explicit_project_member_can_mutate(monkeypatch):
+    from routers import projects
+
+    membership = {"id": "proj-member", "role": "member"}
+    monkeypatch.setattr(projects, "_require_member", AsyncMock(return_value=membership))
+
+    assert await projects._require_editor(_make_member(), "proj-member") == membership
+
+
+@pytest.mark.asyncio
+async def test_project_edit_access_rejects_synthetic_viewer(monkeypatch):
+    from core import project_access
+
+    member = _make_member(member_id="org-viewer")
+    monkeypatch.setattr(
+        project_access,
+        "project_access_role",
+        AsyncMock(return_value=({"id": "proj-org"}, "viewer")),
+    )
+    assert await project_access.member_can_edit_project(member, "proj-org") is False
+
+    project_access.project_access_role.return_value = ({"id": "proj-org"}, "member")
+    assert await project_access.member_can_edit_project(member, "proj-org") is True
+
+
+@pytest.mark.asyncio
+async def test_organization_visible_project_is_readable_without_membership(monkeypatch):
+    from routers import projects
+
+    member = _make_member(member_id="org-viewer")
+    project = {
+        "id": "proj-org",
+        "name": "Shared project",
+        "organization_id": "default",
+        "visibility": "organization",
+        "role": None,
+    }
+    monkeypatch.setattr(projects, "engine", _build_engine(rows_by_call=[project]))
+    monkeypatch.setattr(projects, "reflect_table", _fake_reflect())
+    monkeypatch.setattr(projects, "select", _noop_select)
+    _mock_project_access(monkeypatch, projects, role="viewer", project_id="proj-org")
+    monkeypatch.setattr(projects.permissions, "check", AsyncMock(return_value=True))
+
+    result = await projects.get_project("proj-org", member)
+    assert result["id"] == "proj-org"
+
+
+@pytest.mark.asyncio
+async def test_broker_rechecks_project_tool_policy_before_execution(monkeypatch):
+    from core.exceptions import SafetyLimitViolation
+    from core.models import AgentContext
+    from core.tool_broker import tool_broker
+
+    monkeypatch.setattr(
+        "core.project_access.project_tool_allowlist",
+        AsyncMock(return_value=["browser"]),
+    )
+    agent = AgentContext(
+        id="project-agent",
+        org_id="default",
+        member_id="member-1",
+        project_id="project-1",
+    )
+    with pytest.raises(SafetyLimitViolation, match="project's default tool policy"):
+        await tool_broker.execute(agent, "code.python", {"code": "print('no')"})
+
+
 # ─── GET /projects/{id} — not a member → 404 ─────────────────────────────────
 
 @pytest.mark.asyncio
@@ -210,6 +328,7 @@ async def test_get_project_non_member_returns_404(monkeypatch):
     monkeypatch.setattr(projects, "engine", engine)
     monkeypatch.setattr(projects, "reflect_table", _fake_reflect())
     monkeypatch.setattr(projects, "select", _noop_select)
+    _mock_project_access(monkeypatch, projects, role=None, project_id="proj-999")
     monkeypatch.setattr(projects.permissions, "check", AsyncMock(return_value=True))
 
     with pytest.raises(HTTPException) as exc_info:
@@ -229,6 +348,7 @@ async def test_get_project_cross_org_returns_404(monkeypatch):
     monkeypatch.setattr(projects, "engine", engine)
     monkeypatch.setattr(projects, "reflect_table", _fake_reflect())
     monkeypatch.setattr(projects, "select", _noop_select)
+    _mock_project_access(monkeypatch, projects, role=None, project_id="proj-org-B")
     monkeypatch.setattr(projects.permissions, "check", AsyncMock(return_value=True))
 
     with pytest.raises(HTTPException) as exc_info:
@@ -244,11 +364,10 @@ async def test_patch_project_owner_succeeds(monkeypatch):
     from routers import projects
 
     member = _make_member()
-    mem_row = {"id": "pm-1", "project_id": "proj-1", "member_id": "member-1", "role": "owner"}
     proj_row = {"id": "proj-1", "name": "Old Name", "organization_id": "default"}
 
     call_idx = [0]
-    results = [mem_row, proj_row, None]  # membership, project, UPDATE
+    results = [proj_row, None]  # project, UPDATE
 
     class _FakeResult:
         def __init__(self, data): self._data = data
@@ -273,8 +392,11 @@ async def test_patch_project_owner_succeeds(monkeypatch):
     monkeypatch.setattr(projects, "engine", _FakeEngine())
     monkeypatch.setattr(projects, "reflect_table", _fake_reflect())
     monkeypatch.setattr(projects, "select", _noop_select)
+    monkeypatch.setattr(projects, "insert", _noop_insert)
     monkeypatch.setattr(projects, "update", _noop_update)
+    _mock_project_access(monkeypatch, projects)
     monkeypatch.setattr(projects.permissions, "check", AsyncMock(return_value=True))
+    monkeypatch.setattr(projects, "artifact_access", AsyncMock(return_value=(True, "owner")))
     monkeypatch.setattr(projects.audit, "log", AsyncMock())
 
     class PatchReq:
@@ -296,11 +418,10 @@ async def test_patch_project_emits_instructions_event_when_present(monkeypatch):
     from routers import projects
 
     member = _make_member()
-    mem_row = {"id": "pm-1", "project_id": "proj-1", "member_id": "member-1", "role": "owner"}
     proj_row = {"id": "proj-1", "name": "P1", "organization_id": "default"}
 
     call_idx = [0]
-    results = [mem_row, proj_row, None]
+    results = [proj_row, None]
 
     class _FakeResult:
         def __init__(self, data): self._data = data
@@ -325,7 +446,9 @@ async def test_patch_project_emits_instructions_event_when_present(monkeypatch):
     monkeypatch.setattr(projects, "engine", _FakeEngine())
     monkeypatch.setattr(projects, "reflect_table", _fake_reflect())
     monkeypatch.setattr(projects, "select", _noop_select)
+    monkeypatch.setattr(projects, "insert", _noop_insert)
     monkeypatch.setattr(projects, "update", _noop_update)
+    _mock_project_access(monkeypatch, projects)
     monkeypatch.setattr(projects.permissions, "check", AsyncMock(return_value=True))
     monkeypatch.setattr(projects.audit, "log", AsyncMock())
 
@@ -353,6 +476,7 @@ async def test_patch_project_non_owner_returns_403(monkeypatch):
     monkeypatch.setattr(projects, "engine", engine)
     monkeypatch.setattr(projects, "reflect_table", _fake_reflect())
     monkeypatch.setattr(projects, "select", _noop_select)
+    _mock_project_access(monkeypatch, projects, role="member")
     monkeypatch.setattr(projects.permissions, "check", AsyncMock(return_value=True))
 
     class PatchReq:
@@ -372,10 +496,9 @@ async def test_delete_project_owner_succeeds(monkeypatch):
     from routers import projects
 
     member = _make_member()
-    mem_row = {"id": "pm-1", "project_id": "proj-1", "member_id": "member-1", "role": "owner"}
 
     call_idx = [0]
-    results = [mem_row, None, None]  # membership, DELETE project_members, DELETE project
+    results = [None, None]  # DELETE project_members, DELETE project
 
     class _FakeResult:
         def __init__(self, data): self._data = data
@@ -400,6 +523,7 @@ async def test_delete_project_owner_succeeds(monkeypatch):
     monkeypatch.setattr(projects, "reflect_table", _fake_reflect())
     monkeypatch.setattr(projects, "select", _noop_select)
     monkeypatch.setattr(projects, "delete", _noop_delete)
+    _mock_project_access(monkeypatch, projects)
     monkeypatch.setattr(projects.permissions, "check", AsyncMock(return_value=True))
     monkeypatch.setattr(projects.audit, "log", AsyncMock())
 
@@ -420,6 +544,7 @@ async def test_delete_project_non_owner_returns_403(monkeypatch):
     monkeypatch.setattr(projects, "engine", engine)
     monkeypatch.setattr(projects, "reflect_table", _fake_reflect())
     monkeypatch.setattr(projects, "select", _noop_select)
+    _mock_project_access(monkeypatch, projects, role="member")
     monkeypatch.setattr(projects.permissions, "check", AsyncMock(return_value=True))
 
     with pytest.raises(HTTPException) as exc_info:
@@ -435,13 +560,12 @@ async def test_add_member_by_owner_succeeds(monkeypatch):
     from routers import projects
 
     member = _make_member()
-    mem_row = {"id": "pm-1", "project_id": "proj-1", "member_id": "member-1", "role": "owner"}
     target_member_row = {"id": "member-2", "organization_id": "default", "email": "m2@example.com", "role": "user"}
     new_pm_id = "pm-new-99"
 
     call_idx = [0]
-    # _require_owner (join query), target member existence check, idempotency check, INSERT
-    results = [mem_row, target_member_row, None]
+    # Target member existence check, idempotency check, INSERT.
+    results = [target_member_row, None]
 
     class _FakeResult:
         def __init__(self, data): self._data = data
@@ -467,6 +591,7 @@ async def test_add_member_by_owner_succeeds(monkeypatch):
     monkeypatch.setattr(projects, "reflect_table", _fake_reflect())
     monkeypatch.setattr(projects, "select", _noop_select)
     monkeypatch.setattr(projects, "insert", _noop_insert)
+    _mock_project_access(monkeypatch, projects)
     monkeypatch.setattr(projects.permissions, "check", AsyncMock(return_value=True))
     monkeypatch.setattr(projects.audit, "log", AsyncMock())
 
@@ -492,6 +617,7 @@ async def test_add_member_non_owner_returns_403(monkeypatch):
     monkeypatch.setattr(projects, "engine", engine)
     monkeypatch.setattr(projects, "reflect_table", _fake_reflect())
     monkeypatch.setattr(projects, "select", _noop_select)
+    _mock_project_access(monkeypatch, projects, role="member")
     monkeypatch.setattr(projects.permissions, "check", AsyncMock(return_value=True))
 
     class AddReq:
@@ -512,10 +638,9 @@ async def test_remove_last_owner_raises_400(monkeypatch):
 
     member = _make_member()
     caller_row = {"id": "pm-1", "project_id": "proj-1", "member_id": "member-1", "role": "owner"}
-    owner_count_row = {"count": 1}  # only one owner
 
     call_idx = [0]
-    results = [caller_row, [caller_row]]  # caller membership, all owners
+    results = [[caller_row]]
 
     class _FakeResult:
         def __init__(self, data): self._data = data
@@ -547,6 +672,7 @@ async def test_remove_last_owner_raises_400(monkeypatch):
     monkeypatch.setattr(projects, "engine", _FakeEngine())
     monkeypatch.setattr(projects, "reflect_table", _fake_reflect())
     monkeypatch.setattr(projects, "select", _noop_select)
+    _mock_project_access(monkeypatch, projects)
     monkeypatch.setattr(projects.permissions, "check", AsyncMock(return_value=True))
 
     with pytest.raises(HTTPException) as exc_info:
@@ -562,14 +688,13 @@ async def test_get_project_conversations_scoped_to_project(monkeypatch):
     from routers import projects
 
     member = _make_member()
-    mem_row = {"id": "pm-1", "project_id": "proj-1", "member_id": "member-1", "role": "owner"}
     conv_rows = [
         {"id": "conv-1", "project_id": "proj-1", "title": "First"},
         {"id": "conv-2", "project_id": "proj-1", "title": "Second"},
     ]
 
     call_idx = [0]
-    results = [mem_row, conv_rows]
+    results = [conv_rows]
 
     class _FakeResult:
         def __init__(self, data): self._data = data
@@ -600,6 +725,7 @@ async def test_get_project_conversations_scoped_to_project(monkeypatch):
     monkeypatch.setattr(projects, "engine", _FakeEngine())
     monkeypatch.setattr(projects, "reflect_table", _fake_reflect())
     monkeypatch.setattr(projects, "select", _noop_select)
+    _mock_project_access(monkeypatch, projects)
     monkeypatch.setattr(projects.permissions, "check", AsyncMock(return_value=True))
 
     result = await projects.get_project_conversations("proj-1", member)
@@ -614,7 +740,6 @@ async def test_get_project_artifacts_returns_linked_artifacts(monkeypatch):
     from routers import projects
 
     member = _make_member()
-    mem_row = {"id": "pm-1", "project_id": "proj-1", "member_id": "member-1", "role": "owner"}
     conv_ids = [{"id": "conv-1"}]
     task_ids = [{"id": "task-1"}]
     artifact_rows = [
@@ -623,7 +748,7 @@ async def test_get_project_artifacts_returns_linked_artifacts(monkeypatch):
     ]
 
     call_idx = [0]
-    results = [mem_row, conv_ids, task_ids, artifact_rows]
+    results = [conv_ids, task_ids, artifact_rows]
 
     class _FakeResult:
         def __init__(self, data): self._data = data
@@ -654,7 +779,9 @@ async def test_get_project_artifacts_returns_linked_artifacts(monkeypatch):
     monkeypatch.setattr(projects, "engine", _FakeEngine())
     monkeypatch.setattr(projects, "reflect_table", _fake_reflect())
     monkeypatch.setattr(projects, "select", _noop_select)
+    _mock_project_access(monkeypatch, projects)
     monkeypatch.setattr(projects.permissions, "check", AsyncMock(return_value=True))
+    monkeypatch.setattr(projects, "artifact_access", AsyncMock(return_value=(True, "owner")))
 
     result = await projects.get_project_artifacts("proj-1", member)
     assert len(result) == 2
@@ -668,13 +795,12 @@ async def test_get_project_tasks_returns_project_tasks(monkeypatch):
     from routers import projects
 
     member = _make_member()
-    mem_row = {"id": "pm-1", "project_id": "proj-1", "member_id": "member-1", "role": "owner"}
     task_rows = [
         {"id": "task-1", "project_id": "proj-1", "goal": "Do something", "status": "complete"},
     ]
 
     call_idx = [0]
-    results = [mem_row, task_rows]
+    results = [task_rows]
 
     class _FakeResult:
         def __init__(self, data): self._data = data
@@ -705,6 +831,7 @@ async def test_get_project_tasks_returns_project_tasks(monkeypatch):
     monkeypatch.setattr(projects, "engine", _FakeEngine())
     monkeypatch.setattr(projects, "reflect_table", _fake_reflect())
     monkeypatch.setattr(projects, "select", _noop_select)
+    _mock_project_access(monkeypatch, projects)
     monkeypatch.setattr(projects.permissions, "check", AsyncMock(return_value=True))
 
     result = await projects.get_project_tasks("proj-1", member)
@@ -742,8 +869,6 @@ async def test_chat_create_conversation_persists_project_id(monkeypatch):
 
     # Capture INSERT values
     inserted_values = {}
-    original_insert = chat.insert
-
     def capturing_insert(tbl):
         class _CapturingClause:
             def values(self_inner, **kwargs):
@@ -757,10 +882,21 @@ async def test_chat_create_conversation_persists_project_id(monkeypatch):
     monkeypatch.setattr(chat, "engine", _FakeEngine())
     monkeypatch.setattr(chat, "reflect_table", _reflect)
     monkeypatch.setattr(chat, "insert", capturing_insert)
+    monkeypatch.setattr(
+        chat.workspace_access,
+        "require_workspace_access",
+        AsyncMock(return_value={"id": "workspace-abc"}),
+    )
 
-    conv_id = await chat._create_conversation(member, "Hello", project_id="proj-abc")
+    conv_id = await chat._create_conversation(
+        member,
+        "Hello",
+        project_id="proj-abc",
+        workspace_id="workspace-abc",
+    )
     assert conv_id == new_conv_id
     assert inserted_values.get("project_id") == "proj-abc"
+    assert inserted_values.get("workspace_id") == "workspace-abc"
 
 
 # ─── create_task_record persists project_id ──────────────────────────────────
@@ -802,6 +938,7 @@ async def test_create_task_record_persists_project_id(monkeypatch):
     monkeypatch.setattr(tasks_router, "reflect_table", _reflect)
     monkeypatch.setattr(tasks_router, "insert", capturing_insert)
     monkeypatch.setattr(tasks_router.permissions, "check", AsyncMock(return_value=True))
+    monkeypatch.setattr(tasks_router, "_require_project_membership", AsyncMock())
 
     # Patch resolve_agent_model to avoid LLM import issues
     import core.llm as llm_module
@@ -845,12 +982,13 @@ async def test_remove_owner_locks_owner_count(monkeypatch):
         def limit(self, *a): return self
         def offset(self, *a): return self
         def join(self, *a, **kw): return self
+        def outerjoin(self, *a, **kw): return self
         def with_for_update(self, *a, **kw):
             with_for_update_called[0] = True
             return self
 
     call_idx = [0]
-    results = [caller_row, [caller_row, other_owner_row], None]  # membership, owners, DELETE
+    results = [[caller_row, other_owner_row], None]  # owners, DELETE
 
     class _FakeResult:
         def __init__(self, data): self._data = data
@@ -883,6 +1021,7 @@ async def test_remove_owner_locks_owner_count(monkeypatch):
     monkeypatch.setattr(projects, "reflect_table", _fake_reflect())
     monkeypatch.setattr(projects, "select", _tracking_select)
     monkeypatch.setattr(projects, "delete", _noop_delete)
+    _mock_project_access(monkeypatch, projects)
     monkeypatch.setattr(projects.permissions, "check", AsyncMock(return_value=True))
     monkeypatch.setattr(projects.audit, "log", AsyncMock())
 
@@ -899,11 +1038,9 @@ async def test_add_member_rejects_unknown_member_id(monkeypatch):
     from routers import projects
 
     member = _make_member()
-    caller_row = {"id": "pm-1", "project_id": "proj-1", "member_id": "member-1", "role": "owner"}
 
     call_idx = [0]
-    # _require_owner (join query) returns owner row; member existence returns None
-    results = [caller_row, None]
+    results = [None]
 
     class _FakeResult:
         def __init__(self, data): self._data = data
@@ -928,6 +1065,7 @@ async def test_add_member_rejects_unknown_member_id(monkeypatch):
     monkeypatch.setattr(projects, "engine", _FakeEngine())
     monkeypatch.setattr(projects, "reflect_table", _fake_reflect())
     monkeypatch.setattr(projects, "select", _noop_select)
+    _mock_project_access(monkeypatch, projects)
     monkeypatch.setattr(projects.permissions, "check", AsyncMock(return_value=True))
     monkeypatch.setattr(projects.audit, "log", AsyncMock())
 
@@ -946,20 +1084,18 @@ async def test_add_member_idempotent_on_duplicate(monkeypatch):
     from routers import projects
 
     member = _make_member()
-    caller_row = {"id": "pm-1", "project_id": "proj-1", "member_id": "member-1", "role": "owner"}
     target_member_row = {"id": "member-2", "organization_id": "default", "email": "m2@example.com", "role": "user"}
     existing_pm_row = {"id": "pm-2", "project_id": "proj-1", "member_id": "member-2", "role": "member"}
 
     insert_called = [0]
-    original_insert = projects.insert
 
     def counting_insert(tbl):
         insert_called[0] += 1
         return _Clause()
 
     call_idx = [0]
-    # _require_owner, target existence, idempotency check (already exists) → no INSERT
-    results = [caller_row, target_member_row, existing_pm_row]
+    # Target existence and idempotency check (already exists) → no INSERT.
+    results = [target_member_row, existing_pm_row]
 
     class _FakeResult:
         def __init__(self, data): self._data = data
@@ -985,6 +1121,7 @@ async def test_add_member_idempotent_on_duplicate(monkeypatch):
     monkeypatch.setattr(projects, "reflect_table", _fake_reflect())
     monkeypatch.setattr(projects, "select", _noop_select)
     monkeypatch.setattr(projects, "insert", counting_insert)
+    _mock_project_access(monkeypatch, projects)
     monkeypatch.setattr(projects.permissions, "check", AsyncMock(return_value=True))
     monkeypatch.setattr(projects.audit, "log", AsyncMock())
 

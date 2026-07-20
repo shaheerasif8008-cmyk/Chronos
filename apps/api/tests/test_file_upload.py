@@ -19,6 +19,7 @@ from sqlalchemy import insert, select
 import main
 from core.auth import create_access_token
 from core.db import engine, reflect_table
+from tests.workspace_fixtures import ensure_default_workspace
 
 
 # ---------------------------------------------------------------------------
@@ -67,12 +68,14 @@ async def _make_org_and_member() -> tuple[str, str, str]:
                 role="user",
             )
         )
+    await ensure_default_workspace(org_id, [member_id])
     return org_id, member_id, create_access_token(member_id)
 
 
 async def _insert_conversation(org_id: str, member_id: str) -> str:
     """Insert a minimal conversation row and return its UUID string."""
     conversations = await reflect_table("conversations")
+    workspace_id = await ensure_default_workspace(org_id, [member_id])
     async with engine.begin() as conn:
         row = (
             await conn.execute(
@@ -81,6 +84,7 @@ async def _insert_conversation(org_id: str, member_id: str) -> str:
                     region="us",
                     member_id=member_id,
                     title="test-conv",
+                    workspace_id=workspace_id,
                 ).returning(conversations.c.id)
             )
         ).first()
@@ -314,6 +318,9 @@ async def test_send_message_persists_attachment_refs_on_user_message(monkeypatch
     async def fake_permissions_check(*a, **k):
         return True
 
+    async def fake_workspace_access(*a, **k):
+        return {"id": "workspace-test"}
+
     async def fake_assemble_context(*a, **k):
         return [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
 
@@ -327,6 +334,11 @@ async def test_send_message_persists_attachment_refs_on_user_message(monkeypatch
     monkeypatch.setattr(chat_router, "_get_artifact", fake_get_artifact)
     monkeypatch.setattr(chat_router, "_parse_attachments", fake_parse_attachments)
     monkeypatch.setattr(chat_router.permissions, "check", fake_permissions_check)
+    monkeypatch.setattr(
+        chat_router.workspace_access,
+        "require_workspace_access",
+        fake_workspace_access,
+    )
     monkeypatch.setattr(chat_router, "assemble_context", fake_assemble_context)
     monkeypatch.setattr(chat_router, "extract_explicit_memory_content", lambda _: None)
     monkeypatch.setattr(chat_router, "normalize_chat_model", lambda m: "fast")
@@ -377,6 +389,9 @@ async def test_send_message_filters_cross_org_attachment(monkeypatch):
     async def fake_permissions_check(*a, **k):
         return True
 
+    async def fake_workspace_access(*a, **k):
+        return {"id": "workspace-test"}
+
     async def fake_assemble_context(*a, **k):
         return [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
 
@@ -387,6 +402,11 @@ async def test_send_message_filters_cross_org_attachment(monkeypatch):
     monkeypatch.setattr(chat_router, "_get_artifact", fake_get_artifact)
     monkeypatch.setattr(chat_router, "_parse_attachments", fake_parse_attachments)
     monkeypatch.setattr(chat_router.permissions, "check", fake_permissions_check)
+    monkeypatch.setattr(
+        chat_router.workspace_access,
+        "require_workspace_access",
+        fake_workspace_access,
+    )
     monkeypatch.setattr(chat_router, "assemble_context", fake_assemble_context)
     monkeypatch.setattr(chat_router, "extract_explicit_memory_content", lambda _: None)
     monkeypatch.setattr(chat_router, "normalize_chat_model", lambda m: "fast")

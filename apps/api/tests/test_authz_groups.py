@@ -53,7 +53,7 @@ async def _seed_org_with_group(*, group_role: str = "admin") -> tuple[str, str, 
                 id=member_id,
                 organization_id=org_id,
                 email=f"{member_id[:8]}@test.io",
-                role="user",
+                role=group_role,
             )
         )
         await conn.execute(
@@ -94,12 +94,12 @@ async def test_admin_group_member_gets_org_admin(monkeypatch):
     """A member of an admin-role SCIM group is granted org admin in FGA."""
     monkeypatch.setattr("core.permissions.settings_openfga_configured", lambda: True)
 
-    grants: list[tuple[str, str, bool]] = []  # (member_id, org_id, admin)
+    syncs: list[tuple[str, str, str, bool]] = []
 
-    async def fake_grant_org_membership(member_id: str, org_id: str, *, admin: bool = False) -> None:
-        grants.append((member_id, org_id, admin))
+    async def fake_sync(member_id: str, org_id: str, *, role: str, active: bool = True) -> None:
+        syncs.append((member_id, org_id, role, active))
 
-    monkeypatch.setattr("core.permissions.grant_org_membership", fake_grant_org_membership)
+    monkeypatch.setattr("core.permissions.sync_org_membership", fake_sync)
 
     org_id, member_id, _gid = await _seed_org_with_group(group_role="admin")
     result = await permissions.reconcile_org_groups(org_id)
@@ -109,11 +109,12 @@ async def test_admin_group_member_gets_org_admin(monkeypatch):
     assert result["grants"] == 1
 
     # The grant must target the correct member+org and be elevated to admin.
-    assert len(grants) == 1
-    granted_member, granted_org, granted_admin = grants[0]
+    assert len(syncs) == 1
+    granted_member, granted_org, granted_role, active = syncs[0]
     assert granted_member == member_id
     assert granted_org == org_id
-    assert granted_admin is True, "admin-role group member must receive admin grant"
+    assert granted_role == "admin"
+    assert active is True
 
 
 @pytest.mark.asyncio
@@ -121,19 +122,20 @@ async def test_user_group_member_gets_org_member(monkeypatch):
     """A member of a user-role SCIM group is granted org membership (not admin)."""
     monkeypatch.setattr("core.permissions.settings_openfga_configured", lambda: True)
 
-    grants: list[tuple[str, str, bool]] = []
+    syncs: list[tuple[str, str, str, bool]] = []
 
-    async def fake_grant_org_membership(member_id: str, org_id: str, *, admin: bool = False) -> None:
-        grants.append((member_id, org_id, admin))
+    async def fake_sync(member_id: str, org_id: str, *, role: str, active: bool = True) -> None:
+        syncs.append((member_id, org_id, role, active))
 
-    monkeypatch.setattr("core.permissions.grant_org_membership", fake_grant_org_membership)
+    monkeypatch.setattr("core.permissions.sync_org_membership", fake_sync)
 
     org_id, member_id, _gid = await _seed_org_with_group(group_role="user")
     result = await permissions.reconcile_org_groups(org_id)
 
     assert result["grants"] == 1
-    _, _, granted_admin = grants[0]
-    assert granted_admin is False, "user-role group member must NOT receive admin grant"
+    _, _, granted_role, active = syncs[0]
+    assert granted_role == "user"
+    assert active is True
 
 
 @pytest.mark.asyncio
@@ -141,12 +143,12 @@ async def test_no_groups_returns_zero_grants(monkeypatch):
     """An org with no SCIM groups produces zero grants even when FGA is on."""
     monkeypatch.setattr("core.permissions.settings_openfga_configured", lambda: True)
 
-    grants: list = []
+    syncs: list = []
 
-    async def fake_grant_org_membership(member_id: str, org_id: str, *, admin: bool = False) -> None:
-        grants.append((member_id, org_id, admin))
+    async def fake_sync(member_id: str, org_id: str, *, role: str, active: bool = True) -> None:
+        syncs.append((member_id, org_id, role, active))
 
-    monkeypatch.setattr("core.permissions.grant_org_membership", fake_grant_org_membership)
+    monkeypatch.setattr("core.permissions.sync_org_membership", fake_sync)
 
     # Seed an org with a member but NO groups.
     org_id = str(uuid.uuid4())
@@ -167,8 +169,74 @@ async def test_no_groups_returns_zero_grants(monkeypatch):
         )
 
     result = await permissions.reconcile_org_groups(org_id)
-    assert result == {"groups": 0, "grants": 0}
-    assert grants == []
+    assert result == {"groups": 0, "grants": 1}
+    assert syncs == [(member_id, org_id, "user", True)]
+
+
+@pytest.mark.asyncio
+async def test_sync_org_membership_revokes_stale_admin_before_member_grant(monkeypatch):
+    monkeypatch.setattr("core.permissions.settings_openfga_configured", lambda: True)
+    operations: list[tuple[str, tuple[str, str, str]]] = []
+
+    async def fake_delete(tuple_key: tuple[str, str, str]) -> None:
+        operations.append(("delete", tuple_key))
+
+    async def fake_write(tuples: list[tuple[str, str, str]]) -> None:
+        operations.extend(("write", tuple_key) for tuple_key in tuples)
+
+    monkeypatch.setattr("core.permissions._delete_tuple_idempotently", fake_delete)
+    monkeypatch.setattr("core.permissions._write_tuples_idempotently", fake_write)
+
+    await permissions.sync_org_membership("member-1", "org-1", role="user")
+
+    assert operations == [
+        ("delete", ("user:member-1", "admin", "organization:org-1")),
+        ("write", ("user:member-1", "member", "organization:org-1")),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sync_deactivated_member_revokes_every_org_relation(monkeypatch):
+    monkeypatch.setattr("core.permissions.settings_openfga_configured", lambda: True)
+    deleted: list[tuple[str, str, str]] = []
+    written: list[tuple[str, str, str]] = []
+
+    async def fake_delete(tuple_key: tuple[str, str, str]) -> None:
+        deleted.append(tuple_key)
+
+    async def fake_write(tuples: list[tuple[str, str, str]]) -> None:
+        written.extend(tuples)
+
+    monkeypatch.setattr("core.permissions._delete_tuple_idempotently", fake_delete)
+    monkeypatch.setattr("core.permissions._write_tuples_idempotently", fake_write)
+
+    await permissions.sync_org_membership(
+        "member-1", "org-1", role="admin", active=False
+    )
+
+    assert deleted == [
+        ("user:member-1", "member", "organization:org-1"),
+        ("user:member-1", "admin", "organization:org-1"),
+    ]
+    assert written == []
+
+
+@pytest.mark.asyncio
+async def test_removing_final_admin_group_reconciles_member_to_user(monkeypatch):
+    monkeypatch.setattr("core.permissions.settings_openfga_configured", lambda: True)
+    syncs: list[tuple[str, str, str, bool]] = []
+
+    async def fake_sync(member_id: str, org_id: str, *, role: str, active: bool = True) -> None:
+        syncs.append((member_id, org_id, role, active))
+
+    monkeypatch.setattr("core.permissions.sync_org_membership", fake_sync)
+    org_id, member_id, group_id = await _seed_org_with_group(group_role="admin")
+
+    from core.scim import set_group_members
+
+    await set_group_members(org_id, group_id, [])
+
+    assert syncs[-1] == (member_id, org_id, "user", True)
 
 
 @pytest.mark.asyncio

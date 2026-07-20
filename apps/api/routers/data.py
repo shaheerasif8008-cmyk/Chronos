@@ -13,15 +13,18 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import insert, select
 
 from core import audit, permissions
+from core.artifact_access import artifact_access
 from core.auth import get_current_member
 from core.config import settings
 from core.db import engine, reflect_table
 from core.models import AgentContext, Member
+from core.memory_access import member_can_access_project
+from core.project_access import member_can_edit_project
 
 router = APIRouter(prefix="/datasets", tags=["data"])
 
@@ -45,18 +48,26 @@ async def _require_dataset(member: Member, dataset_id: str) -> dict:
         HTTPException: 404 when the dataset does not exist or belongs to a different org.
     """
     datasets = await reflect_table("datasets")
+    conditions = [
+        datasets.c.id == dataset_id,
+        datasets.c.organization_id == member.organization_id,
+    ]
     async with engine.begin() as conn:
         row = (
             await conn.execute(
-                select(datasets).where(
-                    datasets.c.id == dataset_id,
-                    datasets.c.organization_id == member.organization_id,
-                )
+                select(datasets).where(*conditions)
             )
         ).mappings().first()
     if row is None:
         raise HTTPException(status_code=404, detail="Dataset not found")
-    return dict(row)
+    dataset = dict(row)
+    project_id = dataset.get("project_id")
+    if project_id:
+        if not await member_can_access_project(member, str(project_id)):
+            raise HTTPException(status_code=404, detail="Dataset not found")
+    elif member.role not in {"admin", "owner"} and str(dataset.get("created_by")) != str(member.id):
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    return dataset
 
 
 def _infer_schema(content: bytes, mime_type: str, name: str) -> tuple[list[dict], int]:
@@ -107,6 +118,7 @@ class CreateDatasetRequest(BaseModel):
 
     source_artifact_id: str
     name: str | None = None
+    project_id: str | None = None
 
 
 class AnalyzeRequest(BaseModel):
@@ -154,6 +166,9 @@ async def create_dataset(
         raise HTTPException(status_code=404, detail="Source artifact not found")
     if str(artifact_meta.get("organization_id", "")) != str(member.organization_id):
         raise HTTPException(status_code=404, detail="Source artifact not found")
+    visible, _ = await artifact_access(member, artifact_meta)
+    if not visible:
+        raise HTTPException(status_code=404, detail="Source artifact not found")
 
     content = await read_artifact_content(req.source_artifact_id)
     if content is None:
@@ -162,11 +177,20 @@ async def create_dataset(
     mime_type = str(artifact_meta.get("mime_type") or "")
     artifact_title = str(artifact_meta.get("title") or "")
     dataset_name = req.name or artifact_title or "Untitled dataset"
+    artifact_project_id = artifact_meta.get("project_id")
+    project_id = str(req.project_id or artifact_project_id) if (req.project_id or artifact_project_id) else None
+    if req.project_id and artifact_project_id and str(req.project_id) != str(artifact_project_id):
+        raise HTTPException(status_code=422, detail="Dataset project must match its source artifact")
+    if project_id and not await member_can_edit_project(member, project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
 
     columns, row_count = _infer_schema(content, mime_type, artifact_title)
 
     dataset_id = str(uuid.uuid4())
     datasets = await reflect_table("datasets")
+    conditions = [datasets.c.organization_id == member.organization_id]
+    if member.role not in {"admin", "owner"}:
+        conditions.append(datasets.c.created_by == str(member.id))
     async with engine.begin() as conn:
         await conn.execute(
             insert(datasets).values(
@@ -174,6 +198,7 @@ async def create_dataset(
                 organization_id=member.organization_id,
                 region=member.region,
                 source_artifact_id=req.source_artifact_id,
+                project_id=project_id,
                 name=dataset_name,
                 schema={"columns": columns},
                 row_count=row_count,
@@ -187,13 +212,18 @@ async def create_dataset(
         member.id,
         "create_dataset",
         organization_id=member.organization_id,
-        payload={"dataset_id": dataset_id, "source_artifact_id": req.source_artifact_id},
+        payload={
+            "dataset_id": dataset_id,
+            "source_artifact_id": req.source_artifact_id,
+            "project_id": project_id,
+        },
     )
 
     return {
         "id": dataset_id,
         "organization_id": member.organization_id,
         "source_artifact_id": req.source_artifact_id,
+        "project_id": project_id,
         "name": dataset_name,
         "schema": {"columns": columns},
         "row_count": row_count,
@@ -203,6 +233,7 @@ async def create_dataset(
 
 @router.get("/")
 async def list_datasets(
+    project_id: str | None = Query(default=None),
     member: Member = Depends(get_current_member),
 ) -> list[dict]:
     """List datasets for the authenticated member's org, newest first.
@@ -215,11 +246,18 @@ async def list_datasets(
     """
     await permissions.check(member, "list_datasets", settings.org_id)
     datasets = await reflect_table("datasets")
+    conditions = [datasets.c.organization_id == member.organization_id]
+    if project_id:
+        if not await member_can_access_project(member, project_id):
+            raise HTTPException(status_code=404, detail="Project not found")
+        conditions.append(datasets.c.project_id == project_id)
+    elif member.role not in {"admin", "owner"}:
+        conditions.append(datasets.c.created_by == str(member.id))
     async with engine.begin() as conn:
         rows = (
             await conn.execute(
                 select(datasets)
-                .where(datasets.c.organization_id == member.organization_id)
+                .where(*conditions)
                 .order_by(datasets.c.created_at.desc())
             )
         ).mappings().all()

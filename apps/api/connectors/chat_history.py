@@ -5,7 +5,8 @@ from typing import Any
 from sqlalchemy import and_, or_, select
 
 from core.db import engine, reflect_table
-from core.models import AgentContext, ToolResult
+from core.models import AgentContext, Member, ToolResult
+from core.conversation_access import visibility_clause
 
 _DEFAULT_LIMIT = 10
 _MAX_LIMIT = 20
@@ -42,6 +43,21 @@ class ChatHistoryConnector:
 
     async def _recent(self, args: dict[str, Any], agent: AgentContext) -> ToolResult:
         conversations = await reflect_table("conversations")
+        member = Member(
+            id=agent.member_id,
+            organization_id=agent.org_id,
+            email="chat-history@chronos.invalid",
+            role="agent",
+        )
+        try:
+            acl = await reflect_table("conversation_members")
+        except Exception:
+            acl = None
+        access_filter = (
+            visibility_clause(conversations, acl, member)
+            if acl is not None
+            else conversations.c.member_id == agent.member_id
+        )
         limit = _limit(args.get("limit"))
         async with engine.begin() as conn:
             rows = (
@@ -55,7 +71,7 @@ class ChatHistoryConnector:
                     .where(
                         and_(
                             conversations.c.organization_id == agent.org_id,
-                            conversations.c.member_id == agent.member_id,
+                            access_filter,
                         )
                     )
                     .order_by(conversations.c.updated_at.desc())
@@ -75,10 +91,22 @@ class ChatHistoryConnector:
         escaped = _escape_like(query)
         conversations = await reflect_table("conversations")
         messages = await reflect_table("messages")
+        member = Member(
+            id=agent.member_id,
+            organization_id=agent.org_id,
+            email="chat-history@chronos.invalid",
+            role="agent",
+        )
+        try:
+            acl = await reflect_table("conversation_members")
+        except Exception:
+            acl = None
         limit = _limit(args.get("limit"))
         owned_filter = and_(
             conversations.c.organization_id == agent.org_id,
-            conversations.c.member_id == agent.member_id,
+            visibility_clause(conversations, acl, member)
+            if acl is not None
+            else conversations.c.member_id == agent.member_id,
         )
         async with engine.begin() as conn:
             rows = (

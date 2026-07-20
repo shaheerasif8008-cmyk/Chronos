@@ -56,17 +56,20 @@ def _build_engine(results):
             data = self._data
             class M:
                 def all(self_inner):
-                    if isinstance(data, list): return data
+                    if isinstance(data, list):
+                        return data
                     return [data] if data is not None else []
                 def first(self_inner):
-                    if isinstance(data, list): return data[0] if data else None
+                    if isinstance(data, list):
+                        return data[0] if data else None
                     return data
             return M()
         def scalar_one(self): return self._data
 
     class _FakeConn:
         async def execute(self, stmt):
-            idx = call_idx[0]; call_idx[0] += 1
+            idx = call_idx[0]
+            call_idx[0] += 1
             return _FakeResult(results[idx] if idx < len(results) else None)
         async def __aenter__(self): return self
         async def __aexit__(self, *_): pass
@@ -88,11 +91,10 @@ async def test_upload_with_project_id_creates_source(monkeypatch):
     from starlette.datastructures import UploadFile as StarletteUploadFile, Headers
 
     member = _make_member()
-    mem_row = {"id": "pm-1", "project_id": "proj-1", "member_id": "member-1", "role": "owner"}
     source_id = "src-99"
 
     async def fake_save(raw, **kw):
-        return "att-123"
+        return "00000000-0000-0000-0000-000000000123"
 
     captured = {}
 
@@ -104,8 +106,7 @@ async def test_upload_with_project_id_creates_source(monkeypatch):
             def returning(self_inner, *a): return self_inner
         return _Cap()
 
-    # _require_member runs one SELECT (membership row); then the source INSERT.
-    engine = _build_engine([mem_row, source_id])
+    engine = _build_engine([source_id])
 
     monkeypatch.setattr(attachments, "save_artifact", fake_save)
     monkeypatch.setattr(attachments, "engine", engine)
@@ -113,10 +114,20 @@ async def test_upload_with_project_id_creates_source(monkeypatch):
     monkeypatch.setattr(attachments, "insert", capturing_insert)
     monkeypatch.setattr(attachments.audit, "log", AsyncMock())
     monkeypatch.setattr(attachments.permissions, "check", AsyncMock(return_value=True))
-    # _require_member uses the projects module's engine/reflect/select.
-    monkeypatch.setattr(projects, "engine", engine)
-    monkeypatch.setattr(projects, "reflect_table", _fake_reflect())
-    monkeypatch.setattr(projects, "select", _noop_select)
+    from core.file_security import FileScanResult
+    from datetime import datetime, timezone
+    monkeypatch.setattr(attachments, "scan_file_bytes", AsyncMock(return_value=FileScanResult(
+        verdict="clean", sha256="a" * 64, size_bytes=13,
+        engine="clamav", scanned_at=datetime.now(timezone.utc),
+    )))
+    monkeypatch.setattr(attachments, "record_file_security_event_if_available", AsyncMock(return_value="event-1"))
+    # Project membership is a separate policy seam; this test focuses on the
+    # attachment-to-project-source write after that policy authorizes it.
+    monkeypatch.setattr(
+        projects,
+        "project_access_role",
+        AsyncMock(return_value=({"id": "proj-1"}, "owner")),
+    )
 
     upload = StarletteUploadFile(
         filename="report.pdf",
@@ -128,10 +139,10 @@ async def test_upload_with_project_id_creates_source(monkeypatch):
         task_id=None, research_run_id=None, member=member,
     )
 
-    assert out["attachment_id"] == "att-123"
+    assert out["attachment_id"] == "00000000-0000-0000-0000-000000000123"
     assert out["source_id"] == source_id
     assert captured["source_type"] == "upload"
-    assert captured["artifact_id"] == "att-123"
+    assert captured["artifact_id"] == "00000000-0000-0000-0000-000000000123"
     assert captured["project_id"] == "proj-1"
     assert captured["organization_id"] == "default"
 
@@ -146,7 +157,7 @@ async def test_upload_without_project_id_returns_null_source(monkeypatch):
     member = _make_member()
 
     async def fake_save(raw, **kw):
-        return "att-123"
+        return "00000000-0000-0000-0000-000000000123"
 
     insert_called = [0]
 
@@ -161,6 +172,13 @@ async def test_upload_without_project_id_returns_null_source(monkeypatch):
     # Conversation membership is enforced separately (its own test); stub it here so
     # this test isolates the "no project_id → null source" behavior.
     monkeypatch.setattr(attachments, "_require_conversation_member", AsyncMock())
+    from core.file_security import FileScanResult
+    from datetime import datetime, timezone
+    monkeypatch.setattr(attachments, "scan_file_bytes", AsyncMock(return_value=FileScanResult(
+        verdict="clean", sha256="a" * 64, size_bytes=13,
+        engine="clamav", scanned_at=datetime.now(timezone.utc),
+    )))
+    monkeypatch.setattr(attachments, "record_file_security_event_if_available", AsyncMock(return_value="event-1"))
 
     upload = StarletteUploadFile(
         filename="report.pdf",
@@ -172,7 +190,7 @@ async def test_upload_without_project_id_returns_null_source(monkeypatch):
         task_id=None, research_run_id=None, member=member,
     )
 
-    assert out["attachment_id"] == "att-123"
+    assert out["attachment_id"] == "00000000-0000-0000-0000-000000000123"
     assert out["source_id"] is None
     assert insert_called[0] == 0, "no project_sources insert when project_id absent"
 
@@ -186,21 +204,20 @@ async def test_upload_with_project_id_non_member_raises_404(monkeypatch):
     from starlette.datastructures import UploadFile as StarletteUploadFile, Headers
 
     member = _make_member(member_id="outsider")
-    # _require_member finds no membership row → 404.
-    engine = _build_engine([None])
-
     save_called = [0]
 
     async def fake_save(raw, **kw):
         save_called[0] += 1
-        return "att-123"
+        return "00000000-0000-0000-0000-000000000123"
 
     monkeypatch.setattr(attachments, "save_artifact", fake_save)
     monkeypatch.setattr(attachments.audit, "log", AsyncMock())
     monkeypatch.setattr(attachments.permissions, "check", AsyncMock(return_value=True))
-    monkeypatch.setattr(projects, "engine", engine)
-    monkeypatch.setattr(projects, "reflect_table", _fake_reflect())
-    monkeypatch.setattr(projects, "select", _noop_select)
+    monkeypatch.setattr(
+        projects,
+        "project_access_role",
+        AsyncMock(return_value=(None, None)),
+    )
 
     upload = StarletteUploadFile(
         filename="report.pdf",
@@ -223,22 +240,27 @@ async def test_get_project_sources_returns_org_scoped_rows(monkeypatch):
     from routers import projects
 
     member = _make_member()
-    mem_row = {"id": "pm-1", "project_id": "proj-1", "member_id": "member-1", "role": "owner"}
     source_rows = [
         {"id": "src-1", "project_id": "proj-1", "source_type": "upload", "organization_id": "default"},
         {"id": "src-2", "project_id": "proj-1", "source_type": "upload", "organization_id": "default"},
     ]
 
-    engine = _build_engine([mem_row, source_rows])
+    engine = _build_engine([source_rows])
 
     monkeypatch.setattr(projects, "engine", engine)
     monkeypatch.setattr(projects, "reflect_table", _fake_reflect())
     monkeypatch.setattr(projects, "select", _noop_select)
+    monkeypatch.setattr(
+        projects,
+        "project_access_role",
+        AsyncMock(return_value=({"id": "proj-1"}, "owner")),
+    )
     monkeypatch.setattr(projects.permissions, "check", AsyncMock(return_value=True))
 
     result = await projects.get_project_sources("proj-1", member)
     assert len(result) == 2
-    assert all(r["organization_id"] == "default" for r in result)
+    assert {r["id"] for r in result} == {"src-1", "src-2"}
+    assert all("organization_id" not in r and "permissions" not in r for r in result)
 
 
 @pytest.mark.asyncio
@@ -247,11 +269,11 @@ async def test_get_project_sources_non_member_returns_404(monkeypatch):
     from routers import projects
 
     member = _make_member(member_id="outsider")
-    engine = _build_engine([None])
-
-    monkeypatch.setattr(projects, "engine", engine)
-    monkeypatch.setattr(projects, "reflect_table", _fake_reflect())
-    monkeypatch.setattr(projects, "select", _noop_select)
+    monkeypatch.setattr(
+        projects,
+        "project_access_role",
+        AsyncMock(return_value=(None, None)),
+    )
     monkeypatch.setattr(projects.permissions, "check", AsyncMock(return_value=True))
 
     with pytest.raises(HTTPException) as exc_info:

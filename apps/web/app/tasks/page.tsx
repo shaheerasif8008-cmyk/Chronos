@@ -1,5 +1,5 @@
 import { redirect } from "next/navigation";
 
 export default function TasksPage() {
-  redirect("/activity");
+  redirect("/activity?tab=tasks");
 }

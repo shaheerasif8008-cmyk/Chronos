@@ -7,15 +7,18 @@ member-scoped (member owns the conversation).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import and_, select
+from sqlalchemy import Text, and_, cast, or_, select
 
-from core import audit, memory, permissions
+from core import audit, permissions
 from core.auth import get_current_member
+from core.conversation_access import ADMIN_ROLES, visibility_clause as conversation_visibility
 from core.db import engine, reflect_table
+from core.memory_access import memory_access_condition
 from core.models import Member, RequesterContext
 
 logger = logging.getLogger(__name__)
@@ -65,17 +68,25 @@ def _rank_key(hit: dict[str, Any], q_lower: str):
 async def _search_conversations(q: str, member: Member) -> list[dict[str, Any]]:
     escaped = _escape_like(q)
     tbl = await reflect_table("conversations")
+    conditions = [
+        tbl.c.organization_id == member.organization_id,
+        tbl.c.title.ilike(f"%{escaped}%", escape="\\"),
+    ]
+    if member.role not in ADMIN_ROLES:
+        try:
+            acl = await reflect_table("conversation_members")
+        except Exception:
+            acl = None
+        conditions.append(
+            conversation_visibility(tbl, acl, member)
+            if acl is not None
+            else tbl.c.member_id == member.id
+        )
     async with engine.begin() as conn:
         rows = (
             await conn.execute(
                 select(tbl.c.id, tbl.c.title, tbl.c.created_at, tbl.c.updated_at)
-                .where(
-                    and_(
-                        tbl.c.organization_id == member.organization_id,
-                        tbl.c.member_id == member.id,
-                        tbl.c.title.ilike(f"%{escaped}%", escape="\\"),
-                    )
-                )
+                .where(and_(*conditions))
                 .order_by(tbl.c.updated_at.desc())
                 .limit(_PER_TYPE_LIMIT)
             )
@@ -98,6 +109,21 @@ async def _search_messages(q: str, member: Member) -> list[dict[str, Any]]:
     escaped = _escape_like(q)
     msgs = await reflect_table("messages")
     convos = await reflect_table("conversations")
+    conditions = [
+        msgs.c.organization_id == member.organization_id,
+        convos.c.organization_id == member.organization_id,
+        msgs.c.content.ilike(f"%{escaped}%", escape="\\"),
+    ]
+    if member.role not in ADMIN_ROLES:
+        try:
+            acl = await reflect_table("conversation_members")
+        except Exception:
+            acl = None
+        conditions.append(
+            conversation_visibility(convos, acl, member)
+            if acl is not None
+            else convos.c.member_id == member.id
+        )
     async with engine.begin() as conn:
         rows = (
             await conn.execute(
@@ -110,14 +136,7 @@ async def _search_messages(q: str, member: Member) -> list[dict[str, Any]]:
                     convos.c.updated_at.label("conversation_updated_at"),
                 )
                 .select_from(msgs.join(convos, msgs.c.conversation_id == convos.c.id))
-                .where(
-                    and_(
-                        msgs.c.organization_id == member.organization_id,
-                        convos.c.organization_id == member.organization_id,
-                        convos.c.member_id == member.id,
-                        msgs.c.content.ilike(f"%{escaped}%", escape="\\"),
-                    )
-                )
+                .where(and_(*conditions))
                 .order_by(msgs.c.created_at.desc())
                 .limit(_PER_TYPE_LIMIT)
             )
@@ -139,15 +158,23 @@ async def _search_messages(q: str, member: Member) -> list[dict[str, Any]]:
 async def _search_tasks(q: str, member: Member) -> list[dict[str, Any]]:
     escaped = _escape_like(q)
     tbl = await reflect_table("tasks")
+    conditions = [
+        tbl.c.organization_id == member.organization_id,
+        tbl.c.goal.ilike(f"%{escaped}%", escape="\\"),
+    ]
+    if member.role not in {"admin", "owner"}:
+        conditions.append(
+            or_(
+                tbl.c.triggered_by_member_id == member.id,
+                tbl.c.assignee_member_id == member.id,
+            )
+        )
     async with engine.begin() as conn:
         rows = (
             await conn.execute(
                 select(tbl.c.id, tbl.c.goal, tbl.c.status, tbl.c.created_at)
                 .where(
-                    and_(
-                        tbl.c.organization_id == member.organization_id,
-                        tbl.c.goal.ilike(f"%{escaped}%", escape="\\"),
-                    )
+                    and_(*conditions)
                 )
                 .order_by(tbl.c.created_at.desc())
                 .limit(_PER_TYPE_LIMIT)
@@ -169,15 +196,54 @@ async def _search_tasks(q: str, member: Member) -> list[dict[str, Any]]:
 async def _search_artifacts(q: str, member: Member) -> list[dict[str, Any]]:
     escaped = _escape_like(q)
     tbl = await reflect_table("artifacts")
+    conditions = [
+        tbl.c.organization_id == member.organization_id,
+        tbl.c.is_deleted.is_(False),
+        tbl.c.title.ilike(f"%{escaped}%", escape="\\"),
+    ]
+    if member.role not in {"admin", "owner"}:
+        conversations = await reflect_table("conversations")
+        conversation_members = await reflect_table("conversation_members")
+        tasks = await reflect_table("tasks")
+        project_members = await reflect_table("project_members")
+        member_projects = select(project_members.c.project_id).where(
+            project_members.c.organization_id == member.organization_id,
+            project_members.c.member_id == member.id,
+        )
+        member_conversations = select(conversations.c.id).where(
+            conversations.c.organization_id == member.organization_id,
+            or_(
+                conversations.c.member_id == member.id,
+                select(conversation_members.c.id)
+                .where(
+                    conversation_members.c.organization_id == member.organization_id,
+                    conversation_members.c.conversation_id == conversations.c.id,
+                    conversation_members.c.member_id == member.id,
+                )
+                .exists(),
+            ),
+        )
+        member_tasks = select(tasks.c.id).where(
+            tasks.c.organization_id == member.organization_id,
+            or_(
+                tasks.c.triggered_by_member_id == member.id,
+                tasks.c.assignee_member_id == member.id,
+            ),
+        )
+        conditions.append(
+            or_(
+                tbl.c.created_by.in_([str(member.id), f"member:{member.id}"]),
+                tbl.c.project_id.in_(member_projects),
+                cast(tbl.c.conversation_id, Text).in_(member_conversations),
+                cast(tbl.c.task_id, Text).in_(member_tasks),
+            )
+        )
     async with engine.begin() as conn:
         rows = (
             await conn.execute(
                 select(tbl.c.id, tbl.c.title, tbl.c.kind, tbl.c.created_at)
                 .where(
-                    and_(
-                        tbl.c.organization_id == member.organization_id,
-                        tbl.c.title.ilike(f"%{escaped}%", escape="\\"),
-                    )
+                    and_(*conditions)
                 )
                 .order_by(tbl.c.created_at.desc())
                 .limit(_PER_TYPE_LIMIT)
@@ -197,16 +263,47 @@ async def _search_artifacts(q: str, member: Member) -> list[dict[str, Any]]:
 
 
 async def _search_memory(q: str, member: Member) -> list[dict[str, Any]]:
-    """Memory search always goes through the retrieve seam — never raw SQL."""
-    ctx = RequesterContext.from_member(member)
-    entries = await memory.retrieve(q, ctx)
+    """Search every durable memory scope the caller may currently read.
+
+    A bare chat RequesterContext cannot enumerate all authorized projects,
+    conversations, tasks, and personas. Global search therefore uses the same
+    canonical read predicate as the Memory control center, with literal text
+    matching rather than silently dropping those scopes.
+    """
+    escaped = _escape_like(q)
+    table = await reflect_table("memory_entries")
+    visible = await memory_access_condition(table, member)
+    async with engine.begin() as conn:
+        entries = (
+            await conn.execute(
+                select(
+                    table.c.id,
+                    table.c.content,
+                    table.c.created_at,
+                    table.c.updated_at,
+                )
+                .where(
+                    table.c.organization_id == member.organization_id,
+                    table.c.is_deleted.is_(False),
+                    table.c.is_archived.is_(False),
+                    table.c.superseded_by.is_(None),
+                    table.c.source != "synthesized",
+                    table.c.content.ilike(f"%{escaped}%", escape="\\"),
+                    visible,
+                )
+                .order_by(table.c.is_pinned.desc(), table.c.updated_at.desc())
+                .limit(_PER_TYPE_LIMIT)
+            )
+        ).mappings().all()
     return [
         {
             "type": "memory",
-            "id": entry.id,
-            "title": _snippet(entry.content, max_len=60),
-            "snippet": _snippet(entry.content),
+            "id": str(entry["id"]),
+            "title": _snippet(entry["content"], max_len=60),
+            "snippet": _snippet(entry["content"]),
             "url": "/memory",
+            "created_at": str(entry["created_at"]) if entry.get("created_at") else None,
+            "updated_at": str(entry["updated_at"]) if entry.get("updated_at") else None,
         }
         for entry in entries
     ]
@@ -223,19 +320,41 @@ async def _search_sources(q: str, member: Member) -> list[dict[str, Any]]:
     escaped = _escape_like(q)
     try:
         tbl = await reflect_table("project_sources")
+        chunks = await reflect_table("project_source_chunks")
         members_tbl = await reflect_table("project_members")
     except Exception:
         # Table does not exist yet (arrives in a later sprint)
         return []
     try:
         async with engine.begin() as conn:
+            candidate_limit = _PER_TYPE_LIMIT * 6
             rows = (
                 await conn.execute(
-                    select(tbl.c.id, tbl.c.title, tbl.c.project_id, tbl.c.created_at)
+                    select(
+                        tbl.c.id,
+                        tbl.c.title,
+                        tbl.c.project_id,
+                        tbl.c.created_at,
+                        tbl.c.permissions,
+                        tbl.c.created_by,
+                        tbl.c.index_status,
+                        chunks.c.content.label("matched_content"),
+                        members_tbl.c.role.label("project_role"),
+                    )
                     .select_from(
                         tbl.join(
                             members_tbl,
-                            tbl.c.project_id == members_tbl.c.project_id,
+                            and_(
+                                tbl.c.project_id == members_tbl.c.project_id,
+                                tbl.c.organization_id == members_tbl.c.organization_id,
+                            ),
+                        ).outerjoin(
+                            chunks,
+                            and_(
+                                chunks.c.source_id == tbl.c.id,
+                                chunks.c.organization_id == tbl.c.organization_id,
+                                chunks.c.project_id == tbl.c.project_id,
+                            ),
                         )
                     )
                     .where(
@@ -243,23 +362,49 @@ async def _search_sources(q: str, member: Member) -> list[dict[str, Any]]:
                             tbl.c.organization_id == member.organization_id,
                             members_tbl.c.organization_id == member.organization_id,
                             members_tbl.c.member_id == member.id,
-                            tbl.c.title.ilike(f"%{escaped}%", escape="\\"),
+                            tbl.c.index_status.in_(["indexed", "synced"]),
+                            or_(
+                                tbl.c.title.ilike(f"%{escaped}%", escape="\\"),
+                                chunks.c.content.ilike(f"%{escaped}%", escape="\\"),
+                            ),
                         )
                     )
                     .order_by(tbl.c.created_at.desc())
-                    .limit(_PER_TYPE_LIMIT)
+                    .limit(candidate_limit)
                 )
             ).mappings().all()
+        from memory.source_retrieval import source_permissions_allow
+
+        context = RequesterContext.from_member(member)
+        visible_rows = []
+        seen_source_ids: set[str] = set()
+        for row in rows:
+            source_id = str(row["id"])
+            if source_id in seen_source_ids:
+                continue
+            context.project_id = str(row["project_id"])
+            if source_permissions_allow(
+                row.get("permissions"),
+                context,
+                created_by=row.get("created_by"),
+            ):
+                visible_rows.append(row)
+                seen_source_ids.add(source_id)
+            if len(visible_rows) >= _PER_TYPE_LIMIT:
+                break
         return [
             {
                 "type": "sources",
                 "id": str(row["id"]),
                 "title": row["title"] or "Untitled source",
-                "snippet": _snippet(row["title"]),
-                "url": f"/projects?p={row['project_id']}",
+                "snippet": _snippet(row.get("matched_content") or row["title"]),
+                "url": (
+                    f"/projects?id={row['project_id']}&tab=sources"
+                    f"&source={row['id']}"
+                ),
                 "created_at": str(row["created_at"]) if row["created_at"] is not None else None,
             }
-            for row in rows
+            for row in visible_rows
         ]
     except Exception:
         return []
@@ -296,7 +441,11 @@ async def run_search(
         "search.global",
         organization_id=member.organization_id,
         resource_type="global",
-        payload={"q_preview": q[:120], "types": types_csv or "all"},
+        payload={
+            "query_sha256": hashlib.sha256(q.encode("utf-8")).hexdigest(),
+            "query_length": len(q),
+            "types": types_csv or "all",
+        },
     )
 
     q = q.strip()

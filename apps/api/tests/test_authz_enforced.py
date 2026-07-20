@@ -1,7 +1,7 @@
 """W2.1 — prove the OpenFGA-enabled relationship path.
 
 With ``openfga_api_url`` empty (the default and the standard test env) every
-mapped action returns ``granted_stub`` and the relationship checks are never
+mapped action returns ``granted_allowlist`` and the relationship checks are never
 exercised. These tests turn enforcement ON against a *live* OpenFGA server and
 prove the moat's unproven half:
 
@@ -34,11 +34,20 @@ from core.exceptions import PermissionDenied
 from core.models import Member
 
 OPENFGA_URL = os.environ.get("OPENFGA_TEST_URL", "http://localhost:8080")
+OPENFGA_TOKEN = os.environ.get("OPENFGA_TEST_TOKEN", "")
+
+
+def _openfga_headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {OPENFGA_TOKEN}"} if OPENFGA_TOKEN else {}
 
 
 def _openfga_reachable(url: str) -> bool:
     try:
-        resp = httpx.get(f"{url.rstrip('/')}/stores", timeout=2.0)
+        resp = httpx.get(
+            f"{url.rstrip('/')}/stores",
+            headers=_openfga_headers(),
+            timeout=2.0,
+        )
     except httpx.HTTPError:
         return False
     return resp.status_code < 500
@@ -64,6 +73,7 @@ def enforced_fga(monkeypatch):
         pytest.skip(f"OpenFGA not reachable at {OPENFGA_URL}")
 
     monkeypatch.setattr(authz.settings, "openfga_api_url", OPENFGA_URL)
+    monkeypatch.setattr(authz.settings, "openfga_api_token", OPENFGA_TOKEN)
     monkeypatch.setattr(authz.settings, "permissions_enforce", True)
     monkeypatch.setattr(authz.settings, "openfga_store_id", "")
     monkeypatch.setattr(authz.settings, "openfga_model_id", "")
@@ -144,6 +154,14 @@ async def test_mapped_action_fails_closed_when_server_unreachable(monkeypatch):
     monkeypatch.setattr(authz.settings, "permissions_enforce", True)
     monkeypatch.setattr(authz.settings, "openfga_store_id", "")
     monkeypatch.setattr(authz.settings, "openfga_model_id", "")
+
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def unlocked():
+        yield
+
+    monkeypatch.setattr(authz, "_bootstrap_advisory_lock", unlocked)
 
     decisions: list[str | None] = []
 

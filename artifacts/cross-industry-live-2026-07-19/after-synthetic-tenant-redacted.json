@@ -1,0 +1,10 @@
+{
+  "label": "chronos-eval-v4-20260719",
+  "email": "local-eval-v4-20260719@chronos-eval-v4-20260719.dev",
+  "member_id": "793f456b-82fa-4bd6-94de-203a7d664a86",
+  "org_id": "e0e6202e-514b-427e-a99d-aefea344f751",
+  "subdomain": "chronos-eval-v4-20260719",
+  "created": true,
+  "auth": "supported_dev_otp",
+  "secrets_persisted": false
+}

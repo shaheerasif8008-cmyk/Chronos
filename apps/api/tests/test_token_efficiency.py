@@ -92,6 +92,86 @@ def test_agent_history_compaction_keeps_pending_approval_pair_exact():
     assert any(message.get("content", "").startswith("# Prior Work Summary") for message in compacted)
 
 
+def test_agent_history_compaction_keeps_parallel_tool_protocol_atomic():
+    from runtime.agent_loop import compact_agent_history_for_model
+
+    calls = [
+        {
+            "id": f"parallel-{index}",
+            "type": "function",
+            "function": {"name": "browser__search", "arguments": "{}"},
+        }
+        for index in range(3)
+    ]
+    history = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "goal"},
+        {"role": "assistant", "content": "", "tool_calls": calls},
+        *[
+            {
+                "role": "tool",
+                "tool_call_id": call["id"],
+                "name": "browser__search",
+                "content": json.dumps({"summary": f"done {index}"}),
+            }
+            for index, call in enumerate(calls)
+        ],
+    ]
+
+    compacted = compact_agent_history_for_model(history, recent_tool_iterations=2)
+
+    assert compacted == history
+    assert compacted[2]["tool_calls"] == calls
+    assert {message["tool_call_id"] for message in compacted[3:]} == {
+        call["id"] for call in calls
+    }
+
+
+def test_agent_history_compaction_recovers_orphaned_and_interrupted_results():
+    from runtime.agent_loop import compact_agent_history_for_model
+
+    history = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "goal"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "expected-call",
+                    "type": "function",
+                    "function": {"name": "fs__read", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "wrong-call",
+            "name": "fs__read",
+            "content": json.dumps({"summary": "legacy result"}),
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "fully-orphaned",
+            "name": "browser__search",
+            "content": json.dumps({"summary": "old result"}),
+        },
+    ]
+
+    compacted = compact_agent_history_for_model(history)
+
+    assert all(message.get("role") != "tool" for message in compacted)
+    assert all(not message.get("tool_calls") for message in compacted)
+    recovery = next(
+        message
+        for message in compacted
+        if str(message.get("content") or "").startswith("# Prior Work Summary")
+    )
+    assert "recovered without replaying orphaned results" in recovery["content"]
+    assert "legacy result" in recovery["content"]
+    assert "old result" in recovery["content"]
+
+
 @pytest.mark.asyncio
 async def test_run_loop_saves_token_usage_when_daily_limit_disabled(monkeypatch):
     from runtime import agent_loop

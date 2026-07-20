@@ -12,10 +12,18 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, Form
 from sqlalchemy import insert, select
 
 from core import audit, permissions
-from core.artifacts import save_artifact
+from core.artifacts import ArtifactStorageUnavailable, save_artifact
 from core.auth import get_current_member
+from core.conversation_access import require_conversation
 from core.config import settings
+from core.content_disarm import inspect_active_content
 from core.db import engine, reflect_table
+from core.file_security import (
+    FileScanUnavailable,
+    record_file_security_event_if_available,
+    require_safe_verdict,
+    scan_file_bytes,
+)
 from core.models import Member
 
 router = APIRouter(prefix="/attachments", tags=["attachments"])
@@ -47,9 +55,9 @@ async def _parse_eagerly(attachment_id: str, conversation_id: str | None, org_id
             return
         raw = await read_artifact_content(attachment_id) or b""
         doc = await parse_document(raw, mime, str(meta.get("title") or "file"))
-        if doc.parser_used != "none":
+        if doc.parser_used != "none" and doc.full_text.strip():
             status = "parsed"
-        elif doc.note == UNPARSEABLE_NOTE:
+        elif doc.note == UNPARSEABLE_NOTE or not doc.full_text.strip():
             status = "unparseable"
         else:
             status = "failed"
@@ -58,6 +66,7 @@ async def _parse_eagerly(attachment_id: str, conversation_id: str | None, org_id
                 doc.full_text, kind="parsed_text", title=f"{meta.get('title')} (text)",
                 conversation_id=conversation_id, parent_artifact_id=attachment_id,
                 parse_status="parsed", org_id=org_id, mime_type="text/plain",
+                created_by=meta.get("created_by"),
             )
         await set_parse_status(attachment_id, status)
         await audit.log(
@@ -80,54 +89,36 @@ def _spawn_eager_parse(attachment_id: str, conversation_id: str | None, org_id: 
     task.add_done_callback(_BACKGROUND_TASKS.discard)
 
 
-async def _require_conversation_member(member: Member, conversation_id: str) -> None:
-    """Raise 404 when *conversation_id* does not exist in the member's org.
+def _spawn_source_index(source_id: str, org_id: str) -> None:
+    """Keep project-source indexing alive for the lifetime of the request worker.
 
-    Enforces tenant isolation for conversation-linked uploads without relying
-    on the permissions stub.
-
-    Args:
-        member: The authenticated requester.
-        conversation_id: The target conversation UUID.
-
-    Raises:
-        HTTPException(404): When the conversation does not belong to this org.
+    The source row is durable and remains reindexable after a crash; this strong
+    reference prevents Python from collecting the in-flight task during normal
+    operation (the same lifecycle rule as eager document parsing above).
     """
-    conversations = await reflect_table("conversations")
-    async with engine.begin() as conn:
-        row = (
-            await conn.execute(
-                select(conversations.c.id).where(
-                    conversations.c.id == conversation_id,
-                    conversations.c.organization_id == member.organization_id,
-                )
-            )
-        ).first()
-    if row is None:
-        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    from memory.source_indexing import index_source
+
+    task = asyncio.create_task(index_source(source_id, org_id))
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+
+async def _require_conversation_member(member: Member, conversation_id: str) -> None:
+    """Require editor access before linking an upload to a conversation."""
+
+    try:
+        await require_conversation(member, conversation_id, minimum="editor")
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Conversation not found") from exc
 
 
 async def _require_task_member(member: Member, task_id: str) -> None:
-    """Raise 404 when *task_id* does not exist in the member's org.
+    """Require canonical creator/assignee/admin visibility for task uploads."""
 
-    Args:
-        member: The authenticated requester.
-        task_id: The target task UUID.
+    from core.task_access import visible_task
 
-    Raises:
-        HTTPException(404): When the task does not belong to this org.
-    """
-    tasks = await reflect_table("tasks")
-    async with engine.begin() as conn:
-        row = (
-            await conn.execute(
-                select(tasks.c.id).where(
-                    tasks.c.id == task_id,
-                    tasks.c.organization_id == member.organization_id,
-                )
-            )
-        ).first()
-    if row is None:
+    if await visible_task(member, task_id) is None:
         raise HTTPException(status_code=404, detail="Task not found")
 
 
@@ -169,9 +160,11 @@ async def upload_attachment(
     if conversation_id:
         await _require_conversation_member(member, conversation_id)
     if project_id:
-        # Enforce membership before reading/storing (raises 404 for non-members).
-        from routers.projects import _require_member
-        await _require_member(member, project_id)
+        # Organization-visible projects are read-only to non-members. Uploads
+        # create project source state, so they require explicit membership.
+        from routers.projects import _require_editor
+        await _require_editor(member, project_id)
+        await permissions.check(member, "add_project_source", project_id)
     if task_id:
         await _require_task_member(member, task_id)
     if research_run_id:
@@ -181,20 +174,117 @@ async def upload_attachment(
     if len(raw) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="File exceeds 25 MB limit")
 
-    attachment_id = await save_artifact(
-        raw,
-        kind="attachment",
-        title=file.filename or "upload",
-        conversation_id=conversation_id,
-        task_id=task_id,
+    filename = file.filename or "upload"
+    scan = await scan_file_bytes(raw)
+    try:
+        require_safe_verdict(scan)
+    except ValueError as exc:
+        event_id = await record_file_security_event_if_available(
+            scan,
+            organization_id=member.organization_id,
+            source="attachment",
+            filename=filename,
+            mime_type=file.content_type,
+            created_by=member.id,
+            content_disarm_status="not_run",
+        )
+        await audit.log(
+            "attachment_rejected_malware",
+            member.id,
+            "attachments.upload",
+            organization_id=member.organization_id,
+            resource_type="file_security_events",
+            resource_id=event_id,
+            payload={"verdict": "infected", "signature": scan.signature},
+        )
+        raise HTTPException(
+            status_code=422,
+            detail="This file was blocked because it contains malware.",
+        ) from exc
+    except FileScanUnavailable as exc:
+        event_id = await record_file_security_event_if_available(
+            scan,
+            organization_id=member.organization_id,
+            source="attachment",
+            filename=filename,
+            mime_type=file.content_type,
+            created_by=member.id,
+            content_disarm_status="not_run",
+        )
+        await audit.log(
+            "attachment_scan_unavailable",
+            member.id,
+            "attachments.upload",
+            organization_id=member.organization_id,
+            resource_type="file_security_events",
+            resource_id=event_id,
+            payload={"verdict": "error", "error_code": exc.error_code},
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="File security scanning is temporarily unavailable. Please retry.",
+        ) from exc
+
+    disarm = inspect_active_content(raw, filename=filename, mime_type=file.content_type)
+    if disarm.status != "safe":
+        event_id = await record_file_security_event_if_available(
+            scan,
+            organization_id=member.organization_id,
+            source="attachment",
+            filename=filename,
+            mime_type=file.content_type,
+            created_by=member.id,
+            content_disarm_status=disarm.status,
+            content_disarm_reason=disarm.reason,
+        )
+        await audit.log(
+            "attachment_rejected_active_content",
+            member.id,
+            "attachments.upload",
+            organization_id=member.organization_id,
+            resource_type="file_security_events",
+            resource_id=event_id,
+            payload={"content_disarm_status": disarm.status, "reason": disarm.reason},
+        )
+        raise HTTPException(
+            status_code=422,
+            detail="This file contains active or embedded content that Chronos cannot safely disarm.",
+        )
+
+    try:
+        attachment_id = await save_artifact(
+            raw,
+            kind="attachment",
+            title=filename,
+            conversation_id=conversation_id,
+            task_id=task_id,
+            mime_type=file.content_type,
+            org_id=member.organization_id,
+            parse_status="pending",
+            created_by=member.id,
+            malware_scan_status=scan.verdict,
+            malware_scan_engine=scan.engine,
+            malware_scan_engine_version=scan.engine_version,
+            malware_scan_signature=scan.signature,
+            malware_scanned_at=scan.scanned_at,
+        )
+    except ArtifactStorageUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    event_id = await record_file_security_event_if_available(
+        scan,
+        organization_id=member.organization_id,
+        source="attachment",
+        filename=filename,
         mime_type=file.content_type,
-        org_id=member.organization_id,
-        parse_status="pending",
+        created_by=member.id,
+        artifact_id=attachment_id,
+        content_disarm_status="safe",
     )
     await audit.log(
         "attachment_uploaded", member.id, "attachments.upload",
         organization_id=member.organization_id,
         resource_type="artifacts", resource_id=attachment_id,
+        payload={"file_security_event_id": event_id, "malware_scan_status": scan.verdict},
     )
     _spawn_eager_parse(attachment_id, conversation_id, member.organization_id)
 
@@ -209,7 +299,7 @@ async def upload_attachment(
                     region=settings.region,
                     project_id=project_id,
                     source_type="upload",
-                    title=file.filename or "upload",
+                    title=filename,
                     artifact_id=attachment_id,
                     parse_status="pending",
                     index_status="pending",
@@ -227,8 +317,7 @@ async def upload_attachment(
         # Fire-and-forget background index so upload returns immediately (still
         # index_status="pending"). index_source owns its error handling and marks
         # the source "failed" on error rather than crashing.
-        from memory.source_indexing import index_source
-        asyncio.create_task(index_source(source_id, member.organization_id))
+        _spawn_source_index(source_id, member.organization_id)
 
     if task_id:
         await audit.log(

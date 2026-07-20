@@ -14,6 +14,7 @@ All writes are tenant-scoped on ``organization_id`` and audit-logged.
 """
 from __future__ import annotations
 
+import math
 import re
 from typing import Any
 
@@ -23,6 +24,12 @@ from sqlalchemy.sql import func
 from core import audit
 from core.config import settings
 from core.db import engine, reflect_table
+from core.memory_access import (
+    get_memory_for_member,
+    memory_access_condition,
+    normalize_entry_scope,
+    validate_policy_target,
+)
 from core.models import Member, RequesterContext
 
 # Two memories in the same scope are treated as conflicting near-duplicates when
@@ -74,12 +81,42 @@ async def is_memory_enabled(
     return True
 
 
-async def set_memory_policy(member: Member, *, scope: str, scope_id: str, enabled: bool) -> dict[str, Any]:
+async def get_memory_policy(
+    member: Member,
+    *,
+    scope: str,
+    scope_id: str | None,
+) -> dict[str, Any]:
+    """Return the canonical policy target and its effective capture state."""
+    canonical_scope, canonical_id = await validate_policy_target(member, scope, scope_id)
+    explicit_enabled = not await _policy_disabled(
+        str(member.organization_id), canonical_scope, canonical_id
+    )
+    effective_enabled = await is_memory_enabled(
+        org_id=str(member.organization_id),
+        project_id=canonical_id if canonical_scope == "project" else None,
+        member_id=canonical_id if canonical_scope == "member" else None,
+        conversation_id=canonical_id if canonical_scope == "conversation" else None,
+    )
+    return {
+        "scope": canonical_scope,
+        "scope_id": canonical_id,
+        "enabled": explicit_enabled,
+        "effective_enabled": effective_enabled,
+    }
+
+
+async def set_memory_policy(
+    member: Member,
+    *,
+    scope: str,
+    scope_id: str | None,
+    enabled: bool,
+) -> dict[str, Any]:
     """Enable/disable memory for a scope (org|project|member|conversation)."""
     from core.settings_store import save_settings_doc
 
-    if scope not in {"org", "project", "member", "conversation"}:
-        raise ValueError(f"invalid memory policy scope: {scope}")
+    scope, scope_id = await validate_policy_target(member, scope, scope_id)
     doc = await save_settings_doc(
         member, "memory_policy", {"enabled": enabled}, scope=scope, scope_id=scope_id
     )
@@ -114,6 +151,7 @@ async def record_memory_usage(
             "organization_id": requester_context.org_id,
             "region": settings.region,
             "memory_id": str(mid),
+            "conversation_id": requester_context.conversation_id,
             "task_id": requester_context.task_id,
             "used_by": requester_context.member_id,
             "context": context,
@@ -125,15 +163,20 @@ async def record_memory_usage(
 
 
 async def list_memory_usage(memory_id: str, member: Member, *, limit: int = 50) -> list[dict[str, Any]]:
+    if await get_memory_for_member(memory_id, member) is None:
+        return []
     table = await reflect_table("memory_usage_log")
+    conditions = [
+        table.c.memory_id == memory_id,
+        table.c.organization_id == member.organization_id,
+    ]
+    if member.role not in {"admin", "owner"}:
+        conditions.append(table.c.used_by == member.id)
     async with engine.begin() as conn:
         rows = (
             await conn.execute(
                 select(table)
-                .where(
-                    table.c.memory_id == memory_id,
-                    table.c.organization_id == member.organization_id,
-                )
+                .where(*conditions)
                 .order_by(table.c.created_at.desc())
                 .limit(limit)
             )
@@ -144,7 +187,10 @@ async def list_memory_usage(memory_id: str, member: Member, *, limit: int = 50) 
 # --------------------------------------------------------------------------- #
 # Control-center flag updates
 # --------------------------------------------------------------------------- #
-async def _set_fields(memory_id: str, org_id: str, **values: Any) -> bool:
+async def _set_fields(memory_id: str, member: Member, **values: Any) -> bool:
+    memory = await get_memory_for_member(memory_id, member, mutate=True)
+    if memory is None:
+        return False
     table = await reflect_table("memory_entries")
     values["updated_at"] = func.now()
     async with engine.begin() as conn:
@@ -152,7 +198,9 @@ async def _set_fields(memory_id: str, org_id: str, **values: Any) -> bool:
             update(table)
             .where(
                 table.c.id == memory_id,
-                table.c.organization_id == org_id,
+                table.c.organization_id == member.organization_id,
+                table.c.scope == memory["scope"],
+                table.c.scope_id == memory["scope_id"],
                 table.c.is_deleted.is_(False),
             )
             .values(**values)
@@ -162,7 +210,7 @@ async def _set_fields(memory_id: str, org_id: str, **values: Any) -> bool:
 
 
 async def archive_memory(memory_id: str, member: Member, *, archived: bool = True) -> bool:
-    ok = await _set_fields(memory_id, member.organization_id, is_archived=archived)
+    ok = await _set_fields(memory_id, member, is_archived=archived)
     if ok:
         await audit.log(
             "memory_write", member.id, "memory.archive" if archived else "memory.unarchive",
@@ -173,7 +221,7 @@ async def archive_memory(memory_id: str, member: Member, *, archived: bool = Tru
 
 
 async def set_pinned(memory_id: str, member: Member, *, pinned: bool) -> bool:
-    ok = await _set_fields(memory_id, member.organization_id, is_pinned=pinned)
+    ok = await _set_fields(memory_id, member, is_pinned=pinned)
     if ok:
         await audit.log(
             "memory_write", member.id, "memory.pin" if pinned else "memory.unpin",
@@ -184,7 +232,7 @@ async def set_pinned(memory_id: str, member: Member, *, pinned: bool) -> bool:
 
 
 async def set_sensitive(memory_id: str, member: Member, *, sensitive: bool) -> bool:
-    ok = await _set_fields(memory_id, member.organization_id, is_sensitive=sensitive)
+    ok = await _set_fields(memory_id, member, is_sensitive=sensitive)
     if ok:
         await audit.log(
             "memory_write", member.id, "memory.classify_sensitive",
@@ -196,7 +244,14 @@ async def set_sensitive(memory_id: str, member: Member, *, sensitive: bool) -> b
 
 
 async def change_scope(memory_id: str, member: Member, *, scope: str, scope_id: str) -> bool:
-    ok = await _set_fields(memory_id, member.organization_id, scope=scope, scope_id=scope_id)
+    current = await get_memory_for_member(memory_id, member, mutate=True)
+    if current is None:
+        return False
+    try:
+        scope, scope_id = await normalize_entry_scope(member, scope, scope_id)
+    except ValueError:
+        return False
+    ok = await _set_fields(memory_id, member, scope=scope, scope_id=scope_id)
     if ok:
         await audit.log(
             "memory_write", member.id, "memory.change_scope",
@@ -232,23 +287,23 @@ async def merge_memories(member: Member, *, primary_id: str, duplicate_ids: list
     targets = [d for d in duplicate_ids if d != primary_id]
     if not targets:
         return 0
+    primary = await get_memory_for_member(primary_id, member, mutate=True)
+    duplicates = [await get_memory_for_member(item, member, mutate=True) for item in targets]
+    if primary is None or any(item is None for item in duplicates):
+        return 0
+    scope_pair = (str(primary["scope"]), str(primary["scope_id"]))
+    if any((str(item["scope"]), str(item["scope_id"])) != scope_pair for item in duplicates if item):
+        # Cross-scope supersession can make a private row point at data its
+        # reader cannot access, so merges are deliberately scope-local.
+        return 0
     async with engine.begin() as conn:
-        primary = (
-            await conn.execute(
-                select(table.c.id).where(
-                    table.c.id == primary_id,
-                    table.c.organization_id == org,
-                    table.c.is_deleted.is_(False),
-                )
-            )
-        ).first()
-        if primary is None:
-            return 0
         result = await conn.execute(
             update(table)
             .where(
                 table.c.id.in_(targets),
                 table.c.organization_id == org,
+                table.c.scope == scope_pair[0],
+                table.c.scope_id == scope_pair[1],
                 table.c.is_deleted.is_(False),
             )
             .values(superseded_by=primary_id, updated_at=func.now())
@@ -264,8 +319,9 @@ async def merge_memories(member: Member, *, primary_id: str, duplicate_ids: list
     return len(superseded)
 
 
-async def _active_rows(org_id: str) -> list[dict[str, Any]]:
+async def _active_rows(member: Member) -> list[dict[str, Any]]:
     table = await reflect_table("memory_entries")
+    visible = await memory_access_condition(table, member)
     async with engine.begin() as conn:
         rows = (
             await conn.execute(
@@ -273,10 +329,11 @@ async def _active_rows(org_id: str) -> list[dict[str, Any]]:
                     table.c.id, table.c.scope, table.c.scope_id, table.c.content,
                     table.c.created_at, table.c.importance_score,
                 ).where(
-                    table.c.organization_id == org_id,
+                    table.c.organization_id == member.organization_id,
                     table.c.is_deleted.is_(False),
                     table.c.is_archived.is_(False),
                     table.c.superseded_by.is_(None),
+                    visible,
                 )
             )
         ).mappings().all()
@@ -289,7 +346,7 @@ async def detect_conflicts(member: Member) -> list[dict[str, Any]]:
     Deterministic (token overlap). For each conflicting pair the older entry is
     proposed as the stale one to supersede with the newer survivor.
     """
-    rows = await _active_rows(member.organization_id)
+    rows = await _active_rows(member)
     buckets: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for r in rows:
         buckets.setdefault((r["scope"], r["scope_id"]), []).append(r)
@@ -323,7 +380,13 @@ async def resolve_conflict(member: Member, *, stale_id: str, survivor_id: str) -
     """Supersede a stale memory with its survivor (drops it from retrieval)."""
     if stale_id == survivor_id:
         return False
-    ok = await _set_fields(stale_id, member.organization_id, superseded_by=survivor_id)
+    stale = await get_memory_for_member(stale_id, member, mutate=True)
+    survivor = await get_memory_for_member(survivor_id, member, mutate=True)
+    if stale is None or survivor is None:
+        return False
+    if (stale["scope"], stale["scope_id"]) != (survivor["scope"], survivor["scope_id"]):
+        return False
+    ok = await _set_fields(stale_id, member, superseded_by=survivor_id)
     if ok:
         await audit.log(
             "memory_write", member.id, "memory.resolve_conflict",
@@ -352,6 +415,7 @@ async def list_memories(
     conditions = [
         table.c.organization_id == member.organization_id,
         table.c.is_deleted.is_(False),
+        await memory_access_condition(table, member),
     ]
     if not include_archived:
         conditions.append(table.c.is_archived.is_(False))
@@ -403,29 +467,68 @@ async def import_memories(member: Member, items: list[dict[str, Any]]) -> list[s
     """Create memory entries from a prior export (round-trip)."""
     from core.memory_writes import create_memory_entry
 
+    if len(items) > 10_000:
+        raise ValueError("memory import is limited to 10000 entries")
     ctx = RequesterContext.from_member(member)
-    ids: list[str] = []
-    for item in items:
+    normalized: list[tuple[str, str, str, float, bool, bool, bool]] = []
+    for index, item in enumerate(items):
         content = str(item.get("content") or "").strip()
         if not content:
             continue
+        if len(content) > 10_000:
+            raise ValueError(f"memory import item {index} exceeds 10000 characters")
         scope = str(item.get("scope") or "org")
-        scope_id = str(item.get("scope_id") or member.organization_id)
+        scope_id = item.get("scope_id")
+        if scope in {"org", "workspace", "personal", "restricted"}:
+            # Portable exports carry source-tenant ids. Canonical scopes are
+            # intentionally rebound to the importing tenant/member.
+            scope_id = None
+        normalized_scope, normalized_scope_id = await normalize_entry_scope(
+            member, scope, str(scope_id) if scope_id is not None else None
+        )
+        try:
+            importance = float(item.get("importance_score", 0.7))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"memory import item {index} has invalid importance_score") from exc
+        if not math.isfinite(importance) or not 0.0 <= importance <= 1.0:
+            raise ValueError(f"memory import item {index} has invalid importance_score")
+        flags: list[bool] = []
+        for field in ("is_pinned", "is_archived", "is_sensitive"):
+            value = item.get(field, False)
+            if not isinstance(value, bool):
+                raise ValueError(f"memory import item {index} has invalid {field}")
+            flags.append(value)
+        normalized.append(
+            (
+                content,
+                normalized_scope,
+                normalized_scope_id,
+                importance,
+                flags[0],
+                flags[1],
+                flags[2],
+            )
+        )
+
+    # Validate every target before the first write so a malformed import cannot
+    # leave a partially imported memory set.
+    ids: list[str] = []
+    for content, scope, scope_id, importance, pinned, archived, sensitive in normalized:
         entry_id = await create_memory_entry(
             content=content,
             requester_context=ctx,
             source="imported",
             scope=scope,
             scope_id=scope_id,
-            importance_score=float(item.get("importance_score") or 0.7),
+            importance_score=importance,
             created_by=member.id,
         )
-        if item.get("is_pinned"):
-            await _set_fields(entry_id, member.organization_id, is_pinned=True)
-        if item.get("is_archived"):
-            await _set_fields(entry_id, member.organization_id, is_archived=True)
-        if item.get("is_sensitive"):
-            await _set_fields(entry_id, member.organization_id, is_sensitive=True)
+        if pinned:
+            await _set_fields(entry_id, member, is_pinned=True)
+        if archived:
+            await _set_fields(entry_id, member, is_archived=True)
+        if sensitive:
+            await _set_fields(entry_id, member, is_sensitive=True)
         ids.append(entry_id)
     await audit.log(
         "memory_import", member.id, "memory.import",

@@ -24,9 +24,20 @@ async def _insert_org(org_id: str) -> None:
         await conn.execute(insert(orgs).values(id=org_id, slug=f"slug-{org_id}", name=f"Org {org_id}"))
 
 
-def _member(org_id: str, role: str = "user") -> Member:
+async def _member(org_id: str, role: str = "user") -> Member:
     mid = f"m-{uuid.uuid4().hex[:8]}"
-    return Member(id=mid, organization_id=org_id, email=f"{mid}@example.com", role=role)
+    email = f"{mid}@example.com"
+    members = await reflect_table("members")
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(members).values(
+                id=mid,
+                organization_id=org_id,
+                email=email,
+                role=role,
+            )
+        )
+    return Member(id=mid, organization_id=org_id, email=email, role=role)
 
 
 async def _set_notification_settings(org_id: str, values: dict) -> None:
@@ -39,12 +50,16 @@ async def _set_notification_settings(org_id: str, values: dict) -> None:
 
 
 async def _cleanup(org_ids: list[str]) -> None:
+    receipts = await reflect_table("notification_receipts")
     notif = await reflect_table("notifications")
     sdoc = await reflect_table("settings_documents")
+    members = await reflect_table("members")
     orgs = await reflect_table("organizations")
     async with engine.begin() as conn:
+        await conn.execute(delete(receipts).where(receipts.c.organization_id.in_(org_ids)))
         await conn.execute(delete(notif).where(notif.c.organization_id.in_(org_ids)))
         await conn.execute(delete(sdoc).where(sdoc.c.organization_id.in_(org_ids)))
+        await conn.execute(delete(members).where(members.c.organization_id.in_(org_ids)))
         await conn.execute(delete(orgs).where(orgs.c.id.in_(org_ids)))
 
 
@@ -53,7 +68,7 @@ async def test_emit_list_read_dismiss_lifecycle_and_audit():
     org = f"orgN-{uuid.uuid4().hex[:8]}"
     await _insert_org(org)
     try:
-        member = _member(org)
+        member = await _member(org)
         nid = await notifications.emit(
             organization_id=org, type="approval_request", title="Approval needed",
             body="run gmail.draft", severity="warning", resource_type="task", resource_id="t1",
@@ -97,8 +112,8 @@ async def test_org_wide_visible_to_all_targeted_only_to_recipient():
     org = f"orgV-{uuid.uuid4().hex[:8]}"
     await _insert_org(org)
     try:
-        alice = _member(org)
-        bob = _member(org)
+        alice = await _member(org)
+        bob = await _member(org)
         org_wide = await notifications.emit(organization_id=org, type="security", title="org-wide")
         targeted = await notifications.emit(
             organization_id=org, type="security", title="for-bob", member_id=str(bob.id)
@@ -111,6 +126,103 @@ async def test_org_wide_visible_to_all_targeted_only_to_recipient():
         assert targeted in bob_feed and targeted not in alice_feed
     finally:
         await _cleanup([org])
+
+
+@pytest.mark.asyncio
+async def test_org_wide_read_and_dismiss_state_is_per_member():
+    org = f"orgR-{uuid.uuid4().hex[:8]}"
+    await _insert_org(org)
+    try:
+        alice = await _member(org)
+        bob = await _member(org)
+        nid = await notifications.emit(
+            organization_id=org, type="security", title="shared alert"
+        )
+        assert nid
+
+        # Alice reading a shared row cannot change Bob's unread state.
+        assert await notifications.mark_read(org, str(alice.id), [nid]) == 1
+        assert await notifications.unread_count(org, str(alice.id)) == 0
+        assert await notifications.unread_count(org, str(bob.id)) == 1
+
+        alice_feed = await notifications.list_for(org, str(alice.id))
+        bob_feed = await notifications.list_for(org, str(bob.id))
+        assert next(n for n in alice_feed if n["id"] == nid)["read_at"] is not None
+        assert next(n for n in bob_feed if n["id"] == nid)["read_at"] is None
+
+        # Alice dismissing it hides only her copy; Bob still sees the alert.
+        assert await notifications.dismiss(org, str(alice.id), [nid]) == 1
+        assert nid not in {n["id"] for n in await notifications.list_for(org, str(alice.id))}
+        assert nid in {n["id"] for n in await notifications.list_for(org, str(bob.id))}
+
+        receipts = await reflect_table("notification_receipts")
+        notification_rows = await reflect_table("notifications")
+        async with engine.begin() as conn:
+            receipt_rows = (
+                await conn.execute(
+                    select(receipts).where(receipts.c.notification_id == nid)
+                )
+            ).mappings().all()
+            base = (
+                await conn.execute(
+                    select(notification_rows).where(notification_rows.c.id == nid)
+                )
+            ).mappings().one()
+        assert {r["member_id"] for r in receipt_rows} == {str(alice.id)}
+        assert receipt_rows[0]["read_at"] is not None
+        assert receipt_rows[0]["dismissed_at"] is not None
+        # Deprecated shared columns are never mutated by member actions.
+        assert base["read_at"] is None
+        assert base["dismissed_at"] is None
+    finally:
+        await _cleanup([org])
+
+
+@pytest.mark.asyncio
+async def test_receipt_mutations_reject_other_recipient_and_tenant_ids():
+    org_a = f"orgRA-{uuid.uuid4().hex[:8]}"
+    org_b = f"orgRB-{uuid.uuid4().hex[:8]}"
+    await _insert_org(org_a)
+    await _insert_org(org_b)
+    try:
+        alice = await _member(org_a)
+        bob = await _member(org_a)
+        mallory = await _member(org_b)
+        for_bob = await notifications.emit(
+            organization_id=org_a,
+            type="security",
+            title="bob only",
+            member_id=str(bob.id),
+        )
+        in_other_tenant = await notifications.emit(
+            organization_id=org_b,
+            type="security",
+            title="other tenant",
+            member_id=str(mallory.id),
+        )
+        assert for_bob and in_other_tenant
+
+        # IDs are untrusted input. Neither another recipient's targeted row nor
+        # another tenant's row may produce a receipt for Alice.
+        assert await notifications.mark_read(
+            org_a, str(alice.id), [for_bob, in_other_tenant]
+        ) == 0
+        assert await notifications.dismiss(
+            org_a, str(alice.id), [for_bob, in_other_tenant]
+        ) == 0
+
+        receipts = await reflect_table("notification_receipts")
+        async with engine.begin() as conn:
+            rows = (
+                await conn.execute(
+                    select(receipts).where(receipts.c.member_id == str(alice.id))
+                )
+            ).mappings().all()
+        assert rows == []
+        assert await notifications.unread_count(org_a, str(bob.id)) == 1
+        assert await notifications.unread_count(org_b, str(mallory.id)) == 1
+    finally:
+        await _cleanup([org_a, org_b])
 
 
 @pytest.mark.asyncio
@@ -149,7 +261,7 @@ async def test_feed_is_tenant_scoped():
     await _insert_org(org_a)
     await _insert_org(org_b)
     try:
-        a_member = _member(org_a)
+        a_member = await _member(org_a)
         in_a = await notifications.emit(organization_id=org_a, type="security", title="A")
         await notifications.emit(organization_id=org_b, type="security", title="B")
         feed = await notifications_router.list_notifications(limit=50, offset=0, member=a_member)

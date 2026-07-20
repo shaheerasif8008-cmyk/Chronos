@@ -1,5 +1,1 @@
-import { redirect } from "next/navigation";
-
-export default function AgentsRoute() {
-  redirect("/chat");
-}
+export { default } from "../chat/page";

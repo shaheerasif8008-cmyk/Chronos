@@ -298,6 +298,20 @@ def _fake_connector_chunk():
     )
 
 
+def _fake_upload_chunk():
+    """Return a Citation-like object simulating an indexed uploaded file."""
+    from memory.source_retrieval import Citation
+
+    return Citation(
+        source_id=str(uuid.uuid4()),
+        source_title="Uploaded Brief.pdf",
+        source_type="upload",
+        chunk_index=0,
+        snippet="uploaded project evidence for testing",
+        distance=0.15,
+    )
+
+
 async def _fake_tool_broker_execute(agent, tool: str, args: dict):
     """Fake tool broker: handles browser.search and browser.fetch."""
     if tool == "browser.search":
@@ -469,6 +483,8 @@ async def test_degraded_search_records_limitation():
 
     run = await get_run(run_id, "default")
     assert run is not None
+    assert run["status"] == "failed"
+    assert run["report_artifact_id"] is None
     limitations = run.get("limitations") or ""
     assert "web search" in limitations.lower() or "unavailable" in limitations.lower(), (
         f"Expected web search limitation, got: {limitations!r}"
@@ -477,6 +493,154 @@ async def test_degraded_search_records_limitation():
     citations = await list_citations(run_id, "default")
     web_citations = [c for c in citations if c["source_type"] == "web"]
     assert web_citations == [], f"Expected no web citations for degraded search, got: {web_citations}"
+
+
+def test_research_request_validates_source_and_citation_policy():
+    from pydantic import ValidationError
+
+    from routers.research import ResearchRequest
+
+    default = ResearchRequest(question="  Valid research question  ")
+    assert default.question == "Valid research question"
+    assert default.source_scopes.web is True
+
+    trusted = ResearchRequest(
+        question="Trusted question",
+        depth="trusted",
+        source_scopes={"web": True, "allowed_domains": ["SEC.GOV", "sec.gov"]},
+    )
+    assert trusted.source_scopes.allowed_domains == ["sec.gov"]
+
+    with pytest.raises(ValidationError, match="trusted research requires"):
+        ResearchRequest(question="Trusted question", depth="trusted")
+    with pytest.raises(ValidationError, match="invalid research domain"):
+        ResearchRequest(
+            question="Invalid domain",
+            source_scopes={"web": True, "allowed_domains": ["https://example.com/path"]},
+        )
+    with pytest.raises(ValidationError, match="citation_policy"):
+        ResearchRequest(question="Invalid policy", citation_policy="none")
+    with pytest.raises(ValidationError, match="MCP research requires"):
+        ResearchRequest(question="Missing MCP tool", source_scopes={"web": False, "mcp": True})
+
+    mcp = ResearchRequest(
+        question="Search the approved MCP source",
+        source_scopes={
+            "web": False,
+            "mcp": True,
+            "mcp_tools": [{
+                "server_id": "server-1",
+                "tool_name": "search_docs",
+                "query_argument": "query",
+                "arguments": {"limit": 3},
+            }],
+        },
+    )
+    assert mcp.source_scopes.mcp_tools[0].tool_name == "search_docs"
+
+
+def test_research_domain_filter_includes_subdomains_and_honors_parent_block():
+    from runtime.research_executor import _domain_matches
+
+    assert _domain_matches("investor.example.com", "example.com") is True
+    assert _domain_matches("notexample.com", "example.com") is False
+
+
+@pytest.mark.asyncio
+async def test_research_mcp_discovery_exposes_only_declared_read_tools(monkeypatch):
+    from core.models import Member, ToolResult
+    from routers import research as research_router
+
+    async def allow(*_args, **_kwargs):
+        return None
+
+    async def discover(_agent, tool: str, args: dict):
+        assert tool == "platform.actions"
+        assert args == {"platform_id": "mcp:server-1"}
+        return ToolResult(summary="tools", data={"actions": [
+            {"name": "search", "annotations": {"readOnlyHint": True}},
+            {"name": "send", "annotations": {"readOnlyHint": False}},
+            {"name": "ambiguous", "annotations": {}},
+        ]})
+
+    monkeypatch.setattr(research_router.permissions, "check", allow)
+    monkeypatch.setattr(research_router.tool_broker, "execute", discover)
+    member = Member(id="member-1", organization_id="org-1", email="m@example.com", role="user")
+    result = await research_router.list_research_mcp_tools("server-1", member=member)
+    assert [action["name"] for action in result["actions"]] == ["search"]
+    assert result["excluded_count"] == 2
+
+
+@_requires_db
+@pytest.mark.asyncio
+async def test_uploaded_and_read_only_mcp_sources_create_real_citations():
+    from core.models import Member, ToolResult
+    from core.research import create_run, get_run, list_citations
+    from runtime.research_executor import run_research
+
+    member = Member(id=str(uuid.uuid4()), organization_id="default", email="t@t.com", role="user")
+    upload_run = await create_run(
+        member,
+        question="What does the uploaded brief say?",
+        source_scopes={"web": False, "upload": True},
+        project_id=str(uuid.uuid4()),
+    )
+    with (
+        patch("runtime.research_executor.complete_json", new=AsyncMock(return_value='{"queries": ["brief"]}')),
+        patch("runtime.research_executor.complete_text", new=AsyncMock(return_value="Uploaded answer [S1].")),
+        patch("runtime.research_executor.tool_broker.execute", new=AsyncMock(side_effect=_fake_tool_broker_execute)),
+        patch("runtime.research_executor.retrieve_source_chunks", new=AsyncMock(return_value=[_fake_upload_chunk()])),
+    ):
+        await run_research(upload_run, "default")
+    upload_citations = await list_citations(upload_run, "default")
+    assert [citation["source_type"] for citation in upload_citations] == ["upload"]
+    assert (await get_run(upload_run, "default"))["status"] == "complete"
+
+    mcp_run = await create_run(
+        member,
+        question="What does the MCP knowledge source say?",
+        source_scopes={
+            "web": False,
+            "mcp": True,
+            "mcp_tools": [{
+                "server_id": "server-1",
+                "tool_name": "search_docs",
+                "query_argument": "query",
+                "arguments": {"limit": 3},
+                "title": "Knowledge MCP",
+            }],
+        },
+    )
+
+    async def mcp_execute(_agent, tool: str, args: dict):
+        if tool == "platform.actions":
+            return ToolResult(summary="discovered", data={"actions": [{
+                "name": "search_docs",
+                "annotations": {"readOnlyHint": True},
+                "parameters": {"type": "object"},
+            }]})
+        if tool == "mcp.server-1.search_docs":
+            assert args == {"limit": 3, "query": "mcp evidence"}
+            return ToolResult(
+                summary="MCP result",
+                data={
+                    "result": {"documents": [{"title": "Policy", "text": "real MCP evidence"}]},
+                    "untrusted_content": {"risk": "none"},
+                },
+            )
+        return ToolResult(summary="unexpected", data={})
+
+    with (
+        patch("runtime.research_executor.complete_json", new=AsyncMock(return_value='{"queries": ["mcp evidence"]}')),
+        patch("runtime.research_executor.complete_text", new=AsyncMock(return_value="MCP answer [S1].")),
+        patch("runtime.research_executor.tool_broker.execute", new=AsyncMock(side_effect=mcp_execute)),
+        patch("runtime.research_executor.retrieve_source_chunks", new=AsyncMock(return_value=[])),
+    ):
+        await run_research(mcp_run, "default")
+    mcp_citations = await list_citations(mcp_run, "default")
+    assert [citation["source_type"] for citation in mcp_citations] == ["mcp"]
+    assert "real MCP evidence" in mcp_citations[0]["snippet"]
+    assert (await get_run(mcp_run, "default"))["status"] == "complete"
 
 
 @_requires_db

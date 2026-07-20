@@ -33,6 +33,10 @@ def _patch_broker_deps(tmp_path, monkeypatch):
     """Patch all heavy dependencies so broker imports cleanly in unit tests."""
     import sys
 
+    original_broker = sys.modules.get("core.tool_broker")
+    core_package = sys.modules.get("core")
+    original_core_broker_attr = getattr(core_package, "tool_broker", None) if core_package else None
+
     # --- core.config ---
     cfg = types.SimpleNamespace(
         demo_mode=False,
@@ -129,6 +133,22 @@ def _patch_broker_deps(tmp_path, monkeypatch):
 
     yield
 
+    # Individual tests re-import core.tool_broker against the lightweight stubs.
+    # Do not leak that module (and its stub exception classes) into later test
+    # files in the same pytest process.
+    if original_broker is None:
+        sys.modules.pop("core.tool_broker", None)
+    else:
+        sys.modules["core.tool_broker"] = original_broker
+    if core_package is not None:
+        if original_core_broker_attr is None:
+            try:
+                delattr(core_package, "tool_broker")
+            except AttributeError:
+                pass
+        else:
+            setattr(core_package, "tool_broker", original_core_broker_attr)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -155,7 +175,7 @@ def _make_skills_root(tmp_path: Path, skill_id: str, script_name: str, script_co
 
 @pytest.mark.asyncio
 async def test_happy_path_executes_script(tmp_path, monkeypatch):
-    """skill.run_script resolves + executes a valid script."""
+    """skill.run_script resolves + executes only in the isolated runtime."""
     import sys
 
     script_content = 'import json,sys; params=json.loads(sys.stdin.read() or "{}"); print(json.dumps({"ok": True, "leads": params.get("leads", [])}))'
@@ -168,21 +188,42 @@ async def test_happy_path_executes_script(tmp_path, monkeypatch):
         _make_stub_module("skills.registry", SKILLS_ROOT=skills_root),
     )
 
-    from core.models import ToolResult
+    captured = {"writes": []}
 
-    # Stub data_analysis_connector to avoid spawning real subprocesses
-    captured = {}
+    class FakeIsolatedRuntime:
+        async def create(self, *, timeout_seconds, metadata):
+            captured["metadata"] = metadata
+            return "sandbox-1"
 
-    async def _fake_execute(tool, args):
-        captured["tool"] = tool
-        captured["code"] = args.get("code", "")
-        return ToolResult(summary="ok", data={"status": "success", "stdout_preview": '{"ok": true}'})
+        async def write(self, sandbox_id, path, content):
+            captured["writes"].append((sandbox_id, path, content))
 
-    fake_data_mod = _make_stub_module(
-        "connectors.data_analysis",
-        data_analysis_connector=types.SimpleNamespace(execute=_fake_execute),
+        async def run(self, sandbox_id, command, *, cwd, timeout_seconds):
+            captured["command"] = command
+            return {
+                "status": "success",
+                "returncode": 0,
+                "stdout": '{"ok": true}',
+                "stderr": "",
+            }
+
+        async def kill(self, sandbox_id):
+            captured["killed"] = sandbox_id
+
+    class RuntimeUnavailable(RuntimeError):
+        pass
+
+    fake_runtime = FakeIsolatedRuntime()
+    monkeypatch.setitem(
+        sys.modules,
+        "connectors.e2b_runtime",
+        _make_stub_module(
+            "connectors.e2b_runtime",
+            RuntimeUnavailable=RuntimeUnavailable,
+            SANDBOX_ROOT="/home/user/workspace",
+            default_runtime=lambda: fake_runtime,
+        ),
     )
-    monkeypatch.setitem(sys.modules, "connectors.data_analysis", fake_data_mod)
 
     # Import and call
     import importlib
@@ -201,9 +242,58 @@ async def test_happy_path_executes_script(tmp_path, monkeypatch):
         "fixture",
     )
 
-    assert captured["tool"] == "data.run_script"
-    assert "icp-qualification.py" in captured["code"] or "import json" in captured["code"]
-    assert result.summary == "ok"
+    written = {path: content for _sandbox, path, content in captured["writes"]}
+    assert b"import json" in written["/home/user/workspace/skill.py"]
+    assert json.loads(written["/home/user/workspace/params.json"]) == {"leads": []}
+    assert captured["command"].startswith("python3 /home/user/workspace/skill.py")
+    assert captured["killed"] == "sandbox-1"
+    assert result.data["result"] == {"ok": True}
+    assert result.data["execution_boundary"] == "isolated_runtime"
+
+
+@pytest.mark.asyncio
+async def test_script_without_isolated_runtime_is_truthfully_unavailable(tmp_path, monkeypatch):
+    import sys
+
+    skills_root = _make_skills_root(
+        tmp_path,
+        "sdr-outreach",
+        "icp-qualification.py",
+        "print('{}')",
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "skills.registry",
+        _make_stub_module("skills.registry", SKILLS_ROOT=skills_root),
+    )
+
+    class RuntimeUnavailable(RuntimeError):
+        pass
+
+    monkeypatch.setitem(
+        sys.modules,
+        "connectors.e2b_runtime",
+        _make_stub_module(
+            "connectors.e2b_runtime",
+            RuntimeUnavailable=RuntimeUnavailable,
+            SANDBOX_ROOT="/home/user/workspace",
+            default_runtime=lambda: None,
+        ),
+    )
+
+    if "core.tool_broker" in sys.modules:
+        del sys.modules["core.tool_broker"]
+    import core.tool_broker as tb
+
+    result = await tb._route_skill_run_script(
+        _make_agent(),
+        {"skill_id": "sdr-outreach", "script_name": "icp-qualification.py", "params": {}},
+        "fixture",
+    )
+
+    assert result.data["status"] == "unavailable"
+    assert result.data["execution_boundary"] == "isolated_runtime_required"
+    assert result.data["host_execution"] is False
 
 
 @pytest.mark.asyncio

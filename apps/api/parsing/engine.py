@@ -7,7 +7,9 @@ wrap this module.
 from __future__ import annotations
 
 import io
+import zipfile
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 
 from core.llm import vision_ocr
 
@@ -22,8 +24,20 @@ UNPARSEABLE_NOTE = "not parseable yet"
 MAX_OCR_PAGES = 50
 
 _TEXT_MIMES = {"text/plain", "text/csv", "text/markdown", "application/csv"}
-_TEXT_EXTS = {".txt", ".csv", ".md", ".markdown", ".log", ".tsv"}
+_TEXT_EXTS = {
+    ".txt", ".csv", ".md", ".markdown", ".log", ".tsv",
+    ".py", ".pyi", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx",
+    ".json", ".jsonl", ".yaml", ".yml", ".toml", ".ini", ".cfg",
+    ".sql", ".graphql", ".gql", ".html", ".htm", ".css", ".scss",
+    ".java", ".kt", ".kts", ".go", ".rs", ".rb", ".php", ".swift",
+    ".c", ".h", ".cc", ".cpp", ".hpp", ".cs", ".sh", ".zsh",
+    ".fish", ".ps1", ".dockerfile", ".env", ".xml", ".proto",
+}
 _IMAGE_MIMES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
+
+_MAX_ARCHIVE_FILES = 500
+_MAX_ARCHIVE_FILE_BYTES = 2 * 1024 * 1024
+_MAX_ARCHIVE_TOTAL_BYTES = 25 * 1024 * 1024
 
 
 @dataclass
@@ -32,7 +46,7 @@ class ParsedDocument:
     preview: str
     page_count: int
     char_count: int
-    parser_used: str   # "pdf"|"pdf+ocr"|"docx"|"xlsx"|"pptx"|"text"|"image-ocr"|"none"
+    parser_used: str   # "pdf"|"pdf+ocr"|"docx"|"xlsx"|"pptx"|"text"|"zip"|"image-ocr"|"none"
     truncated: bool
     note: str | None = None
 
@@ -69,10 +83,74 @@ async def parse_document(raw: bytes, mime: str, filename: str) -> ParsedDocument
         return _parse_xlsx(raw)
     if ext == ".pptx" or "presentationml" in mime:
         return _parse_pptx(raw)
+    if ext == ".zip" or mime in {"application/zip", "application/x-zip-compressed"}:
+        return _parse_zip(raw)
     if mime in _IMAGE_MIMES or ext in {".png", ".jpg", ".jpeg", ".webp"}:
         return await _parse_image(raw, mime or f"image/{ext.lstrip('.')}")
 
     return _finalize("", page_count=0, parser_used="none", note=UNPARSEABLE_NOTE)
+
+
+def _parse_zip(raw: bytes) -> ParsedDocument:
+    """Read a code/text folder archive without extracting it to disk.
+
+    Entry count and uncompressed byte limits prevent zip bombs.  Unsafe paths,
+    symlinks, nested archives, binaries, and oversized files are skipped.
+    """
+
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(raw))
+    except (zipfile.BadZipFile, OSError):
+        return _finalize("", page_count=0, parser_used="none", note="could not read zip archive")
+
+    parts: list[str] = []
+    accepted = 0
+    total_bytes = 0
+    skipped = 0
+    try:
+        for info in archive.infolist()[: _MAX_ARCHIVE_FILES + 1]:
+            if accepted + skipped >= _MAX_ARCHIVE_FILES:
+                skipped += 1
+                break
+            path = PurePosixPath(info.filename)
+            if (
+                info.is_dir()
+                or path.is_absolute()
+                or ".." in path.parts
+                or info.file_size > _MAX_ARCHIVE_FILE_BYTES
+                or path.suffix.lower() not in _TEXT_EXTS
+                or ((info.external_attr >> 16) & 0o170000) == 0o120000
+            ):
+                skipped += 1
+                continue
+            total_bytes += info.file_size
+            if total_bytes > _MAX_ARCHIVE_TOTAL_BYTES:
+                skipped += 1
+                break
+            try:
+                text = archive.read(info).decode("utf-8", errors="replace")
+            except (OSError, RuntimeError, zipfile.BadZipFile):
+                skipped += 1
+                continue
+            if not text.strip():
+                skipped += 1
+                continue
+            parts.append(f"# File: {path.as_posix()}\n{text}")
+            accepted += 1
+    finally:
+        archive.close()
+
+    note = None
+    if skipped:
+        note = f"{skipped} unsupported, unsafe, empty, or oversized archive entries skipped"
+    if not parts:
+        return _finalize("", page_count=0, parser_used="none", note=note or UNPARSEABLE_NOTE)
+    return _finalize(
+        "\n\n".join(parts),
+        page_count=accepted,
+        parser_used="zip",
+        note=note,
+    )
 
 
 def _pdf_page_texts(raw: bytes) -> list[str]:

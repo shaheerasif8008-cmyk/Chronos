@@ -91,6 +91,18 @@ async def test_resume_awaiting_approval_uses_resume_after_approval(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_executor_does_not_treat_operator_pause_as_approval_resume(monkeypatch):
+    from runtime import executor
+
+    task = _native_task(status="paused", history=[{"role": "user", "content": "hi"}])
+    calls = _wire_resume(monkeypatch, executor, task)
+
+    await executor.TaskExecutor().resume("task-5")
+
+    assert not any(calls.values())
+
+
+@pytest.mark.asyncio
 async def test_resume_ignores_terminal_task(monkeypatch):
     from runtime import executor
 

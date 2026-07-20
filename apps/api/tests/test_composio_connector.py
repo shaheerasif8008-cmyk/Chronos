@@ -274,17 +274,28 @@ async def test_initiate_connection_uses_current_connected_account_flow(monkeypat
 async def test_connector_health_reports_composio_managed_setup_for_core_saas(monkeypatch):
     from core import connector_health
 
-    async def fake_browser_available():
-        return False, "browser unavailable"
+    async def no_playwright():
+        return False, "Playwright is not installed."
 
+    async def verified_composio():
+        return connector_health.ProbeResult(
+            ok=True,
+            checked_at=connector_health._utcnow(),
+            latency_ms=8,
+        )
+
+    monkeypatch.setattr(connector_health.settings, "composio_api_key", "cmp-test")
     monkeypatch.setattr(composio_client, "is_configured", lambda: True)
-    monkeypatch.setattr(connector_health, "_browser_available", fake_browser_available)
+    monkeypatch.setattr(connector_health, "_playwright_available", no_playwright)
+    monkeypatch.setattr(connector_health, "_probe_composio", verified_composio)
     connector_health._CACHE = None
 
     health = await connector_health.check_connectors(refresh=True)
 
     for provider in ("gmail", "slack", "github", "google_drive"):
         assert health[provider]["tier"] == "live"
+        assert health[provider]["status"] == "verified"
+        assert health[provider]["verified"] is True
         assert health[provider]["auth"] == "composio_managed"
         assert "Composio managed auth" in health[provider]["reason"]
         assert "Connect" in health[provider]["setup"]

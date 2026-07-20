@@ -29,7 +29,26 @@ export DATABASE_URL="postgresql+asyncpg://chronos:chronos@localhost:55433/chrono
 export REDIS_URL="redis://localhost:6379/3"
 npx playwright test                            # all specs
 npx playwright test chat.spec.ts               # one spec
+npm run test:e2e:mobile                        # Pixel 7 Chromium + iPhone 15 WebKit
 ```
+
+The focused mobile command uses deterministic in-browser API fixtures, so it
+does not require provider credentials or a seeded database. It still runs the
+real production Next.js bundle and exercises the real responsive route code.
+
+## Proof levels
+
+- Files ending in `-static.spec.ts` inspect source contracts. They are useful
+  regression guards, but they do not navigate a browser, call the API, or prove
+  runtime behavior. Run them with `npm run test:static`.
+- The specs listed below use a real browser against the isolated web/API stack,
+  except `mobile-responsive.spec.ts`, which uses a real production Next.js
+  bundle with deterministic in-browser API fixtures.
+- Passing either class locally is not production evidence. The release gate must
+  rerun the behavioral flows against the deployed Git SHA and supplement them
+  with exhaustive Computer Use screenshots for desktop/mobile routes and
+  states. Provider-backed Browserbase, E2B, Gmail, Stripe, SendGrid, and
+  multimodal operations require their own live smoke evidence.
 
 ### Specs
 
@@ -43,6 +62,7 @@ npx playwright test chat.spec.ts               # one spec
 | `model-selection.spec.ts` | model choice persists across reload |
 | `connectors.spec.ts` | directory renders catalog + reflects a connected app (seeded) |
 | `approvals.spec.ts` | inbox renders a pending approval → Approve decides it |
+| `mobile-responsive.spec.ts` | mobile navigation, core surfaces, auth, and onboarding stay reachable without viewport overflow in Chromium and WebKit |
 
 ### Approvals spec needs a seeded approval
 

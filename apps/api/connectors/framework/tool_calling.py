@@ -60,5 +60,8 @@ async def execute_tool_call(
         action_name=action_name,
         arguments=arguments,
         context=context,
+        metadata={"idempotency_key": str(tool_call["idempotency_key"])}
+        if tool_call.get("idempotency_key")
+        else None,
     )
     return {"status": result.status, "output": result.output, "error": result.error}

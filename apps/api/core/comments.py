@@ -65,12 +65,47 @@ async def _org_members(organization_id: str) -> list[dict[str, Any]]:
     async with engine.begin() as conn:
         rows = (
             await conn.execute(
-                select(members.c.id, members.c.email, members.c.name).where(
-                    members.c.organization_id == organization_id
+                select(
+                    members.c.id,
+                    members.c.email,
+                    members.c.name,
+                    members.c.role,
+                    members.c.region,
+                    members.c.status,
+                ).where(
+                    members.c.organization_id == organization_id,
+                    members.c.status == "active",
                 )
             )
         ).mappings().all()
     return [dict(r) for r in rows]
+
+
+async def _active_member(organization_id: str, member_id: str):
+    """Load a minimal active member context without crossing the tenant."""
+
+    from core.models import Member
+
+    members = await reflect_table("members")
+    async with engine.begin() as conn:
+        row = (
+            await conn.execute(
+                select(
+                    members.c.id,
+                    members.c.organization_id,
+                    members.c.region,
+                    members.c.email,
+                    members.c.role,
+                    members.c.name,
+                    members.c.status,
+                ).where(
+                    members.c.id == member_id,
+                    members.c.organization_id == organization_id,
+                    members.c.status == "active",
+                )
+            )
+        ).mappings().first()
+    return Member(**dict(row)) if row else None
 
 
 async def resolve_mentions(organization_id: str, body: str | None) -> list[str]:
@@ -98,8 +133,11 @@ async def member_can_access_target(
     """Whether *member_id* can see the comment target.
 
     - ``project``: must hold a ``project_members`` row for the project.
-    - ``task`` / ``artifact``: org-scoped — any member of the owning org can see
-      it (mirrors the existing attachment/source access model).
+    - ``task``: creator-only, with the same org-admin break-glass policy as the
+      task API.
+    - ``artifact``: delegates to the canonical artifact visibility helper,
+      including creator, parent task/conversation, project membership, and
+      org-admin access.
     """
     if target_type == "project":
         project_members = await reflect_table("project_members")
@@ -117,20 +155,32 @@ async def member_can_access_target(
             ).first()
         return row is not None
 
-    table_name = "tasks" if target_type == "task" else "artifacts"
-    table = await reflect_table(table_name)
+    member = await _active_member(organization_id, member_id)
+    if member is None:
+        return False
+
+    if target_type == "task":
+        from core.task_access import visible_task
+
+        return await visible_task(member, target_id) is not None
+
+    from core.artifact_access import artifact_access
+
+    artifacts = await reflect_table("artifacts")
+    conditions = [
+        artifacts.c.id == target_id,
+        artifacts.c.organization_id == organization_id,
+    ]
+    if "is_deleted" in artifacts.c:
+        conditions.append(artifacts.c.is_deleted.is_(False))
     async with engine.begin() as conn:
         row = (
-            await conn.execute(
-                select(table.c.id).where(
-                    and_(
-                        table.c.id == target_id,
-                        table.c.organization_id == organization_id,
-                    )
-                )
-            )
-        ).first()
-    return row is not None
+            await conn.execute(select(artifacts).where(*conditions))
+        ).mappings().first()
+    if row is None:
+        return False
+    visible, _writable = await artifact_access(member, dict(row))
+    return visible
 
 
 async def create_comment(

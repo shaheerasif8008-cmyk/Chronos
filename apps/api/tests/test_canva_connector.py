@@ -35,7 +35,7 @@ def test_canva_registered_as_oauth_app():
 
 @pytest.mark.asyncio
 async def test_degrades_truthfully_without_connection(monkeypatch):
-    async def _no_connection(_self, _org):
+    async def _no_connection(_self, _org, _member):
         return None
 
     monkeypatch.setattr(canva_connector, "_connection_vault_ref", _no_connection.__get__(canva_connector))
@@ -49,8 +49,10 @@ async def test_degrades_truthfully_without_connection(monkeypatch):
 @pytest.mark.asyncio
 async def test_create_design_shapes_request_and_returns_urls(monkeypatch):
     calls: list[tuple] = []
+    lookup: list[tuple[str, str | None]] = []
 
-    async def _conn(_self, _org):
+    async def _conn(_self, org, member):
+        lookup.append((org, member))
         return "vault:canva:org-x"
 
     async def _fake_call(self, vault_ref, method, endpoint, *, params=None, body=None):
@@ -67,8 +69,15 @@ async def test_create_design_shapes_request_and_returns_urls(monkeypatch):
     monkeypatch.setattr(canva_connector, "_call", _fake_call.__get__(canva_connector))
 
     result = await canva_connector.execute(
-        "canva.create_design", {"__org_id": "org-x", "title": "ABC", "design_type": "presentation"}
+        "canva.create_design",
+        {
+            "__org_id": "org-x",
+            "__member_id": "member-a",
+            "title": "ABC",
+            "design_type": "presentation",
+        },
     )
+    assert lookup == [("org-x", "member-a")]
     method, endpoint, body = calls[0]
     assert (method, endpoint) == ("POST", "/v1/designs")
     assert body["design_type"] == {"type": "preset", "name": "presentation"}
@@ -79,7 +88,7 @@ async def test_create_design_shapes_request_and_returns_urls(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_export_polls_until_success(monkeypatch):
-    async def _conn(_self, _org):
+    async def _conn(_self, _org, _member):
         return "vault:canva:org-x"
 
     seq = [

@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 
 from core import notifications, permissions
 from core.auth import get_current_member
@@ -15,6 +15,8 @@ from runtime import task_runner
 from runtime.executor import emit_activity
 
 router = APIRouter(prefix="/approvals", tags=["approvals"])
+
+_ORG_APPROVER_ROLES = {"admin", "owner", "approver"}
 
 
 class ApprovalDecision(BaseModel):
@@ -76,13 +78,23 @@ async def list_approvals(
 ) -> list[dict]:
     await permissions.check(member, "list_approvals", settings.org_id)
     approvals = await reflect_table("approvals")
+    tasks = await reflect_table("tasks")
     stmt = (
         select(approvals)
+        .join(tasks, tasks.c.id == approvals.c.task_id)
         .where(approvals.c.organization_id == member.organization_id, approvals.c.status == status)
         .order_by(approvals.c.requested_at.asc())
         .limit(limit)
         .offset(offset)
     )
+    if member.role not in _ORG_APPROVER_ROLES:
+        stmt = stmt.where(
+            tasks.c.organization_id == member.organization_id,
+            or_(
+                tasks.c.triggered_by_member_id == member.id,
+                tasks.c.assignee_member_id == member.id,
+            ),
+        )
     async with engine.begin() as conn:
         rows = (await conn.execute(stmt)).mappings().all()
     return [_with_summary(dict(row)) for row in rows]
@@ -92,12 +104,24 @@ async def list_approvals(
 async def get_approval(approval_id: str, member: Member = Depends(get_current_member)) -> dict:
     await permissions.check(member, "view_approval", approval_id)
     approvals = await reflect_table("approvals")
+    tasks = await reflect_table("tasks")
+    conditions = [
+        approvals.c.id == approval_id,
+        approvals.c.organization_id == member.organization_id,
+    ]
+    if member.role not in _ORG_APPROVER_ROLES:
+        conditions.extend(
+            [
+                tasks.c.organization_id == member.organization_id,
+                or_(
+                    tasks.c.triggered_by_member_id == member.id,
+                    tasks.c.assignee_member_id == member.id,
+                ),
+            ]
+        )
     async with engine.begin() as conn:
         row = (await conn.execute(
-            select(approvals).where(
-                approvals.c.id == approval_id,
-                approvals.c.organization_id == member.organization_id,
-            )
+            select(approvals).join(tasks, tasks.c.id == approvals.c.task_id).where(*conditions)
         )).mappings().first()
     if not row:
         raise HTTPException(status_code=404, detail="Approval not found")
@@ -114,7 +138,10 @@ async def decide_approval(
         raise HTTPException(status_code=400, detail="decision must be approved or rejected")
     await permissions.check(member, "decide_approval", approval_id)
     approvals = await reflect_table("approvals")
+    delivery_receipts = await reflect_table("notification_delivery_receipts")
+    agent_publications = await reflect_table("agent_publications")
     decided_at = datetime.now(timezone.utc)
+    publication_reply = False
 
     async with engine.begin() as conn:
         row = (await conn.execute(
@@ -126,6 +153,12 @@ async def decide_approval(
         if not row:
             raise HTTPException(status_code=404, detail="Approval not found")
         row_dict = dict(row)
+        if row_dict["status"] != "pending":
+            raise HTTPException(status_code=409, detail="Approval has already been decided")
+        expires_at = row_dict.get("expires_at")
+        if expires_at is not None and expires_at <= decided_at:
+            raise HTTPException(status_code=409, detail="Approval has expired")
+        publication_reply = row_dict.get("action_type") == "agent.publication.reply"
         batch_id = (row_dict.get("action_payload") or {}).get("batch_id")
         # Every mutation is scoped to the caller's org so a member can never
         # decide another tenant's approvals (RULE 9).
@@ -148,6 +181,64 @@ async def decide_approval(
                 decision_note=req.note,
             )
         )
+        if publication_reply:
+            released_status = "pending"
+            released_at = None
+            error_code = None
+            if req.decision == "rejected":
+                released_status = "dead_letter"
+                error_code = "approval_rejected"
+            else:
+                receipt_channel = (
+                    await conn.execute(
+                        select(delivery_receipts.c.channel).where(
+                            delivery_receipts.c.organization_id == member.organization_id,
+                            delivery_receipts.c.approval_id == approval_id,
+                            delivery_receipts.c.status == "approval_pending",
+                        )
+                    )
+                ).scalar_one_or_none()
+                if receipt_channel in {"web", "api"}:
+                    released_status = "delivered"
+                    released_at = decided_at
+            await conn.execute(
+                update(delivery_receipts)
+                .where(
+                    delivery_receipts.c.organization_id == member.organization_id,
+                    delivery_receipts.c.approval_id == approval_id,
+                    delivery_receipts.c.status == "approval_pending",
+                )
+                .values(
+                    status=released_status,
+                    delivered_at=released_at,
+                    last_error_code=error_code,
+                    next_attempt_at=decided_at if released_status == "pending" else None,
+                    updated_at=decided_at,
+                )
+            )
+            if released_status == "delivered":
+                publication_id = (
+                    await conn.execute(
+                        select(delivery_receipts.c.publication_id).where(
+                            delivery_receipts.c.organization_id == member.organization_id,
+                            delivery_receipts.c.approval_id == approval_id,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if publication_id:
+                    await conn.execute(
+                        update(agent_publications)
+                        .where(
+                            agent_publications.c.id == publication_id,
+                            agent_publications.c.organization_id == member.organization_id,
+                        )
+                        .values(
+                            provider_status="ready",
+                            last_outbound_at=decided_at,
+                            last_error_code=None,
+                            updated_at=decided_at,
+                        )
+                    )
 
     await emit_activity(
         row_dict["task_id"],
@@ -183,8 +274,15 @@ async def decide_approval(
     # reviewer's note. Best-effort — never let it break the decision response.
     await _record_decision_to_trust(row_dict, req, member, approval_id)
 
-    await task_runner.enqueue_task(row_dict["task_id"])
-    return {"status": "accepted", "approval_id": approval_id, "decision": req.decision, "resuming": True}
+    if not publication_reply:
+        await task_runner.enqueue_task(row_dict["task_id"])
+    return {
+        "status": "accepted",
+        "approval_id": approval_id,
+        "decision": req.decision,
+        "resuming": not publication_reply,
+        **({"publication_response_released": req.decision == "approved"} if publication_reply else {}),
+    }
 
 
 async def _record_decision_to_trust(

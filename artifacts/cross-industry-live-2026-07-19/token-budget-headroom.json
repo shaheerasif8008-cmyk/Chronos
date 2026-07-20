@@ -1,0 +1,10 @@
+{
+  "organization_id": "e0e6202e-514b-427e-a99d-aefea344f751",
+  "metered": true,
+  "tokens_today": 73269,
+  "daily_limit": 200000,
+  "enforced": true,
+  "warning": false,
+  "headroom_tokens": 126731,
+  "headroom_percent": 63.37
+}

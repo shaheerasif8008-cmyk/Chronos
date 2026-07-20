@@ -11,6 +11,7 @@ async def test_search_returns_empty_when_live_search_unavailable(monkeypatch):
 
     monkeypatch.setattr(browser.settings, "demo_mode", False)
     monkeypatch.setattr(browser.settings, "tavily_api_key", "")
+    monkeypatch.setattr(browser.settings, "browserbase_api_key", "")
     monkeypatch.setattr(browser, "_new_page", boom)
 
     result = await browser.browser_connector._search({"query": "q4 funding rounds", "max_results": 5})

@@ -1,5 +1,12 @@
 # W5 — Admin & Compliance Plan
 
+> **Historical plan:** this captures the 2026-06-23 workstream and is not the
+> current product-status contract. Compliance export, in-app notifications,
+> durable automatic SendGrid retry/dead-letter delivery, weekly digests,
+> paired-mac notifications, and the admin console have since changed. Use
+> `docs/chronos_total_parity_matrix.md` and the current code/tests for status;
+> Slack/Teams notification delivery and the remaining admin gaps are still open.
+
 _Workstream plan: design + phase decomposition. W5.1 is detailed and executable; later phases are scoped, not yet step-by-step. Each phase's FIRST step is "audit and confirm the gap against current code" — pieces of this subsystem already exist and the gaps below are grounded in the 2026-06-23 audit, not assumed._
 
 ## Goal

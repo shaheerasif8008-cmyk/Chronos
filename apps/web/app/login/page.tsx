@@ -2,6 +2,7 @@
 
 import { FormEvent, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
+import { PublicProductLinks } from "../../components/system/PublicProductLinks";
 
 const CONFIGURED_API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
 
@@ -23,12 +24,22 @@ type AuthConfig = {
     enabled: boolean;
     loginUrl?: string | null;
     callbackUrl?: string;
+    requiresTenant?: boolean;
+    tenant?: string | null;
   };
 };
 
-const FALLBACK_DEV_AUTH_CONFIG: AuthConfig = {
-  provider: "dev_otp",
-  devOtp: true,
+type InvitationContext = {
+  email: string;
+  role: string;
+  organization_name: string;
+  tenant: string;
+  expires_at?: string | null;
+};
+
+const UNAVAILABLE_AUTH_CONFIG: AuthConfig = {
+  provider: "unavailable",
+  devOtp: false,
   cognito: { enabled: false },
 };
 
@@ -39,16 +50,45 @@ export default function LoginPage() {
   const [requested, setRequested] = useState(false);
   const [error, setError] = useState("");
   const [authConfig, setAuthConfig] = useState<AuthConfig | null>(null);
+  const [workspace, setWorkspace] = useState("");
+  const [cognitoBusy, setCognitoBusy] = useState(false);
+  const [invitation, setInvitation] = useState<InvitationContext | null>(null);
 
   useEffect(() => {
-    fetch(`${apiBase()}/auth/config`)
-      .then(r => r.json())
-      .then((data: AuthConfig) => setAuthConfig(data))
-      .catch((err) => {
+    void (async () => {
+      const hostname = window.location.hostname.toLowerCase();
+      const labels = hostname.split(".");
+      const reserved = new Set(["app", "www", "api", "admin", "static", "assets"]);
+      let tenant = labels.length >= 3 && !reserved.has(labels[0]) ? labels[0] : "";
+      const inviteToken = new URLSearchParams(window.location.search).get("invite");
+      if (inviteToken) {
+        try {
+          const res = await fetch(`${apiBase()}/auth/invitations/${encodeURIComponent(inviteToken)}`);
+          const body = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            setError(typeof body.detail === "string" ? body.detail : "Invitation is invalid or expired.");
+          } else {
+            const context = body as InvitationContext;
+            setInvitation(context);
+            setEmail(context.email);
+            tenant = context.tenant || tenant;
+          }
+        } catch {
+          setError("Could not verify this invitation. Please try again.");
+        }
+      }
+      if (tenant) setWorkspace(tenant);
+      const query = tenant ? `?tenant=${encodeURIComponent(tenant)}` : "";
+      try {
+        const response = await fetch(`${apiBase()}/auth/config${query}`, { credentials: "include" });
+        if (!response.ok) throw new Error(`Auth config failed (${response.status})`);
+        setAuthConfig(await response.json() as AuthConfig);
+      } catch (err) {
         console.error("Auth config fetch failed:", err);
         setError("Connection failed: Ensure the API is running on the correct port.");
-        setAuthConfig(FALLBACK_DEV_AUTH_CONFIG);
-      });
+        setAuthConfig(UNAVAILABLE_AUTH_CONFIG);
+      }
+    })();
   }, []);
 
   async function requestOtp(event: FormEvent) {
@@ -83,13 +123,40 @@ export default function LoginPage() {
     router.push("/chat");
   }
 
-  function signInWithCognito() {
-    const loginUrl = authConfig?.cognito?.loginUrl;
+  async function signInWithCognito() {
+    setError("");
+    let loginUrl = authConfig?.cognito?.loginUrl;
+    if (!loginUrl && authConfig?.cognito?.requiresTenant) {
+      const tenant = workspace.trim().toLowerCase();
+      if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(tenant)) {
+        setError("Enter your organization workspace, such as novatech.");
+        return;
+      }
+      setCognitoBusy(true);
+      try {
+        const res = await fetch(`${apiBase()}/auth/config?tenant=${encodeURIComponent(tenant)}`, {
+          credentials: "include",
+        });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          setError(typeof body.detail === "string" ? body.detail : "Organization not found.");
+          return;
+        }
+        const scoped = body as AuthConfig;
+        setAuthConfig(scoped);
+        loginUrl = scoped.cognito.loginUrl;
+      } catch {
+        setError("Could not load your organization sign-in. Please try again.");
+        return;
+      } finally {
+        setCognitoBusy(false);
+      }
+    }
     if (!loginUrl) {
-      setError("Cognito is not configured. See docs/cognito-setup.md.");
+      setError("Cognito sign-in is unavailable for this organization.");
       return;
     }
-    window.location.href = loginUrl;
+    window.location.assign(loginUrl);
   }
 
   async function signInWithSSO() {
@@ -99,7 +166,9 @@ export default function LoginPage() {
       return;
     }
     try {
-      const res = await fetch(`${apiBase()}/auth/sso/start?email=${encodeURIComponent(email)}`);
+      const res = await fetch(`${apiBase()}/auth/sso/start?email=${encodeURIComponent(email)}`, {
+        credentials: "include",
+      });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
         setError(body.detail ?? "Single sign-on is not configured for this email domain.");
@@ -114,13 +183,14 @@ export default function LoginPage() {
 
   const cognitoEnabled = authConfig?.cognito?.enabled;
   const devOtpEnabled = authConfig?.devOtp ?? false;
+  const authUnavailable = authConfig?.provider === "unavailable";
 
   const inputClass =
-    "mt-2 w-full rounded-[var(--r-sm)] border px-3 py-2.5 text-[14px] outline-none smooth focus:border-[var(--accent)] focus:shadow-[0_0_0_3px_color-mix(in_oklch,var(--accent)_12%,transparent)]";
+    "mt-2 w-full rounded-[var(--r-sm)] border px-3 py-2.5 text-[16px] outline-none smooth focus:border-[var(--accent)] focus:shadow-[0_0_0_3px_color-mix(in_oklch,var(--accent)_12%,transparent)] sm:text-[14px]";
 
   return (
-    <main className="min-h-screen px-6 py-10" style={{ background: "var(--bg)", color: "var(--text)", overflow: "auto" }}>
-      <section className="mx-auto flex min-h-[calc(100vh-5rem)] max-w-md flex-col justify-center">
+    <main className="h-[100dvh] px-4 py-8 sm:px-6 sm:py-10" style={{ background: "var(--bg)", color: "var(--text)", overflow: "auto" }}>
+      <section className="mx-auto flex min-h-[calc(100dvh-4rem)] max-w-md flex-col justify-center sm:min-h-[calc(100dvh-5rem)]">
         <div className="flex items-center gap-2.5 mb-6">
           <div className="w-8 h-8 rounded-xl flex items-center justify-center" style={{ background: "var(--accent)", color: "white", fontFamily: "var(--font-serif), serif", fontWeight: 600 }}>
             C
@@ -130,12 +200,25 @@ export default function LoginPage() {
         <p className="text-[14px] leading-6" style={{ color: "var(--text-muted)" }}>
           Chronos helps you complete work through chat, files, and durable AI tasks.
         </p>
+
+        {invitation ? (
+          <div className="mt-5 rounded-lg border px-4 py-3 text-[13px]" style={{ borderColor: "var(--border)", background: "var(--surface)" }}>
+            <strong>You&apos;re invited to {invitation.organization_name}.</strong>
+            <div className="mt-1" style={{ color: "var(--text-muted)" }}>
+              Sign in as {invitation.email} to accept the {invitation.role} invitation.
+            </div>
+          </div>
+        ) : null}
         <p className="mt-3 text-[13.5px] leading-6" style={{ color: "var(--text-dim)" }}>
           {!authConfig
             ? "Loading sign-in options…"
-            : cognitoEnabled
+            : authUnavailable
+              ? "Sign-in services are temporarily unavailable."
+              : cognitoEnabled
               ? "Sign in with your organization account."
-              : "Sign in with your email to receive a one-time code."}
+              : devOtpEnabled
+                ? "Sign in with your email to receive a one-time code."
+                : "Sign in with your organization single sign-on."}
         </p>
 
         {!authConfig && (
@@ -144,7 +227,15 @@ export default function LoginPage() {
           </div>
         )}
 
-        {authConfig && (
+        {authUnavailable && (
+          <div className="mt-8 rounded-xl border p-4" style={{ borderColor: "var(--danger)", background: "var(--surface)" }} role="alert">
+            <div className="text-[14px] font-semibold">Chronos cannot reach its authentication service.</div>
+            <p className="mt-1 text-[13px] leading-5" style={{ color: "var(--text-muted)" }}>{error || "Please try again in a moment."}</p>
+            <button type="button" onClick={() => window.location.reload()} className="btn btn-secondary mt-4 w-full justify-center">Retry connection</button>
+          </div>
+        )}
+
+        {authConfig && !authUnavailable && (
           <div className="mt-8 space-y-3">
             <label className="block">
               <span className="text-[13px] font-medium" style={{ color: "var(--text-muted)" }}>Work email</span>
@@ -153,6 +244,7 @@ export default function LoginPage() {
                 style={{ borderColor: "var(--border)", background: "var(--surface)", color: "var(--text)" }}
                 value={email}
                 onChange={(event) => setEmail(event.target.value)}
+                readOnly={Boolean(invitation)}
                 type="email"
                 placeholder="you@company.com"
               />
@@ -161,22 +253,44 @@ export default function LoginPage() {
               Continue with SSO
             </button>
             <p className="text-xs" style={{ color: "var(--text-dim)" }}>
-              Uses your organization's single sign-on. We route you to your identity provider by email domain.
+              Uses your organization&apos;s single sign-on. We route you to your identity provider by email domain.
             </p>
           </div>
         )}
 
         {cognitoEnabled ? (
           <div className="mt-8 space-y-4">
+            {authConfig?.cognito?.requiresTenant && !authConfig.cognito.tenant ? (
+              <label className="block">
+                <span className="text-[13px] font-medium" style={{ color: "var(--text-muted)" }}>Organization workspace</span>
+                <div className="relative">
+                  <input
+                    className={`${inputClass} sm:pr-40`}
+                    style={{ borderColor: "var(--border)", background: "var(--surface)", color: "var(--text)" }}
+                    value={workspace}
+                    onChange={(event) => setWorkspace(event.target.value.toLowerCase())}
+                    autoCapitalize="none"
+                    autoCorrect="off"
+                    placeholder="novatech"
+                    aria-describedby="workspace-domain"
+                  />
+                  <span id="workspace-domain" className="pointer-events-none absolute right-3 top-1/2 mt-1 hidden -translate-y-1/2 text-xs sm:block" style={{ color: "var(--text-dim)" }}>
+                    .cognisiatech.com
+                  </span>
+                </div>
+                <span className="mt-1 block text-xs sm:hidden" style={{ color: "var(--text-dim)" }}>Your workspace URL ends in .cognisiatech.com</span>
+              </label>
+            ) : null}
             <button
               type="button"
               onClick={signInWithCognito}
+              disabled={cognitoBusy}
               className="btn btn-accent w-full justify-center"
               style={{ padding: "11px 16px" }}
             >
-              Sign in with Cognito
+              {cognitoBusy ? "Loading organization…" : "Sign in with Cognito"}
             </button>
-            {error ? <p className="text-[13px]" style={{ color: "var(--danger)" }}>{error}</p> : null}
+            {error ? <p role="alert" className="text-[13px]" style={{ color: "var(--danger)" }}>{error}</p> : null}
           </div>
         ) : null}
 
@@ -212,16 +326,19 @@ export default function LoginPage() {
                   />
                 </label>
               ) : null}
-              {error && !cognitoEnabled ? <p className="text-[13px]" style={{ color: "var(--danger)" }}>{error}</p> : null}
+              {error && !cognitoEnabled ? <p role="alert" className="text-[13px]" style={{ color: "var(--danger)" }}>{error}</p> : null}
               <button className="btn btn-accent w-full justify-center" style={{ padding: "11px 16px" }}>
                 {requested ? "Verify OTP" : "Request OTP"}
               </button>
             </form>
           </>
         ) : null}
-        <p style={{ marginTop: 16, textAlign: "center" }}>
-          <a href="/signup">Create an organization</a>
-        </p>
+        {devOtpEnabled ? (
+          <p style={{ marginTop: 16, textAlign: "center" }}>
+            <a href="/signup">Create an organization</a>
+          </p>
+        ) : null}
+        <PublicProductLinks discloseSessionCookie className="mt-8" />
       </section>
     </main>
   );

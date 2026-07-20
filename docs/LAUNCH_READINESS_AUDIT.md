@@ -1,5 +1,159 @@
 # Chronos — Launch-Readiness Audit
 
+> **Status reconciliation — 2026-07-19.** The body below this addendum is the
+> immutable historical audit of commit `8678c63` and its retired Render-oriented
+> path. It is not a description of the current checkout and must not be copied
+> into a launch decision. This addendum controls wherever the historical body
+> conflicts with it. Repository implementation, external configuration, and
+> production evidence are deliberately reported separately: none substitutes
+> for the other two.
+
+## Current release verdict
+
+The original B1-B7 architecture defects are superseded in the current AWS code
+path. Recent repository work also closes the previously listed product-code
+gaps for monitor polling, task controls, rich artifact previews/exports, native
+workspace administration, runtime health, agent publication, per-message memory
+evidence, hands-free voice, and untrusted-file quarantine.
+
+Chronos is nevertheless **not yet certified GA-ready for unattended real-client
+use**. A production certificate requires one immutable release to pass the full
+migration, CI, browser, provider, infrastructure, load, security, and recovery
+gates below. Focused tests are implementation evidence; they are not evidence
+that external production accounts are configured and healthy.
+
+A read-only external refresh on 2026-07-19 confirmed that the target AWS
+account still has no Chronos ECS/RDS/ALB/ECR/Secrets Manager stack or deploy
+role, SES remains sandboxed, the operator IAM user and all Cognito pools lack
+MFA, `app`/`api` DNS still target deleted load balancers, and GitHub `main` has
+no protection/ruleset/environment. The checked-in workflows now pin every
+third-party action to an immutable commit, but repository policy must still
+enforce reviewed protected releases before production deployment.
+
+The controlling current contracts are the
+[`chronos_total_parity_matrix.md`](chronos_total_parity_matrix.md),
+[`PRODUCTION_CONFIGURATION.md`](PRODUCTION_CONFIGURATION.md),
+[`PRODUCTION_OPERATIONS.md`](PRODUCTION_OPERATIONS.md),
+[`TERRAFORM_STATE_ADOPTION.md`](TERRAFORM_STATE_ADOPTION.md), and
+[`DISASTER_RECOVERY.md`](DISASTER_RECOVERY.md).
+
+## Current disposition of the original launch blockers
+
+| Original blocker | Current code/infrastructure disposition | Evidence still required |
+|---|---|---|
+| B1 — Render Postgres lacks pgvector | Superseded. Render is not the supported production path. Terraform provisions PostgreSQL 15 RDS and Alembic installs pgvector. On 2026-07-19 a new empty local PostgreSQL database migrated from base through the current `0069_artifact_share_expiry` head, and the retained local database completed the rolling `0068` → `0069` upgrade. | Run the exact chain as the one-off production migration task and retain logs/schema evidence from that applied environment. Do not use `render.yaml` as the production contract. |
+| B2 — no connector worker | Superseded in code. AWS defines a dedicated autoscaled `python -m connectors.worker_main` ECS service with at least two production tasks. | Live queue round-trip, recovery, scaling, heartbeat, and deploy/restart proof. |
+| B3 — OpenFGA absent | Superseded in infrastructure. AWS defines pinned OpenFGA application/migration services, a separate Multi-AZ datastore, private discovery, pre-shared auth, and enforced permission configuration. | Live model/tuple reconciliation, allowed/denied role and workspace cases, and outage fail-closed proof. |
+| B4 — duplicate schedulers/fragile runtime | Superseded in code. Redis leader election, distributed leases, heartbeats, reapers, durable cancellation cleanup, and multi-service scaling are present. | Multi-replica exactly-once schedules/monitors, task restart, cancellation, and failure injection under the deployed topology. |
+| B5 — default-tenant-only workflow recovery | Superseded in code. Startup recovery enumerates tenants with interrupted workflows instead of hard-coding `default`. | Restart with at least two tenants and prove no duplicate external action. |
+| B6 — unverified/free model defaults | Superseded in code/config. Production requires explicit non-free models, a finite org budget, and a separately keyed direct-provider fallback; an OpenRouter-prefixed backup is rejected. | Live primary outage/direct fallback success, embeddings, tool/structured/vision calls, pre-output stream failover, quota, latency, spend, and load proof. Provider model IDs remain external and can drift. |
+| B7 — no backup/restore/DR | Superseded in infrastructure code. Multi-AZ data services, 35-day recovery windows, S3 versioning, cross-Region AWS Backup, vault locks, alarms, automated restore tests, and a guarded separate-state rehearsal plan are defined. | Application/OpenFGA/S3/Redis reconciliation, tenant/authorization validation, measured RTO/RPO, and full promotion/failback rehearsal under [`DISASTER_RECOVERY.md`](DISASTER_RECOVERY.md). |
+
+The current operator contract is
+[`PRODUCTION_OPERATIONS.md`](PRODUCTION_OPERATIONS.md), with configuration in
+[`PRODUCTION_CONFIGURATION.md`](PRODUCTION_CONFIGURATION.md), state safety in
+[`TERRAFORM_STATE_ADOPTION.md`](TERRAFORM_STATE_ADOPTION.md), and recovery in
+[`DISASTER_RECOVERY.md`](DISASTER_RECOVERY.md).
+
+## Current product-code reconciliation
+
+The following items were missing or materially weaker in the historical audit
+and now have repository implementations. Each still needs the live evidence in
+the last column; “implemented” here means source/tests, not externally
+configured or production-proven.
+
+| Capability | Current repository disposition | Remaining launch proof |
+|---|---|---|
+| Browser operator | Production path uses persistent Browserbase Contexts and remote sessions, cross-replica locking/reconnection, S3 screenshots/downloads, explicit consent/expiry/sensitive-site approval, short-lived takeover URL, and context deletion on close/revoke. On 2026-07-16 the configured key/project completed authenticated project/usage lookup, web search, context create/get/delete, and a keep-alive `us-east-1` session create/release lifecycle without leaking provider URLs or keys. | The current Free quota is not a production capacity commitment. Complete navigation, login/takeover, clean/malicious download and upload, cross-replica restart, expiry/revoke, quota/failure, and paid-capacity evidence on the released build. |
+| Cloud computer | Dedicated E2B desktop profile provides tenant-bound terminal/files/packages, screenshots, bounded input, pause/resume/cancel/expiry, quotas, artifact export, and consent-bound exact-domain egress within an operator ceiling. Provider `allow_out` is paired with dual-stack deny-all and a destructive allowed/blocked pre-use probe. API-host execution is blocked in production. | Provision and validate the desktop template/key; real pixels/input, cross-replica resume, quota, allowed-domain success plus unlisted-IP denial, expiry/destruction, and cost evidence. |
+| Repository runtime | Dedicated E2B repo profile, configurable Git/package domain allowlist with destructive pre-use egress proof, Postgres lease/state, S3 snapshots, private GitHub archive import without sandbox tokens, branch/edit/test/diff/commit, and restart recovery are present. | Real E2B/GitHub private import and resume, allowed Git/package plus blocked-unlisted egress capture, approved push/PR, provider revocation, concurrency/quota, and no-secret evidence. |
+| Gmail send | Send is approval-bound, draft-first, tenant/task/member/payload bound, and stores provider evidence before sending so retries either replay, send the existing draft, recover `SENT`, or stop on ambiguity. | Real member-scoped Gmail/Composio search, draft, approve, send, crash/retry, and revoke proof. |
+| Notifications | In-app/member receipts, paired-mac delivery, and durable email/Slack/Teams per-recipient claims use retry/backoff/dead-letter and idempotent weekly digests under leader election. Slack/Teams general notification delivery remains distinct from agent-response publication. | Verified provider/domain delivery and action links, controlled failure/retry/dead-letter, digest, packaged desktop, preference, and channel-revocation proof. |
+| Billing | Stripe customer/checkout/portal, tenant binding, idempotency keys, signed configured-price webhook reconciliation, event ordering/deduplication, and billing UI are present. | Live products/prices/portal/webhook, checkout/update/cancel, invalid signature, tax/refund/support, and tenant isolation evidence. |
+| Compliance | Tenant-scoped redacted, hash-chained, signed compliance bundles are durable artifacts and cover audit, connector access, memory access, approvals, and task execution. | Authenticated production export/download/verification with representative client data and no secrets. |
+| Web error monitoring | Next.js client, Node, edge, router-transition, request-error, route-error, and global-render hooks use the existing Sentry DSN. The deploy passes the browser transport with a masked BuildKit secret, the web task receives the server DSN from Secrets Manager, CSP permits only that ingest origin, releases/environments are tagged, and request bodies/cookies/auth-CSRF headers/default PII are stripped. | Trigger controlled deployed server and browser errors; verify project/release/environment routing, redaction, alert ownership, quota/sample behavior, and no secret/PII capture. |
+| Disaster recovery | A guarded separate-state restore plan, quarantine assertions, snapshot preflight, and read-only infrastructure evidence collector exist. | Applied application/OpenFGA/S3/Redis reconciliation, tenant/authorization validation, measured RTO/RPO, promotion/failback, and retained evidence. |
+| Model failover | [`core/llm.py`](../apps/api/core/llm.py) applies an independent direct-provider backup to non-stream and pre-output stream failures; production config/Terraform reject a missing or OpenRouter-routed backup. On 2026-07-16 the configured OpenRouter account listed the selected paid chat/image/vision models and a live `google/gemini-embedding-2` request returned the configured 1,536 dimensions. | Create and fund the direct-provider backup account/key, then capture billed primary/fallback calls, forced primary outage, no duplicate partial stream/tool action, quota, latency, and spend evidence. |
+| File ingress and quarantine | [`core/file_security.py`](../apps/api/core/file_security.py), [`core/content_disarm.py`](../apps/api/core/content_disarm.py), and migrations [`0065`](../apps/api/migrations/versions/0065_file_security.py)/[`0067`](../apps/api/migrations/versions/0067_file_quarantine_review.py) cover attachments, browser transfers, and connector-synced binaries with fail-closed malware scanning, active-content disarm, metadata-only evidence, quarantine, and audited admin review. On 2026-07-19 the local ClamAV path proved fresh-signature health, clean and EICAR verdicts, `scanner_unavailable` fail-closed behavior during a stopped-daemon drill, and clean recovery after restart. | Repeat clean/EICAR/outage recovery in the deployed private task, then exercise active-content, connector/browser transfer, and live E2B/Browserbase egress paths. |
+| Rich artifacts and research exports | Safe previews cover Markdown/code/JSON/CSV/images/sanitized HTML/SVG, Office files, notebooks, ZIP manifests, and rasterized PDF. Artifact/research exports are durable, bounded, and idempotent. React/diagram source is intentionally non-executing. | Current browser inspection of every renderer/download and real DOCX/PDF open/render proof on the released build. |
+| Task console and monitors | Durable pause/resume/cancel/retry/dead-letter controls, live activity/timeline/reconnect state, and leased monitor polling with retry, dedupe, alerts, and workflow triggers are present. | Multi-replica browser proof for controls, refresh/reconnect, exactly-once poll/alert/workflow behavior, restart, and controlled failure. |
+| Native groups/workspaces and chat binding | Admin lifecycle APIs/UI manage groups, workspace roles, archive/restore, legal-hold-aware deletion, and API keys. Migration [`0066`](../apps/api/migrations/versions/0066_conversation_workspaces.py) binds every conversation to a tenant workspace; chat exposes only accessible workspaces and prevents rebinding. | Owner/admin/member UI/API proof including cross-tenant and removed/archived-workspace denial. |
+| Memory evidence and hands-free voice | Assistant messages persist authorized `memory_refs` and reload an exact “Memory used” control. Hands-free voice loops bounded record/silence detection → transcription → send → TTS → playback until stopped, with cleanup. | Two-member negative-isolation refresh/deep-link proof plus real microphone permission, billed STT/TTS, persistence, interruption, hard-cap, and provider-failure proof. |
+| Agent publication | Migration [`0064`](../apps/api/migrations/versions/0064_agent_publications.py), [`core/agent_publications.py`](../apps/api/core/agent_publications.py), and the Agents UI implement publish/unpublish/rotate/revoke plus signed/rate-limited inbound and durable approval-gated outbound for Slack, Teams, email, web, and API. Migration [`0068`](../apps/api/migrations/versions/0068_publication_constraint_reconcile.py) repairs already-stamped 0064-0067 schemas whose publication checks/approval linkage predated the final contract. | Live provider installs/signatures, channel/thread mapping, approval, delivery/retry/dead-letter/revoke, web-origin, and API-token evidence. |
+| Public artifact sharing | Migration [`0069`](../apps/api/migrations/versions/0069_artifact_share_expiry.py) adds a finite expiry to share records, backfills still-active historical links with a bounded lifetime, and the public read/download path rejects expired links. Fresh-base and retained-local rolling upgrades reached `0069` on 2026-07-19. | Apply the migration as the one-off production task, retain its schema evidence, then prove create/read/download/expiry/revoke/rate-limit behavior through the deployed edge. |
+| Runtime health and onboarding | Authenticated health separates required services from optional capabilities, redacts non-admin output, supports audited admin refresh, and server-gates onboarding completion on required production health. | Deployed database/Redis/S3/ClamAV/OpenFGA/worker/identity/model/provider checks plus role-specific browser proof. |
+| Project access and first-use guidance | Private and organization-visible projects now share one tenant-scoped access seam; organization visibility is read-only without explicit membership, OpenFGA mirrors the relationship, and non-empty project tool defaults are broker-enforced allowlists. The onboarding/welcome guide derives connector → project → source → research → approval → schedule progress from durable tenant records. | Two-member deployed private/organization read/write denial, mid-task tool-policy revocation, and full first-use browser walkthrough against real providers. |
+
+Focused repository proof on 2026-07-16 ran the publication migration repair,
+publication delivery, file security, workspace chat, rich artifact export,
+monitor polling, and runtime-health suites: **58 passed**. The migration proof
+includes the then-current 0068 contract and a transactional simulation of an
+already-stamped historical schema, with idempotent double application. A
+separate new empty local PostgreSQL database also migrated from base through
+`0068_publication_reconcile` and reported that revision as head at that time.
+On 2026-07-19 a new empty local PostgreSQL database migrated from base through
+`0069_artifact_share_expiry`, while the retained local database was safely
+stamped at `0068` and upgraded through `0069`; the focused migration/share
+suite passed. The applied production one-off migration and its retained schema
+evidence still remain. These are not
+the backend, frontend, dependency, container, Terraform, desktop, production
+migration, or behavioral browser gates.
+
+## Residual launch-blocker ledger
+
+### Repository and release proof
+
+- Repeat the complete Alembic chain in release CI and the one-off production
+  migration task, retaining head/constraint/foreign-key/application evidence
+  from the applied production environment.
+- Pass the complete backend suite, web typecheck/lint/build, dependency and
+  container scans, Terraform format/validate/test/plan, desktop build/signing,
+  and behavioral E2E on one immutable SHA.
+- Complete every acceptance item still open in the current parity matrix,
+  including exhaustive keyboard/VoiceOver/zoom/contrast and Computer Use
+  inspection of every desktop/mobile route, modal, and state. Static source
+  contracts are not behavioral conformance proof.
+
+### External configuration and provider evidence
+
+- A reviewed production plan/apply and state-adoption record for this checkout.
+- Replace the currently configured Composio credential: a 2026-07-16 live
+  connected-account lookup returned the provider's invalid-key response, so
+  connector setup must not promote it merely because the environment value is
+  non-empty.
+- Issued certificates, corrected DNS, hardened Cognito, GitHub OIDC deploy role,
+  confirmed paging route, and configured production provider/billing/email/
+  observability accounts.
+- Verified quotas, budgets, callback/signature settings, domain ownership,
+  credential rotation/revocation, and degraded/error behavior for every enabled
+  capability. A non-empty secret is not provider readiness.
+- Real model/fallback, Gmail/Composio, Browserbase, E2B, SendGrid, Slack/Teams,
+  Stripe, Canva, image/voice, custom integration, and repository-publication
+  exercises required by [`PRODUCTION_CONFIGURATION.md`](PRODUCTION_CONFIGURATION.md).
+
+### Deployment, security, capacity, and recovery
+
+- Successful current CI, behavioral E2E, production deployment, authenticated
+  tenant/role and cross-tenant smoke, and exhaustive desktop/mobile browser
+  evidence on the exact deployed image digests.
+- Measured load/capacity, SLO, RTO/RPO, application-level restore, and
+  cross-Region promotion/failback evidence.
+- Live proof of the declared ECR controls: reject a tag overwrite and verify the
+  released digest replicated into the immutable backup-Region repositories.
+- Live OpenFGA fail-closed, WAF/rate-limit, ClamAV failure, prompt-injection,
+  sandbox egress, cancellation cleanup, duplicate-delivery, provider outage,
+  secret-redaction, and tenant-isolation exercises.
+- Confirmed alert/on-call ownership, backup restore evidence, incident/support
+  process, privacy/data-processing terms, retention/deletion policy, SLA/SLO,
+  and client onboarding/rollback ownership.
+
+Until those items have evidence, Chronos must not be represented as GA-ready for
+unattended real-client use.
+
+---
+
+## Historical audit below — superseded except as history
+
 **Auditor role:** principal engineer / QA lead / security reviewer / launch operator
 **Date:** 2026-06-29
 **Branch audited:** `claude/chronos-launch-readiness-audit-y8mix6` (tip of `main` @ `8678c63`)

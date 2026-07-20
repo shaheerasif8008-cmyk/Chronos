@@ -11,13 +11,14 @@ type BrowserSession = {
   current_url?: string | null;
   title?: string | null;
   screenshot_data_url?: string | null;
+  screenshot_url?: string | null;
   screenshot_object_path?: string | null;
   takeover_state?: string | null;
   takeover_reason?: string | null;
   takeover_summary?: string | null;
   consent?: { purpose?: string; allowed_domains?: string[]; [key: string]: unknown };
   sensitive_site_approvals?: Array<{ domain?: string; approval_id?: string | null; approved_at?: string }>;
-  downloads?: Array<{ filename?: string; path?: string; created_at?: string }>;
+  downloads?: Array<{ filename?: string; created_at?: string; content_type?: string; size_bytes?: number; download_url?: string }>;
   history?: Array<{ action?: string; payload?: Record<string, unknown>; created_at?: string }>;
   updated_at?: string;
   created_at?: string;
@@ -58,6 +59,12 @@ export default function BrowserOperatorScreen() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [handBackSummary, setHandBackSummary] = useState("");
+  const [newSessionOpen, setNewSessionOpen] = useState(false);
+  const [purpose, setPurpose] = useState("");
+  const [domainScope, setDomainScope] = useState("");
+  const [expiryMinutes, setExpiryMinutes] = useState("60");
+  const [consentConfirmed, setConsentConfirmed] = useState(false);
+  const [screenshotUrl, setScreenshotUrl] = useState<string | null>(null);
 
   const active = useMemo(
     () => sessions.find(session => session.id === activeId) ?? sessions[0] ?? null,
@@ -103,17 +110,60 @@ export default function BrowserOperatorScreen() {
 
   useEffect(() => { void loadSessions(); }, [loadSessions]);
   useEffect(() => { void loadEvents(active?.id ?? null); }, [active?.id, loadEvents]);
+  useEffect(() => {
+    let cancelled = false;
+    let objectUrl: string | null = null;
+    const durableUrl = active?.screenshot_url;
+    if (!durableUrl) {
+      setScreenshotUrl(active?.screenshot_data_url || null);
+      return () => undefined;
+    }
+    setScreenshotUrl(null);
+    apiFetch(durableUrl)
+      .then(response => response.blob())
+      .then(blob => {
+        if (cancelled) return;
+        objectUrl = URL.createObjectURL(blob);
+        setScreenshotUrl(objectUrl);
+      })
+      .catch(() => {
+        if (!cancelled) setScreenshotUrl(null);
+      });
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [active?.id, active?.screenshot_data_url, active?.screenshot_url]);
 
   async function createSession() {
+    const allowedDomains = domainScope
+      .split(/[\s,]+/)
+      .map(value => value.trim().toLowerCase().replace(/^https?:\/\//, "").split("/")[0])
+      .filter(Boolean);
+    if (!purpose.trim() || allowedDomains.length === 0 || !consentConfirmed) {
+      setError("Describe the purpose, allow at least one domain, and confirm the consent scope.");
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
       const created = (await (await apiFetch("/browser-sessions/", {
         method: "POST",
-        body: JSON.stringify({ consent: { purpose: "Manual browser operation", allowed_domains: [] } }),
+        body: JSON.stringify({
+          consent: {
+            purpose: purpose.trim(),
+            allowed_domains: Array.from(new Set(allowedDomains)),
+            expires_at: new Date(Date.now() + Number(expiryMinutes) * 60_000).toISOString(),
+            confirmed_by_user: true,
+          },
+        }),
       })).json()) as BrowserSession;
       await loadSessions();
       setActiveId(created.id);
+      setNewSessionOpen(false);
+      setPurpose("");
+      setDomainScope("");
+      setConsentConfirmed(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unable to create browser session");
     } finally {
@@ -140,9 +190,46 @@ export default function BrowserOperatorScreen() {
     }
   }
 
+  async function openLiveView() {
+    if (!active || active.takeover_state !== "requested") return;
+    const popup = window.open("about:blank", "_blank", "noopener,noreferrer");
+    setBusy(true);
+    setError(null);
+    try {
+      const payload = await apiFetch(`/browser-sessions/${active.id}/live-view`).then(response => response.json()) as { live_view_url?: string };
+      if (!payload.live_view_url) throw new Error("Live view URL was not returned");
+      if (popup) popup.location.replace(payload.live_view_url);
+      else window.open(payload.live_view_url, "_blank", "noopener,noreferrer");
+    } catch (err) {
+      popup?.close();
+      setError(err instanceof Error ? err.message : "Unable to open live view");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function downloadFile(download: NonNullable<BrowserSession["downloads"]>[number]) {
+    if (!download.download_url) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const blob = await apiFetch(download.download_url).then(response => response.blob());
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = download.filename || "download";
+      anchor.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to download file");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="flex-1 min-w-0 overflow-hidden flex flex-col">
-      <header className="px-10 pt-9 pb-5 flex items-start justify-between gap-6 flex-shrink-0">
+      <header className="flex flex-shrink-0 flex-col items-start justify-between gap-4 px-4 pb-4 pt-5 sm:flex-row sm:gap-6 md:px-10 md:pb-5 md:pt-9">
         <div className="min-w-0">
           <h1 className="h-page tracking-tight">Browser</h1>
           <p className="mt-1.5 text-[14px]" style={{ color: "var(--text-dim)" }}>
@@ -151,24 +238,49 @@ export default function BrowserOperatorScreen() {
         </div>
         <div className="flex items-center gap-2">
           <button className="btn btn-ghost btn-sm" onClick={() => { void loadSessions(); void loadEvents(active?.id ?? null); }} disabled={busy}>Refresh</button>
-          <button className="btn btn-accent btn-sm" onClick={createSession} disabled={busy}>New session</button>
+          <button className="btn btn-accent btn-sm" aria-expanded={newSessionOpen} aria-controls="browser-session-consent" onClick={() => setNewSessionOpen(open => !open)} disabled={busy}>{newSessionOpen ? "Cancel" : "New session"}</button>
         </div>
       </header>
 
+      {newSessionOpen && (
+        <section id="browser-session-consent" className="mx-4 mb-4 rounded-xl border border-soft p-4 md:mx-10" style={{ background: "var(--surface)" }} aria-labelledby="browser-consent-heading">
+          <h2 id="browser-consent-heading" className="text-[14px] font-semibold">Review browser access</h2>
+          <p className="mt-1 text-[12.5px]" style={{ color: "var(--text-dim)" }}>Chronos can navigate only the domains listed here. Sensitive sites still require a separate approval.</p>
+          <div className="mt-4 grid gap-3 md:grid-cols-2">
+            <label className="grid gap-1 text-[12px]">Purpose
+              <input className="input-field w-full" value={purpose} onChange={event => setPurpose(event.target.value)} placeholder="Reconcile invoices in the client portal" />
+            </label>
+            <label className="grid gap-1 text-[12px]">Allowed domains
+              <input className="input-field w-full" value={domainScope} onChange={event => setDomainScope(event.target.value)} placeholder="client.example.com, docs.example.com" />
+            </label>
+            <label className="grid gap-1 text-[12px]">Session expires
+              <select className="input-field w-full" value={expiryMinutes} onChange={event => setExpiryMinutes(event.target.value)}>
+                <option value="15">15 minutes</option><option value="30">30 minutes</option><option value="60">1 hour</option><option value="120">2 hours</option>
+              </select>
+            </label>
+            <label className="flex items-start gap-2 rounded-lg border border-soft p-3 text-[12.5px]">
+              <input type="checkbox" checked={consentConfirmed} onChange={event => setConsentConfirmed(event.target.checked)} className="mt-0.5" />
+              <span>I authorize this purpose and domain scope for the selected time window.</span>
+            </label>
+          </div>
+          <div className="mt-4 flex justify-end"><button className="btn btn-accent btn-sm" onClick={() => void createSession()} disabled={busy || !consentConfirmed}>{busy ? "Creating…" : "Create governed session"}</button></div>
+        </section>
+      )}
+
       {error && (
-        <div className="mx-10 mb-3 rounded-lg border px-3 py-2 text-[12.5px]" style={{ borderColor: "var(--danger)", background: "var(--danger-soft)", color: "var(--danger)" }}>
+        <div role="alert" className="mx-4 mb-3 rounded-lg border px-3 py-2 text-[12.5px] md:mx-10" style={{ borderColor: "var(--danger)", background: "var(--danger-soft)", color: "var(--danger)" }}>
           {error}
         </div>
       )}
 
-      <div className="flex-1 min-h-0 px-10 pb-10 grid gap-4" style={{ gridTemplateColumns: "320px minmax(0, 1fr)" }}>
-        <aside className="surface border border-soft rounded-lg overflow-hidden min-h-0 flex flex-col">
+      <div className="grid min-h-0 flex-1 grid-cols-1 gap-4 overflow-y-auto px-4 pb-6 md:grid-cols-[320px_minmax(0,1fr)] md:overflow-hidden md:px-10 md:pb-10">
+        <aside className="surface border border-soft rounded-lg overflow-hidden min-h-0 flex max-h-[260px] flex-col md:max-h-none">
           <div className="px-3 py-2 border-b hairline flex items-center justify-between">
             <span className="text-[12.5px] font-medium">Sessions</span>
             <span className="text-[11.5px]" style={{ color: "var(--text-dim)" }}>{sessions.length}</span>
           </div>
           <div className="overflow-y-auto p-2 space-y-2">
-            {loading && <div className="text-[13px] p-3" style={{ color: "var(--text-dim)" }}>Loading...</div>}
+            {loading && <div role="status" className="text-[13px] p-3" style={{ color: "var(--text-dim)" }}>Loading browser sessions…</div>}
             {!loading && sessions.length === 0 && (
               <div className="text-[13px] p-3" style={{ color: "var(--text-dim)" }}>No browser sessions yet.</div>
             )}
@@ -177,6 +289,7 @@ export default function BrowserOperatorScreen() {
                 key={session.id}
                 className="w-full rounded-md border border-soft p-3 text-left smooth"
                 onClick={() => setActiveId(session.id)}
+                aria-pressed={active?.id === session.id}
                 style={{ background: active?.id === session.id ? "var(--surface-2)" : "transparent" }}
               >
                 <div className="flex items-center gap-2">
@@ -199,23 +312,28 @@ export default function BrowserOperatorScreen() {
             <div className="flex-1 flex items-center justify-center text-[13px]" style={{ color: "var(--text-dim)" }}>Select or create a browser session.</div>
           ) : (
             <>
-              <div className="px-4 py-3 border-b hairline flex items-center justify-between gap-3">
+              <div className="flex flex-col items-stretch justify-between gap-3 border-b hairline px-4 py-3 sm:flex-row sm:items-center">
                 <div className="min-w-0">
                   <div className="text-[14px] font-medium truncate">{active.title || "Browser session"}</div>
                   <div className="text-[12px] truncate" style={{ color: "var(--text-dim)" }}>{active.current_url || "No URL"}</div>
                 </div>
-                <div className="flex items-center gap-2">
-                  <button className="btn btn-ghost btn-sm" disabled={busy || !active} onClick={() => void postAction("close")}>Close</button>
-                  <button className="btn btn-ghost btn-sm" disabled={busy || !active} onClick={() => void postAction("revoke", { reason: "revoked from browser view" })}>Revoke</button>
+                <div className="flex flex-wrap items-center gap-2">
+                  {active.status === "active" && active.takeover_state !== "requested" && (
+                    <button className="btn btn-ghost btn-sm" disabled={busy} onClick={() => void postAction("request-takeover", { reason: "User requested live takeover" })}>Request takeover</button>
+                  )}
+                  {active.takeover_state === "requested" && (
+                    <button className="btn btn-accent btn-sm" disabled={busy} onClick={() => void openLiveView()}>Open live view</button>
+                  )}
+                  <button className="btn btn-ghost btn-sm" disabled={busy || !active} onClick={() => { if (window.confirm("Close this browser session? Running browser work will stop.")) void postAction("close"); }}>Close</button>
+                  <button className="btn btn-ghost btn-sm" disabled={busy || !active} onClick={() => { if (window.confirm("Revoke this browser session? Chronos will permanently lose access to it.")) void postAction("revoke", { reason: "revoked from browser view" }); }}>Revoke</button>
                 </div>
               </div>
 
-              <div className="flex-1 min-h-0 grid" style={{ gridTemplateColumns: "minmax(0, 1fr) 300px" }}>
+              <div className="grid min-h-0 flex-1 grid-cols-1 overflow-y-auto lg:grid-cols-[minmax(0,1fr)_300px] lg:overflow-hidden">
                 <div className="min-w-0 min-h-0 p-4 overflow-auto">
                   <div className="rounded-lg border border-soft overflow-hidden bg-black" style={{ aspectRatio: "16 / 10" }} data-testid="browser-viewport">
-                    {active.screenshot_data_url ? (
-                      // eslint-disable-next-line @next/next/no-img-element
-                      <img src={active.screenshot_data_url} alt="Current browser screenshot" className="w-full h-full object-contain" />
+                    {screenshotUrl ? (
+                      <img src={screenshotUrl} alt="Current browser screenshot" className="w-full h-full object-contain" />
                     ) : (
                       <div className="w-full h-full flex items-center justify-center text-[13px]" style={{ color: "rgba(255,255,255,.72)" }}>
                         {active.status === "degraded" ? "Browser runtime unavailable" : "No screenshot captured"}
@@ -224,11 +342,12 @@ export default function BrowserOperatorScreen() {
                   </div>
 
                   {active.takeover_state === "requested" && (
-                    <div className="mt-4 rounded-lg border px-3 py-3" style={{ borderColor: "var(--warn)", background: "var(--warn-soft)" }}>
-                      <div className="text-[13px] font-medium" style={{ color: "var(--warn)" }}>Takeover requested</div>
+                    <div role="region" aria-labelledby="browser-takeover-heading" className="mt-4 rounded-lg border px-3 py-3" style={{ borderColor: "var(--warn)", background: "var(--warn-soft)" }}>
+                      <div id="browser-takeover-heading" role="status" aria-live="polite" className="text-[13px] font-medium" style={{ color: "var(--warn)" }}>Takeover requested</div>
                       <div className="mt-1 text-[12.5px]" style={{ color: "var(--text-dim)" }}>{active.takeover_reason || "User input required"}</div>
-                      <div className="mt-3 flex gap-2">
+                      <div className="mt-3 flex flex-col gap-2 sm:flex-row">
                         <input
+                          aria-label="Browser takeover hand-back summary"
                           value={handBackSummary}
                           onChange={event => setHandBackSummary(event.target.value)}
                           placeholder="Hand-back summary"
@@ -241,7 +360,7 @@ export default function BrowserOperatorScreen() {
 
                   <div className="mt-4 rounded-lg border border-soft overflow-hidden">
                     <div className="px-3 py-2 border-b hairline text-[12.5px] font-medium">Replay</div>
-                    <div className="divide-y" style={{ borderColor: "var(--border-soft)" }}>
+                    <div className="divide-y" style={{ borderColor: "var(--border-soft)" }} aria-live="polite" aria-relevant="additions text">
                       {replayEvents.map((event, index) => {
                         const payload = event.payload || {};
                         const type = event.event_type || event.action || String(payload.type || "browser_event");
@@ -261,7 +380,7 @@ export default function BrowserOperatorScreen() {
                   </div>
                 </div>
 
-                <aside className="border-l hairline p-4 overflow-y-auto space-y-4">
+                <aside className="space-y-4 overflow-y-auto border-t hairline p-4 lg:border-l lg:border-t-0">
                   <div>
                     <div className="text-[12px] font-medium mb-2">State</div>
                     <div className="space-y-1.5 text-[12.5px]" style={{ color: "var(--text-dim)" }}>
@@ -294,7 +413,10 @@ export default function BrowserOperatorScreen() {
                     <div className="space-y-1.5">
                       {(active.downloads || []).length === 0 && <div className="text-[12px]" style={{ color: "var(--text-dim)" }}>No downloads</div>}
                       {(active.downloads || []).map((download, index) => (
-                        <div key={`${download.filename}-${index}`} className="rounded-md border border-soft px-2 py-1.5 text-[12px] truncate">{download.filename || download.path || "download"}</div>
+                        <button key={`${download.filename}-${index}`} type="button" disabled={!download.download_url || busy} onClick={() => void downloadFile(download)} className="block w-full truncate rounded-md border border-soft px-2 py-1.5 text-left text-[12px] disabled:cursor-not-allowed disabled:opacity-60">
+                          {download.filename || "download"}
+                          {typeof download.size_bytes === "number" ? ` · ${Math.max(1, Math.round(download.size_bytes / 1024))} KB` : ""}
+                        </button>
                       ))}
                     </div>
                   </div>

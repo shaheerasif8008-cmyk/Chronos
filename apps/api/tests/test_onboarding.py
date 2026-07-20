@@ -4,6 +4,7 @@ from __future__ import annotations
 import uuid
 import httpx
 import pytest
+from sqlalchemy import select
 
 import main
 from core.auth import create_access_token
@@ -12,6 +13,14 @@ from core.db import engine, reflect_table
 
 def _client():
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://test")
+
+
+def _ready_report() -> dict:
+    return {
+        "status": "ready",
+        "can_complete_onboarding": True,
+        "blockers": [],
+    }
 
 
 async def _org_and_admin(state: str = "new"):
@@ -38,7 +47,40 @@ async def test_get_onboarding_state():
 
 
 @pytest.mark.asyncio
-async def test_complete_onboarding_sets_state_and_persists():
+async def test_first_use_guide_is_server_derived_and_tenant_scoped():
+    org_id, _, token, sub = await _org_and_admin(state="complete")
+    headers = {"Authorization": f"Bearer {token}", "X-Chronos-Org": sub}
+    projects = await reflect_table("projects")
+    async with engine.begin() as conn:
+        await conn.execute(
+            projects.insert().values(
+                organization_id=org_id,
+                name="First project",
+                visibility="private",
+                default_tools=[],
+            )
+        )
+    async with _client() as client:
+        response = await client.get("/settings/onboarding/guide", headers=headers)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 6
+    steps = {step["id"]: step for step in payload["steps"]}
+    assert steps["project"]["complete"] is True
+    assert steps["project"]["evidence_count"] == 1
+    assert steps["connector"]["complete"] is False
+    assert steps["schedule"]["href"] == "/workflows?onboarding=schedule"
+
+
+@pytest.mark.asyncio
+async def test_complete_onboarding_sets_state_and_persists(monkeypatch):
+    async def ready(**_kwargs):
+        return _ready_report()
+
+    monkeypatch.setattr(
+        "routers.settings.runtime_health.build_runtime_health_report", ready
+    )
     org_id, _, token, sub = await _org_and_admin(state="new")
     headers = {"Authorization": f"Bearer {token}", "X-Chronos-Org": sub}
     async with _client() as client:
@@ -50,6 +92,41 @@ async def test_complete_onboarding_sets_state_and_persists():
     async with engine.begin() as conn:
         row = (await conn.execute(orgs.select().where(orgs.c.id == org_id))).mappings().one()
     assert row["onboarding_state"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_complete_onboarding_blocks_when_required_runtime_is_unavailable(
+    monkeypatch,
+):
+    async def blocked(**_kwargs):
+        return {
+            "status": "blocked",
+            "can_complete_onboarding": False,
+            "blockers": [
+                {"id": "database", "label": "Database", "status": "unavailable"}
+            ],
+        }
+
+    monkeypatch.setattr(
+        "routers.settings.runtime_health.build_runtime_health_report", blocked
+    )
+    org_id, _, token, sub = await _org_and_admin(state="new")
+    headers = {"Authorization": f"Bearer {token}", "X-Chronos-Org": sub}
+    async with _client() as client:
+        response = await client.post("/settings/onboarding/complete", headers=headers)
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "runtime_not_ready"
+    organizations = await reflect_table("organizations")
+    async with engine.begin() as conn:
+        state = (
+            await conn.execute(
+                select(organizations.c.onboarding_state).where(
+                    organizations.c.id == org_id
+                )
+            )
+        ).scalar_one()
+    assert state == "new"
 
 
 @pytest.mark.asyncio

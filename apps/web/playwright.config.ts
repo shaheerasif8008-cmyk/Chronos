@@ -8,6 +8,7 @@ const BASE_URL = `http://localhost:${WEB_PORT}`;
 
 export default defineConfig({
   testDir: "./e2e",
+  outputDir: "output/playwright",
   timeout: 90_000,
   expect: { timeout: 15_000 },
   fullyParallel: false,
@@ -25,6 +26,19 @@ export default defineConfig({
     {
       name: "chromium",
       use: { ...devices["Desktop Chrome"], storageState: "e2e/.auth/user.json" },
+      dependencies: ["setup"],
+      testIgnore: /mobile-responsive\.spec\.ts/,
+    },
+    {
+      name: "mobile-chromium",
+      testMatch: /mobile-responsive\.spec\.ts/,
+      use: { ...devices["Pixel 7"], storageState: "e2e/.auth/user.json" },
+      dependencies: ["setup"],
+    },
+    {
+      name: "mobile-webkit",
+      testMatch: /mobile-responsive\.spec\.ts/,
+      use: { ...devices["iPhone 15"], storageState: "e2e/.auth/user.json" },
       dependencies: ["setup"],
     },
   ],

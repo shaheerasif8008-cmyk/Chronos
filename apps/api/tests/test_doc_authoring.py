@@ -43,6 +43,7 @@ def cap(monkeypatch):
         c.saved.append({
             "artifact_id": aid, "bytes": raw, "kind": kind, "title": title,
             "mime_type": mime_type, "org_id": org_id, "parent": parent_artifact_id,
+            "created_by": created_by,
         })
         return aid
 
@@ -89,7 +90,8 @@ def _pdf_text(raw: bytes) -> str:
 @pytest.mark.asyncio
 async def test_create_pdf(cap):
     result = await da.doc_authoring_connector.execute("doc.create", {
-        "__org_id": "org1", "format": "pdf", "title": "Lab Report",
+        "__org_id": "org1", "__member_id": "member-doc-1",
+        "format": "pdf", "title": "Lab Report",
         "blocks": [
             {"type": "heading", "text": "Results", "level": 1},
             {"type": "paragraph", "text": "The reaction was exothermic."},
@@ -98,6 +100,7 @@ async def test_create_pdf(cap):
     })
     assert result.data["status"] == "success"
     saved = cap.saved[-1]
+    assert saved["created_by"] == "member-doc-1"
     assert saved["mime_type"] == "application/pdf"
     assert saved["bytes"][:4] == b"%PDF"
     text = _pdf_text(saved["bytes"])
@@ -111,6 +114,7 @@ async def test_create_markdown(cap):
         "blocks": [{"type": "bullet", "text": "point A"}],
     })
     assert result.data["status"] == "success"
+    assert cap.saved[-1]["created_by"] == "doc_authoring_connector"
     body = cap.saved[-1]["bytes"].decode()
     assert "# Notes" in body and "- point A" in body
 
@@ -144,13 +148,14 @@ async def test_create_rejects_empty_blocks(cap):
 @pytest.mark.asyncio
 async def test_create_slides(cap):
     result = await da.doc_authoring_connector.execute("doc.create_slides", {
-        "__org_id": "org1", "title": "Deck",
+        "__org_id": "org1", "__member_id": "member-slides-1", "title": "Deck",
         "slides": [
             {"title": "Intro", "bullets": ["first", "second"], "notes": "say hi"},
             {"title": "End"},
         ],
     })
     assert result.data["status"] == "success"
+    assert cap.saved[-1]["created_by"] == "member-slides-1"
     assert result.data["slides"] == 2
     from pptx import Presentation
     prs = Presentation(io.BytesIO(cap.saved[-1]["bytes"]))
@@ -169,13 +174,15 @@ async def test_fill_pdf_by_anchor(cap):
     cap.add_source("src-1", src, org_id="org1")
 
     result = await da.doc_authoring_connector.execute("doc.fill_pdf", {
-        "__org_id": "org1", "artifact_id": "src-1",
+        "__org_id": "org1", "__member_id": "member-fill-1",
+        "artifact_id": "src-1",
         "items": [
             {"page": 1, "type": "text", "anchor_text": "Answer:",
              "dx": 90, "dy": 0, "text": "Water", "color": "#0000ff"},
         ],
     })
     assert result.data["status"] == "success"
+    assert cap.saved[-1]["created_by"] == "member-fill-1"
     assert result.data["items_placed"] == 1
     out = cap.saved[-1]
     # Output preserves the original content AND carries the overlay.
@@ -259,12 +266,14 @@ async def test_fill_pdf_non_pdf_source(cap):
 @pytest.mark.asyncio
 async def test_render_chart_line(cap):
     result = await da.doc_authoring_connector.execute("doc.render_chart", {
-        "__org_id": "org1", "chart_type": "line", "title": "Trend",
+        "__org_id": "org1", "__member_id": "member-chart-1",
+        "chart_type": "line", "title": "Trend",
         "series": [{"name": "a", "values": [1, 2, 3]}],
         "labels": ["x", "y", "z"],
     })
     assert result.data["status"] == "success"
     saved = cap.saved[-1]
+    assert saved["created_by"] == "member-chart-1"
     assert saved["kind"] == "image"
     assert saved["bytes"][:4] == b"\x89PNG"
 

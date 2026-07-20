@@ -111,7 +111,7 @@ class ToolOrchestrationPlanner:
                 connector_id=connector_id,
                 action_name=action_name,
                 arguments=step.arguments,
-                context=AgentContext(id=employee_id, org_id=tenant_id, member_id=user_id, workspace_id=workspace_id),
+                context=AgentContext(id=employee_id, org_id=tenant_id, member_id=user_id, workspace_id=workspace_id, task_id=f"connector-plan:{plan.id}:{step.id}"),
             )
             step_result = {
                 "id": step.id,

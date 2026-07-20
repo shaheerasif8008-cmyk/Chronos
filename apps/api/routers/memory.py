@@ -4,16 +4,20 @@ import json
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from core import audit, permissions
+from core import audit, permissions, retention
 from core.auth import get_current_member
-from core.config import settings
+from core.memory_access import (
+    get_memory_for_member,
+    normalize_entry_scope,
+)
 from core.memory_control import (
     archive_memory,
     change_scope,
     detect_conflicts,
     export_memories,
+    get_memory_policy,
     import_memories,
     list_memories,
     list_memory_usage,
@@ -25,7 +29,7 @@ from core.memory_control import (
 )
 from core.memory_writes import (
     create_memory_entry,
-    soft_delete_memory_entry,
+    MemoryCaptureDisabled,
     undo_autonomous_memory,
     update_memory_entry,
 )
@@ -36,15 +40,15 @@ router = APIRouter(prefix="/memory", tags=["memory"])
 
 
 class MemoryCreate(BaseModel):
-    content: str
-    scope: str = "org"
+    content: str = Field(min_length=1, max_length=10_000)
+    scope: str = "personal"
     scope_id: str | None = None
-    importance_score: float = 0.8
+    importance_score: float = Field(default=0.8, ge=0.0, le=1.0)
 
 
 class MemoryUpdate(BaseModel):
-    content: str
-    importance_score: float | None = None
+    content: str = Field(min_length=1, max_length=10_000)
+    importance_score: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 class FlagBody(BaseModel):
@@ -53,7 +57,7 @@ class FlagBody(BaseModel):
 
 class ScopeBody(BaseModel):
     scope: str
-    scope_id: str
+    scope_id: str | None = None
 
 
 class MergeBody(BaseModel):
@@ -68,12 +72,12 @@ class ResolveConflictBody(BaseModel):
 
 class PolicyBody(BaseModel):
     scope: str
-    scope_id: str
+    scope_id: str | None = None
     enabled: bool
 
 
 class ImportBody(BaseModel):
-    items: list[dict]
+    items: list[dict] = Field(max_length=10_000)
 
 
 @router.get("/")
@@ -86,7 +90,7 @@ async def list_memory(
     offset: int = Query(default=0, ge=0),
     member: Member = Depends(get_current_member),
 ) -> list[dict]:
-    await permissions.check(member, "list_memory", settings.org_id)
+    await permissions.check(member, "list_memory", member.organization_id)
     return await list_memories(
         member,
         query=q,
@@ -100,23 +104,27 @@ async def list_memory(
 
 @router.post("/")
 async def add_memory(req: MemoryCreate, member: Member = Depends(get_current_member)) -> dict:
-    await permissions.check(member, "create_memory", settings.org_id)
+    await permissions.check(member, "create_memory", member.organization_id)
     from core.memory_control import is_memory_enabled
 
     if not await is_memory_enabled(org_id=member.organization_id, member_id=member.id):
         raise HTTPException(status_code=403, detail="Memory is disabled for this scope")
-    scope_id = req.scope_id
-    if scope_id is None:
-        scope_id = member.id if req.scope in {"personal", "restricted"} else member.organization_id
-    entry_id = await create_memory_entry(
-        content=req.content,
-        requester_context=RequesterContext.from_member(member),
-        source="explicit",
-        scope=req.scope,
-        scope_id=scope_id,
-        importance_score=req.importance_score,
-        created_by=member.id,
-    )
+    try:
+        scope, scope_id = await normalize_entry_scope(member, req.scope, req.scope_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    try:
+        entry_id = await create_memory_entry(
+            content=req.content,
+            requester_context=RequesterContext.from_member(member),
+            source="explicit",
+            scope=scope,
+            scope_id=scope_id,
+            importance_score=req.importance_score,
+            created_by=member.id,
+        )
+    except MemoryCaptureDisabled as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     return {"id": entry_id}
 
 
@@ -139,7 +147,13 @@ async def update_memory(memory_id: str, req: MemoryUpdate, member: Member = Depe
 @router.delete("/{memory_id}")
 async def delete_memory(memory_id: str, member: Member = Depends(get_current_member)) -> dict:
     await permissions.check(member, "delete_memory", memory_id)
-    if not await soft_delete_memory_entry(memory_id, member):
+    try:
+        deleted = await retention.soft_delete_memory_if_allowed(memory_id, member)
+    except retention.RetentionResourceHeld:
+        raise HTTPException(
+            status_code=423, detail="Memory is protected by an active retention hold"
+        ) from None
+    if not deleted:
         raise HTTPException(status_code=404, detail="Memory not found")
     await audit.log(
         "memory_write",
@@ -155,7 +169,13 @@ async def delete_memory(memory_id: str, member: Member = Depends(get_current_mem
 @router.post("/{memory_id}/undo")
 async def undo_memory(memory_id: str, member: Member = Depends(get_current_member)) -> dict:
     await permissions.check(member, "undo_memory", memory_id)
-    undone = await undo_autonomous_memory(memory_id, member)
+    try:
+        undone = await undo_autonomous_memory(memory_id, member)
+    except retention.RetentionResourceHeld:
+        raise HTTPException(
+            status_code=423,
+            detail="Memory is protected by an active retention hold",
+        ) from None
     if not undone:
         raise HTTPException(status_code=404, detail="Undo window expired or memory not found")
     return {"id": memory_id, "undone": True}
@@ -163,7 +183,7 @@ async def undo_memory(memory_id: str, member: Member = Depends(get_current_membe
 
 @router.get("/conflicts")
 async def memory_conflicts(member: Member = Depends(get_current_member)) -> list[dict]:
-    await permissions.check(member, "list_memory", settings.org_id)
+    await permissions.check(member, "list_memory", member.organization_id)
     return await detect_conflicts(member)
 
 
@@ -186,14 +206,19 @@ async def memory_merge(req: MergeBody, member: Member = Depends(get_current_memb
 
 @router.get("/export")
 async def memory_export(member: Member = Depends(get_current_member)) -> list[dict]:
-    await permissions.check(member, "list_memory", settings.org_id)
+    await permissions.check(member, "list_memory", member.organization_id)
     return await export_memories(member)
 
 
 @router.post("/import")
 async def memory_import(req: ImportBody, member: Member = Depends(get_current_member)) -> dict:
-    await permissions.check(member, "create_memory", settings.org_id)
-    ids = await import_memories(member, req.items)
+    await permissions.check(member, "create_memory", member.organization_id)
+    try:
+        ids = await import_memories(member, req.items)
+    except MemoryCaptureDisabled as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {"imported": len(ids), "ids": ids}
 
 
@@ -204,12 +229,32 @@ async def memory_policy(req: PolicyBody, member: Member = Depends(get_current_me
         await set_memory_policy(member, scope=req.scope, scope_id=req.scope_id, enabled=req.enabled)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
-    return {"scope": req.scope, "scope_id": req.scope_id, "enabled": req.enabled}
+    # set_memory_policy canonicalizes the target; fetch the same canonical pair
+    # for the response so clients never need placeholder ids such as "default".
+    from core.memory_access import validate_policy_target
+
+    scope, scope_id = await validate_policy_target(member, req.scope, req.scope_id)
+    return {"scope": scope, "scope_id": scope_id, "enabled": req.enabled}
+
+
+@router.get("/policy")
+async def memory_policy_status(
+    scope: str = Query(default="member"),
+    scope_id: str | None = Query(default=None),
+    member: Member = Depends(get_current_member),
+) -> dict:
+    await permissions.check(member, "list_memory", member.organization_id)
+    try:
+        return await get_memory_policy(member, scope=scope, scope_id=scope_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.get("/{memory_id}/usage")
 async def memory_usage(memory_id: str, member: Member = Depends(get_current_member)) -> list[dict]:
     await permissions.check(member, "list_memory", memory_id)
+    if await get_memory_for_member(memory_id, member) is None:
+        raise HTTPException(status_code=404, detail="Memory not found")
     return await list_memory_usage(memory_id, member)
 
 
@@ -240,18 +285,29 @@ async def memory_sensitive(memory_id: str, req: FlagBody, member: Member = Depen
 @router.post("/{memory_id}/scope")
 async def memory_change_scope(memory_id: str, req: ScopeBody, member: Member = Depends(get_current_member)) -> dict:
     await permissions.check(member, "update_memory", memory_id)
-    if not await change_scope(memory_id, member, scope=req.scope, scope_id=req.scope_id):
+    try:
+        scope, scope_id = await normalize_entry_scope(member, req.scope, req.scope_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not await change_scope(memory_id, member, scope=scope, scope_id=scope_id):
         raise HTTPException(status_code=404, detail="Memory not found")
-    return {"id": memory_id, "scope": req.scope, "scope_id": req.scope_id}
+    return {"id": memory_id, "scope": scope, "scope_id": scope_id}
 
 
 @router.get("/events/{conversation_id}")
 async def memory_events(conversation_id: str, member: Member = Depends(get_current_member)) -> StreamingResponse:
     await permissions.check(member, "stream_memory_events", conversation_id)
+    try:
+        from core.conversation_access import require_conversation
+
+        await require_conversation(member, conversation_id, minimum="viewer")
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Conversation not found") from exc
 
     async def stream():
         pubsub = redis_client.pubsub()
-        await pubsub.subscribe(f"memories:{conversation_id}")
+        channel = f"memories:{conversation_id}:{member.id}"
+        await pubsub.subscribe(channel)
         try:
             while True:
                 message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=15)
@@ -264,7 +320,7 @@ async def memory_events(conversation_id: str, member: Member = Depends(get_curre
                     yield ": keepalive\n\n"
                 await asyncio.sleep(0)
         finally:
-            await pubsub.unsubscribe(f"memories:{conversation_id}")
+            await pubsub.unsubscribe(channel)
             await pubsub.close()
 
     return StreamingResponse(stream(), media_type="text/event-stream")

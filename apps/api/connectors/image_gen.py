@@ -63,6 +63,19 @@ async def _call_edit_provider(
     Raises:
         RuntimeError: When the provider returns an unexpected response shape.
     """
+    from connectors.openrouter_multimodal import edit_image, is_openrouter_model
+
+    if is_openrouter_model(settings.image_model):
+        return await edit_image(
+            model=settings.image_model,
+            image_bytes=image_bytes,
+            prompt=prompt,
+            mask=mask,
+            operation=operation,
+            api_key=settings.openrouter_api_key,
+            api_base=settings.openrouter_api_base,
+        )
+
     import base64
     import litellm  # type: ignore[import]
 
@@ -117,6 +130,19 @@ async def _call_provider(prompt: str, size: str, count: int, style: str | None =
     Raises:
         RuntimeError: When the provider returns an unexpected response shape.
     """
+    from connectors.openrouter_multimodal import generate_images, is_openrouter_model
+
+    if is_openrouter_model(settings.image_model):
+        return await generate_images(
+            model=settings.image_model,
+            prompt=prompt,
+            size=size,
+            count=count,
+            style=style,
+            api_key=settings.openrouter_api_key,
+            api_base=settings.openrouter_api_base,
+        )
+
     import litellm  # type: ignore[import]
 
     # litellm exposes image_generation() which mirrors the OpenAI Images API.
@@ -155,7 +181,8 @@ class ImageGenConnector:
         Args:
             tool: "image.generate" or "image.edit".
             args: Tool arguments, including broker-injected keys
-                ``__connector_tier``, ``__org_id``, ``__task_id``.
+                ``__connector_tier``, ``__org_id``, ``__task_id``, and
+                ``__member_id``.
 
         Returns:
             ToolResult with data containing artifact ids / version metadata,
@@ -165,16 +192,22 @@ class ImageGenConnector:
         args.pop("__connector_tier", None)
         org_id: str = str(args.pop("__org_id", "default") or "default")
         task_id: str | None = args.pop("__task_id", None)
+        member_id: str = str(args.pop("__member_id", "image_gen_connector") or "image_gen_connector")
 
         if tool == "image.generate":
-            return await self._execute_generate(args, org_id=org_id, task_id=task_id)
+            return await self._execute_generate(
+                args, org_id=org_id, task_id=task_id, member_id=member_id
+            )
         elif tool == "image.edit":
-            return await self._execute_edit(args, org_id=org_id, task_id=task_id)
+            return await self._execute_edit(
+                args, org_id=org_id, task_id=task_id, member_id=member_id
+            )
         else:
             raise ValueError(f"Unknown image tool: {tool}")
 
     async def _execute_generate(
-        self, args: dict[str, Any], *, org_id: str, task_id: str | None
+        self, args: dict[str, Any], *, org_id: str, task_id: str | None,
+        member_id: str = "image_gen_connector"
     ) -> ToolResult:
         """Handle ``image.generate``.
 
@@ -211,6 +244,20 @@ class ImageGenConnector:
                     "Set IMAGE_MODEL in your environment to enable image generation."
                 ),
             )
+        from connectors.openrouter_multimodal import is_openrouter_model
+
+        if is_openrouter_model(settings.image_model) and not settings.openrouter_api_key.strip():
+            return ToolResult(
+                data={
+                    "status": "unavailable",
+                    "fallback_reason": "OpenRouter image credentials are not configured",
+                    "images": [],
+                },
+                summary=(
+                    "Image generation is not available: IMAGE_MODEL selects OpenRouter, "
+                    "but OPENROUTER_API_KEY is not configured."
+                ),
+            )
 
         # Call the provider (stubbed in tests via monkeypatch). A provider/network
         # error must degrade honestly into an error ToolResult — never propagate and
@@ -245,7 +292,7 @@ class ImageGenConnector:
                 task_id=task_id,
                 org_id=org_id,
                 mime_type="image/png",
-                created_by="image_gen_connector",
+                created_by=member_id,
             )
             artifact_ids.append(artifact_id)
 
@@ -272,7 +319,8 @@ class ImageGenConnector:
         )
 
     async def _execute_edit(
-        self, args: dict[str, Any], *, org_id: str, task_id: str | None
+        self, args: dict[str, Any], *, org_id: str, task_id: str | None,
+        member_id: str = "image_gen_connector"
     ) -> ToolResult:
         """Handle ``image.edit`` — non-destructive: writes a new artifact version.
 
@@ -320,6 +368,19 @@ class ImageGenConnector:
                     "Set IMAGE_MODEL in your environment to enable image editing."
                 ),
             )
+        from connectors.openrouter_multimodal import is_openrouter_model
+
+        if is_openrouter_model(settings.image_model) and not settings.openrouter_api_key.strip():
+            return ToolResult(
+                data={
+                    "status": "unavailable",
+                    "fallback_reason": "OpenRouter image credentials are not configured",
+                },
+                summary=(
+                    "Image editing is not available: IMAGE_MODEL selects OpenRouter, "
+                    "but OPENROUTER_API_KEY is not configured."
+                ),
+            )
 
         # Resolve and org-check the source artifact.
         from core.artifacts import get_artifact, read_artifact_content
@@ -347,7 +408,27 @@ class ImageGenConnector:
         mask_bytes: bytes | None = None
         mask_raw: str | None = args.get("mask") or None
         if mask_raw:
+            if is_openrouter_model(settings.image_model):
+                return ToolResult(
+                    data={
+                        "status": "error",
+                        "reason": "mask semantics are unsupported by the configured OpenRouter image endpoint",
+                    },
+                    summary=(
+                        "Image editing was not attempted: OpenRouter's dedicated Images API "
+                        "supports full-image reference edits but does not expose mask semantics."
+                    ),
+                )
+        if mask_raw:
             mask_bytes = await self._resolve_mask(mask_raw, org_id)
+            if not mask_bytes:
+                return ToolResult(
+                    data={"status": "error", "reason": "mask could not be resolved"},
+                    summary=(
+                        "Image editing was not attempted because the supplied mask was "
+                        "missing, invalid, or outside this organization."
+                    ),
+                )
 
         # Call the provider (stubbed in tests via monkeypatch). A provider/network
         # error must degrade honestly into an error ToolResult — never propagate.
@@ -381,7 +462,7 @@ class ImageGenConnector:
                 org_id=org_id,
                 mime_type="image/png",
                 edit_summary=edit_summary,
-                created_by="image_gen_connector",
+                created_by=member_id,
             )
         except Exception as exc:
             # create_version can raise ValueError (not found / TOCTOU delete), RuntimeError
@@ -437,7 +518,8 @@ class ImageGenConnector:
 
         # Attempt base64 decode.
         try:
-            return base64.b64decode(mask_raw)
+            decoded = base64.b64decode(mask_raw, validate=True)
+            return decoded or None
         except Exception:
             return None
 

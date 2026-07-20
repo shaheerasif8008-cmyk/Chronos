@@ -43,6 +43,11 @@ export default function DesktopScreen() {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [newSessionOpen, setNewSessionOpen] = useState(false);
+  const [purpose, setPurpose] = useState("");
+  const [resourceScope, setResourceScope] = useState("");
+  const [expiryMinutes, setExpiryMinutes] = useState("60");
+  const [consentConfirmed, setConsentConfirmed] = useState(false);
 
   const active = useMemo(
     () => sessions.find(session => session.id === activeId) ?? sessions[0] ?? null,
@@ -82,15 +87,32 @@ export default function DesktopScreen() {
   useEffect(() => { void loadEvents(active?.id ?? null); }, [active?.id, loadEvents]);
 
   async function createSession() {
+    const allowedResources = resourceScope.split(/[,\n]+/).map(value => value.trim()).filter(Boolean);
+    if (!purpose.trim() || allowedResources.length === 0 || !consentConfirmed) {
+      setError("Describe the purpose, list the allowed apps or resources, and confirm consent.");
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
       const created = (await (await apiFetch("/desktop-sessions/", {
         method: "POST",
-        body: JSON.stringify({ purpose: "Manual desktop operation session" }),
+        body: JSON.stringify({
+          purpose: purpose.trim(),
+          consent: {
+            purpose: purpose.trim(),
+            allowed_resources: Array.from(new Set(allowedResources)),
+            expires_at: new Date(Date.now() + Number(expiryMinutes) * 60_000).toISOString(),
+            confirmed_by_user: true,
+          },
+        }),
       })).json()) as DesktopSession;
       await loadSessions();
       setActiveId(created.id);
+      setNewSessionOpen(false);
+      setPurpose("");
+      setResourceScope("");
+      setConsentConfirmed(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unable to create desktop session");
     } finally {
@@ -116,7 +138,7 @@ export default function DesktopScreen() {
 
   return (
     <div className="flex-1 min-w-0 overflow-hidden flex flex-col">
-      <header className="px-10 pt-9 pb-5 flex items-start justify-between gap-6 flex-shrink-0">
+      <header className="flex flex-shrink-0 flex-col items-start justify-between gap-4 px-4 pb-4 pt-5 sm:flex-row sm:gap-6 md:px-10 md:pb-5 md:pt-9">
         <div className="min-w-0">
           <h1 className="h-page tracking-tight">Desktop</h1>
           <p className="mt-1.5 text-[14px]" style={{ color: "var(--text-dim)" }}>
@@ -125,18 +147,43 @@ export default function DesktopScreen() {
         </div>
         <div className="flex items-center gap-2">
           <button className="btn btn-ghost btn-sm" onClick={() => { void loadSessions(); void loadEvents(active?.id ?? null); }} disabled={busy}>Refresh</button>
-          <button className="btn btn-accent btn-sm" onClick={createSession} disabled={busy}>New desktop session</button>
+          <button className="btn btn-accent btn-sm" onClick={() => setNewSessionOpen(open => !open)} disabled={busy}>{newSessionOpen ? "Cancel" : "New desktop session"}</button>
         </div>
       </header>
 
+      {newSessionOpen && (
+        <section className="mx-4 mb-4 rounded-xl border border-soft p-4 md:mx-10" style={{ background: "var(--surface)" }} aria-label="Desktop session consent">
+          <h2 className="text-[14px] font-semibold">Review desktop access</h2>
+          <p className="mt-1 text-[12.5px]" style={{ color: "var(--text-dim)" }}>The session is revocable and replayed. Limit it to the apps and resources needed for this task.</p>
+          <div className="mt-4 grid gap-3 md:grid-cols-2">
+            <label className="grid gap-1 text-[12px]">Purpose
+              <input className="input-field w-full" value={purpose} onChange={event => setPurpose(event.target.value)} placeholder="Update the approved presentation" />
+            </label>
+            <label className="grid gap-1 text-[12px]">Allowed apps or resources
+              <input className="input-field w-full" value={resourceScope} onChange={event => setResourceScope(event.target.value)} placeholder="Keynote, Client Q3 deck" />
+            </label>
+            <label className="grid gap-1 text-[12px]">Session expires
+              <select className="input-field w-full" value={expiryMinutes} onChange={event => setExpiryMinutes(event.target.value)}>
+                <option value="15">15 minutes</option><option value="30">30 minutes</option><option value="60">1 hour</option><option value="120">2 hours</option>
+              </select>
+            </label>
+            <label className="flex items-start gap-2 rounded-lg border border-soft p-3 text-[12.5px]">
+              <input type="checkbox" checked={consentConfirmed} onChange={event => setConsentConfirmed(event.target.checked)} className="mt-0.5" />
+              <span>I authorize only the stated purpose and resources for this time window.</span>
+            </label>
+          </div>
+          <div className="mt-4 flex justify-end"><button className="btn btn-accent btn-sm" onClick={() => void createSession()} disabled={busy || !consentConfirmed}>{busy ? "Creating…" : "Create governed desktop"}</button></div>
+        </section>
+      )}
+
       {error && (
-        <div className="mx-10 mb-3 rounded-lg border px-3 py-2 text-[12.5px]" style={{ borderColor: "var(--danger)", background: "var(--danger-soft)", color: "var(--danger)" }}>
+        <div className="mx-4 mb-3 rounded-lg border px-3 py-2 text-[12.5px] md:mx-10" style={{ borderColor: "var(--danger)", background: "var(--danger-soft)", color: "var(--danger)" }}>
           {error}
         </div>
       )}
 
-      <div className="flex-1 min-h-0 px-10 pb-10 grid gap-4" style={{ gridTemplateColumns: "320px minmax(0, 1fr)" }}>
-        <aside className="surface border border-soft rounded-lg overflow-hidden min-h-0 flex flex-col">
+      <div className="grid min-h-0 flex-1 grid-cols-1 gap-4 overflow-y-auto px-4 pb-6 md:grid-cols-[320px_minmax(0,1fr)] md:overflow-hidden md:px-10 md:pb-10">
+        <aside className="surface border border-soft rounded-lg overflow-hidden min-h-0 flex max-h-[260px] flex-col md:max-h-none">
           <div className="px-3 py-2 border-b hairline flex items-center justify-between">
             <span className="text-[12.5px] font-medium">Desktop sessions</span>
             <span className="text-[11.5px]" style={{ color: "var(--text-dim)" }}>{sessions.length}</span>
@@ -164,7 +211,7 @@ export default function DesktopScreen() {
         </aside>
 
         <section className="surface border border-soft rounded-lg min-w-0 min-h-0 overflow-hidden flex flex-col">
-          <div className="px-4 py-3 border-b hairline flex items-center justify-between gap-3">
+          <div className="flex flex-col items-stretch justify-between gap-3 border-b hairline px-4 py-3 sm:flex-row sm:items-center">
             <div className="min-w-0">
               <div className="text-[14px] font-medium truncate">{active?.purpose || "Desktop session"}</div>
               <div className="text-[12px] truncate" style={{ color: "var(--text-dim)" }}>
@@ -172,7 +219,7 @@ export default function DesktopScreen() {
               </div>
             </div>
             {active && (
-              <div className="flex items-center gap-2 flex-shrink-0">
+              <div className="flex flex-wrap items-center gap-2 flex-shrink-0">
                 <span className="tag">{active.status}</span>
                 <button className="btn btn-ghost btn-sm" disabled={busy || active.status !== "active"} onClick={() => void sessionAction(active.id, "revoke")}>Revoke</button>
                 <button className="btn btn-ghost btn-sm" disabled={busy} onClick={() => void sessionAction(active.id, "close")}>Close</button>

@@ -7,8 +7,8 @@ to each mentioned member as an in-app notification.
 
 Access model:
 - Reading/commenting requires the caller to be able to see the target (project
-  membership for projects; org scope for tasks/artifacts). Non-access returns
-  404 so target existence is not leaked.
+  membership for projects; canonical member-level privacy for tasks/artifacts).
+  Non-access returns 404 so target existence is not leaked.
 - Deletion is limited to the comment author or an org ``admin``/``owner``.
 """
 from __future__ import annotations

@@ -26,7 +26,7 @@ type SkillVersion = {
 };
 
 // ─── Main Component ───────────────────────────────────────────────────────────
-export default function SkillsScreen() {
+export default function SkillsScreen({ canManage = false }: { canManage?: boolean }) {
   const [skills, setSkills] = useState<Skill[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -63,25 +63,26 @@ export default function SkillsScreen() {
   }
 
   return (
-    <div className="flex h-full min-h-0">
+    <div className="flex h-full min-h-0 flex-col md:flex-row">
       {/* ── Left aside ── */}
-      <aside className="w-[320px] flex-shrink-0 border-r flex flex-col" style={{ borderColor: "var(--border)" }}>
+      <aside className="h-[260px] w-full flex-shrink-0 border-b flex flex-col md:h-auto md:w-[320px] md:border-b-0 md:border-r" style={{ borderColor: "var(--border)" }}>
         <div className="p-3 border-b flex flex-col gap-2" style={{ borderColor: "var(--border)" }}>
           <div className="flex items-center justify-between">
             <div className="text-[15px] font-semibold">Skills</div>
-            <div className="flex gap-2">
-              <button data-testid="skills-chat-create" onClick={makeSkillInChat} className="btn btn-ghost btn-sm">
-                Make in chat
-              </button>
-              <button
-                data-testid="skills-new"
-                onClick={() => setComposerOpen(v => !v)}
-                className="btn btn-primary btn-sm"
-              >
-                {composerOpen ? "Cancel" : "New skill"}
-              </button>
-            </div>
+            {canManage && <div className="flex gap-2">
+                <button data-testid="skills-chat-create" onClick={makeSkillInChat} className="btn btn-ghost btn-sm">
+                  Make in chat
+                </button>
+                <button
+                  data-testid="skills-new"
+                  onClick={() => setComposerOpen(v => !v)}
+                  className="btn btn-primary btn-sm"
+                >
+                  {composerOpen ? "Cancel" : "New skill"}
+                </button>
+              </div>}
           </div>
+          {!canManage && <div className="text-[12px]" style={{ color: "var(--text-dim)" }}>Read-only for your role. Managers can create and delete skills.</div>}
           {composerOpen && (
             <SkillComposer onSaved={onSaved} onCancel={() => setComposerOpen(false)} />
           )}
@@ -119,9 +120,9 @@ export default function SkillsScreen() {
       {/* ── Detail pane ── */}
       <section className="flex-1 min-w-0">
         {selectedSlug
-          ? <SkillDetailPane key={selectedSlug} slug={selectedSlug} onDeleted={() => { setSelectedSlug(null); void loadSkills(); }} />
+          ? <SkillDetailPane key={selectedSlug} slug={selectedSlug} canManage={canManage} onDeleted={() => { setSelectedSlug(null); void loadSkills(); }} />
           : <div className="h-full flex items-center justify-center text-[14px]" style={{ color: "var(--text-dim)" }}>
-              Select a skill, create one here, or make one through chat.
+              {canManage ? "Select a skill, create one here, or make one through chat." : "Select a skill to inspect its instructions and version history."}
             </div>
         }
       </section>
@@ -196,6 +197,7 @@ function SkillComposer({ onSaved, onCancel }: { onSaved: (slug: string) => void;
         </div>
       )}
       <input
+        aria-label="Skill slug"
         value={slug}
         onChange={e => setSlug(e.target.value)}
         placeholder="slug (e.g. sdr-outreach)"
@@ -203,6 +205,7 @@ function SkillComposer({ onSaved, onCancel }: { onSaved: (slug: string) => void;
         style={{ borderColor: "var(--border)", background: "var(--surface)" }}
       />
       <input
+        aria-label="Skill name"
         value={name}
         onChange={e => setName(e.target.value)}
         placeholder="Name"
@@ -210,6 +213,7 @@ function SkillComposer({ onSaved, onCancel }: { onSaved: (slug: string) => void;
         style={{ borderColor: "var(--border)", background: "var(--surface)" }}
       />
       <input
+        aria-label="Skill description"
         value={description}
         onChange={e => setDescription(e.target.value)}
         placeholder="Brief description"
@@ -217,6 +221,7 @@ function SkillComposer({ onSaved, onCancel }: { onSaved: (slug: string) => void;
         style={{ borderColor: "var(--border)", background: "var(--surface)" }}
       />
       <textarea
+        aria-label="When to use this skill"
         value={whenToUse}
         onChange={e => setWhenToUse(e.target.value)}
         placeholder="When should Chronos use this skill?"
@@ -225,6 +230,7 @@ function SkillComposer({ onSaved, onCancel }: { onSaved: (slug: string) => void;
         style={{ borderColor: "var(--border)", background: "var(--surface)" }}
       />
       <textarea
+        aria-label="Skill procedure"
         value={steps}
         onChange={e => setSteps(e.target.value)}
         placeholder="Steps Chronos should follow. One per line works well."
@@ -233,6 +239,7 @@ function SkillComposer({ onSaved, onCancel }: { onSaved: (slug: string) => void;
         style={{ borderColor: "var(--border)", background: "var(--surface)" }}
       />
       <textarea
+        aria-label="Skill examples and constraints"
         value={examples}
         onChange={e => setExamples(e.target.value)}
         placeholder="Optional examples, constraints, or output format."
@@ -241,6 +248,7 @@ function SkillComposer({ onSaved, onCancel }: { onSaved: (slug: string) => void;
         style={{ borderColor: "var(--border)", background: "var(--surface)" }}
       />
       <input
+        aria-label="Required connectors"
         value={requiresConnectors}
         onChange={e => setRequiresConnectors(e.target.value)}
         placeholder="requires_connectors (comma separated)"
@@ -315,7 +323,7 @@ function buildSkillContent(input: {
 }
 
 // ─── Detail pane ──────────────────────────────────────────────────────────────
-function SkillDetailPane({ slug, onDeleted }: { slug: string; onDeleted: () => void }) {
+function SkillDetailPane({ slug, onDeleted, canManage }: { slug: string; onDeleted: () => void; canManage: boolean }) {
   const [skill, setSkill] = useState<SkillDetail | null>(null);
   const [versions, setVersions] = useState<SkillVersion[]>([]);
   const [openVersion, setOpenVersion] = useState<number | null>(null);
@@ -395,7 +403,7 @@ function SkillDetailPane({ slug, onDeleted }: { slug: string; onDeleted: () => v
             <span className="text-[12px]" style={{ color: "var(--text-dim)" }}>v{skill.current_version}</span>
           </div>
         </div>
-        {!isFilesystem && (
+        {!isFilesystem && canManage && (
           <button
             onClick={remove}
             disabled={deleting}
@@ -461,8 +469,8 @@ function SkillDetailPane({ slug, onDeleted }: { slug: string; onDeleted: () => v
                 <tbody>
                   {versions.map(v => (
                     <Fragment key={v.version}>
-                      <tr className="border-t cursor-pointer" style={{ borderColor: "var(--border)" }} onClick={() => void viewVersion(v.version)}>
-                        <td className="px-3 py-2 font-mono">v{v.version}</td>
+                      <tr className="border-t" style={{ borderColor: "var(--border)" }}>
+                        <td className="px-3 py-2 font-mono"><button className="underline-offset-2 hover:underline" onClick={() => void viewVersion(v.version)} aria-expanded={openVersion === v.version}>v{v.version}</button></td>
                         <td className="px-3 py-2">{v.created_at ? new Date(v.created_at).toLocaleString() : "—"}</td>
                         <td className="px-3 py-2" style={{ color: "var(--text-dim)" }}>{v.created_by ?? "—"}</td>
                       </tr>

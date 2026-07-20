@@ -51,6 +51,18 @@ def test_match_token_by_email_local_and_name():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["read_comment", "create_comment", "delete_comment"])
+async def test_comment_actions_reach_canonical_target_acl(monkeypatch, action):
+    """The permission seam must not pre-empt the router's scoped target ACL."""
+    from core import permissions
+
+    monkeypatch.setattr(permissions.audit, "log", AsyncMock())
+    assert await permissions.check(
+        _make_member(role="admin"), action, "project:proj-1"
+    )
+
+
+@pytest.mark.asyncio
 async def test_resolve_mentions_dedupes_to_member_ids(monkeypatch):
     from core import comments
     members = [

@@ -1,3 +1,4 @@
 # Default Org
 
-Chronos is running in Phase 1 local development mode.
+This is the default local development organization. Do not infer production
+account configuration, client identity, or launch readiness from this context.

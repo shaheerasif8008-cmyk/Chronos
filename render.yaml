@@ -6,7 +6,7 @@ services:
     rootDir: apps/api
     buildCommand: pip install -r requirements.txt
     preDeployCommand: alembic upgrade head
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --timeout-graceful-shutdown 45
     healthCheckPath: /health
     # The API process runs the in-process APScheduler schedulers and the startup
     # recovery sweep. These are now Redis leader-elected (core/leader.py), so only
@@ -58,6 +58,26 @@ services:
         sync: false          # your Anthropic or OpenAI key
       - key: OPENROUTER_API_KEY
         sync: false
+      - key: E2B_API_KEY
+        sync: false
+      - key: E2B_TEMPLATE_ID
+        sync: false
+      - key: E2B_COMPUTER_TEMPLATE_ID
+        sync: false
+      - key: E2B_COMPUTER_ALLOW_INTERNET_ACCESS
+        value: "true"
+      - key: E2B_COMPUTER_IDLE_TIMEOUT_SECONDS
+        value: "900"
+      - key: E2B_COMPUTER_MAX_SESSION_SECONDS
+        value: "14400"
+      - key: E2B_COMPUTER_MAX_ACTIVE_PER_MEMBER
+        value: "2"
+      - key: E2B_COMPUTER_MAX_ACTIVE_PER_ORG
+        value: "20"
+      - key: E2B_COMPUTER_SCREEN_WIDTH
+        value: "1280"
+      - key: E2B_COMPUTER_SCREEN_HEIGHT
+        value: "800"
       - key: OPENROUTER_MODEL
         value: openrouter/deepseek/deepseek-v4-flash:free
       - key: AGENT_MODEL
@@ -85,6 +105,16 @@ services:
         value: "1800"
       - key: TAVILY_API_KEY
         sync: false
+      - key: BROWSERBASE_API_KEY
+        sync: false
+      - key: BROWSERBASE_OPERATOR_ENABLED
+        value: "true"
+      - key: BROWSERBASE_PROJECT_ID
+        sync: false
+      - key: BROWSERBASE_REGION
+        value: us-east-1
+      - key: BROWSERBASE_SESSION_TIMEOUT_SECONDS
+        value: "14400"
       - key: LANGFUSE_PUBLIC_KEY
         sync: false
       - key: LANGFUSE_SECRET_KEY
@@ -145,6 +175,36 @@ services:
         sync: false
       - key: OPENROUTER_API_BASE
         value: https://openrouter.ai/api/v1
+      - key: E2B_API_KEY
+        sync: false
+      - key: E2B_TEMPLATE_ID
+        sync: false
+      - key: E2B_COMPUTER_TEMPLATE_ID
+        sync: false
+      - key: E2B_COMPUTER_ALLOW_INTERNET_ACCESS
+        value: "true"
+      - key: E2B_COMPUTER_IDLE_TIMEOUT_SECONDS
+        value: "900"
+      - key: E2B_COMPUTER_MAX_SESSION_SECONDS
+        value: "14400"
+      - key: E2B_COMPUTER_MAX_ACTIVE_PER_MEMBER
+        value: "2"
+      - key: E2B_COMPUTER_MAX_ACTIVE_PER_ORG
+        value: "20"
+      - key: E2B_COMPUTER_SCREEN_WIDTH
+        value: "1280"
+      - key: E2B_COMPUTER_SCREEN_HEIGHT
+        value: "800"
+      - key: BROWSERBASE_API_KEY
+        sync: false
+      - key: BROWSERBASE_OPERATOR_ENABLED
+        value: "true"
+      - key: BROWSERBASE_PROJECT_ID
+        sync: false
+      - key: BROWSERBASE_REGION
+        value: us-east-1
+      - key: BROWSERBASE_SESSION_TIMEOUT_SECONDS
+        value: "14400"
       - key: OPENFGA_API_URL
         fromService:
           name: chronos-openfga

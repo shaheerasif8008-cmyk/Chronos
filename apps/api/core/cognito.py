@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from functools import lru_cache
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 import jwt
 from jwt import PyJWKClient
 
 from core.config import settings
+from core.ssrf import UnsafeURLError, assert_safe_url
 
 
 class CognitoAuthError(Exception):
@@ -32,11 +33,33 @@ def cognito_enabled() -> bool:
 
 
 def issuer() -> str:
-    return f"https://cognito-idp.{settings.cognito_region}.amazonaws.com/{settings.cognito_user_pool_id}"
+    value = settings.cognito_issuer_url.strip() or (
+        f"https://cognito-idp.{settings.cognito_region}.amazonaws.com/"
+        f"{settings.cognito_user_pool_id}"
+    )
+    try:
+        parsed = urlsplit(value)
+        _ = parsed.port
+    except ValueError as exc:
+        raise CognitoAuthError("COGNITO_ISSUER_URL must be a valid HTTPS URL") from exc
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        raise CognitoAuthError("COGNITO_ISSUER_URL must be an absolute HTTPS URL")
+    return value.rstrip("/")
 
 
 def jwks_url() -> str:
-    return f"{issuer()}/.well-known/jwks.json"
+    value = settings.cognito_jwks_url.strip() or f"{issuer()}/.well-known/jwks.json"
+    try:
+        parsed = urlsplit(value)
+        _ = parsed.port
+    except ValueError as exc:
+        raise CognitoAuthError("COGNITO_JWKS_URL must be a valid HTTPS URL") from exc
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        raise CognitoAuthError("COGNITO_JWKS_URL must be an absolute HTTPS URL")
+    try:
+        return assert_safe_url(value)
+    except UnsafeURLError as exc:
+        raise CognitoAuthError("COGNITO_JWKS_URL must resolve to a public endpoint") from exc
 
 
 def hosted_ui_base() -> str:

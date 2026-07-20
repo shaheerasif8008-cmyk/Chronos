@@ -10,7 +10,7 @@ Capability map
   gmail.read_inbox   — list recent INBOX threads
   gmail.search       — search threads by query string
   gmail.draft        — create a draft (NEVER sends automatically)
-  gmail.send         — blocked at ToolBroker level (ApprovalRequired)
+  gmail.send         — approval-bound draft-first delivery with durable replay
 
 OAuth state
 -----------
@@ -27,7 +27,6 @@ Token lifecycle
 from __future__ import annotations
 
 import base64
-import email as email_lib
 import hashlib
 import hmac
 import json
@@ -43,8 +42,17 @@ from urllib.parse import urlencode
 
 import httpx
 
-from core.exceptions import ApprovalRequired
+from core.exceptions import ApprovalRequired, SafetyLimitViolation
 from core.models import ToolResult
+from connectors.gmail_delivery import (
+    DeliveryContext,
+    DraftEvidence,
+    EmailEnvelope,
+    GmailDeliveryIndeterminate,
+    SentEvidence,
+    deliver_approved_email,
+    validate_email_args,
+)
 
 log = logging.getLogger(__name__)
 
@@ -183,6 +191,8 @@ async def _gmail_request(
 
     if resp.status_code == 401:
         raise _GmailUnauthorised()
+    if resp.status_code == 404:
+        raise _GmailNotFound()
     if resp.status_code >= 400:
         raise RuntimeError(f"Gmail API {method} {path} → {resp.status_code}: {resp.text[:300]}")
     return resp.json() if resp.content else {}
@@ -190,6 +200,10 @@ async def _gmail_request(
 
 class _GmailUnauthorised(Exception):
     """Signals that the access token was rejected — triggers a refresh+retry."""
+
+
+class _GmailNotFound(Exception):
+    """Signals that a draft/message no longer exists at the provider."""
 
 
 async def _gmail_call_with_refresh(
@@ -216,13 +230,26 @@ async def _gmail_call_with_refresh(
         return await _gmail_request(method, path, token, params=params, json_body=json_body)
 
 
-def _build_rfc822(to: str, subject: str, body: str, cc: str = "") -> str:
+def _build_rfc822(
+    to: str,
+    subject: str,
+    body: str,
+    cc: str = "",
+    *,
+    bcc: str = "",
+    is_html: bool = False,
+    message_id: str = "",
+) -> str:
     """Return a base64url-encoded RFC 822 message for the Gmail drafts API."""
-    msg = MIMEText(body, "plain", "utf-8")
+    msg = MIMEText(body, "html" if is_html else "plain", "utf-8")
     msg["To"] = to
     msg["Subject"] = subject
     if cc:
         msg["Cc"] = cc
+    if bcc:
+        msg["Bcc"] = bcc
+    if message_id:
+        msg["Message-ID"] = message_id
     raw_bytes = msg.as_bytes()
     return base64.urlsafe_b64encode(raw_bytes).decode().rstrip("=")
 
@@ -304,12 +331,21 @@ class GmailConnector:
     async def execute(self, tool: str, args: dict[str, Any], vault_ref: str) -> ToolResult:
         from core.connector_health import connector_tier
 
-        if tool == "gmail.send":
-            raise ApprovalRequired("gmail.send", "use gmail.draft; sending requires an approval record")
-
+        approved_by_gate = bool(args.pop("__approved_by_gate", False))
+        approval_id = str(args.pop("__approval_id", "") or "")
+        idempotency_key = str(args.pop("__idempotency_key", "") or "")
         tier = args.pop("__connector_tier", None) or await connector_tier("gmail")
         org_id = str(args.pop("__org_id", "") or "")
-        args.pop("__task_id", None)
+        task_id = str(args.pop("__task_id", "") or "")
+        member_id = str(args.pop("__member_id", "") or "")
+
+        if tool == "gmail.send":
+            if not approved_by_gate:
+                raise ApprovalRequired("gmail.send", "sending requires an approved approval record")
+            if not all((approval_id, idempotency_key, org_id, task_id, member_id)):
+                raise SafetyLimitViolation(
+                    "gmail.send: approved execution requires approval, idempotency, tenant, task, and member scope"
+                )
 
         from core.config import settings
         if settings.demo_mode or tier in {"demo", "fixture"} or vault_ref in {"demo", "fixture"}:
@@ -321,6 +357,16 @@ class GmailConnector:
             return await self._create_draft(vault_ref, org_id, args)
         if tool == "gmail.search":
             return await self._search(vault_ref, org_id, args)
+        if tool == "gmail.send":
+            return await self._send_approved(
+                vault_ref,
+                org_id,
+                member_id,
+                task_id,
+                approval_id,
+                idempotency_key,
+                args,
+            )
 
         raise ValueError(f"Unknown gmail tool: {tool}")
 
@@ -337,6 +383,11 @@ class GmailConnector:
             return ToolResult(
                 data={"threads": [], "tier": tier, "query": args.get("query", "")},
                 summary=f"Demo search '{args.get('query', '')}': 0 results",
+            )
+        if tool == "gmail.send":
+            return ToolResult(
+                data={"status": "unavailable", "sent": False, "tier": tier},
+                summary="Demo Gmail cannot send external email; connect a live Gmail account",
             )
         raise ValueError(f"Unknown gmail tool: {tool}")
 
@@ -423,6 +474,143 @@ class GmailConnector:
         return ToolResult(
             data=data,
             summary=f"Draft created: {draft_id}",
+        )
+
+    async def _send_approved(
+        self,
+        vault_ref: str,
+        org_id: str,
+        member_id: str,
+        task_id: str,
+        approval_id: str,
+        idempotency_key: str,
+        args: dict[str, Any],
+    ) -> ToolResult:
+        """Create a draft, persist its IDs, and send it at most once."""
+        envelope = validate_email_args(args)
+        context = DeliveryContext(
+            approval_id=approval_id,
+            organization_id=org_id,
+            member_id=member_id,
+            task_id=task_id,
+            credential_scope=f"direct:{vault_ref}",
+            idempotency_key=idempotency_key,
+        )
+
+        async def create_draft(
+            approved_email: EmailEnvelope,
+            idempotency_sha256: str,
+        ) -> DraftEvidence:
+            raw_rfc822 = _build_rfc822(
+                to=", ".join(approved_email.to),
+                cc=", ".join(approved_email.cc),
+                bcc=", ".join(approved_email.bcc),
+                subject=approved_email.subject,
+                body=approved_email.body,
+                is_html=approved_email.is_html,
+                message_id=(
+                    f"<chronos-{idempotency_sha256[:32]}@idempotency.chronos>"
+                ),
+            )
+            data = await _gmail_call_with_refresh(
+                vault_ref,
+                org_id,
+                "POST",
+                "/drafts",
+                json_body={"message": {"raw": raw_rfc822}},
+            )
+            draft_id = str(data.get("id") or "")
+            message = data.get("message") if isinstance(data.get("message"), dict) else {}
+            message_id = str(message.get("id") or "") or None
+            if not draft_id:
+                raise RuntimeError("Gmail draft creation returned no draft id")
+            return DraftEvidence(draft_id=draft_id, message_id=message_id)
+
+        async def inspect_delivery(evidence: DraftEvidence) -> SentEvidence | None | bool:
+            try:
+                await _gmail_call_with_refresh(
+                    vault_ref,
+                    org_id,
+                    "GET",
+                    f"/drafts/{evidence.draft_id}",
+                    params={"format": "minimal"},
+                )
+                return False  # draft still exists; safe to send
+            except _GmailNotFound:
+                message: dict[str, Any] | None = None
+                if evidence.message_id:
+                    try:
+                        message = await _gmail_call_with_refresh(
+                            vault_ref,
+                            org_id,
+                            "GET",
+                            f"/messages/{evidence.message_id}",
+                            params={"format": "minimal"},
+                        )
+                    except _GmailNotFound:
+                        message = None
+                # Gmail normally preserves the draft message id after send. A
+                # deterministic RFC Message-ID is a second provider-side proof
+                # for versions/accounts that replace it during delivery.
+                if message is None:
+                    rfc822_id = (
+                        f"chronos-{context.idempotency_sha256[:32]}@idempotency.chronos"
+                    )
+                    matches = await _gmail_call_with_refresh(
+                        vault_ref,
+                        org_id,
+                        "GET",
+                        "/messages",
+                        params={
+                            "q": f"rfc822msgid:{rfc822_id}",
+                            "includeSpamTrash": True,
+                            "maxResults": 2,
+                        },
+                    )
+                    refs = matches.get("messages") or []
+                    if refs and refs[0].get("id"):
+                        try:
+                            message = await _gmail_call_with_refresh(
+                                vault_ref,
+                                org_id,
+                                "GET",
+                                f"/messages/{refs[0]['id']}",
+                                params={"format": "minimal"},
+                            )
+                        except _GmailNotFound:
+                            message = None
+                if message is None:
+                    return None
+                labels = {str(label).upper() for label in message.get("labelIds") or []}
+                if "SENT" not in labels:
+                    return None
+                return SentEvidence(
+                    message_id=str(message.get("id") or evidence.message_id),
+                    thread_id=str(message.get("threadId") or "") or None,
+                )
+
+        async def send_draft(evidence: DraftEvidence) -> SentEvidence:
+            data = await _gmail_call_with_refresh(
+                vault_ref,
+                org_id,
+                "POST",
+                "/drafts/send",
+                json_body={"id": evidence.draft_id},
+            )
+            message_id = str(data.get("id") or evidence.message_id or "")
+            if not message_id:
+                raise GmailDeliveryIndeterminate("Gmail send returned no message id")
+            return SentEvidence(
+                message_id=message_id,
+                thread_id=str(data.get("threadId") or "") or None,
+            )
+
+        return await deliver_approved_email(
+            context=context,
+            envelope=envelope,
+            create_draft=create_draft,
+            inspect_delivery=inspect_delivery,
+            send_draft=send_draft,
         )
 
 

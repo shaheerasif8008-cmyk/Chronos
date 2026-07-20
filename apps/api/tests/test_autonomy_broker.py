@@ -9,6 +9,7 @@ Covers:
 from __future__ import annotations
 
 import types
+import uuid
 
 import pytest
 
@@ -36,9 +37,12 @@ def broker_env(monkeypatch):
     import sys
 
     knobs = types.SimpleNamespace(
+        org_id=f"autonomy-test-{uuid.uuid4()}",
+        workspace_id=f"workspace-test-{uuid.uuid4()}",
         autonomy="supervised",
         policy={"enabled": True, "approval_required": False},
         connector_result=None,
+        routed_args=None,
     )
 
     cfg = types.SimpleNamespace(demo_mode=False, per_org_daily_token_limit=0, fast_model="stub", region="us")
@@ -87,12 +91,12 @@ def broker_env(monkeypatch):
         RateLimitExceeded=RateLimitExceeded, SafetyLimitViolation=SafetyLimitViolation))
 
     class Member:
-        def __init__(self, org_id="default"):
-            self.id = "member-1"; self.organization_id = org_id; self.role = "user"
+        def __init__(self, org_id=None):
+            self.id = "member-1"; self.organization_id = org_id or knobs.org_id; self.role = "user"
 
     class AgentContext:
-        def __init__(self, org_id="default"):
-            self.id = "agent-1"; self.org_id = org_id; self.task_id = None; self.workspace_id = "ws-1"
+        def __init__(self, org_id=None):
+            self.id = "agent-1"; self.org_id = org_id or knobs.org_id; self.task_id = None; self.workspace_id = knobs.workspace_id; self.project_id = None
         def as_member(self): return Member(self.org_id)
 
     class ToolResult:
@@ -104,6 +108,7 @@ def broker_env(monkeypatch):
 
     # Stub the data connector that data.* tools route to.
     async def _data_execute(tool, args):
+        knobs.routed_args = dict(args)
         return knobs.connector_result or ToolResult(summary="data ok", data={})
     monkeypatch.setitem(sys.modules, "connectors.data_analysis", _make_stub_module(
         "connectors.data_analysis", data_analysis_connector=types.SimpleNamespace(execute=_data_execute)))
@@ -146,6 +151,18 @@ async def test_full_auto_passes_policy_approval_tool(broker_env):
     import core.tool_broker as tb
     result = await tb.execute(_agent(), "data.query", {"q": "select 1"})
     assert result.summary == "data ok"
+
+
+@pytest.mark.asyncio
+async def test_route_propagates_member_when_context_has_authenticated_member(broker_env):
+    import core.tool_broker as tb
+
+    agent = _agent()
+    agent.member_id = "member-authenticated"
+    result = await tb._route(agent, "data.query", {"q": "select 1"}, "fixture", "fixture")
+
+    assert result.summary == "data ok"
+    assert broker_env.routed_args["__member_id"] == "member-authenticated"
 
 
 @pytest.mark.asyncio

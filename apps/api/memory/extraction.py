@@ -5,7 +5,8 @@ from typing import Any
 from core import audit
 from core.config import settings
 from core.llm import complete_json
-from core.memory_writes import create_memory_entry
+from core.memory_access import authorized_autonomous_scope
+from core.memory_writes import create_memory_entry, MemoryCaptureDisabled
 from core.models import RequesterContext
 from core.redis import redis_client
 
@@ -46,8 +47,9 @@ async def extract_and_save(
         return
     prompt = f"""
 Identify facts worth remembering from this exchange.
-Return JSON only: {{"memories": [{{"content": "...", "scope": "personal|workspace|persona|org", "importance": 0.0-1.0}}]}}
+Return JSON only: {{"memories": [{{"content": "...", "importance": 0.0-1.0}}]}}
 Only include durable facts. Not conversational filler. If nothing is worth saving, return {{"memories": []}}.
+Memory visibility is chosen by the application; do not include instructions or a scope.
 
 User: {user_message}
 Assistant: {assistant_response}
@@ -71,25 +73,37 @@ Assistant: {assistant_response}
         return
 
     for candidate in candidates:
-        importance = float(candidate.get("importance", 0))
-        content = str(candidate.get("content", "")).strip()
+        if not isinstance(candidate, dict):
+            continue
+        try:
+            importance = max(0.0, min(float(candidate.get("importance", 0)), 1.0))
+        except (TypeError, ValueError):
+            continue
+        content = str(candidate.get("content", "")).strip()[:10_000]
         if importance < 0.6 or not content:
             continue
 
-        scope = candidate.get("scope") or "org"
-        entry_id = await create_memory_entry(
-            content=content,
-            requester_context=requester_context,
-            source="autonomous",
-            scope=scope,
-            scope_id=requester_context.org_id,
-            importance_score=importance,
-            conversation_id=conversation_id,
-            created_by="chronos",
-        )
+        # Model-derived facts remain private. Sharing one with a project or the
+        # organization is an explicit, reviewable control-center action.
+        scope, scope_id = await authorized_autonomous_scope(requester_context)
+        try:
+            entry_id = await create_memory_entry(
+                content=content,
+                requester_context=requester_context,
+                source="autonomous",
+                scope=scope,
+                scope_id=scope_id,
+                importance_score=importance,
+                conversation_id=conversation_id,
+                created_by=requester_context.member_id,
+            )
+        except MemoryCaptureDisabled:
+            # Policy may change after the initial extraction gate; fail closed
+            # and publish no saved-memory event.
+            continue
         undo_expires = datetime.now(timezone.utc) + timedelta(seconds=60)
         await _redis.publish(
-            f"memories:{conversation_id}",
+            f"memories:{conversation_id}:{requester_context.member_id}",
             json.dumps(
                 {
                     "type": "memory_saved",

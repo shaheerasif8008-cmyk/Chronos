@@ -3,6 +3,7 @@ from typing import Any
 
 from sqlalchemy import insert
 
+from core.audit_redaction import redact
 from core.config import settings
 from core.db import engine, reflect_table
 
@@ -36,7 +37,7 @@ async def log(
                 action=action,
                 resource_type=resource_type,
                 resource_id=resource_id,
-                payload=payload,
+                payload=redact(payload) if payload is not None else None,
                 decision=decision,
             )
             .returning(audit_log.c.id)

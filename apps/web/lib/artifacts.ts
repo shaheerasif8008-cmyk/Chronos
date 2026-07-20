@@ -25,6 +25,50 @@ export type ArtifactVersion = {
 
 export type DiffResult = { is_binary: boolean; from_version: number; to_version: number; diff: string };
 
+export type PreviewBlock = { type: string; style?: string; text: string };
+export type PreviewSlide = {
+  number: number;
+  texts: string[];
+  tables: string[][][];
+  charts: { series: { name: string; values: string[] }[] }[];
+  omitted_images: number;
+};
+export type PreviewSheet = { name: string; rows: string[][]; truncated: boolean };
+export type PreviewCell = {
+  number: number;
+  cell_type: string;
+  source: string;
+  outputs: string[];
+};
+export type PreviewArchiveEntry = {
+  path: string;
+  size_bytes: number;
+  compressed_bytes: number;
+  directory: boolean;
+};
+export type ArtifactPreview = {
+  status: "ready" | "unsupported" | "error";
+  renderer: "download" | "document" | "presentation" | "workbook" | "notebook" | "archive" | "pdf" | "markup" | "image" | "markdown" | "json" | "csv" | "text" | "source";
+  format: string;
+  mime_type: string;
+  size_bytes: number;
+  limitations: string[];
+  text?: string;
+  html?: string;
+  blocks?: PreviewBlock[];
+  tables?: string[][][];
+  slides?: PreviewSlide[];
+  sheets?: PreviewSheet[];
+  cells?: PreviewCell[];
+  entries?: PreviewArchiveEntry[];
+  page_count?: number;
+  preview_page_count?: number;
+  width?: number;
+  height?: number;
+  frames?: number;
+  image_format?: string;
+};
+
 export async function listArtifacts(params: { conversation_id?: string; kind?: string } = {}): Promise<Artifact[]> {
   const q = new URLSearchParams();
   if (params.conversation_id) q.set("conversation_id", params.conversation_id);
@@ -43,6 +87,14 @@ export async function getContentText(id: string): Promise<string> {
 
 export async function getContentBlob(id: string): Promise<Blob> {
   return (await apiFetch(`/artifacts/${id}/content`)).blob();
+}
+
+export async function getPreview(id: string): Promise<ArtifactPreview> {
+  return (await apiFetch(`/artifacts/${id}/preview`)).json();
+}
+
+export async function getPreviewPageBlob(id: string, page: number): Promise<Blob> {
+  return (await apiFetch(`/artifacts/${id}/preview/pages/${page}`)).blob();
 }
 
 export async function listVersions(id: string): Promise<ArtifactVersion[]> {
@@ -77,12 +129,22 @@ export async function deleteArtifact(id: string): Promise<void> {
   await apiFetch(`/artifacts/${id}`, { method: "DELETE" });
 }
 
-export async function getShareStatus(id: string): Promise<{ published: boolean; token?: string; share_path?: string }> {
+export type ArtifactShareStatus = {
+  published: boolean;
+  token?: string;
+  share_path?: string;
+  expires_at?: string | null;
+};
+
+export async function getShareStatus(id: string): Promise<ArtifactShareStatus> {
   return (await apiFetch(`/artifacts/${id}/share`)).json();
 }
 
-export async function publishArtifact(id: string): Promise<{ token: string; share_path: string }> {
-  return (await apiFetch(`/artifacts/${id}/publish`, { method: "POST" })).json();
+export async function publishArtifact(id: string, expiresInHours = 168): Promise<{ token: string; share_path: string; expires_at?: string | null }> {
+  return (await apiFetch(`/artifacts/${id}/publish`, {
+    method: "POST",
+    body: JSON.stringify({ expires_in_hours: expiresInHours }),
+  })).json();
 }
 
 export async function unpublishArtifact(id: string): Promise<{ revoked: boolean }> {

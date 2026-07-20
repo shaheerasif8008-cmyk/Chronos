@@ -1,0 +1,15 @@
+{
+  "organization_id": "e0e6202e-514b-427e-a99d-aefea344f751",
+  "workspace": {
+    "id": "1ceb9092-ffba-4557-81e9-cb0837363624",
+    "name": "Default workspace",
+    "slug": "default",
+    "legacy_key": "default",
+    "status": "active"
+  },
+  "membership": {
+    "member_id": "793f456b-82fa-4bd6-94de-203a7d664a86",
+    "role": "owner"
+  },
+  "source": "local_postgres_after_supported_dev_otp_signup"
+}

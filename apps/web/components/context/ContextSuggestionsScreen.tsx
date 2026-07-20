@@ -23,13 +23,16 @@ export default function ContextSuggestionsScreen() {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
   const [toast, setToast] = useState<{ kind: "ok" | "danger"; text: string } | null>(null);
+  const [loadError, setLoadError] = useState("");
 
   const load = useCallback(async () => {
     setLoading(true);
+    setLoadError("");
     try {
       setItems(await (await apiFetch("/context/suggestions?status=pending")).json());
-    } catch {
+    } catch (error) {
       setItems([]);
+      setLoadError(error instanceof Error ? error.message : "Context suggestions could not be loaded.");
     } finally {
       setLoading(false);
     }
@@ -73,12 +76,12 @@ export default function ContextSuggestionsScreen() {
   return (
     <div>
       {toast && (
-        <div className="mb-4 rounded-lg border px-3 py-2 text-[13px]" style={{ borderColor: toast.kind === "ok" ? "var(--ok)" : "var(--danger)", color: toast.kind === "ok" ? "var(--ok)" : "var(--danger)" }}>
+        <div role={toast.kind === "danger" ? "alert" : "status"} className="mb-4 rounded-lg border px-3 py-2 text-[13px]" style={{ borderColor: toast.kind === "ok" ? "var(--ok)" : "var(--danger)", color: toast.kind === "ok" ? "var(--ok)" : "var(--danger)" }}>
           {toast.text}
         </div>
       )}
 
-      <div className="flex items-center justify-between mb-4">
+      <div className="flex flex-col items-start justify-between gap-3 mb-4 sm:flex-row sm:items-center">
         <p className="text-[13px] max-w-[620px]" style={{ color: "var(--text-dim)" }}>
           Chronos proposes updates to your organization context as it learns from conversations. Review and apply what is accurate.
         </p>
@@ -88,7 +91,8 @@ export default function ContextSuggestionsScreen() {
       </div>
 
       {loading && <div className="text-[13px]" style={{ color: "var(--text-dim)" }}>Loading…</div>}
-      {!loading && items.length === 0 && (
+      {loadError && <div className="mb-3 flex items-center justify-between gap-3 rounded-lg border px-3 py-2 text-[13px]" role="alert" style={{ borderColor: "var(--danger)", color: "var(--danger)" }}><span>{loadError}</span><button className="btn btn-ghost btn-sm" onClick={() => void load()}>Try again</button></div>}
+      {!loading && !loadError && items.length === 0 && (
         <div className="surface border border-soft rounded-xl px-4 py-8 text-center text-[13px]" style={{ color: "var(--text-dim)" }}>
           No pending context suggestions.
         </div>

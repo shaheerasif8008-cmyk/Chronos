@@ -95,6 +95,7 @@ async def test_search_returns_only_caller_org_rows(monkeypatch):
         sa.Column("id", sa.String, primary_key=True),
         sa.Column("organization_id", sa.String, nullable=False),
         sa.Column("member_id", sa.String, nullable=False),
+        sa.Column("project_id", sa.String),
         sa.Column("title", sa.String),
         sa.Column("created_at", sa.String),
         sa.Column("updated_at", sa.String),
@@ -111,6 +112,8 @@ async def test_search_returns_only_caller_org_rows(monkeypatch):
         "tasks", meta,
         sa.Column("id", sa.String, primary_key=True),
         sa.Column("organization_id", sa.String, nullable=False),
+        sa.Column("triggered_by_member_id", sa.String),
+        sa.Column("project_id", sa.String),
         sa.Column("goal", sa.String),
         sa.Column("status", sa.String),
         sa.Column("created_at", sa.String),
@@ -119,9 +122,21 @@ async def test_search_returns_only_caller_org_rows(monkeypatch):
         "artifacts", meta,
         sa.Column("id", sa.String, primary_key=True),
         sa.Column("organization_id", sa.String, nullable=False),
+        sa.Column("created_by", sa.String),
+        sa.Column("is_deleted", sa.Boolean, nullable=False, default=False),
+        sa.Column("project_id", sa.String),
+        sa.Column("conversation_id", sa.String),
+        sa.Column("task_id", sa.String),
         sa.Column("title", sa.String),
         sa.Column("kind", sa.String),
         sa.Column("created_at", sa.String),
+    )
+    project_members_tbl = sa.Table(
+        "project_members", meta,
+        sa.Column("id", sa.String, primary_key=True),
+        sa.Column("organization_id", sa.String, nullable=False),
+        sa.Column("member_id", sa.String, nullable=False),
+        sa.Column("project_id", sa.String, nullable=False),
     )
 
     async with sqlite_engine.begin() as conn:
@@ -136,11 +151,11 @@ async def test_search_returns_only_caller_org_rows(monkeypatch):
             content="acme account notes", created_at="2024-01-01T00:00:00Z",
         ))
         await conn.execute(tasks_tbl.insert().values(
-            id="task-default", organization_id="default",
+            id="task-default", organization_id="default", triggered_by_member_id="member-1",
             goal="research acme", status="complete", created_at="2024-01-01T00:00:00Z",
         ))
         await conn.execute(artifacts_tbl.insert().values(
-            id="art-default", organization_id="default",
+            id="art-default", organization_id="default", created_by="member:member-1", is_deleted=False,
             title="acme brief", kind="document", created_at="2024-01-01T00:00:00Z",
         ))
         # Insert matching rows for a DIFFERENT org — these must NEVER appear.
@@ -153,11 +168,11 @@ async def test_search_returns_only_caller_org_rows(monkeypatch):
             content="acme stolen data", created_at="2024-01-01T00:00:00Z",
         ))
         await conn.execute(tasks_tbl.insert().values(
-            id="task-other", organization_id="other-org",
+            id="task-other", organization_id="other-org", triggered_by_member_id="member-x",
             goal="acme other goal", status="complete", created_at="2024-01-01T00:00:00Z",
         ))
         await conn.execute(artifacts_tbl.insert().values(
-            id="art-other", organization_id="other-org",
+            id="art-other", organization_id="other-org", created_by="member:member-x", is_deleted=False,
             title="acme other artifact", kind="document", created_at="2024-01-01T00:00:00Z",
         ))
 
@@ -167,6 +182,7 @@ async def test_search_returns_only_caller_org_rows(monkeypatch):
         "messages": messages_tbl,
         "tasks": tasks_tbl,
         "artifacts": artifacts_tbl,
+        "project_members": project_members_tbl,
     }
 
     async def fake_reflect_table(name: str):
@@ -180,15 +196,10 @@ async def test_search_returns_only_caller_org_rows(monkeypatch):
     async def fake_audit_log(*args, **kwargs):
         return "audit-1"
 
-    async def fake_memory_retrieve(query, requester_context):
-        assert requester_context.org_id == "default"
-        return []
-
     monkeypatch.setattr(search, "reflect_table", fake_reflect_table)
     monkeypatch.setattr(search, "engine", sqlite_engine)
     monkeypatch.setattr(search.permissions, "check", fake_permissions_check)
     monkeypatch.setattr(search.audit, "log", fake_audit_log)
-    monkeypatch.setattr(search.memory, "retrieve", fake_memory_retrieve)
 
     member = _make_member(org_id="default", member_id="member-1")
     results = await search.run_search(q="acme", types_csv="conversations,messages,tasks,artifacts", member=member)
@@ -245,12 +256,6 @@ async def test_search_types_filter_only_queries_requested_types(monkeypatch):
         def begin(self):
             return FakeConn()
 
-    memory_called = []
-
-    async def fake_memory_retrieve(query, requester_context):
-        memory_called.append(True)
-        return []
-
     async def fake_permissions_check(*args, **kwargs):
         return True
 
@@ -261,12 +266,9 @@ async def test_search_types_filter_only_queries_requested_types(monkeypatch):
     monkeypatch.setattr(search, "engine", FakeEngine())
     monkeypatch.setattr(search.permissions, "check", fake_permissions_check)
     monkeypatch.setattr(search.audit, "log", fake_audit_log)
-    monkeypatch.setattr(search.memory, "retrieve", fake_memory_retrieve)
 
     results = await search.run_search(q="hello", types_csv="conversations", member=member)
 
-    # memory.retrieve must NOT be called when types=conversations
-    assert not memory_called, "memory.retrieve was called despite types=conversations"
     # Only conversations table should have been reflected
     assert "conversations" in queried_tables
     assert "messages" not in queried_tables
@@ -277,34 +279,52 @@ async def test_search_types_filter_only_queries_requested_types(monkeypatch):
 # ─── Test 3: memory path uses the seam, not raw SQL ──────────────────────────
 
 @pytest.mark.asyncio
-async def test_search_memory_type_uses_retrieve_seam_not_raw_query(monkeypatch):
-    """When types=memory, memory.retrieve is called; no raw memory_entries query."""
-    from core.models import MemoryEntry
+async def test_search_memory_type_uses_canonical_all_scope_acl(monkeypatch):
+    """Global memory search uses the control-center ACL across all readable scopes."""
     from routers import search
 
     member = _make_member()
-
-    reflected_tables: list[str] = []
+    sqlite_engine = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
+    metadata = sa.MetaData()
+    table = sa.Table(
+        "memory_entries", metadata,
+        sa.Column("id", sa.String, primary_key=True),
+        sa.Column("organization_id", sa.String, nullable=False),
+        sa.Column("scope", sa.String, nullable=False),
+        sa.Column("scope_id", sa.String, nullable=False),
+        sa.Column("content", sa.String, nullable=False),
+        sa.Column("source", sa.String, nullable=False),
+        sa.Column("is_deleted", sa.Boolean, nullable=False),
+        sa.Column("is_archived", sa.Boolean, nullable=False),
+        sa.Column("is_pinned", sa.Boolean, nullable=False),
+        sa.Column("superseded_by", sa.String),
+        sa.Column("created_at", sa.String),
+        sa.Column("updated_at", sa.String),
+    )
+    async with sqlite_engine.begin() as conn:
+        await conn.run_sync(metadata.create_all)
+        await conn.execute(table.insert(), [
+            {
+                "id": "mem-1", "organization_id": "default", "scope": "personal", "scope_id": member.id,
+                "content": "ACME uses HubSpot.", "source": "explicit", "is_deleted": False,
+                "is_archived": False, "is_pinned": False, "superseded_by": None,
+                "created_at": "2024-01-01T00:00:00Z", "updated_at": "2024-01-01T00:00:00Z",
+            },
+            {
+                "id": "mem-peer", "organization_id": "default", "scope": "personal", "scope_id": "member-peer",
+                "content": "Peer HubSpot secret.", "source": "explicit", "is_deleted": False,
+                "is_archived": False, "is_pinned": False, "superseded_by": None,
+                "created_at": "2024-01-01T00:00:00Z", "updated_at": "2024-01-01T00:00:00Z",
+            },
+        ])
 
     async def fake_reflect_table(name: str):
-        # If search.py tries to reflect memory_entries, this list will include it — fail.
-        reflected_tables.append(name)
-        raise Exception(f"Unexpected reflect_table({name!r}) for types=memory test")
+        assert name == "memory_entries"
+        return table
 
-    memory_retrieve_calls: list = []
-
-    async def fake_memory_retrieve(query, requester_context):
-        memory_retrieve_calls.append({"query": query, "ctx": requester_context})
-        return [
-            MemoryEntry(
-                id="mem-1",
-                organization_id="default",
-                content="ACME uses HubSpot.",
-                scope="org",
-                scope_id="default",
-                source="explicit",
-            )
-        ]
+    async def allow_visible(table_arg, member_arg):
+        assert table_arg is table and member_arg is member
+        return table_arg.c.scope_id == member_arg.id
 
     async def fake_permissions_check(*args, **kwargs):
         return True
@@ -313,21 +333,18 @@ async def test_search_memory_type_uses_retrieve_seam_not_raw_query(monkeypatch):
         return "audit-1"
 
     monkeypatch.setattr(search, "reflect_table", fake_reflect_table)
+    monkeypatch.setattr(search, "memory_access_condition", allow_visible)
+    monkeypatch.setattr(search, "engine", sqlite_engine)
     monkeypatch.setattr(search.permissions, "check", fake_permissions_check)
     monkeypatch.setattr(search.audit, "log", fake_audit_log)
-    monkeypatch.setattr(search.memory, "retrieve", fake_memory_retrieve)
 
     results = await search.run_search(q="hubspot", types_csv="memory", member=member)
 
-    # Seam must have been called
-    assert len(memory_retrieve_calls) == 1
-    assert memory_retrieve_calls[0]["query"] == "hubspot"
-    # memory_entries table must NOT have been reflected directly
-    assert "memory_entries" not in reflected_tables
-    # Result contains the memory hit
     memory_hits = [r for r in results if r["type"] == "memory"]
     assert len(memory_hits) == 1
     assert "ACME" in memory_hits[0]["snippet"]
+    assert memory_hits[0]["id"] == "mem-1"
+    await sqlite_engine.dispose()
 
 
 # ─── Test 4: missing project_sources degrades gracefully ─────────────────────
@@ -350,13 +367,9 @@ async def test_search_missing_project_sources_returns_empty_not_500(monkeypatch)
     async def fake_audit_log(*args, **kwargs):
         return "audit-1"
 
-    async def fake_memory_retrieve(query, requester_context):
-        return []
-
     monkeypatch.setattr(search, "reflect_table", fake_reflect_table)
     monkeypatch.setattr(search.permissions, "check", fake_permissions_check)
     monkeypatch.setattr(search.audit, "log", fake_audit_log)
-    monkeypatch.setattr(search.memory, "retrieve", fake_memory_retrieve)
 
     # Must not raise
     results = await search.run_search(q="contract", types_csv="sources", member=member)
@@ -403,14 +416,10 @@ async def test_search_permission_and_audit_fire_on_every_call(monkeypatch):
         audit_calls.append((event_type, action))
         return "audit-1"
 
-    async def fake_memory_retrieve(query, requester_context):
-        return []
-
     monkeypatch.setattr(search, "reflect_table", fake_reflect_table)
     monkeypatch.setattr(search, "engine", FakeEngine())
     monkeypatch.setattr(search.permissions, "check", fake_permissions_check)
     monkeypatch.setattr(search.audit, "log", fake_audit_log)
-    monkeypatch.setattr(search.memory, "retrieve", fake_memory_retrieve)
 
     await search.run_search(q="anything", types_csv=None, member=member)
 
@@ -493,14 +502,10 @@ async def test_search_like_metacharacters_escaped(monkeypatch):
     async def fake_audit_log(*args, **kwargs):
         return "audit-1"
 
-    async def fake_memory_retrieve(query, requester_context):
-        return []
-
     monkeypatch.setattr(search, "reflect_table", fake_reflect_table)
     monkeypatch.setattr(search, "engine", sqlite_engine)
     monkeypatch.setattr(search.permissions, "check", fake_permissions_check)
     monkeypatch.setattr(search.audit, "log", fake_audit_log)
-    monkeypatch.setattr(search.memory, "retrieve", fake_memory_retrieve)
 
     member = _make_member(org_id="default", member_id="member-1")
     results = await search.run_search(q="50%", types_csv="conversations", member=member)
@@ -537,7 +542,18 @@ async def test_search_sources_scoped_to_project_membership(monkeypatch):
         sa.Column("organization_id", sa.String, nullable=False),
         sa.Column("project_id", sa.String, nullable=False),
         sa.Column("title", sa.String),
+        sa.Column("permissions", sa.JSON, nullable=False, default=dict),
+        sa.Column("created_by", sa.String),
+        sa.Column("index_status", sa.String, nullable=False, default="indexed"),
         sa.Column("created_at", sa.String),
+    )
+    project_source_chunks_tbl = sa.Table(
+        "project_source_chunks", meta,
+        sa.Column("id", sa.String, primary_key=True),
+        sa.Column("organization_id", sa.String, nullable=False),
+        sa.Column("project_id", sa.String, nullable=False),
+        sa.Column("source_id", sa.String, nullable=False),
+        sa.Column("content", sa.String, nullable=False),
     )
     project_members_tbl = sa.Table(
         "project_members", meta,
@@ -545,26 +561,47 @@ async def test_search_sources_scoped_to_project_membership(monkeypatch):
         sa.Column("organization_id", sa.String, nullable=False),
         sa.Column("project_id", sa.String, nullable=False),
         sa.Column("member_id", sa.String, nullable=False),
+        sa.Column("role", sa.String, nullable=False, default="member"),
     )
 
     async with sqlite_engine.begin() as conn:
         await conn.run_sync(meta.create_all)
         # Caller (member-1) belongs to project-A only.
         await conn.execute(project_members_tbl.insert().values(
-            id="pm-1", organization_id="default", project_id="project-A", member_id="member-1",
+            id="pm-1", organization_id="default", project_id="project-A", member_id="member-1", role="member",
         ))
         await conn.execute(project_sources_tbl.insert().values(
             id="src-A", organization_id="default", project_id="project-A",
-            title="acme handbook", created_at="2024-01-02T00:00:00Z",
+            title="acme handbook", permissions={}, created_by="member-1", index_status="indexed",
+            created_at="2024-01-02T00:00:00Z",
         ))
         # project-B is in the same org but the caller is NOT a member.
         await conn.execute(project_sources_tbl.insert().values(
             id="src-B", organization_id="default", project_id="project-B",
-            title="acme secrets", created_at="2024-01-03T00:00:00Z",
+            title="acme secrets", permissions={}, created_by="member-x", index_status="indexed",
+            created_at="2024-01-03T00:00:00Z",
         ))
+        await conn.execute(project_sources_tbl.insert(), [
+            {
+                "id": "src-private", "organization_id": "default", "project_id": "project-A",
+                "title": "private notes", "permissions": {"visibility": "private"},
+                "created_by": "member-x", "index_status": "indexed", "created_at": "2024-01-04T00:00:00Z",
+            },
+            {
+                "id": "src-revoked", "organization_id": "default", "project_id": "project-A",
+                "title": "revoked notes", "permissions": {"revoked": True},
+                "created_by": "member-1", "index_status": "indexed", "created_at": "2024-01-05T00:00:00Z",
+            },
+        ])
+        await conn.execute(project_source_chunks_tbl.insert(), [
+            {"id": "chunk-a", "organization_id": "default", "project_id": "project-A", "source_id": "src-A", "content": "content-only-needle"},
+            {"id": "chunk-private", "organization_id": "default", "project_id": "project-A", "source_id": "src-private", "content": "content-only-needle"},
+            {"id": "chunk-revoked", "organization_id": "default", "project_id": "project-A", "source_id": "src-revoked", "content": "content-only-needle"},
+        ])
 
     TABLE_MAP = {
         "project_sources": project_sources_tbl,
+        "project_source_chunks": project_source_chunks_tbl,
         "project_members": project_members_tbl,
     }
 
@@ -585,6 +622,15 @@ async def test_search_sources_scoped_to_project_membership(monkeypatch):
     assert "src-A" in returned_ids, "Member's own project source should be found"
     assert "src-B" not in returned_ids, (
         "Authorization breach: a non-member saw project-B's source via search"
+    )
+
+    content_results = await search.run_search(
+        q="content-only-needle", types_csv="sources", member=member
+    )
+    content_ids = {row["id"] for row in content_results}
+    assert content_ids == {"src-A"}, (
+        "Chunk-only search must return the authorized source while excluding "
+        "private and revoked documents."
     )
 
     await sqlite_engine.dispose()

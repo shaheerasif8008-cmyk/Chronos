@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Desktop GUI operator — real virtual-display computer-use bridge.
 
 Each desktop session owns a virtual X display (Xvfb) into which GUI apps are
@@ -17,6 +15,8 @@ Postgres when the migration is present, with an in-process fallback for tests
 and partially-migrated dev environments.
 """
 
+from __future__ import annotations
+
 import asyncio
 import base64
 import os
@@ -32,6 +32,7 @@ from sqlalchemy import func, insert, select, update
 from core import audit
 from core.config import settings
 from core.db import engine, reflect_table
+from core.execution_boundary import api_host_execution_allowed, unavailable_host_execution_result
 from core.models import ToolResult
 
 DESKTOP_ROOT = Path("/tmp/chronos_desktops")
@@ -55,6 +56,18 @@ _VALID_BUTTONS = {"left": 1, "middle": 2, "right": 3}
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _consent_expired(consent: Any) -> bool:
+    if not isinstance(consent, dict) or not consent.get("expires_at"):
+        return False
+    try:
+        expires_at = datetime.fromisoformat(str(consent["expires_at"]).replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    return expires_at <= datetime.now(timezone.utc)
 
 
 def _stamp() -> str:
@@ -91,6 +104,8 @@ class DesktopConnector:
     # ── Broker entrypoint ──────────────────────────────────────────────────
     async def execute(self, tool: str, args: dict[str, Any]) -> ToolResult:
         args.pop("__connector_tier", None)
+        if not api_host_execution_allowed():
+            return unavailable_host_execution_result(tool)
         org_id = str(args.pop("__org_id", settings.org_id) or settings.org_id)
         task_id = str(args.pop("__task_id", "") or "") or None
         action = tool.split(".", 1)[1]
@@ -108,6 +123,12 @@ class DesktopConnector:
         session = await self._load_or_create(args, organization_id=org_id, task_id=task_id)
         if session.get("status") == "revoked":
             raise ValueError("desktop session has been revoked")
+        if _consent_expired(session.get("consent")):
+            session.update({"status": "revoked", "closed_at": _now(), "updated_at": _now()})
+            await self._save_session(session)
+            await self._teardown_runtime(session["id"])
+            await self._record_event(session, "desktop_session_expired", {})
+            raise ValueError("desktop session consent has expired")
 
         if action == "screenshot":
             return await self._screenshot(session)
@@ -180,12 +201,20 @@ class DesktopConnector:
         await self._record_event(session, "desktop_session_revoked", {"reason": reason})
         return _public_session(session)
 
-    async def list_sessions(self, *, organization_id: str, task_id: str | None = None) -> list[dict[str, Any]]:
+    async def list_sessions(
+        self,
+        *,
+        organization_id: str,
+        task_id: str | None = None,
+        member_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         try:
             table = await reflect_table("desktop_sessions")
             stmt = select(table).where(table.c.organization_id == organization_id)
             if task_id:
                 stmt = stmt.where(table.c.task_id == task_id)
+            if member_id:
+                stmt = stmt.where(table.c.member_id == member_id)
             stmt = stmt.order_by(table.c.updated_at.desc())
             async with engine.begin() as conn:
                 rows = (await conn.execute(stmt)).mappings().all()
@@ -194,7 +223,9 @@ class DesktopConnector:
             sessions = [
                 _public_session(s)
                 for s in self._sessions.values()
-                if s["organization_id"] == organization_id and (task_id is None or s.get("task_id") == task_id)
+                if s["organization_id"] == organization_id
+                and (task_id is None or s.get("task_id") == task_id)
+                and (member_id is None or str(s.get("member_id")) == member_id)
             ]
             return sorted(sessions, key=lambda item: str(item.get("updated_at") or ""), reverse=True)
 

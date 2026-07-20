@@ -326,7 +326,7 @@ async def test_upload_attachment_stores_and_returns_id(monkeypatch):
     async def fake_save(raw, **kw):
         saved.update(kw)
         saved["raw"] = raw
-        return "att-123"
+        return "00000000-0000-0000-0000-000000000123"
 
     async def fake_log(*a, **k):
         return None
@@ -341,6 +341,13 @@ async def test_upload_attachment_stores_and_returns_id(monkeypatch):
     monkeypatch.setattr(att_router.audit, "log", fake_log)
     monkeypatch.setattr(att_router.permissions, "check", fake_check)
     monkeypatch.setattr(att_router, "_require_conversation_member", fake_require_conv)
+    from core.file_security import FileScanResult
+    from datetime import datetime, timezone
+    monkeypatch.setattr(att_router, "scan_file_bytes", AsyncMock(return_value=FileScanResult(
+        verdict="clean", sha256="a" * 64, size_bytes=13,
+        engine="clamav", scanned_at=datetime.now(timezone.utc),
+    )))
+    monkeypatch.setattr(att_router, "record_file_security_event_if_available", AsyncMock(return_value="event-1"))
 
     # Adjust Member constructor kwargs to match core/models.py exactly.
     from core.models import Member
@@ -354,7 +361,7 @@ async def test_upload_attachment_stores_and_returns_id(monkeypatch):
         file=upload, conversation_id="c1", project_id=None, task_id=None,
         research_run_id=None, member=member,
     )
-    assert out["attachment_id"] == "att-123"
+    assert out["attachment_id"] == "00000000-0000-0000-0000-000000000123"
     assert out["filename"] == "report.pdf"
     assert saved["kind"] == "attachment"
     assert saved["parse_status"] == "pending"

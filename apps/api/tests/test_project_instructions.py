@@ -440,8 +440,16 @@ async def test_send_message_pushes_req_project_id_into_requester_context(monkeyp
     async def fake_check(*args, **kwargs):
         return True
 
-    async def fake_create_conversation(member, title, project_id=None):
+    async def fake_project_access(*args, **kwargs):
+        return True
+
+    async def fake_create_conversation(
+        member, title, project_id=None, workspace_id=None
+    ):
         return "conv-new-1"
+
+    async def fake_workspace_access(*args, **kwargs):
+        return {"id": "workspace-default"}
 
     async def fake_save_message(*args, **kwargs):
         # New conversations (conversation_id=None) return None (no RETURNING fired)
@@ -457,6 +465,10 @@ async def test_send_message_pushes_req_project_id_into_requester_context(monkeyp
 
     monkeypatch.setattr(chat, "assemble_context", fake_assemble_context)
     monkeypatch.setattr(chat.permissions, "check", fake_check)
+    monkeypatch.setattr(chat, "member_can_edit_project", fake_project_access)
+    monkeypatch.setattr(
+        chat.workspace_access, "require_workspace_access", fake_workspace_access
+    )
     monkeypatch.setattr(chat, "_create_conversation", fake_create_conversation)
     monkeypatch.setattr(chat, "_save_message", fake_save_message)
     monkeypatch.setattr(chat, "extract_explicit_memory_content", fake_extract_explicit)
@@ -503,6 +515,12 @@ async def test_send_message_hydrates_project_id_from_existing_conversation(monke
     async def fake_check(*args, **kwargs):
         return True
 
+    async def fake_project_access(*args, **kwargs):
+        return True
+
+    async def fake_workspace_access(*args, **kwargs):
+        return {"id": "workspace-default"}
+
     async def fake_save_message(*args, **kwargs):
         # Simulate _save_message returning the conversation row when member/org are scoped.
         if kwargs.get("_member_id") is not None:
@@ -519,6 +537,10 @@ async def test_send_message_hydrates_project_id_from_existing_conversation(monke
 
     monkeypatch.setattr(chat, "assemble_context", fake_assemble_context)
     monkeypatch.setattr(chat.permissions, "check", fake_check)
+    monkeypatch.setattr(chat, "member_can_edit_project", fake_project_access)
+    monkeypatch.setattr(
+        chat.workspace_access, "require_workspace_access", fake_workspace_access
+    )
     monkeypatch.setattr(chat, "_save_message", fake_save_message)
     monkeypatch.setattr(chat, "extract_explicit_memory_content", fake_extract_explicit)
     monkeypatch.setattr(chat, "stream_chat_turn", fake_stream_chat_turn)
@@ -647,6 +669,9 @@ async def test_send_message_raises_422_when_project_id_mismatches_conversation(m
     async def fake_check(*args, **kwargs):
         return True
 
+    async def fake_workspace_access(*args, **kwargs):
+        return {"id": "workspace-default"}
+
     async def fake_save_message(*args, **kwargs):
         # Return a stored project_id that differs from req.project_id
         if kwargs.get("_member_id") is not None:
@@ -654,6 +679,9 @@ async def test_send_message_raises_422_when_project_id_mismatches_conversation(m
         return None
 
     monkeypatch.setattr(chat.permissions, "check", fake_check)
+    monkeypatch.setattr(
+        chat.workspace_access, "require_workspace_access", fake_workspace_access
+    )
     monkeypatch.setattr(chat, "_save_message", fake_save_message)
     monkeypatch.setattr(chat.audit, "log", AsyncMock())
 
@@ -697,8 +725,13 @@ async def test_send_message_skips_hydration_when_no_conversation_id(monkeypatch)
     async def fake_check(*args, **kwargs):
         return True
 
-    async def fake_create_conversation(member, title, project_id=None):
+    async def fake_create_conversation(
+        member, title, project_id=None, workspace_id=None
+    ):
         return "conv-new-1"
+
+    async def fake_workspace_access(*args, **kwargs):
+        return {"id": "workspace-default"}
 
     async def fake_save_message(*args, **kwargs):
         save_message_kwargs_list.append(kwargs)
@@ -714,6 +747,9 @@ async def test_send_message_skips_hydration_when_no_conversation_id(monkeypatch)
 
     monkeypatch.setattr(chat, "assemble_context", fake_assemble_context)
     monkeypatch.setattr(chat.permissions, "check", fake_check)
+    monkeypatch.setattr(
+        chat.workspace_access, "require_workspace_access", fake_workspace_access
+    )
     monkeypatch.setattr(chat, "_create_conversation", fake_create_conversation)
     monkeypatch.setattr(chat, "_save_message", fake_save_message)
     monkeypatch.setattr(chat, "extract_explicit_memory_content", fake_extract_explicit)
@@ -749,3 +785,100 @@ async def test_send_message_skips_hydration_when_no_conversation_id(monkeypatch)
     )
     # project_id in requester_context must remain None
     assert captured_context.get("project_id") is None
+
+
+@pytest.mark.asyncio
+async def test_project_task_resume_revalidates_membership_before_cached_context(monkeypatch):
+    from runtime import agent_loop
+    from core import memory_access
+
+    class Col:
+        def __eq__(self, other): return True
+    class Table:
+        class c:
+            id = Col(); organization_id = Col(); status = Col()
+    class Clause:
+        def where(self, *args): return self
+    class Result:
+        def mappings(self): return self
+        def first(self):
+            return {"id": "member-1", "organization_id": "default", "email": "m@example.com", "role": "user", "status": "active"}
+    class Conn:
+        async def execute(self, stmt): return Result()
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return None
+    class Engine:
+        def begin(self): return Conn()
+
+    async def revoked(*args, **kwargs): return False
+    async def reflect(_name): return Table()
+
+    monkeypatch.setattr(agent_loop, "engine", Engine())
+    monkeypatch.setattr(agent_loop, "reflect_table", reflect)
+    monkeypatch.setattr(agent_loop, "select", lambda *args: Clause())
+    monkeypatch.setattr(agent_loop, "_agent_system_message", AsyncMock(return_value={"role": "system", "content": "base"}))
+    monkeypatch.setattr(memory_access, "member_can_access_project", revoked)
+
+    task = {
+        "id": "task-1",
+        "organization_id": "default",
+        "triggered_by_member_id": "member-1",
+        "triggered_by": "manual",
+        "project_id": "project-1",
+        "agent_state": {"agent_history": [{"role": "system", "content": "cached private project context"}]},
+    }
+    with pytest.raises(PermissionError, match="access was revoked"):
+        await agent_loop._load_history(task)
+
+
+@pytest.mark.asyncio
+async def test_project_agent_trigger_is_not_treated_as_conversation_uuid(monkeypatch):
+    from runtime import agent_loop
+    from core import context, memory_access
+
+    class Col:
+        def __eq__(self, other): return True
+    class Table:
+        class c:
+            id = Col(); organization_id = Col(); status = Col()
+    class Clause:
+        def where(self, *args): return self
+    class Result:
+        def mappings(self): return self
+        def first(self):
+            return {"id": "member-1", "organization_id": "default", "email": "m@example.com", "role": "user", "status": "active"}
+    class Conn:
+        async def execute(self, stmt): return Result()
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return None
+    class Engine:
+        def begin(self): return Conn()
+
+    captured = {}
+    async def allowed(*args, **kwargs): return True
+    async def assemble(conversation_id, message, requester):
+        captured["conversation_id"] = conversation_id
+        captured["requester_conversation_id"] = requester.conversation_id
+        return [{"role": "system", "content": "fresh authorized context"}]
+    async def reflect(_name): return Table()
+
+    monkeypatch.setattr(agent_loop, "engine", Engine())
+    monkeypatch.setattr(agent_loop, "reflect_table", reflect)
+    monkeypatch.setattr(agent_loop, "select", lambda *args: Clause())
+    monkeypatch.setattr(agent_loop, "save_task", AsyncMock())
+    monkeypatch.setattr(agent_loop, "_agent_system_message", AsyncMock(return_value={"role": "system", "content": "base"}))
+    monkeypatch.setattr(memory_access, "member_can_access_project", allowed)
+    monkeypatch.setattr(context, "assemble_context", assemble)
+
+    task = {
+        "id": "task-1",
+        "organization_id": "default",
+        "triggered_by_member_id": "member-1",
+        "triggered_by": "agent:profile-1",
+        "project_id": "project-1",
+        "goal": "prepare project brief",
+        "agent_state": {"agent_history": [{"role": "system", "content": "old"}]},
+    }
+    history = await agent_loop._load_history(task)
+    assert captured == {"conversation_id": None, "requester_conversation_id": None}
+    assert "fresh authorized context" in history[0]["content"]

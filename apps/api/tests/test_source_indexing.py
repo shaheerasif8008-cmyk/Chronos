@@ -23,6 +23,8 @@ def _make_member(member_id="member-1", org_id="default", role="user"):
 class _FakeCol:
     def __eq__(self, other): return True
     def desc(self): return self
+    def asc(self): return self
+    def in_(self, other): return self
 
 
 class _FakeTable:
@@ -35,6 +37,10 @@ class _FakeTable:
         parent_artifact_id = _FakeCol()
         kind = _FakeCol()
         created_at = _FakeCol()
+        updated_at = _FakeCol()
+        source_type = _FakeCol()
+        parent_source_id = _FakeCol()
+        index_status = _FakeCol()
 
 
 def _fake_reflect():
@@ -51,12 +57,49 @@ class _Clause:
     def order_by(self, *a): return self
     def join(self, *a, **kw): return self
     def with_for_update(self, *a, **kw): return self
+    def limit(self, *a, **kw): return self
 
 
 def _noop_select(*a, **kw): return _Clause("select")
 def _noop_insert(_tbl): return _Clause("insert")
 def _noop_update(_tbl): return _Clause("update")
 def _noop_delete(_tbl): return _Clause("delete")
+
+
+def test_chunking_enforces_bounded_source_index_budget():
+    from memory import source_indexing as si
+
+    text = "x" * (si.MAX_INDEX_TEXT_CHARS + si.CHUNK_CHARS)
+    chunks = si._chunk_text(text[: si.MAX_INDEX_TEXT_CHARS])
+    assert len(chunks) == si.MAX_INDEX_CHUNKS
+
+
+@pytest.mark.asyncio
+async def test_restart_recovery_routes_uploads_and_connector_feeds(monkeypatch):
+    from jobs import source_sync
+    from memory import source_indexing as si
+
+    rows = [
+        {"id": "upload-1", "organization_id": "org-1", "source_type": "upload", "parent_source_id": None},
+        {"id": "feed-1", "organization_id": "org-1", "source_type": "connector", "parent_source_id": None},
+        {"id": "child-1", "organization_id": "org-1", "source_type": "connector", "parent_source_id": "feed-1"},
+    ]
+    ops: list[str] = []
+    monkeypatch.setattr(si, "engine", _build_engine([rows], ops))
+    monkeypatch.setattr(si, "reflect_table", _fake_reflect())
+    monkeypatch.setattr(si, "select", _noop_select)
+    index = AsyncMock(return_value={"index_status": "indexed"})
+    sync = AsyncMock(return_value={"index_status": "synced"})
+    monkeypatch.setattr(si, "index_source", index)
+    monkeypatch.setattr(source_sync, "sync_connector_source", sync)
+
+    recovered = await si.recover_pending_sources(limit=10)
+    assert recovered == ["upload-1", "feed-1", "child-1"]
+    assert [call.args for call in index.await_args_list] == [
+        ("upload-1", "org-1"),
+        ("child-1", "org-1"),
+    ]
+    sync.assert_awaited_once_with("feed-1", "org-1")
 
 
 def _build_engine(results, ops):
@@ -196,7 +239,7 @@ async def test_delete_source_chunks_scoped_and_counts(monkeypatch):
 # ─── empty / no-text source ─────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_index_source_empty_text_indexed_zero_chunks(monkeypatch):
+async def test_index_source_empty_text_fails_honestly_with_zero_chunks(monkeypatch):
     from memory import source_indexing as si
 
     source_row = {"id": "src-1", "project_id": "proj-1", "organization_id": "default",
@@ -215,7 +258,7 @@ async def test_index_source_empty_text_indexed_zero_chunks(monkeypatch):
     monkeypatch.setattr(si.audit, "log", AsyncMock())
 
     out = await si.index_source("src-1", "default")
-    assert out == {"source_id": "src-1", "chunk_count": 0, "index_status": "indexed"}
+    assert out == {"source_id": "src-1", "chunk_count": 0, "index_status": "failed"}
     assert "insert" not in ops, "no chunk inserts for empty text"
 
 
@@ -290,14 +333,17 @@ async def test_reindex_source_404_when_not_in_project(monkeypatch):
     from routers import projects
 
     member = _make_member()
-    mem_row = {"id": "pm-1", "project_id": "proj-1", "member_id": "member-1", "role": "owner"}
-    # _require_member → membership row; _require_source → None (not found).
     ops: list[str] = []
-    engine = _build_engine([mem_row, None], ops)
+    engine = _build_engine([None], ops)
 
     monkeypatch.setattr(projects, "engine", engine)
     monkeypatch.setattr(projects, "reflect_table", _fake_reflect())
     monkeypatch.setattr(projects, "select", _noop_select)
+    monkeypatch.setattr(
+        projects,
+        "project_access_role",
+        AsyncMock(return_value=({"id": "proj-1"}, "owner")),
+    )
     monkeypatch.setattr(projects.permissions, "check", AsyncMock(return_value=True))
 
     with pytest.raises(HTTPException) as exc:
@@ -310,14 +356,11 @@ async def test_delete_source_requires_owner(monkeypatch):
     from routers import projects
 
     member = _make_member(role="user")
-    # _require_member returns a non-owner membership → _require_owner raises 403.
-    mem_row = {"id": "pm-1", "project_id": "proj-1", "member_id": "member-1", "role": "member"}
-    ops: list[str] = []
-    engine = _build_engine([mem_row], ops)
-
-    monkeypatch.setattr(projects, "engine", engine)
-    monkeypatch.setattr(projects, "reflect_table", _fake_reflect())
-    monkeypatch.setattr(projects, "select", _noop_select)
+    monkeypatch.setattr(
+        projects,
+        "project_access_role",
+        AsyncMock(return_value=({"id": "proj-1"}, "member")),
+    )
     monkeypatch.setattr(projects.permissions, "check", AsyncMock(return_value=True))
 
     with pytest.raises(HTTPException) as exc:
@@ -330,17 +373,20 @@ async def test_delete_source_owner_deletes_chunks_and_row(monkeypatch):
     from routers import projects
 
     member = _make_member(role="user")
-    mem_row = {"id": "pm-1", "project_id": "proj-1", "member_id": "member-1", "role": "owner"}
     source_row = {"id": "src-1", "project_id": "proj-1", "organization_id": "default"}
-    # _require_owner→_require_member (1 select), _require_source (1 select),
-    # then delete_source_chunks via si (1 delete), then row delete (1 delete).
+    # _require_source (1 select), delete_source_chunks (1 delete), row delete (1 delete).
     ops: list[str] = []
-    engine = _build_engine([mem_row, source_row, 2, None], ops)
+    engine = _build_engine([source_row, 2, None], ops)
 
     monkeypatch.setattr(projects, "engine", engine)
     monkeypatch.setattr(projects, "reflect_table", _fake_reflect())
     monkeypatch.setattr(projects, "select", _noop_select)
     monkeypatch.setattr(projects, "delete", _noop_delete)
+    monkeypatch.setattr(
+        projects,
+        "project_access_role",
+        AsyncMock(return_value=({"id": "proj-1"}, "owner")),
+    )
     monkeypatch.setattr(projects.permissions, "check", AsyncMock(return_value=True))
     monkeypatch.setattr(projects.audit, "log", AsyncMock())
 

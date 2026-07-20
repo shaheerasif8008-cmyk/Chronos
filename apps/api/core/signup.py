@@ -136,7 +136,19 @@ async def signup_or_join(email: str, org_name: str | None = None) -> dict:
         # now finds the claim and handles auto-join vs. approval correctly).
         orgs = await reflect_table("organizations")
         members = await reflect_table("members")
+        workspaces = await reflect_table("workspaces")
+        workspace_members = await reflect_table("workspace_members")
         async with engine.begin() as conn:
+            await conn.execute(
+                workspace_members.delete().where(
+                    workspace_members.c.organization_id == prov["org_id"]
+                )
+            )
+            await conn.execute(
+                workspaces.delete().where(
+                    workspaces.c.organization_id == prov["org_id"]
+                )
+            )
             await conn.execute(members.delete().where(members.c.id == prov["owner_member_id"]))
             await conn.execute(orgs.delete().where(orgs.c.id == prov["org_id"]))
         return await signup_or_join(email, org_name)

@@ -18,37 +18,51 @@ if aws s3api head-bucket --bucket "$BUCKET" --profile "$PROFILE" 2>/dev/null; th
 else
   aws s3api create-bucket --bucket "$BUCKET" --region "$REGION" --profile "$PROFILE" \
     $( [[ "$REGION" != "us-east-1" ]] && echo "--create-bucket-configuration LocationConstraint=$REGION" )
-  aws s3api put-bucket-versioning \
-    --bucket "$BUCKET" \
-    --versioning-configuration Status=Enabled \
-    --profile "$PROFILE"
-  aws s3api put-bucket-encryption \
-    --bucket "$BUCKET" \
-    --server-side-encryption-configuration \
-      '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}' \
-    --profile "$PROFILE"
-  aws s3api put-public-access-block \
-    --bucket "$BUCKET" \
-    --public-access-block-configuration "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true" \
-    --profile "$PROFILE"
   echo "    created."
 fi
 
-# ── DynamoDB lock table ───────────────────────────────────────────────────────
-TABLE="chronos-terraform-locks"
-echo "==> Creating DynamoDB lock table: $TABLE"
-if aws dynamodb describe-table --table-name "$TABLE" --region "$REGION" --profile "$PROFILE" 2>/dev/null; then
-  echo "    (already exists)"
-else
-  aws dynamodb create-table \
-    --table-name "$TABLE" \
-    --attribute-definitions AttributeName=LockID,AttributeType=S \
-    --key-schema AttributeName=LockID,KeyType=HASH \
-    --billing-mode PAY_PER_REQUEST \
+# Apply the controls on every run so an existing bootstrap bucket cannot drift
+# silently. The customer-managed key is necessary because Terraform state holds
+# generated passwords and provider inputs even when application secrets use
+# Secrets Manager at runtime.
+STATE_KEY_ALIAS="alias/chronos-terraform-state"
+STATE_KEY_ID=$(aws kms list-aliases --region "$REGION" --profile "$PROFILE" \
+  --query "Aliases[?AliasName=='${STATE_KEY_ALIAS}'].TargetKeyId | [0]" --output text)
+if [[ -z "$STATE_KEY_ID" || "$STATE_KEY_ID" == "None" ]]; then
+  STATE_KEY_ID=$(aws kms create-key \
+    --description "Chronos Terraform state" \
     --region "$REGION" \
-    --profile "$PROFILE"
-  echo "    created."
+    --profile "$PROFILE" \
+    --query KeyMetadata.KeyId --output text)
+  aws kms enable-key-rotation --key-id "$STATE_KEY_ID" --region "$REGION" --profile "$PROFILE"
+  aws kms create-alias --alias-name "$STATE_KEY_ALIAS" --target-key-id "$STATE_KEY_ID" \
+    --region "$REGION" --profile "$PROFILE"
 fi
+STATE_KEY_ARN=$(aws kms describe-key --key-id "$STATE_KEY_ID" --region "$REGION" --profile "$PROFILE" \
+  --query KeyMetadata.Arn --output text)
+
+aws s3api put-bucket-versioning \
+  --bucket "$BUCKET" \
+  --versioning-configuration Status=Enabled \
+  --profile "$PROFILE"
+aws s3api put-bucket-encryption \
+  --bucket "$BUCKET" \
+  --server-side-encryption-configuration \
+    "{\"Rules\":[{\"ApplyServerSideEncryptionByDefault\":{\"SSEAlgorithm\":\"aws:kms\",\"KMSMasterKeyID\":\"${STATE_KEY_ARN}\"},\"BucketKeyEnabled\":true}]}" \
+  --profile "$PROFILE"
+aws s3api put-public-access-block \
+  --bucket "$BUCKET" \
+  --public-access-block-configuration "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true" \
+  --profile "$PROFILE"
+aws s3api put-bucket-lifecycle-configuration \
+  --bucket "$BUCKET" \
+  --lifecycle-configuration \
+    '{"Rules":[{"ID":"retain-state-history-one-year","Status":"Enabled","Filter":{"Prefix":""},"NoncurrentVersionExpiration":{"NoncurrentDays":365}}]}' \
+  --profile "$PROFILE"
+aws s3api put-bucket-policy \
+  --bucket "$BUCKET" \
+  --policy "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"DenyInsecureTransport\",\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3:*\",\"Resource\":[\"arn:aws:s3:::${BUCKET}\",\"arn:aws:s3:::${BUCKET}/*\"],\"Condition\":{\"Bool\":{\"aws:SecureTransport\":\"false\"}}}]}" \
+  --profile "$PROFILE"
 
 # ── GitHub Actions OIDC provider ─────────────────────────────────────────────
 echo "==> Ensuring GitHub OIDC provider exists"
@@ -68,8 +82,6 @@ fi
 echo ""
 echo "==> Bootstrap complete. Next steps:"
 echo "    1. Copy terraform.tfvars.example → terraform.tfvars and fill in secrets."
-echo "    2. terraform init"
-echo "    3. terraform plan -out=tfplan"
-echo "    4. terraform apply tfplan"
-echo "    5. After apply, run: bash post-apply.sh to write DB/Redis connection URLs."
-echo "    6. Add AWS_DEPLOY_ROLE_ARN to GitHub Actions secrets."
+echo "    2. Follow docs/TERRAFORM_STATE_ADOPTION.md before the first plan."
+echo "    3. Follow the zero-task bootstrap sequence in docs/PRODUCTION_OPERATIONS.md."
+echo "    4. Use post-apply.sh only to verify Terraform-managed secret versions."

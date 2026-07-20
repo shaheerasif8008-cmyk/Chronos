@@ -3,6 +3,8 @@
 TDD: tests are written first and fail until the endpoints are implemented.
 Mocking style mirrors test_rich_messages.py: monkeypatch at module level.
 """
+from unittest.mock import AsyncMock
+
 import pytest
 from fastapi import HTTPException
 
@@ -167,10 +169,122 @@ async def test_create_conversation_uses_member_org(monkeypatch):
     monkeypatch.setattr(chat, "engine", _FakeEngine())
     monkeypatch.setattr(chat, "reflect_table", fake_reflect_table)
     monkeypatch.setattr(chat, "insert", lambda *_: _Clause())
+    monkeypatch.setattr(
+        chat.workspace_access,
+        "require_workspace_access",
+        AsyncMock(return_value={"id": "workspace-1"}),
+    )
 
-    assert await chat._create_conversation(member, "hello") == "conv-1"
+    assert await chat._create_conversation(member, "hello", workspace_id="workspace-1") == "conv-1"
     assert captured_values["member_id"] == "member-1"
     assert captured_values["organization_id"] == "org-1"
+    assert captured_values["workspace_id"] == "workspace-1"
+
+
+@pytest.mark.asyncio
+async def test_create_conversation_resolves_legacy_default_workspace(monkeypatch):
+    from routers import chat
+
+    member = _make_member(member_id="member-1", org_id="org-1")
+    captured_values = {}
+    resolve_workspace = AsyncMock(return_value={"id": "canonical-default-workspace"})
+
+    class _Clause:
+        def values(self, **kwargs):
+            captured_values.update(kwargs)
+            return self
+
+        def returning(self, *_args):
+            return self
+
+    class _Columns:
+        id = object()
+
+    class _Table:
+        c = _Columns()
+
+    class _FakeResult:
+        def scalar_one(self):
+            return "conv-default"
+
+    class _FakeConn:
+        async def execute(self, _stmt):
+            return _FakeResult()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            pass
+
+    class _FakeEngine:
+        def begin(self):
+            return _FakeConn()
+
+    async def fake_reflect_table(name):
+        assert name == "conversations"
+        return _Table()
+
+    monkeypatch.setattr(chat, "engine", _FakeEngine())
+    monkeypatch.setattr(chat, "reflect_table", fake_reflect_table)
+    monkeypatch.setattr(chat, "insert", lambda *_: _Clause())
+    monkeypatch.setattr(chat.workspace_access, "require_workspace_access", resolve_workspace)
+
+    assert await chat._create_conversation(member, "legacy caller") == "conv-default"
+    resolve_workspace.assert_awaited_once_with(member, "default", access="write")
+    assert captured_values["workspace_id"] == "canonical-default-workspace"
+
+
+@pytest.mark.asyncio
+async def test_save_message_rejects_workspace_change_before_insert(monkeypatch):
+    """An existing conversation cannot be moved by changing the request body."""
+    from fastapi import HTTPException
+    from routers import chat
+
+    execute_count = 0
+
+    class _Columns:
+        id = object()
+
+    class _Table:
+        c = _Columns()
+
+    class _FakeConn:
+        async def execute(self, _stmt):
+            nonlocal execute_count
+            execute_count += 1
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            pass
+
+    class _FakeEngine:
+        def begin(self):
+            return _FakeConn()
+
+    async def fake_reflect_table(_name):
+        return _Table()
+
+    async def fake_check(*_args, **_kwargs):
+        return {"id": "conv-1", "workspace_id": "workspace-one", "project_id": None}
+
+    monkeypatch.setattr(chat, "engine", _FakeEngine())
+    monkeypatch.setattr(chat, "reflect_table", fake_reflect_table)
+    monkeypatch.setattr(chat, "_check_conversation_ownership", fake_check)
+
+    with pytest.raises(HTTPException, match="workspace_id does not match conversation"):
+        await chat._save_message(
+            "conv-1",
+            "user",
+            "hello",
+            _member_id="member-1",
+            _org_id="org-1",
+            _workspace_id="workspace-two",
+        )
+
+    assert execute_count == 0
 
 
 def _fake_engine_factory(rows_by_call=None, returning_scalar=None):
@@ -525,7 +639,14 @@ async def test_branch_creates_new_conversation_with_lineage(monkeypatch):
     from unittest.mock import AsyncMock
 
     member = _make_member()
-    conv_row = {"id": "conv-1", "member_id": "member-1", "organization_id": "default", "title": "Original"}
+    conv_row = {
+        "id": "conv-1",
+        "member_id": "member-1",
+        "organization_id": "default",
+        "title": "Original",
+        "workspace_id": "workspace-source",
+        "project_id": "project-source",
+    }
     # source message to branch at
     src_msg = {
         "id": "msg-2", "conversation_id": "conv-1", "role": "user",
@@ -574,16 +695,34 @@ async def test_branch_creates_new_conversation_with_lineage(monkeypatch):
         def begin(self): return _FakeConn()
 
     _select, _insert, _update, _reflect = _fake_sql_builder()
+    inserted_values: list[dict] = []
+
+    def capturing_insert(_table):
+        class _InsertClause:
+            def values(self, **values):
+                inserted_values.append(values)
+                return self
+
+            def returning(self, *args):
+                return self
+
+        return _InsertClause()
+
     monkeypatch.setattr(chat, "engine", _FakeEngine())
     monkeypatch.setattr(chat, "reflect_table", _reflect)
     monkeypatch.setattr(chat, "select", _select)
-    monkeypatch.setattr(chat, "insert", _insert)
+    monkeypatch.setattr(chat, "insert", capturing_insert)
     monkeypatch.setattr(chat, "update", _update)
     monkeypatch.setattr(chat.permissions, "check", AsyncMock(return_value=True))
     monkeypatch.setattr(chat.audit, "log", AsyncMock())
 
     result = await chat.branch_conversation("conv-1", "msg-2", member)
     assert "conversation_id" in result
+    branch_values = next(
+        values for values in inserted_values if values.get("title") == "Branch: Original"
+    )
+    assert branch_values["workspace_id"] == "workspace-source"
+    assert branch_values["project_id"] == "project-source"
     chat.audit.log.assert_awaited()
 
 
@@ -630,6 +769,7 @@ async def test_save_memory_calls_create_memory_entry(monkeypatch):
     from unittest.mock import AsyncMock, patch
 
     member = _make_member()
+    member.role = "admin"
     conv_row = {"id": "conv-1", "member_id": "member-1", "organization_id": "default"}
     msg_row = {"id": "msg-1", "conversation_id": "conv-1", "role": "assistant", "content": "Remember this fact."}
 
@@ -912,7 +1052,14 @@ async def test_branch_uses_or_predicate(monkeypatch):
     from unittest.mock import AsyncMock, MagicMock
 
     member = _make_member()
-    conv_row = {"id": "conv-1", "member_id": "member-1", "organization_id": "default", "title": "Original"}
+    conv_row = {
+        "id": "conv-1",
+        "member_id": "member-1",
+        "organization_id": "default",
+        "workspace_id": "workspace-1",
+        "project_id": "project-1",
+        "title": "Original",
+    }
     src_msg = {
         "id": "msg-2", "conversation_id": "conv-1", "role": "user",
         "content": "branch here", "created_at": "2024-01-01T00:00:00",

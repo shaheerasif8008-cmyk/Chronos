@@ -350,10 +350,11 @@ class OAuthHTTPAdapter:
                 "GET",
                 str(args["endpoint"]),
                 params={"q": args["query"], "limit": args.get("limit")},
+                context=context,
             )
         if action_name == "read":
             endpoint = str(args.get("endpoint") or args["id"])
-            return await self._request(credentials, "GET", endpoint)
+            return await self._request(credentials, "GET", endpoint, context=context)
         if action_name == "write":
             return await self._request(
                 credentials,
@@ -361,6 +362,7 @@ class OAuthHTTPAdapter:
                 str(args["endpoint"]),
                 params=args.get("params"),
                 body=args.get("body"),
+                context=context,
             )
         return ConnectorResult(status="failure", error=f"Unknown action: {action_name}")
 
@@ -375,6 +377,7 @@ class OAuthHTTPAdapter:
         *,
         params: dict[str, Any] | None = None,
         body: dict[str, Any] | None = None,
+        context: dict[str, Any] | None = None,
     ) -> ConnectorResult:
         import httpx
 
@@ -394,6 +397,10 @@ class OAuthHTTPAdapter:
             headers["Notion-Version"] = "2022-06-28"
         if self.app.id == "github":
             headers["Accept"] = "application/vnd.github+json"
+        mutation = method.upper() not in {"GET", "HEAD", "OPTIONS"}
+        provider_key = str((context or {}).get("provider_idempotency_key") or "")
+        if mutation and provider_key and self.app.id == "stripe":
+            headers["Idempotency-Key"] = provider_key
 
         clean_params = {key: value for key, value in (params or {}).items() if value is not None}
         try:
@@ -405,13 +412,30 @@ class OAuthHTTPAdapter:
                     params=clean_params or None,
                     json=body,
                 )
-        except httpx.HTTPError as exc:
-            return ConnectorResult(status="failure", error=f"{self.app.id} request failed: {exc}")
-
-        if response.status_code >= 400:
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
             return ConnectorResult(
                 status="failure",
-                error=f"{self.app.id} {method.upper()} {endpoint} returned {response.status_code}: {response.text[:240]}",
+                error=f"{self.app.id} connection failed before a provider response",
+            )
+        except httpx.HTTPError:
+            return ConnectorResult(
+                status="ambiguous" if mutation else "failure",
+                error=(
+                    f"{self.app.id} provider outcome is unknown after a transport failure"
+                    if mutation
+                    else f"{self.app.id} request failed"
+                ),
+            )
+
+        if response.status_code >= 400:
+            if mutation and response.status_code >= 500:
+                return ConnectorResult(
+                    status="ambiguous",
+                    error=f"{self.app.id} returned HTTP {response.status_code}; mutation outcome is unknown",
+                )
+            return ConnectorResult(
+                status="failure",
+                error=f"{self.app.id} returned HTTP {response.status_code}",
             )
         data = response.json() if response.content else {}
         return ConnectorResult(status="success", output={"data": data, "status_code": response.status_code})
@@ -521,12 +545,37 @@ class MCPAdapter:
             )
         try:
             result = await call_mcp(self._server, "tools/call", {"name": action_name, "arguments": args})
-        except (MCPTransportError, OSError, TimeoutError, ValueError) as exc:
+        except (MCPTransportError, OSError, TimeoutError):
+            return ConnectorResult(
+                status="ambiguous",
+                error="MCP transport failed after dispatch; provider outcome is unknown",
+            )
+        except ValueError as exc:
             return ConnectorResult(status="failure", error=str(exc))
         return ConnectorResult(status="success", output={"result": result})
 
     async def validate_credentials(self, credentials: dict[str, Any]) -> bool:
         return True
+
+
+class DynamicAdapterRegistry(dict[str, ConnectorAdapter]):
+    """Return a tenant-created HTTP adapter without global mutable registration.
+
+    Custom connector ids are random and persisted, so workers cannot know them
+    at process start.  The prefix is generated exclusively by the authenticated
+    admin API; the adapter still re-checks the tenant-scoped database row before
+    every request.
+    """
+
+    def get(self, key: str, default: ConnectorAdapter | None = None) -> ConnectorAdapter | None:
+        found = super().get(key)
+        if found is not None:
+            return found
+        if key.startswith("custom_http_"):
+            from core.custom_integrations import TenantCustomHTTPAdapter
+
+            return TenantCustomHTTPAdapter(key)
+        return default
 
 
 def adapter_registry() -> dict[str, ConnectorAdapter]:
@@ -540,4 +589,4 @@ def adapter_registry() -> dict[str, ConnectorAdapter]:
             adapters.append(CustomHTTPAdapter(app))
         else:
             adapters.append(OAuthHTTPAdapter(app))
-    return {adapter.connector.id: adapter for adapter in adapters}
+    return DynamicAdapterRegistry({adapter.connector.id: adapter for adapter in adapters})

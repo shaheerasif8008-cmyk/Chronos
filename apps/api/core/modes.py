@@ -12,7 +12,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 ALLOWED_MODES: frozenset[str] = frozenset({
-    "default", "research", "agent", "browser", "computer",
+    "default", "chat", "research", "agent", "browser", "computer",
     "data", "image", "voice", "coding",
 })
 
@@ -26,11 +26,19 @@ _MODE_METADATA: tuple[dict, ...] = (
         "creates_task": False,
     },
     {
+        "id": "chat",
+        "label": "Direct answer",
+        "description": "Answers in the conversation without promoting the turn to a durable task.",
+        "capabilities": ["chat", "memory", "artifacts"],
+        "status": "available",
+        "creates_task": False,
+    },
+    {
         "id": "research",
         "label": "Research",
         "description": "Plans a source-gathering task and returns grounded findings.",
         "capabilities": ["web_search", "source_review", "citations"],
-        "status": "foundation",
+        "status": "available",
         "creates_task": True,
     },
     {
@@ -52,17 +60,17 @@ _MODE_METADATA: tuple[dict, ...] = (
     {
         "id": "computer",
         "label": "Computer",
-        "description": "Reserved for sandboxed computer sessions when that runtime ships.",
-        "capabilities": [],
-        "status": "unavailable",
+        "description": "Runs a governed E2B cloud computer with terminal, files, screenshots, desktop input, pause, and resume.",
+        "capabilities": ["terminal", "files", "desktop", "screenshots", "pause_resume", "artifacts"],
+        "status": "available",
         "creates_task": True,
     },
     {
         "id": "data",
         "label": "Data",
-        "description": "Uses code tools for data questions; a full data workspace is still pending.",
-        "capabilities": ["code_python", "artifacts"],
-        "status": "foundation",
+        "description": "Analyzes uploaded CSV, JSON, and spreadsheet data in an isolated Python workspace with durable results.",
+        "capabilities": ["code_python", "datasets", "charts", "artifacts"],
+        "status": "available",
         "creates_task": True,
     },
     {
@@ -70,23 +78,23 @@ _MODE_METADATA: tuple[dict, ...] = (
         "label": "Image",
         "description": "Generate images from text descriptions. Results appear as image artifacts in the chat.",
         "capabilities": ["image_generate", "artifacts"],
-        "status": "foundation",
+        "status": "available",
         "creates_task": False,
     },
     {
         "id": "voice",
         "label": "Voice",
-        "description": "Reserved for speech-to-text and text-to-speech workflows.",
-        "capabilities": [],
-        "status": "unavailable",
+        "description": "Transcribes recorded audio and produces governed text-to-speech output with durable attachments.",
+        "capabilities": ["speech_to_text", "text_to_speech", "attachments"],
+        "status": "available",
         "creates_task": False,
     },
     {
         "id": "coding",
         "label": "Coding",
-        "description": "Uses code-oriented context and tools; repo workspaces are still pending.",
-        "capabilities": ["code_python", "artifacts"],
-        "status": "foundation",
+        "description": "Uses a persistent tenant-isolated repo workspace for inspect, edit, test, diff, commit, and approval-bound pull requests.",
+        "capabilities": ["repo_workspace", "git", "tests", "diff", "commit", "pull_request", "artifacts"],
+        "status": "available",
         "creates_task": True,
     },
 )

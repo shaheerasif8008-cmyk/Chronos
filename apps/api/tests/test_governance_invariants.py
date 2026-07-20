@@ -32,6 +32,7 @@ _ALLOWED_DIRECT_IMPORTERS = {
 }
 
 API_ROOT = pathlib.Path(__file__).resolve().parents[1]  # apps/api/
+_SKIP_SCAN_DIRS = {".venv", ".pytest_cache", "__pycache__", "fixtures"}
 
 
 def _is_allowed(rel_path: str) -> bool:
@@ -64,7 +65,10 @@ def test_no_direct_connector_imports_outside_gateway():
     violations: list[str] = []
 
     for py_file in API_ROOT.rglob("*.py"):
-        rel = str(py_file.relative_to(API_ROOT))
+        relative = py_file.relative_to(API_ROOT)
+        if any(part in _SKIP_SCAN_DIRS for part in relative.parts):
+            continue
+        rel = str(relative)
         if _is_allowed(rel):
             continue
 

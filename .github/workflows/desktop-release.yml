@@ -1,0 +1,165 @@
+name: Desktop release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Semver version without a prefix
+        required: true
+        type: string
+  push:
+    tags:
+      - "desktop-v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-gate:
+    name: Require reviewed main SHA and successful CI
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    outputs:
+      source_sha: ${{ steps.verify.outputs.source_sha }}
+      approved_pr: ${{ steps.verify.outputs.approved_pr }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: main
+          sparse-checkout: .github/scripts
+      - name: Verify reviewed main SHA and exact successful CI run
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ github.sha }}
+          REQUIRE_BRANCH_HEAD: ${{ github.event_name == 'workflow_dispatch' }}
+        run: bash .github/scripts/verify-reviewed-ci-sha.sh
+
+  build-sign-notarize:
+    needs: release-gate
+    runs-on: macos-15
+    environment: desktop-production
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.release-gate.outputs.source_sha }}
+
+      - name: Resolve release version
+        id: release
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#desktop-v}"
+          else
+            version="${{ inputs.version }}"
+          fi
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build and run the native security self-test
+        working-directory: apps/desktop-macos
+        run: swift run -c release ChronosDesktop --self-test
+
+      - name: Import Developer ID certificate
+        env:
+          CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.APPLE_BUILD_KEYCHAIN_PASSWORD }}
+        run: |
+          certificate="$RUNNER_TEMP/developer-id.p12"
+          keychain="$RUNNER_TEMP/chronos-signing.keychain-db"
+          printf '%s' "$CERTIFICATE_P12_BASE64" | base64 --decode > "$certificate"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security import "$certificate" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$keychain"
+
+      - name: Build signed installer
+        working-directory: apps/desktop-macos
+        env:
+          CHRONOS_DESKTOP_VERSION: ${{ steps.release.outputs.version }}
+          CHRONOS_DESKTOP_BUILD: ${{ github.run_number }}
+          CHRONOS_CODESIGN_IDENTITY: ${{ secrets.APPLE_DEVELOPER_ID_IDENTITY }}
+        run: scripts/package-dmg.sh
+
+      - name: Notarize and staple
+        working-directory: apps/desktop-macos
+        env:
+          CHRONOS_DESKTOP_VERSION: ${{ steps.release.outputs.version }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: scripts/notarize.sh
+
+      - name: Verify checksum, package, Gatekeeper, mount, and packaged launch
+        shell: bash
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          DMG="$GITHUB_WORKSPACE/apps/desktop-macos/dist/Chronos-Desktop-$VERSION.dmg"
+          CHECKSUM="$DMG.sha256"
+          MOUNT_POINT="$RUNNER_TEMP/chronos-desktop-mount"
+
+          test -f "$DMG"
+          test -f "$CHECKSUM"
+          shasum -a 256 -c "$CHECKSUM"
+          hdiutil verify "$DMG"
+          codesign --verify --strict --verbose=2 "$DMG"
+          xcrun stapler validate "$DMG"
+          spctl --assess --type open --context context:primary-signature --verbose=2 "$DMG"
+
+          rm -rf "$MOUNT_POINT"
+          mkdir -p "$MOUNT_POINT"
+          cleanup() {
+            hdiutil detach "$MOUNT_POINT" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          hdiutil attach -readonly -nobrowse -mountpoint "$MOUNT_POINT" "$DMG" >/dev/null
+
+          APP="$MOUNT_POINT/Chronos Desktop.app"
+          test -d "$APP"
+          test "$(readlink "$MOUNT_POINT/Applications")" = "/Applications"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          SIGNATURE=$(codesign -dv --verbose=4 "$APP" 2>&1)
+          grep -F "Authority=Developer ID Application:" <<<"$SIGNATURE"
+          spctl --assess --type execute --verbose=2 "$APP"
+
+          PLIST="$APP/Contents/Info.plist"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")" = "$VERSION"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$PLIST")" = "$GITHUB_RUN_NUMBER"
+          "$APP/Contents/MacOS/ChronosDesktop" --self-test
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Chronos-Desktop-${{ steps.release.outputs.version }}
+          path: |
+            apps/desktop-macos/dist/Chronos-Desktop-${{ steps.release.outputs.version }}.dmg
+            apps/desktop-macos/dist/Chronos-Desktop-${{ steps.release.outputs.version }}.dmg.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish tagged release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "apps/desktop-macos/dist/Chronos-Desktop-$VERSION.dmg" \
+            "apps/desktop-macos/dist/Chronos-Desktop-$VERSION.dmg.sha256" \
+            --verify-tag \
+            --generate-notes \
+            --title "Chronos Desktop $VERSION"

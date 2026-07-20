@@ -1,6 +1,6 @@
 "use client";
 
-import { Component, ReactNode, useEffect, useRef, useState, useMemo, useCallback } from "react";
+import { Component, type KeyboardEvent as ReactKeyboardEvent, ReactNode, useEffect, useRef, useState, useMemo, useCallback } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import ArtifactsScreen from "../../components/artifacts/ArtifactsScreen";
 import AgentsScreen from "../../components/agents/AgentsScreen";
@@ -15,8 +15,21 @@ import DesktopScreen from "../../components/desktop/DesktopScreen";
 import ConnectorsScreen from "../../components/connectors/ConnectorsScreen";
 import ContextSuggestionsScreen from "../../components/context/ContextSuggestionsScreen";
 import SSOConnectionsSettings from "../../components/settings/SSOConnectionsSettings";
+import DesktopDevicesSettings from "../../components/settings/DesktopDevicesSettings";
+import ComplianceExportControl from "../../components/settings/ComplianceExportControl";
+import RuntimeHealthPanel from "../../components/settings/RuntimeHealthPanel";
+import { AdminDirectorySettings, OrganizationApiKeysSettings, OrganizationDangerSettings } from "../../components/settings/AdminLifecycleSettings";
+import { TaskControls } from "../../components/tasks/TaskControls";
 import DataScreen from "../../components/data/DataScreen";
 import Markdown from "../../components/Markdown";
+import {
+  ConversationCollaboration,
+  type ConversationAccessState,
+} from "../../components/collaboration/ConversationCollaboration";
+import { TaskAssignmentPanel } from "../../components/collaboration/TaskAssignmentPanel";
+import { CommentsThread } from "../../components/collaboration/CommentsThread";
+import { moveMenuFocus, useDialogFocus } from "../../lib/accessibility";
+import { publicProductLinks } from "../../lib/public-config";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 const CONFIGURED_API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
@@ -46,10 +59,36 @@ function formatSearchResultTime(value?: string) {
   return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
+function handleHorizontalTabKeyDown(event: ReactKeyboardEvent<HTMLElement>) {
+  if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+  const tabs = [...event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]:not([disabled])')];
+  if (tabs.length === 0) return;
+  event.preventDefault();
+  const current = tabs.indexOf(document.activeElement as HTMLButtonElement);
+  const next = event.key === "Home"
+    ? tabs[0]
+    : event.key === "End"
+      ? tabs[tabs.length - 1]
+      : event.key === "ArrowRight"
+        ? tabs[(current + 1 + tabs.length) % tabs.length]
+        : tabs[(current - 1 + tabs.length) % tabs.length];
+  next.focus();
+  next.click();
+}
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 type Route = "chat" | "activity" | "approvals" | "memory" | "connectors" | "assistants" | "settings" | "projects" | "artifacts" | "workflows" | "skills" | "audit";
-type SettingsTab = "general" | "profile" | "organization" | "members" | "permissions" | "employees" | "runtime" | "memory-settings" | "data" | "tools-settings" | "approval-settings" | "notifications" | "security" | "billing" | "audit" | "context" | "developer" | "danger";
-type Conversation = { id: string; title: string | null; updated_at?: string; created_at?: string };
+type SettingsTab = "general" | "profile" | "devices" | "organization" | "members" | "permissions" | "employees" | "runtime" | "memory-settings" | "data" | "tools-settings" | "approval-settings" | "notifications" | "security" | "billing" | "audit" | "context" | "developer" | "danger";
+type Conversation = { id: string; title: string | null; member_id?: string | null; project_id?: string | null; workspace_id?: string | null; updated_at?: string; created_at?: string };
+type Workspace = {
+  id: string;
+  name: string;
+  slug?: string | null;
+  legacy_key?: string | null;
+  description?: string | null;
+  status: "active" | "archived";
+  role: "owner" | "editor" | "viewer";
+};
 type MessageRole = "user" | "assistant" | "system" | "tool";
 type MessageStatus = "streaming" | "complete" | "paused" | "approval_pending" | "error";
 type Message = {
@@ -62,6 +101,7 @@ type Message = {
   reasoning_summaries?: ReasoningSummary[];
   artifacts?: ArtifactRef[];
   citations?: Array<{ url?: string; text?: string; [key: string]: unknown }>;
+  memory_refs?: MemoryReference[];
   model?: string;
   mode?: string;
   thinking?: boolean;
@@ -70,6 +110,13 @@ type Message = {
   structured_response?: StructuredResponse | null;
   clarification?: ClarificationPrompt | null;
   error_detail?: string;
+};
+type MemoryReference = {
+  id?: string | null;
+  content?: string;
+  scope?: string | null;
+  source?: string | null;
+  importance_score?: number | null;
 };
 type ToolTrace = { id: string; tool: string; summary: string; status: MessageStatus };
 type ReasoningSummary = { id: string; iteration?: number; summary: string; status: MessageStatus };
@@ -119,7 +166,7 @@ type StructuredResponse = {
 };
 type ProjectSource = { id: string; title?: string | null; source_type?: string | null; parse_status?: string | null; index_status?: string | null; uri?: string | null; created_at?: string };
 type SourceChunkPreview = { chunk_index: number; content: string; token_count?: number | null };
-type SourceDetail = { id: string; title?: string | null; source_type?: string | null; uri?: string | null; artifact_id?: string | null; parse_status?: string | null; index_status?: string | null; warning?: string | null; chunk_count: number; chunks: SourceChunkPreview[] };
+type SourceDetail = { id: string; title?: string | null; source_type?: string | null; uri?: string | null; has_original?: boolean; download_url?: string | null; parse_status?: string | null; index_status?: string | null; warning?: string | null; chunk_count: number; chunk_offset?: number; next_offset?: number | null; chunks: SourceChunkPreview[] };
 type MemoryEntry = { id: string; scope: string; scope_id: string; content: string; source: string; importance_score?: number; created_by?: string | null; created_at?: string; is_pinned?: boolean; is_archived?: boolean; is_sensitive?: boolean; superseded_by?: string | null };
 type MemoryConflict = { stale_id: string; survivor_id: string; similarity: number; scope: string; stale_content: string; survivor_content: string };
 type Connector = {
@@ -137,51 +184,7 @@ type Connector = {
   connected_at?: string | null;
   last_used_at?: string | null;
 };
-type ConnectorAction = {
-  name: string;
-  description: string;
-  parameters_schema: Record<string, unknown>;
-  required_permissions: string[];
-  risk_level: string;
-  approval_required: boolean;
-};
-type ConnectorExecutionLog = {
-  id: string;
-  connector_id: string;
-  action_name: string;
-  arguments_redacted: Record<string, unknown>;
-  result_status: string;
-  error_message?: string | null;
-  duration_ms: number;
-  created_at?: string | null;
-};
-type ConnectorHealth = {
-  connector_id: string;
-  status: string;
-  latency_ms?: number;
-  failure_rate?: number;
-  timeout_rate?: number;
-  updated_at?: string | null;
-};
-type ConnectorTrace = {
-  id: string;
-  connector_id: string;
-  action_name: string;
-  status: string;
-  duration_ms?: number;
-  started_at?: string | null;
-};
-type ConnectorApproval = {
-  id: string;
-  connector_id: string;
-  action_name: string;
-  risk_level: string;
-  status: string;
-  approval_mode: string;
-  justification?: string;
-  created_at?: string | null;
-};
-type Task = { id: string; status: string; goal: string; current_step: number; plan?: TaskStep[] | { steps?: TaskStep[] }; agent_state?: Record<string, unknown>; result?: Record<string, unknown>; error?: string | null; created_at?: string; parent_task_id?: string | null; depth?: number; iteration_count?: number };
+type Task = { id: string; status: string; goal: string; current_step: number; plan?: TaskStep[] | { steps?: TaskStep[] }; agent_state?: Record<string, unknown>; result?: Record<string, unknown>; error?: string | null; created_at?: string; parent_task_id?: string | null; depth?: number; iteration_count?: number; dead_letter?: boolean; triggered_by_member_id?: string | null; assignee_member_id?: string | null; assigned_by_member_id?: string | null; assigned_at?: string | null };
 type TaskStep = { id: string; action: string; description: string; tool?: string | null };
 type ChatModel = { id: string; label: string; model: string; description?: string; capabilities?: string[]; status?: string; tool_use?: boolean; fallback_for?: string[]; policy?: string };
 type TaskStreamEvent = {
@@ -272,6 +275,7 @@ type ActivityAction = {
 
 const MODEL_STORAGE_KEY = "chronos.chat.selectedModel";
 const DISABLED_TOOLS_STORAGE_KEY = "chronos.chat.disabledTools";
+const WORKSPACE_STORAGE_KEY = "chronos.chat.selectedWorkspace";
 const DEFAULT_MODEL_ID = "auto";
 const REASONING_STORAGE_KEY = "chronos.chat.reasoningEffort";
 const REASONING_OPTIONS = [
@@ -304,7 +308,8 @@ function taskSteps(task: Task | null | undefined): TaskStep[] {
 
 function taskMessageStatus(task: Task): MessageStatus {
   if (task.status === "failed") return "error";
-  if (task.status === "awaiting_approval" || task.status === "paused") return "approval_pending";
+  if (task.status === "awaiting_approval") return "approval_pending";
+  if (task.status === "paused") return "paused";
   if (task.status === "complete") return "complete";
   return "streaming";
 }
@@ -312,7 +317,7 @@ function taskMessageStatus(task: Task): MessageStatus {
 function taskMessageContent(task: Task): string {
   if (task.status === "failed") return formatTaskError(task.error ?? undefined);
   if (task.status === "awaiting_approval") return "Waiting for approval before Chronos continues.";
-  if (task.status === "paused") return "Paused. Chronos will continue when the pause is cleared.";
+  if (task.status === "paused") return "Paused by an operator. Resume the task when you are ready.";
   if (task.status === "complete") {
     const answer = task.result?.answer;
     return typeof answer === "string" && answer.trim() ? answer.trim() : "Task completed.";
@@ -327,7 +332,13 @@ function taskToolTraces(task: Task): ToolTrace[] {
     return [{
       id: `${task.id}-task-state`,
       tool: "task",
-      summary: task.status === "queued" || task.status === "pending" || task.status === "planning" ? "Preparing task plan..." : "Working...",
+      summary: task.status === "queued" || task.status === "pending" || task.status === "planning"
+        ? "Preparing task plan..."
+        : task.status === "paused"
+          ? "Paused by an operator"
+          : task.status === "awaiting_approval"
+            ? "Waiting for an approval decision"
+            : "Working...",
       status: taskMessageStatus(task),
     }];
   }
@@ -335,6 +346,7 @@ function taskToolTraces(task: Task): ToolTrace[] {
     let status: MessageStatus = "complete";
     if (task.status === "failed") status = "error";
     else if (task.status === "awaiting_approval" && step.action === "approval_gate" && index >= task.current_step) status = "approval_pending";
+    else if (task.status === "paused" && index >= task.current_step) status = "paused";
     else if (task.status !== "complete" && index >= task.current_step) status = index === task.current_step ? "streaming" : "paused";
     return {
       id: `${task.id}-${step.id}`,
@@ -560,10 +572,63 @@ type SettingsOverview = {
     suspended?: boolean;
   };
   runtime_health: Record<string, unknown> & {
-    connectors?: Record<string, { status?: string; tier?: string; reason?: string; setup?: string | null }>;
+    connectors?: Record<string, {
+      status?: string;
+      tier?: string;
+      configured?: boolean;
+      verified?: boolean;
+      checked_at?: string | null;
+      verified_at?: string | null;
+      stale?: boolean;
+      latency_ms?: number | null;
+      error_code?: string | null;
+      reason?: string;
+      setup?: string | null;
+    }>;
   };
-  capabilities: Record<string, { supported: boolean; reason: string }>;
+  capabilities: Record<string, { supported: boolean; reason?: string; delivery?: string }>;
 };
+type AuthenticatedMember = {
+  id: string;
+  email: string;
+  name?: string | null;
+  role: string;
+  organization_id: string;
+};
+type ServiceHealth = "checking" | "healthy" | "degraded" | "unavailable";
+type IdentityState = "loading" | "ready" | "error";
+
+const ROLE_RANK: Record<string, number> = {
+  viewer: 1,
+  operator: 2,
+  user: 2, // Legacy role retained by older tenants.
+  approver: 2,
+  manager: 3,
+  admin: 4,
+  owner: 5,
+};
+
+function hasMinimumRole(role: string | undefined, minimum: "viewer" | "operator" | "manager" | "admin") {
+  return (ROLE_RANK[role || "viewer"] ?? 0) >= ROLE_RANK[minimum];
+}
+
+function roleLabel(role?: string) {
+  const value = (role === "user" ? "operator" : (role || "viewer")).replaceAll("_", " ");
+  return value.charAt(0).toUpperCase() + value.slice(1);
+}
+
+function routeAccess(role: string | undefined, route: Route): { allowed: boolean; reason?: string } {
+  if (["approvals", "connectors", "skills"].includes(route) && !hasMinimumRole(role, "operator")) {
+    return { allowed: false, reason: "This section requires an operator, manager, admin, or owner role." };
+  }
+  if (route === "workflows" && !hasMinimumRole(role, "manager")) {
+    return { allowed: false, reason: "Routines and workflows require a manager, admin, or owner role." };
+  }
+  if (route === "audit" && !hasMinimumRole(role, "admin")) {
+    return { allowed: false, reason: "Audit logs are restricted to administrators and owners." };
+  }
+  return { allowed: true };
+}
 type AutonomyTrustLevel = {
   id?: string;
   scope: string;
@@ -599,7 +664,7 @@ function routeFromPath(pathname: string | null): Route {
   if (pathname === "/activity") return "activity";
   if (pathname === "/approvals") return "approvals";
   if (pathname === "/connectors") return "connectors";
-  if (pathname === "/assistants") return "assistants";
+  if (pathname === "/assistants" || pathname === "/agents") return "assistants";
   if (pathname === "/artifacts") return "artifacts";
   if (pathname === "/settings") return "settings";
   if (pathname === "/projects") return "projects";
@@ -612,6 +677,21 @@ function routeFromPath(pathname: string | null): Route {
 function pathForRoute(route: Route) {
   return route === "chat" ? "/chat" : `/${route}`;
 }
+
+const ROUTE_LABELS: Record<Route, string> = {
+  chat: "Chat",
+  activity: "Activity",
+  approvals: "Approvals",
+  memory: "Memory",
+  connectors: "Connectors",
+  assistants: "Assistants",
+  settings: "Settings",
+  projects: "Projects",
+  artifacts: "Artifacts",
+  workflows: "Routines",
+  skills: "Skills",
+  audit: "Audit",
+};
 
 const ACCENT_PALETTES: Record<string, { accent: string; hover: string; soft: string; text: string }> = {
   coral:  { accent: "oklch(0.67 0.12 41)",   hover: "oklch(0.615 0.135 40)", soft: "oklch(0.945 0.038 52)", text: "oklch(0.41 0.125 42)" },
@@ -632,21 +712,35 @@ const PALETTE_TYPE_LABELS: Record<string, string> = {
   sources: "Sources",
 };
 
-// ─── Auth helpers ─────────────────────────────────────────────────────────────
-function getToken() {
-  // Auth now lives in an httpOnly `chronos_session` cookie. The client cannot
-  // read it directly, so API requests are the source of truth for session state.
-  return true;
-}
-
 async function apiFetch(path: string, init: RequestInit = {}) {
   const headers = new Headers(init.headers);
-  if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+  if (typeof init.body === "string" && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
   const res = await fetch(`${apiBase()}${path}`, { ...init, headers, credentials: "include" });
   if (res.status === 401) {
     window.location.href = "/login";
   }
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) {
+    const fallback = `${res.status} ${res.statusText || "Request failed"}`.trim();
+    let message = fallback;
+    try {
+      const raw = await res.text();
+      if (raw) {
+        try {
+          const parsed = JSON.parse(raw) as { detail?: unknown; message?: unknown };
+          if (typeof parsed.detail === "string" && parsed.detail.trim()) message = parsed.detail;
+          else if (typeof parsed.message === "string" && parsed.message.trim()) message = parsed.message;
+          else message = raw;
+        } catch {
+          message = raw;
+        }
+      }
+    } catch {
+      // Keep the status-based fallback when the response body cannot be read.
+    }
+    throw new Error(message);
+  }
   return res;
 }
 
@@ -723,8 +817,10 @@ function StatusDot({ status }: { status: string }) {
   const map: Record<string, { c: string; pulse?: boolean; ring?: boolean }> = {
     working:   { c: "var(--accent)", pulse: true, ring: true },
     awaiting:  { c: "var(--warn)" },
+    paused:    { c: "var(--warn)" },
     done:      { c: "var(--ok)" },
     failed:    { c: "var(--danger)" },
+    cancelled: { c: "var(--text-dim)" },
     queued:    { c: "var(--text-faint)" },
     connected: { c: "var(--ok)" },
     available: { c: "var(--text-faint)" },
@@ -750,13 +846,27 @@ function PersonaAvatar({ name, color = "var(--accent)", size = 28 }: { name?: st
 
 function PageHeader({ title, subtitle, right }: { title: string; subtitle?: string; right?: ReactNode }) {
   return (
-    <header className="glass sticky top-0 z-20 px-10 pt-9 pb-6 flex items-start justify-between gap-6 flex-shrink-0 border-b hairline">
+    <header className="glass sticky top-0 z-20 px-4 pt-5 pb-4 md:px-10 md:pt-9 md:pb-6 flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4 sm:gap-6 flex-shrink-0 border-b hairline">
       <div className="min-w-0 fadeup">
         <h1 className="h-page tracking-tight">{title}</h1>
         {subtitle && <p className="mt-1.5 text-[14px]" style={{ color: "var(--text-dim)" }}>{subtitle}</p>}
       </div>
       {right && <div className="flex items-center gap-2 flex-shrink-0 fadein">{right}</div>}
     </header>
+  );
+}
+
+function RoleAccessNotice({ reason }: { reason: string }) {
+  return (
+    <div className="flex flex-1 items-center justify-center px-6 py-10" role="status">
+      <div className="surface max-w-md rounded-2xl border border-soft p-6 text-center">
+        <div className="mx-auto mb-4 flex h-11 w-11 items-center justify-center rounded-full" style={{ background: "var(--surface-2)", color: "var(--text-dim)" }}>
+          <IC.Lock size={18}/>
+        </div>
+        <h1 className="text-[17px] font-semibold">Access restricted</h1>
+        <p className="mt-2 text-[13px]" style={{ color: "var(--text-dim)" }}>{reason}</p>
+      </div>
+    </div>
   );
 }
 
@@ -772,7 +882,7 @@ function EmptyState({ icon, title, sub, action }: { icon?: ReactNode; title: str
   );
 }
 
-// ─── Mock personas ─────────────────────────────────────────────────────────────
+// ─── Built-in read-only assistant presets ──────────────────────────────────────
 const PERSONAS = [
   { id: "p_chronos", name: "Chronos", role: "General assistant", color: "var(--accent)",
     prompt: "An all-purpose operations assistant. Acts confidently, escalates when uncertain, always asks before sending anything outside the organization.",
@@ -851,10 +961,19 @@ function ChronosAppInner() {
   const [shellNotice, setShellNotice] = useState<{ text: string; kind: "ok" | "warn" | "danger" } | null>(null);
   const taskStatusesRef = useRef<Record<string, string> | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const mobileNavTriggerRef = useRef<HTMLButtonElement>(null);
+  const mobileNavWasOpenRef = useRef(false);
   const [theme, setTheme] = useState<"light" | "dark">("dark");
   const [accent, setAccent] = useState("coral");
   const [searchPaletteOpen, setSearchPaletteOpen] = useState(false);
   const [agentMenuOpen, setAgentMenuOpen] = useState(false);
+  const [currentMember, setCurrentMember] = useState<AuthenticatedMember | null>(null);
+  const [identityState, setIdentityState] = useState<IdentityState>("loading");
+  const [identityError, setIdentityError] = useState("");
+  const [serviceHealth, setServiceHealth] = useState<ServiceHealth>("checking");
+  const [accessibleWorkspaces, setAccessibleWorkspaces] = useState<Workspace[]>([]);
+  const [workspaceLoadError, setWorkspaceLoadError] = useState("");
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark");
@@ -868,11 +987,62 @@ function ChronosAppInner() {
     document.documentElement.style.setProperty("--accent-text", p.text);
   }, [accent]);
 
-  useEffect(() => {
-    if (!getToken()) { router.replace("/login"); return; }
-    void loadPendingApprovals();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+  const loadIdentity = useCallback(async () => {
+    setIdentityState("loading");
+    setIdentityError("");
+    try {
+      const member = await apiFetch("/auth/me").then(response => response.json()) as AuthenticatedMember;
+      setCurrentMember(member);
+      setIdentityState("ready");
+    } catch (error) {
+      setCurrentMember(null);
+      setIdentityError(error instanceof Error ? error.message : "The account session could not be verified.");
+      setIdentityState("error");
+    }
   }, []);
+
+  useEffect(() => { void loadIdentity(); }, [loadIdentity]);
+
+  useEffect(() => {
+    if (identityState !== "ready") {
+      setAccessibleWorkspaces([]);
+      setWorkspaceLoadError("");
+      return;
+    }
+    let cancelled = false;
+    setWorkspaceLoadError("");
+    void apiFetch("/settings/admin-lifecycle/accessible-workspaces")
+      .then(response => response.json())
+      .then((rows: Workspace[]) => {
+        if (!cancelled) setAccessibleWorkspaces(Array.isArray(rows) ? rows : []);
+      })
+      .catch(error => {
+        if (cancelled) return;
+        setAccessibleWorkspaces([]);
+        setWorkspaceLoadError(error instanceof Error ? error.message : "Workspace access could not be loaded.");
+      });
+    return () => { cancelled = true; };
+  }, [identityState, currentMember?.id]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void apiFetch("/health")
+      .then(async response => {
+        const health = await response.json() as { status?: string };
+        if (!cancelled) setServiceHealth(health.status === "ok" ? "healthy" : "degraded");
+      })
+      .catch(() => { if (!cancelled) setServiceHealth("unavailable"); });
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    if (identityState !== "ready" || !hasMinimumRole(currentMember?.role, "operator")) {
+      setPendingApprovals(0);
+      return;
+    }
+    void loadPendingApprovals();
+
+  }, [identityState, currentMember?.role]);
 
   useEffect(() => {
     setRoute(routeFromPath(pathname));
@@ -895,13 +1065,15 @@ function ChronosAppInner() {
     setActiveConvoId(conversationId);
     setNewConversationOpen(false);
     newConversationOpenRef.current = false;
-    void loadConversations(conversationId);
+    if (identityState === "ready") void loadConversations(conversationId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pathname]);
+  }, [pathname, identityState]);
 
   useEffect(() => {
+    if (identityState !== "ready") return;
     void loadConversations();
-  }, [route]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [route, identityState]);
 
   useEffect(() => {
     newConversationOpenRef.current = newConversationOpen;
@@ -951,6 +1123,7 @@ function ChronosAppInner() {
       }
     }
     setConversationsLoading(false);
+    setShellNotice({ kind: "danger", text: "Conversations could not be loaded. Check your connection and try again." });
   }
 
   async function loadPendingApprovals() {
@@ -966,7 +1139,16 @@ function ChronosAppInner() {
   }
 
   function signOut() {
-    router.replace("/login");
+    void apiFetch("/auth/logout", { method: "POST" })
+      .then(() => {
+        window.location.replace("/login");
+      })
+      .catch((error) => {
+        setShellNotice({
+          kind: "danger",
+          text: error instanceof Error ? `Sign out failed: ${error.message}` : "Sign out failed",
+        });
+      });
   }
 
   async function deleteConversation(id: string) {
@@ -974,7 +1156,9 @@ function ChronosAppInner() {
       await apiFetch(`/chat/conversations/${id}`, { method: "DELETE" });
       setConversations(prev => prev.filter(c => c.id !== id));
       if (activeConvoId === id) setActiveConvoId(null);
-    } catch { /* silently */ }
+    } catch (error) {
+      setShellNotice({ kind: "danger", text: error instanceof Error ? `Conversation was not deleted: ${error.message}` : "Conversation was not deleted." });
+    }
   }
 
   async function renameConversation(id: string, title: string) {
@@ -983,7 +1167,9 @@ function ChronosAppInner() {
     try {
       await apiFetch(`/chat/conversations/${id}`, { method: "PATCH", body: JSON.stringify({ title: trimmed }) });
       setConversations(prev => prev.map(c => c.id === id ? { ...c, title: trimmed } : c));
-    } catch { /* keep old title */ }
+    } catch (error) {
+      setShellNotice({ kind: "danger", text: error instanceof Error ? `Conversation was not renamed: ${error.message}` : "Conversation was not renamed." });
+    }
   }
 
   // Light notification loop: keep the approvals badge fresh and surface task
@@ -1009,14 +1195,15 @@ function ChronosAppInner() {
   }, []);
 
   useEffect(() => {
+    if (identityState !== "ready") return;
     void checkTaskTransitions();
     const timer = setInterval(() => {
       void loadPendingApprovals();
       void checkTaskTransitions();
     }, 60_000);
     return () => clearInterval(timer);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [checkTaskTransitions]);
+
+  }, [checkTaskTransitions, identityState]);
 
   useEffect(() => {
     if (!shellNotice) return;
@@ -1024,19 +1211,113 @@ function ChronosAppInner() {
     return () => clearTimeout(timer);
   }, [shellNotice]);
 
+  useEffect(() => {
+    if (typeof window !== "undefined" && window.matchMedia("(max-width: 767px)").matches) {
+      setSidebarCollapsed(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    setMobileNavOpen(false);
+  }, [pathname]);
+
+  useEffect(() => {
+    if (!mobileNavOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setMobileNavOpen(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [mobileNavOpen]);
+
+  const openGlobalSearch = useCallback(() => {
+    setSearchPaletteOpen(true);
+    if (pathname !== "/chat") {
+      setRoute("chat");
+      router.push("/chat");
+    }
+  }, [pathname, router]);
+
+  useEffect(() => {
+    function onGlobalSearchKeyDown(event: KeyboardEvent) {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        if (searchPaletteOpen) setSearchPaletteOpen(false);
+        else openGlobalSearch();
+      } else if (event.key === "Escape" && searchPaletteOpen) {
+        setSearchPaletteOpen(false);
+      }
+    }
+    window.addEventListener("keydown", onGlobalSearchKeyDown);
+    return () => window.removeEventListener("keydown", onGlobalSearchKeyDown);
+  }, [openGlobalSearch, searchPaletteOpen]);
+
+  useEffect(() => {
+    if (mobileNavOpen) {
+      mobileNavWasOpenRef.current = true;
+      return;
+    }
+    if (mobileNavWasOpenRef.current) {
+      mobileNavWasOpenRef.current = false;
+      mobileNavTriggerRef.current?.focus();
+    }
+  }, [mobileNavOpen]);
+
+  if (identityState !== "ready" || !currentMember) {
+    return (
+      <main className="flex min-h-[100dvh] items-center justify-center px-6" style={{ background: "var(--bg)", color: "var(--text)" }}>
+        <div className="surface w-full max-w-md rounded-2xl border border-soft p-6 text-center" role={identityState === "error" ? "alert" : "status"}>
+          <div className="mx-auto mb-4 flex h-11 w-11 items-center justify-center rounded-full" style={{ background: identityState === "error" ? "var(--danger-soft)" : "var(--accent-soft)", color: identityState === "error" ? "var(--danger)" : "var(--accent)" }}>
+            {identityState === "error" ? (
+              <IC.Info size={19}/>
+            ) : (
+              <IC.Refresh size={18} style={{ animation: "spin 1s linear infinite" }}/>
+            )}
+          </div>
+          <h1 className="text-[18px] font-semibold">{identityState === "error" ? "Account verification failed" : "Opening your workspace"}</h1>
+          <p className="mt-2 text-[13px]" style={{ color: "var(--text-dim)" }}>
+            {identityState === "error" ? identityError || "Chronos could not verify the current session." : "Verifying your signed-in account and workspace permissions…"}
+          </p>
+          {identityState === "error" && (
+            <div className="mt-5 flex justify-center gap-2">
+              <button className="btn btn-accent btn-sm" onClick={() => void loadIdentity()}>Try again</button>
+              <button className="btn btn-ghost btn-sm" onClick={() => window.location.replace("/login")}>Return to sign in</button>
+            </div>
+          )}
+        </div>
+      </main>
+    );
+  }
+
+  const access = routeAccess(currentMember.role, route);
+  const canManage = hasMinimumRole(currentMember.role, "manager");
+  const canAdmin = hasMinimumRole(currentMember.role, "admin");
+  const mobileRouteLabel = pathname === "/memory" ? "Memory" : pathname === "/audit" ? "Audit" : ROUTE_LABELS[route];
+
   return (
-    <div className="flex" style={{ height: "100vh", background: "var(--bg)", color: "var(--text)" }}>
+    <div className="flex overflow-hidden" style={{ height: "100dvh", background: "var(--bg)", color: "var(--text)" }}>
+      {mobileNavOpen && (
+        <button
+          type="button"
+          aria-label="Close navigation"
+          className="fixed inset-0 z-[65] bg-black/30 overlay-in md:hidden"
+          onClick={() => setMobileNavOpen(false)}
+        />
+      )}
       <Sidebar
         collapsed={sidebarCollapsed}
         onCollapse={() => setSidebarCollapsed(true)}
         onExpand={() => setSidebarCollapsed(false)}
+        mobileOpen={mobileNavOpen}
+        onMobileClose={() => setMobileNavOpen(false)}
         route={route}
-        onNavigate={navigateRoute}
+        onNavigate={(next) => { setMobileNavOpen(false); navigateRoute(next); }}
         conversations={conversations}
         conversationsLoading={conversationsLoading}
         activeConvoId={activeConvoId}
-        onSelectConvo={openConversation}
+        onSelectConvo={(id) => { setMobileNavOpen(false); openConversation(id); }}
         onNewConvo={() => {
+          setMobileNavOpen(false);
           setActiveConvoId(null);
           setNewConversationOpen(true);
           newConversationOpenRef.current = true;
@@ -1047,20 +1328,59 @@ function ChronosAppInner() {
         onDeleteConvo={deleteConversation}
         onRenameConvo={renameConversation}
         pendingApprovals={pendingApprovals}
-        onOpenSettings={openSettings}
+        onOpenSettings={(tab) => { setMobileNavOpen(false); openSettings(tab); }}
         onSignOut={signOut}
-        onOpenSearch={() => setSearchPaletteOpen(true)}
+        onOpenSearch={openGlobalSearch}
         onRefreshConversations={() => void loadConversations()}
+        currentMember={currentMember}
+        serviceHealth={serviceHealth}
       />
 
-      <main className="flex-1 min-w-0 flex flex-col" style={{ background: "var(--bg)" }}>
-        {route === "chat"       && <ChatScreen key={activeConvoId ?? `new-${newConversationNonce}`} activeConvoId={activeConvoId} activePersonaId={activePersonaId} onPersonaChange={setActivePersonaId} onConvoCreated={(id) => { setActiveConvoId(id); setNewConversationOpen(false); newConversationOpenRef.current = false; router.replace(`/chat?c=${encodeURIComponent(id)}`); void loadConversations(id); }} onConvoSelected={openConversation} onConversationMissing={handleConversationMissing} onApprovalsChanged={loadPendingApprovals} paletteOpen={searchPaletteOpen} onPaletteOpenChange={setSearchPaletteOpen} onOpenAgentMenu={() => setAgentMenuOpen(true)} />}
-        {route === "activity"   && <ActivityScreen />}
-        {route === "approvals"  && <ApprovalsScreen onDecision={loadPendingApprovals} />}
-        {route === "memory"     && <MemoryScreen />}
-        {route === "artifacts"  && <ArtifactsScreen />}
-        {route === "connectors" && <ConnectorsScreen />}
-        {route === "assistants" && <AssistantsScreen onStartConversation={(personaId) => {
+      <main className="flex-1 min-w-0 min-h-0 flex flex-col" style={{ background: "var(--bg)" }}>
+        <div className="mobile-app-bar z-30 flex flex-shrink-0 items-center gap-3 border-b hairline px-3 md:hidden" style={{ background: "var(--bg)" }}>
+          <button
+            ref={mobileNavTriggerRef}
+            type="button"
+            className="btn btn-ghost btn-icon"
+            aria-label="Open navigation"
+            aria-controls="chronos-primary-navigation"
+            aria-expanded={mobileNavOpen}
+            onClick={() => setMobileNavOpen(true)}
+          >
+            <IC.PanelOpen size={18}/>
+          </button>
+          <div className="flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-lg" style={{ background: "var(--accent)", color: "white" }}>
+            <IC.Logo size={14} stroke={2.2}/>
+          </div>
+          <span className="min-w-0 flex-1 truncate text-[15px] font-semibold">{mobileRouteLabel}</span>
+          {route === "chat" && (
+            <button
+              type="button"
+              aria-label="New conversation"
+              className="btn btn-secondary btn-icon"
+              onClick={() => {
+                setActiveConvoId(null);
+                setNewConversationOpen(true);
+                newConversationOpenRef.current = true;
+                setNewConversationNonce(n => n + 1);
+                router.replace("/chat");
+              }}
+            >
+              <IC.Plus size={16}/>
+            </button>
+          )}
+        </div>
+        <div className="flex min-h-0 flex-1 flex-col">
+        {!access.allowed ? (
+          <RoleAccessNotice reason={access.reason || "Your role cannot open this section."}/>
+        ) : (<>
+        {route === "chat"       && <ChatScreen key={activeConvoId ?? `new-${newConversationNonce}`} activeConvoId={activeConvoId} activeConversation={conversations.find(conversation => conversation.id === activeConvoId) ?? null} currentMember={currentMember} accessibleWorkspaces={accessibleWorkspaces} workspaceLoadError={workspaceLoadError} activePersonaId={activePersonaId} onPersonaChange={setActivePersonaId} onConvoCreated={(id) => { setActiveConvoId(id); setNewConversationOpen(false); newConversationOpenRef.current = false; const requestedProject = new URLSearchParams(window.location.search).get("project_id"); router.replace(`/chat?c=${encodeURIComponent(id)}${requestedProject ? `&project_id=${encodeURIComponent(requestedProject)}` : ""}`); void loadConversations(id); }} onConvoSelected={openConversation} onConversationMissing={handleConversationMissing} onRenameConversation={renameConversation} onApprovalsChanged={loadPendingApprovals} paletteOpen={searchPaletteOpen} onPaletteOpenChange={setSearchPaletteOpen} onOpenAgentMenu={() => setAgentMenuOpen(true)} />}
+        {route === "activity"   && <ActivityScreen currentMember={currentMember} />}
+        {route === "approvals"  && <ApprovalsScreen currentMemberRole={currentMember.role} onDecision={loadPendingApprovals} />}
+        {route === "memory"     && <MemoryScreen canManageOrganization={canAdmin} />}
+        {route === "artifacts"  && <ArtifactsScreen memberRole={currentMember.role} currentMember={currentMember} />}
+        {route === "connectors" && <ConnectorsScreen memberRole={currentMember.role} />}
+        {route === "assistants" && <AssistantsScreen memberRole={currentMember.role} onStartConversation={(personaId) => {
           setActivePersonaId(personaId);
           setActiveConvoId(null);
           setNewConversationOpen(true);
@@ -1068,18 +1388,20 @@ function ChronosAppInner() {
           setRoute("chat");
           router.replace("/chat");
         }} />}
-        {route === "settings"   && <SettingsScreen tab={settingsTab} setTab={setSettingsTab} theme={theme} setTheme={setTheme} accent={accent} setAccent={setAccent} signOut={signOut} />}
-        {route === "projects"   && <ProjectsScreen />}
-        {route === "skills"     && <SkillsScreen />}
+        {route === "settings"   && <SettingsScreen tab={settingsTab} setTab={setSettingsTab} setTheme={setTheme} accent={accent} setAccent={setAccent} signOut={signOut} />}
+        {route === "projects"   && <ProjectsScreen canCreate={canAdmin} currentMember={currentMember} />}
+        {route === "skills"     && <SkillsScreen canManage={canManage} />}
         {route === "workflows"  && <WorkflowsScreen />}
-        {route === "audit"      && <AuditScreen />}
+        {route === "audit"      && <AuditScreen canExport={canAdmin} />}
+        </>)}
+        </div>
       </main>
-      <InChatArtifactPanel />
+      <InChatArtifactPanel currentMember={currentMember} />
       <ComputerLiveView />
-      {agentMenuOpen && <AgentMenuModal onClose={() => setAgentMenuOpen(false)} />}
+      {agentMenuOpen && <AgentMenuModal memberRole={currentMember.role} onClose={() => setAgentMenuOpen(false)} />}
       {shellNotice && (
         <div
-          className="fixed bottom-5 right-5 z-50 flex items-center gap-3 rounded-2xl border px-4 py-3 sheet-up max-w-[420px]"
+          className="fixed bottom-3 left-3 right-3 z-50 flex items-center gap-3 rounded-2xl border px-4 py-3 sheet-up sm:bottom-5 sm:left-auto sm:right-5 sm:max-w-[420px]"
           style={{
             background: "var(--surface)",
             borderColor: shellNotice.kind === "ok" ? "var(--ok)" : shellNotice.kind === "warn" ? "var(--warn)" : "var(--danger)",
@@ -1106,11 +1428,13 @@ function ChronosAppInner() {
 
 // ─── Sidebar ──────────────────────────────────────────────────────────────────
 function Sidebar({
-  collapsed, onCollapse, onExpand, route, onNavigate, conversations, conversationsLoading, activeConvoId,
+  collapsed, onCollapse, onExpand, mobileOpen, onMobileClose, route, onNavigate, conversations, conversationsLoading, activeConvoId,
   onSelectConvo, onNewConvo, onDeleteConvo, onRenameConvo, pendingApprovals, onOpenSettings, onSignOut, onRefreshConversations,
   onOpenSearch,
+  currentMember, serviceHealth,
 }: {
   collapsed: boolean; onCollapse: () => void; onExpand: () => void;
+  mobileOpen: boolean; onMobileClose: () => void;
   route: Route; onNavigate: (r: Route) => void;
   conversations: Conversation[]; conversationsLoading: boolean; activeConvoId: string | null;
   onSelectConvo: (id: string) => void; onNewConvo: () => void;
@@ -1118,26 +1442,88 @@ function Sidebar({
   onOpenSettings: (tab: SettingsTab) => void; onSignOut: () => void;
   onOpenSearch?: () => void;
   onRefreshConversations: () => void;
+  currentMember: AuthenticatedMember | null;
+  serviceHealth: ServiceHealth;
 }) {
   const [accountOpen, setAccountOpen] = useState(false);
   const [convoMenu, setConvoMenu] = useState<string | null>(null);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
+  const sidebarRef = useRef<HTMLElement>(null);
+  const mobileCloseRef = useRef<HTMLButtonElement>(null);
+  const conversationMenuRef = useRef<HTMLDivElement>(null);
+  const conversationMenuTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const conversationMenuWasOpenRef = useRef(false);
+
+  useEffect(() => {
+    if (!convoMenu) {
+      if (conversationMenuWasOpenRef.current) {
+        conversationMenuWasOpenRef.current = false;
+        window.requestAnimationFrame(() => conversationMenuTriggerRef.current?.focus());
+      }
+      return;
+    }
+    conversationMenuWasOpenRef.current = true;
+    const frame = window.requestAnimationFrame(() => {
+      conversationMenuRef.current?.querySelector<HTMLElement>('[role="menuitem"]')?.focus();
+    });
+    function onPointerDown(event: MouseEvent) {
+      if (!conversationMenuRef.current?.contains(event.target as Node) && event.target !== conversationMenuTriggerRef.current) {
+        setConvoMenu(null);
+      }
+    }
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") setConvoMenu(null);
+      else if (conversationMenuRef.current?.contains(document.activeElement)) moveMenuFocus(conversationMenuRef.current, event);
+    }
+    document.addEventListener("mousedown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      document.removeEventListener("mousedown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [convoMenu]);
+
+  useEffect(() => {
+    if (!mobileOpen || !sidebarRef.current) return;
+    const sidebar = sidebarRef.current;
+    mobileCloseRef.current?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Tab") return;
+      const focusable = [...sidebar.querySelectorAll<HTMLElement>('button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])')]
+        .filter(element => element.offsetParent !== null);
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    sidebar.addEventListener("keydown", onKeyDown);
+    return () => sidebar.removeEventListener("keydown", onKeyDown);
+  }, [mobileOpen]);
 
   // Three plainly-labeled groups instead of a "chat-first + Advanced" split:
   // Work (what's happening), Build (what you configure), System (governance).
   type NavItem = { id: Route; icon: ReactNode; label: string; badge?: number | null; badgeKind?: "warn" };
+  const canOperate = hasMinimumRole(currentMember?.role, "operator");
+  const canManage = hasMinimumRole(currentMember?.role, "manager");
   const navGroups: { label: string; items: NavItem[] }[] = [
     { label: "Work", items: [
       { id: "activity",   icon: <IC.Activity size={15}/>,   label: "Activity" },
-      { id: "approvals",  icon: <IC.Approvals size={15}/>,  label: "Approvals", badge: pendingApprovals || null, badgeKind: "warn" },
+      ...(canOperate ? [{ id: "approvals" as Route, icon: <IC.Approvals size={15}/>, label: "Approvals", badge: pendingApprovals || null, badgeKind: "warn" as const }] : []),
       { id: "projects",   icon: <IC.Folder size={15}/>,     label: "Projects" },
       { id: "artifacts",  icon: <IC.Artifact size={15}/>,   label: "Artifacts" },
     ]},
     { label: "Build", items: [
-      { id: "skills",     icon: <IC.Sparkles size={15}/>,   label: "Skills" },
-      { id: "workflows",  icon: <IC.Refresh size={15}/>,    label: "Routines" },
-      { id: "connectors", icon: <IC.Connectors size={15}/>, label: "Connectors" },
+      ...(canOperate ? [{ id: "skills" as Route, icon: <IC.Sparkles size={15}/>, label: "Skills" }] : []),
+      ...(canManage ? [{ id: "workflows" as Route, icon: <IC.Refresh size={15}/>, label: "Routines" }] : []),
+      ...(canOperate ? [{ id: "connectors" as Route, icon: <IC.Connectors size={15}/>, label: "Connectors" }] : []),
     ]},
   ];
   const navItems = navGroups.flatMap(g => g.items);
@@ -1159,14 +1545,14 @@ function Sidebar({
     ];
   }, [conversations]);
 
-  if (collapsed) {
+  if (collapsed && !mobileOpen) {
     return (
-      <aside className="flex-shrink-0 flex flex-col items-center py-3 gap-2 border-r hairline"
+      <aside className="hidden flex-shrink-0 flex-col items-center gap-2 border-r hairline py-3 md:flex"
              style={{ width: 56, background: "var(--bg-deep)" }}>
-        <button onClick={onExpand} className="btn btn-ghost btn-icon" title="Expand sidebar">
+        <button onClick={onExpand} className="btn btn-ghost btn-icon" title="Expand sidebar" aria-label="Expand sidebar">
           <IC.PanelOpen size={16}/>
         </button>
-        <button onClick={onNewConvo} className="btn btn-secondary btn-icon" title="New conversation">
+        <button onClick={onNewConvo} className="btn btn-secondary btn-icon" title="New conversation" aria-label="New conversation">
           <IC.Plus size={16}/>
         </button>
         <div className="w-8 h-px" style={{ background: "var(--border-soft)" }}/>
@@ -1175,6 +1561,8 @@ function Sidebar({
             <button key={it.id}
                     onClick={() => onNavigate(it.id)}
                     title={it.label}
+                    aria-label={it.label}
+                    aria-current={route === it.id ? "page" : undefined}
                     className="btn btn-ghost btn-icon relative flex-shrink-0"
                     style={{ background: route === it.id ? "var(--surface-2)" : "transparent",
                              color: route === it.id ? "var(--text)" : "var(--text-muted)" }}>
@@ -1191,8 +1579,15 @@ function Sidebar({
   }
 
   return (
-    <aside className="flex-shrink-0 flex flex-col border-r hairline relative"
-           style={{ width: 256, background: "var(--bg-deep)" }}>
+    <aside
+      ref={sidebarRef}
+      id="chronos-primary-navigation"
+      className={`fixed inset-y-0 left-0 z-[70] flex w-[min(88vw,320px)] flex-shrink-0 flex-col border-r hairline transition-transform duration-200 md:relative md:inset-auto md:z-auto md:w-64 md:translate-x-0 ${mobileOpen ? "translate-x-0" : "-translate-x-full"}`}
+      style={{ background: "var(--bg-deep)" }}
+      role={mobileOpen ? "dialog" : undefined}
+      aria-modal={mobileOpen ? true : undefined}
+      aria-label="Primary navigation"
+    >
       {/* Brand + collapse */}
       <div className="px-3 pt-3 pb-2 flex items-center justify-between">
         <div className="flex items-center gap-2 pl-1">
@@ -1202,8 +1597,11 @@ function Sidebar({
           </div>
           <span className="text-[17px] tracking-tight" style={{ fontFamily: "var(--font-serif), var(--font-geist), Georgia, serif", fontWeight: 500 }}>Chronos</span>
         </div>
-        <button onClick={onCollapse} className="btn btn-ghost btn-icon" title="Collapse sidebar">
+        <button onClick={onCollapse} className="btn btn-ghost btn-icon hidden md:flex" title="Collapse sidebar" aria-label="Collapse sidebar">
           <IC.PanelClose size={16}/>
+        </button>
+        <button ref={mobileCloseRef} type="button" onClick={onMobileClose} className="btn btn-ghost btn-icon md:hidden" aria-label="Close navigation">
+          <IC.X size={17}/>
         </button>
       </div>
 
@@ -1217,6 +1615,7 @@ function Sidebar({
         <button
           onClick={() => onOpenSearch?.()}
           title="Search (⌘K)"
+          aria-label="Search Chronos"
           className="btn btn-ghost btn-icon flex-shrink-0 surface border border-soft hover:border-[var(--border)]"
         >
           <IC.Search size={14}/>
@@ -1233,6 +1632,7 @@ function Sidebar({
             {group.items.map(it => (
               <button key={it.id}
                       onClick={() => onNavigate(it.id)}
+                      aria-current={route === it.id ? "page" : undefined}
                       className={`nav-item w-full ${route === it.id ? "active" : ""}`}>
                 <span className="nav-icon flex-shrink-0">{it.icon}</span>
                 <span className="flex-1 text-left">{it.label}</span>
@@ -1252,7 +1652,7 @@ function Sidebar({
 
       <div className="px-3 flex items-center justify-between">
         <span className="text-[11.5px] font-medium uppercase tracking-wider" style={{ color: "var(--text-dim)" }}>Conversations</span>
-        <button onClick={onRefreshConversations} className="btn btn-ghost btn-icon" title="Refresh conversations" style={{ width: 22, height: 22 }}>
+        <button onClick={onRefreshConversations} className="btn btn-ghost btn-icon" title="Refresh conversations" aria-label="Refresh conversations" style={{ width: 22, height: 22 }}>
           <IC.Refresh size={12}/>
         </button>
       </div>
@@ -1276,6 +1676,8 @@ function Sidebar({
             <div className="space-y-0.5">
               {g.items.map(c => {
                 const isActive = c.id === activeConvoId && route === "chat";
+                const ownedByCurrentMember = !c.member_id || c.member_id === currentMember?.id;
+                const sharedWithCurrentMember = Boolean(c.member_id && c.member_id !== currentMember?.id);
                 if (renamingId === c.id) {
                   return (
                     <div key={c.id} className="px-1 py-0.5">
@@ -1300,22 +1702,33 @@ function Sidebar({
                     <button onClick={() => onSelectConvo(c.id)}
                             className={`convo-row w-full pr-8 ${isActive ? "active" : ""}`}>
                       <span className="flex-1 truncate text-left">{c.title ?? "Untitled"}</span>
+                      {sharedWithCurrentMember && <span className="ml-1 flex-shrink-0 text-[10.5px]" style={{ color: "var(--accent-text)" }}>Shared</span>}
                     </button>
-                    <button
-                      onClick={e => { e.stopPropagation(); setConvoMenu(convoMenu === c.id ? null : c.id); }}
-                      className="absolute right-1 top-1/2 -translate-y-1/2 p-1.5 rounded-md opacity-0 group-hover:opacity-100 smooth hover:bg-[var(--surface-2)]"
-                      style={{ color: "var(--text-dim)" }}>
+                    {ownedByCurrentMember && <button
+                      onClick={e => {
+                        e.stopPropagation();
+                        if (convoMenu !== c.id) conversationMenuTriggerRef.current = e.currentTarget;
+                        setConvoMenu(convoMenu === c.id ? null : c.id);
+                      }}
+                      className="absolute right-1 top-1/2 -translate-y-1/2 p-1.5 rounded-md opacity-0 group-hover:opacity-100 focus:opacity-100 smooth hover:bg-[var(--surface-2)]"
+                      style={{ color: "var(--text-dim)" }}
+                      aria-haspopup="menu"
+                      aria-expanded={convoMenu === c.id}
+                      aria-controls={`conversation-menu-${c.id}`}
+                      aria-label={`Actions for ${c.title ?? "Untitled conversation"}`}>
                       <IC.More size={13}/>
-                    </button>
-                    {convoMenu === c.id && (
-                      <div className="surface absolute right-1 top-8 z-30 w-36 overflow-hidden rounded-lg border shadow-lg"
+                    </button>}
+                    {ownedByCurrentMember && convoMenu === c.id && (
+                      <div ref={conversationMenuRef} id={`conversation-menu-${c.id}`} role="menu" aria-label={`Actions for ${c.title ?? "Untitled conversation"}`} className="surface absolute right-1 top-8 z-30 w-36 overflow-hidden rounded-lg border shadow-lg"
                            style={{ borderColor: "var(--border)" }}>
                         <button onClick={() => { setRenameValue(c.title ?? ""); setRenamingId(c.id); setConvoMenu(null); }}
+                                role="menuitem"
                                 className="flex w-full items-center gap-2 px-3 py-2 text-[13px] text-left hover:bg-[var(--surface-2)]"
                                 style={{ color: "var(--text)" }}>
                           <IC.Pencil size={13}/> Rename
                         </button>
                         <button onClick={() => { onDeleteConvo(c.id); setConvoMenu(null); }}
+                                role="menuitem"
                                 className="flex w-full items-center gap-2 px-3 py-2 text-[13px] text-left hover:bg-[var(--danger-soft)]"
                                 style={{ color: "var(--danger)" }}>
                           <IC.Trash size={13}/> Delete
@@ -1333,12 +1746,16 @@ function Sidebar({
       {/* Account footer */}
       <div className="px-2 pb-2 pt-1 border-t hairline relative">
         <button onClick={() => setAccountOpen(v => !v)}
+                aria-expanded={accountOpen}
+                aria-haspopup="menu"
+                aria-controls="account-menu"
+                aria-label="Open account menu"
                 className="w-full flex items-center gap-2.5 px-2 py-2 rounded-lg smooth hover:bg-[var(--surface-2)]"
                 style={{ background: accountOpen ? "var(--surface-2)" : "transparent" }}>
-          <div className="avatar-u" style={{ width: 28, height: 28 }}>A</div>
+          <div className="avatar-u" style={{ width: 28, height: 28 }}>{(currentMember?.email || "?").charAt(0).toUpperCase()}</div>
           <div className="flex-1 min-w-0 text-left">
-            <div className="text-[13px] font-medium truncate">My Workspace</div>
-            <div className="text-[11.5px] truncate" style={{ color: "var(--text-dim)" }}>Owner</div>
+            <div className="text-[13px] font-medium truncate">{currentMember?.email || "Loading account…"}</div>
+            <div className="text-[11.5px] truncate" style={{ color: "var(--text-dim)" }}>{roleLabel(currentMember?.role)}</div>
           </div>
           <IC.ChevronDown size={14} style={{ color: "var(--text-dim)", transform: accountOpen ? "rotate(180deg)" : undefined, transition: "transform .15s" }}/>
         </button>
@@ -1348,6 +1765,8 @@ function Sidebar({
             onClose={() => setAccountOpen(false)}
             onSettings={(tab) => { setAccountOpen(false); onOpenSettings(tab); }}
             onSignOut={onSignOut}
+            member={currentMember}
+            serviceHealth={serviceHealth}
           />
         )}
       </div>
@@ -1355,31 +1774,58 @@ function Sidebar({
   );
 }
 
-function AccountMenu({ onClose, onSettings, onSignOut }: { onClose: () => void; onSettings: (tab: SettingsTab) => void; onSignOut: () => void }) {
+function AccountMenu({ onClose, onSettings, onSignOut, member, serviceHealth }: {
+  onClose: () => void;
+  onSettings: (tab: SettingsTab) => void;
+  onSignOut: () => void;
+  member: AuthenticatedMember | null;
+  serviceHealth: ServiceHealth;
+}) {
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const frame = window.requestAnimationFrame(() => {
+      ref.current?.querySelector<HTMLElement>('[role="menuitem"]')?.focus();
+    });
     const onClick = (e: MouseEvent) => { if (!ref.current?.contains(e.target as Node)) onClose(); };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+      else if (ref.current?.contains(document.activeElement)) moveMenuFocus(ref.current, e);
+    };
     setTimeout(() => document.addEventListener("click", onClick), 0);
-    return () => document.removeEventListener("click", onClick);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      document.removeEventListener("click", onClick);
+      document.removeEventListener("keydown", onKeyDown);
+      window.requestAnimationFrame(() => previousFocus?.focus());
+    };
   }, [onClose]);
 
   return (
-    <div ref={ref} className="absolute bottom-[64px] left-2 right-2 surface border rounded-xl fadeup overflow-hidden z-50"
+    <div ref={ref} id="account-menu" className="absolute bottom-[64px] left-2 right-2 surface border rounded-xl fadeup overflow-hidden z-50"
+         role="menu"
+         aria-label="Account"
          style={{ borderColor: "var(--border)", boxShadow: "0 1px 2px color-mix(in oklch, var(--text) 8%, transparent), 0 12px 32px color-mix(in oklch, var(--text) 12%, transparent)" }}>
       <div className="px-3 py-3 border-b hairline">
-        <div className="text-[13.5px] font-semibold">My Workspace</div>
-        <div className="text-[12px]" style={{ color: "var(--text-dim)" }}>owner · Chronos workspace</div>
+        <div className="text-[13.5px] font-semibold truncate">{member?.email || "Loading account…"}</div>
+        <div className="text-[12px]" style={{ color: "var(--text-dim)" }}>{roleLabel(member?.role)} · Chronos workspace</div>
       </div>
 
       {[
         { label: "Profile",            icon: <IC.Personas size={14}/>, tab: "profile" as SettingsTab },
         { label: "General settings",   icon: <IC.Settings size={14}/>, tab: "general" as SettingsTab },
         { label: "Organization",       icon: <IC.Briefcase size={14}/>, tab: "organization" as SettingsTab },
-        { label: "Memory",             icon: <IC.Memory size={14}/>, tab: "memory-settings" as SettingsTab },
+        ...(["user", "operator", "approver", "manager", "admin", "owner"].includes(member?.role || "")
+          ? [{ label: "Memory", icon: <IC.Memory size={14}/>, tab: "memory-settings" as SettingsTab }]
+          : []),
         { label: "Notifications",      icon: <IC.Bell size={14}/>, tab: "notifications" as SettingsTab },
-        { label: "Audit log",          icon: <IC.Audit size={14}/>, tab: "audit" as SettingsTab },
+        ...(["admin", "owner"].includes(member?.role || "")
+          ? [{ label: "Audit log", icon: <IC.Audit size={14}/>, tab: "audit" as SettingsTab }]
+          : []),
       ].map(it => (
         <button key={it.tab} onClick={() => onSettings(it.tab)}
+                role="menuitem"
                 className="w-full flex items-center gap-2.5 px-3 py-2 text-[13px] smooth hover:bg-[var(--surface-2)]"
                 style={{ color: "var(--text)" }}>
           <span style={{ color: "var(--text-dim)" }}>{it.icon}</span>
@@ -1388,20 +1834,38 @@ function AccountMenu({ onClose, onSettings, onSignOut }: { onClose: () => void; 
       ))}
 
       <div className="border-t hairline"/>
-      <button onClick={() => {}} className="w-full flex items-center gap-2.5 px-3 py-2 text-[13px] smooth hover:bg-[var(--surface-2)]" style={{ color: "var(--text)" }}>
-        <span style={{ color: "var(--text-dim)" }}><IC.Help size={14}/></span>
-        <span className="flex-1 text-left font-medium">Help & feedback</span>
-      </button>
-
+      {[
+        { label: "Support", href: publicProductLinks.support, icon: <IC.Help size={14}/> },
+        { label: "Service status", href: publicProductLinks.status, icon: <IC.Activity size={14}/> },
+        { label: "Privacy", href: publicProductLinks.privacy, icon: <IC.Lock size={14}/> },
+        { label: "Terms", href: publicProductLinks.terms, icon: <IC.Audit size={14}/> },
+      ].map(item => item.href ? (
+        <a
+          key={item.label}
+          href={item.href}
+          target="_blank"
+          rel="noreferrer"
+          role="menuitem"
+          className="flex w-full items-center gap-2.5 px-3 py-2 text-[13px] smooth hover:bg-[var(--surface-2)]"
+          style={{ color: "var(--text)" }}
+        >
+          <span style={{ color: "var(--text-dim)" }}>{item.icon}</span>
+          <span className="flex-1 text-left font-medium">{item.label}</span>
+          <IC.External size={12}/>
+        </a>
+      ) : null)}
       <div className="border-t hairline"/>
-      <button onClick={onSignOut} className="w-full flex items-center gap-2.5 px-3 py-2 text-[13px] smooth hover:bg-[var(--danger-soft)]" style={{ color: "var(--danger)" }}>
+      <button onClick={onSignOut} role="menuitem" className="w-full flex items-center gap-2.5 px-3 py-2 text-[13px] smooth hover:bg-[var(--danger-soft)]" style={{ color: "var(--danger)" }}>
         <IC.ArrowRight size={14}/> Sign out
       </button>
 
       <div className="px-3 py-2 border-t hairline">
         <div className="flex items-center justify-between text-[11px]" style={{ color: "var(--text-dim)" }}>
         <span>Chronos by Cognisia</span>
-          <span className="flex items-center gap-1"><Dot color="var(--ok)" size={5}/> Healthy</span>
+          <span className="flex items-center gap-1">
+            <Dot color={serviceHealth === "healthy" ? "var(--ok)" : serviceHealth === "degraded" ? "var(--warn)" : "var(--danger)"} size={5}/>
+            {serviceHealth === "checking" ? "Checking…" : roleLabel(serviceHealth)}
+          </span>
         </div>
       </div>
     </div>
@@ -1434,26 +1898,45 @@ function ComposerMenu({
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuWasOpenRef = useRef(false);
 
   useEffect(() => {
     if (!open) return;
+    const frame = window.requestAnimationFrame(() => {
+      ref.current?.querySelector<HTMLElement>('[role="menuitem"], [role="menuitemradio"]')?.focus();
+    });
     function onDown(e: MouseEvent) {
       if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
     }
     function onKey(e: KeyboardEvent) {
       if (e.key === "Escape") setOpen(false);
+      else if (ref.current?.contains(document.activeElement)) moveMenuFocus(ref.current, e);
     }
     document.addEventListener("mousedown", onDown);
     document.addEventListener("keydown", onKey);
     return () => {
+      window.cancelAnimationFrame(frame);
       document.removeEventListener("mousedown", onDown);
       document.removeEventListener("keydown", onKey);
     };
   }, [open]);
 
+  useEffect(() => {
+    if (open) {
+      menuWasOpenRef.current = true;
+      return;
+    }
+    if (menuWasOpenRef.current) {
+      menuWasOpenRef.current = false;
+      window.requestAnimationFrame(() => triggerRef.current?.focus());
+    }
+  }, [open]);
+
   return (
     <div className="relative" ref={ref}>
       <button
+        ref={triggerRef}
         type="button"
         aria-haspopup="menu"
         aria-expanded={open}
@@ -1469,7 +1952,7 @@ function ComposerMenu({
       {open && (
         <div
           role="menu"
-          className={`absolute bottom-full mb-2 ${align === "right" ? "right-0" : "left-0"} z-50 surface border border-soft rounded-lg shadow-xl overflow-hidden py-1`}
+          className={`composer-menu-popover absolute bottom-full mb-2 ${align === "right" ? "right-0" : "left-0"} z-50 surface border border-soft rounded-lg shadow-xl overflow-hidden py-1`}
           style={{ width: menuWidth }}
         >
           {children(() => setOpen(false))}
@@ -1518,22 +2001,32 @@ function ComposerMenuItem({
 // ─── Chat Screen ──────────────────────────────────────────────────────────────
 function ChatScreen({
   activeConvoId,
+  activeConversation,
+  currentMember,
+  accessibleWorkspaces,
+  workspaceLoadError,
   activePersonaId,
   onPersonaChange,
   onConvoCreated,
   onConvoSelected,
   onConversationMissing,
+  onRenameConversation,
   onApprovalsChanged,
   paletteOpen,
   onPaletteOpenChange,
   onOpenAgentMenu,
 }: {
   activeConvoId: string | null;
+  activeConversation: Conversation | null;
+  currentMember: AuthenticatedMember;
+  accessibleWorkspaces: Workspace[];
+  workspaceLoadError: string;
   activePersonaId: string;
   onPersonaChange: (personaId: string) => void;
   onConvoCreated: (id: string) => void;
   onConvoSelected: (id: string) => void;
   onConversationMissing: () => void;
+  onRenameConversation: (id: string, title: string) => Promise<void>;
   onApprovalsChanged: () => void;
   paletteOpen: boolean;
   onPaletteOpenChange: (open: boolean) => void;
@@ -1541,9 +2034,18 @@ function ChatScreen({
 }) {
   const [draft, setDraft] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
+  const [conversationAccess, setConversationAccess] = useState<ConversationAccessState>(() => {
+    if (!activeConvoId) return { role: "owner", status: "ready" };
+    if (activeConversation?.member_id === currentMember.id) return { role: "owner", status: "ready" };
+    return { role: null, status: "loading" };
+  });
+  const [titleEditing, setTitleEditing] = useState(false);
+  const [titleDraft, setTitleDraft] = useState(activeConversation?.title ?? "");
+  const cancelTitleEditRef = useRef(false);
   const [chatModels, setChatModels] = useState<ChatModel[]>([]);
   const [selectedModel, setSelectedModel] = useState(DEFAULT_MODEL_ID);
   const [modelsLoadError, setModelsLoadError] = useState("");
+  const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<string | null>(activeConversation?.workspace_id ?? null);
   // Chronos is chat-first: the model self-routes within a single default mode,
   // so there is no mode picker. The value is kept for the request body shape.
   const selectedMode = "default";
@@ -1577,7 +2079,14 @@ function ChatScreen({
   const [voiceError, setVoiceError] = useState<string | null>(null);
   const [voiceBusy, setVoiceBusy] = useState(false);
   const [recording, setRecording] = useState(false);
+  const [handsFree, setHandsFree] = useState(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordingCleanupRef = useRef<(() => void) | null>(null);
+  const handsFreeRef = useRef(false);
+  const handsFreeAwaitingReplyRef = useRef(false);
+  const handsFreeSpokenMessageRef = useRef<string | null>(null);
+  const handsFreeAudioRef = useRef<HTMLAudioElement | null>(null);
+  const handsFreeAudioUrlRef = useRef<string | null>(null);
   const [skillsList, setSkillsList] = useState<{ slug: string; name: string; description?: string | null }[] | null>(null);
   // Claude-style "Search and tools": connected connectors + built-in tool
   // families the user can toggle off for this browser (sent as disabled_tools).
@@ -1598,7 +2107,76 @@ function ChatScreen({
     });
   }, []);
   const attachmentPreviewUrlsRef = useRef<Set<string>>(new Set());
+  const requestedProjectId = useMemo(() => {
+    if (typeof window === "undefined") return null;
+    return new URLSearchParams(window.location.search).get("project_id");
+  }, []);
+  const effectiveProjectId = activeConversation?.project_id ?? requestedProjectId;
+  const [projectContext, setProjectContext] = useState<Project | null>(null);
   const isEmpty = !activeConvoId && messages.length === 0;
+  const selectedWorkspace = useMemo(
+    () => accessibleWorkspaces.find(workspace => workspace.id === selectedWorkspaceId || workspace.legacy_key === selectedWorkspaceId) ?? null,
+    [accessibleWorkspaces, selectedWorkspaceId],
+  );
+  const workspaceWriteReady = Boolean(selectedWorkspace && selectedWorkspace.status === "active" && !workspaceLoadError);
+  const canMutateConversation = (
+    (!activeConvoId
+      || (conversationAccess.status === "ready" && ["owner", "editor"].includes(conversationAccess.role ?? "")))
+    && workspaceWriteReady
+  );
+  const readOnlyConversationReason = workspaceLoadError
+      ? `Workspace access could not be verified: ${workspaceLoadError}`
+      : !selectedWorkspace
+        ? "Choose an active workspace before sending a message."
+        : selectedWorkspace.status !== "active"
+          ? `The ${selectedWorkspace.name} workspace is archived. Restore it before adding messages.`
+          : conversationAccess.status === "loading"
+      ? "Checking your access before enabling conversation changes…"
+      : conversationAccess.status === "error"
+        ? "Conversation access could not be verified, so editing is disabled until access can be checked."
+        : "You have view-only access to this shared conversation.";
+
+  useEffect(() => {
+    if (accessibleWorkspaces.length === 0) {
+      setSelectedWorkspaceId(activeConversation?.workspace_id ?? null);
+      return;
+    }
+    const boundId = activeConversation?.workspace_id;
+    if (boundId) {
+      const bound = accessibleWorkspaces.find(workspace => workspace.id === boundId || workspace.legacy_key === boundId);
+      setSelectedWorkspaceId(bound?.id ?? boundId);
+      return;
+    }
+    let stored = "";
+    try { stored = window.localStorage.getItem(WORKSPACE_STORAGE_KEY) || ""; } catch { /* storage may be unavailable */ }
+    const preferred = accessibleWorkspaces.find(workspace => workspace.status === "active" && (workspace.id === stored || workspace.legacy_key === stored))
+      ?? accessibleWorkspaces.find(workspace => workspace.status === "active" && workspace.legacy_key === "default")
+      ?? accessibleWorkspaces.find(workspace => workspace.status === "active")
+      ?? null;
+    setSelectedWorkspaceId(preferred?.id ?? null);
+  }, [accessibleWorkspaces, activeConversation?.workspace_id]);
+
+  useEffect(() => {
+    if (activeConvoId || !selectedWorkspace?.id) return;
+    try { window.localStorage.setItem(WORKSPACE_STORAGE_KEY, selectedWorkspace.id); } catch { /* storage may be unavailable */ }
+  }, [activeConvoId, selectedWorkspace?.id]);
+
+  useEffect(() => {
+    if (!titleEditing) setTitleDraft(activeConversation?.title ?? "");
+  }, [activeConversation?.title, titleEditing]);
+
+  useEffect(() => {
+    if (!effectiveProjectId) {
+      setProjectContext(null);
+      return;
+    }
+    let cancelled = false;
+    apiFetch(`/projects/${effectiveProjectId}`)
+      .then(response => response.json())
+      .then((data: Project) => { if (!cancelled) setProjectContext(data); })
+      .catch(() => { if (!cancelled) setProjectContext(null); });
+    return () => { cancelled = true; };
+  }, [effectiveProjectId]);
   const inlineApprovalIds = useMemo(() => {
     const ids = new Set<string>();
     const decided = new Set<string>();
@@ -1615,9 +2193,10 @@ function ChatScreen({
   }, [activeTaskEvents]);
 
   useEffect(() => {
+    const previewUrls = attachmentPreviewUrlsRef.current;
     return () => {
-      attachmentPreviewUrlsRef.current.forEach(url => URL.revokeObjectURL(url));
-      attachmentPreviewUrlsRef.current.clear();
+      previewUrls.forEach(url => URL.revokeObjectURL(url));
+      previewUrls.clear();
       const recorder = mediaRecorderRef.current;
       if (recorder) {
         recorder.ondataavailable = null;
@@ -1650,10 +2229,11 @@ function ChatScreen({
     const browserUrl = activeTaskId
       ? `/browser-sessions/?task_id=${encodeURIComponent(activeTaskId)}`
       : "/browser-sessions/";
-    let [browserRows, computerRows] = await Promise.all([
+    const [initialBrowserRows, computerRows] = await Promise.all([
       apiFetch(browserUrl).then(r => r.json()).catch(() => []),
       apiFetch("/computer-sessions/").then(r => r.json()).catch(() => []),
     ]) as [BrowserSession[], ComputerSession[]];
+    let browserRows = initialBrowserRows;
     // If the active task has no session yet, fall back to the most recent ones
     // globally so manually opened/standalone sessions still appear.
     if (activeTaskId && Array.isArray(browserRows) && browserRows.length === 0) {
@@ -1682,42 +2262,25 @@ function ChatScreen({
   const [paletteQuery, setPaletteQuery] = useState("");
   const [paletteResults, setPaletteResults] = useState<SearchResult[]>([]);
   const [paletteSelectedIdx, setPaletteSelectedIdx] = useState(-1);
+  const paletteDialogRef = useRef<HTMLDivElement>(null);
   const paletteInputRef = useRef<HTMLInputElement>(null);
   const paletteDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const paletteAbortRef = useRef<AbortController | null>(null);
-  const palettePrevFocusRef = useRef<Element | null>(null);
 
-  // Cmd/Ctrl+K global listener — toggles palette
-  useEffect(() => {
-    function onKeyDown(e: KeyboardEvent) {
-      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
-        e.preventDefault();
-        onPaletteOpenChange(!paletteOpen);
-      }
-      if (e.key === "Escape" && paletteOpen) {
-        onPaletteOpenChange(false);
-      }
-    }
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [paletteOpen, onPaletteOpenChange]);
+  useDialogFocus({
+    active: paletteOpen,
+    containerRef: paletteDialogRef,
+    initialFocusRef: paletteInputRef,
+    onClose: () => onPaletteOpenChange(false),
+  });
 
   useEffect(() => {
     if (paletteOpen) {
-      // Capture previously focused element so we can restore it on close
-      palettePrevFocusRef.current = document.activeElement;
       setPaletteQuery("");
       setPaletteResults([]);
       setPaletteSelectedIdx(-1);
-      setTimeout(() => paletteInputRef.current?.focus(), 0);
     } else {
-      // Abort any in-flight request
       paletteAbortRef.current?.abort();
-      // Restore focus to previously focused element (best-effort)
-      if (palettePrevFocusRef.current && palettePrevFocusRef.current instanceof HTMLElement) {
-        palettePrevFocusRef.current.focus();
-      }
-      palettePrevFocusRef.current = null;
     }
   }, [paletteOpen]);
 
@@ -1731,7 +2294,7 @@ function ChatScreen({
       paletteAbortRef.current = ctrl;
       try {
         const q = encodeURIComponent(paletteQuery.trim());
-        const res = await apiFetch(`/search?q=${q}&types=conversations,messages`, { signal: ctrl.signal });
+        const res = await apiFetch(`/search?q=${q}`, { signal: ctrl.signal });
         if (!res.ok) return;
         const data = (await res.json()) as SearchResult[];
         if (!ctrl.signal.aborted) { setPaletteResults(data); setPaletteSelectedIdx(-1); }
@@ -1746,9 +2309,6 @@ function ChatScreen({
       if (paletteDebounceRef.current) clearTimeout(paletteDebounceRef.current);
     };
   }, [paletteQuery]);
-
-  // Flat list of all results for keyboard index math
-  const paletteFlatResults = paletteResults;
 
   function handlePaletteSelect(result: SearchResult) {
     onPaletteOpenChange(false);
@@ -1792,6 +2352,9 @@ function ChatScreen({
     ...g,
     items: g.items.map(item => ({ item, flatIdx: _paletteFlatIdx++ })),
   }));
+  // Keyboard order must match the grouped visual order, not the backend's
+  // interleaved relevance order.
+  const paletteFlatResults = paletteGroups.flatMap(group => group.items);
   // ── End command palette ───────────────────────────────────────────────────
 
   useEffect(() => {
@@ -1850,6 +2413,7 @@ function ChatScreen({
         model: m.model != null ? String(m.model) : undefined,
         mode: m.mode != null ? String(m.mode) : undefined,
         citations: Array.isArray(m.citations) ? (m.citations as Array<{ url?: string; text?: string }>) : undefined,
+        memory_refs: Array.isArray(m.memory_refs) ? (m.memory_refs as MemoryReference[]) : undefined,
         // Persisted tool_traces from DB (overridden by live SSE during streaming)
         tool_traces: Array.isArray(m.tool_traces)
           ? (m.tool_traces as ToolTrace[])
@@ -2106,7 +2670,7 @@ function ChatScreen({
 
     void listenMemoryEvents();
     return () => controller.abort();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+
   }, [activeConvoId]);
 
   function setAttachmentState(id: string, state: AttachmentState) {
@@ -2131,11 +2695,8 @@ function ChatScreen({
   }
 
   async function uploadFiles(files: FileList) {
-    // Must use bare fetch, NOT apiFetch: apiFetch forces Content-Type: application/json
-    // on any request with a body (see apiFetch line ~178), which breaks multipart
-    // uploads — the browser needs to set the multipart boundary itself.
-    const token = getToken();
-    const base = apiBase();
+    // apiFetch preserves the browser-generated multipart boundary for FormData
+    // and includes the httpOnly session cookie.
     setUploadError(null);
     for (const file of Array.from(files)) {
       const previewUrl = file.type.startsWith("image/") ? URL.createObjectURL(file) : undefined;
@@ -2145,29 +2706,18 @@ function ChatScreen({
       const form = new FormData();
       form.append("file", file);
       if (activeConvoId) form.append("conversation_id", activeConvoId);
+      if (effectiveProjectId) form.append("project_id", effectiveProjectId);
       try {
-        const res = await fetch(`${base}/attachments`, {
+        const res = await apiFetch("/attachments", {
           method: "POST",
           body: form,
-          headers: token ? { Authorization: `Bearer ${token}` } : {},
         });
-        if (res.ok) {
-          const data = await res.json() as { attachment_id: string; filename: string; size_bytes: number };
-          const isImage = file.type.startsWith("image/");
-          setAttachments(prev => prev.map(a => a.id === localId
-            ? { ...a, id: data.attachment_id, name: data.filename, size: data.size_bytes, state: isImage ? "ready" : "processing" }
-            : a));
-          if (!isImage) void watchParseStatus(data.attachment_id);
-        } else {
-          setAttachments(prev => prev.filter(a => a.id !== localId));
-          if (previewUrl) {
-            URL.revokeObjectURL(previewUrl);
-            attachmentPreviewUrlsRef.current.delete(previewUrl);
-          }
-          let detail = `Upload failed (${res.status})`;
-          try { const body = await res.json() as { detail?: string }; if (body.detail) detail = body.detail; } catch { /* ignore */ }
-          setUploadError(detail);
-        }
+        const data = await res.json() as { attachment_id: string; filename: string; size_bytes: number };
+        const isImage = file.type.startsWith("image/");
+        setAttachments(prev => prev.map(a => a.id === localId
+          ? { ...a, id: data.attachment_id, name: data.filename, size: data.size_bytes, state: isImage ? "ready" : "processing" }
+          : a));
+        if (!isImage) void watchParseStatus(data.attachment_id);
       } catch (err) {
         setAttachments(prev => prev.filter(a => a.id !== localId));
         if (previewUrl) {
@@ -2179,12 +2729,10 @@ function ChatScreen({
     }
   }
 
-  async function uploadVoice(file: File | undefined) {
+  async function uploadVoice(file: File | undefined, submitTranscript = false) {
     // Upload audio file via /attachments then call /chat/voice/transcribe.
     // On success, populate the composer draft with the transcript text.
     // On unavailable (no STT provider), show an honest degraded error message.
-    const token = getToken();
-    const base = apiBase();
     setVoiceError(null);
     if (!file) return;
     setVoiceBusy(true);
@@ -2193,16 +2741,11 @@ function ChatScreen({
       const form = new FormData();
       form.append("file", file);
       if (activeConvoId) form.append("conversation_id", activeConvoId);
-      const uploadRes = await fetch(`${base}/attachments`, {
+      if (effectiveProjectId) form.append("project_id", effectiveProjectId);
+      const uploadRes = await apiFetch("/attachments", {
         method: "POST",
         body: form,
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
       });
-      if (!uploadRes.ok) {
-        const body = await uploadRes.json().catch(() => ({})) as { detail?: string };
-        setVoiceError(body.detail || `Upload failed (${uploadRes.status})`);
-        return;
-      }
       const uploadData = await uploadRes.json() as { attachment_id: string };
 
       // Step 2: Transcribe via broker-routed endpoint
@@ -2214,8 +2757,14 @@ function ChatScreen({
         }),
       }).catch(err => { throw err instanceof Error ? err : new Error(String(err)); });
       const transcribeData = await transcribeRes.json() as { transcript?: string };
-      if (transcribeData.transcript) {
-        setDraft(prev => prev ? `${prev} ${transcribeData.transcript}` : transcribeData.transcript!);
+      const transcript = String(transcribeData.transcript || "").trim();
+      if (transcript) {
+        if (submitTranscript && handsFreeRef.current) {
+          handsFreeAwaitingReplyRef.current = true;
+          await sendMessage(transcript);
+        } else {
+          setDraft(prev => prev ? `${prev} ${transcript}` : transcript);
+        }
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Transcription unavailable";
@@ -2227,7 +2776,7 @@ function ChatScreen({
     }
   }
 
-  async function startRecording() {
+  async function startRecording(autoHandsFree = false) {
     // Claude.ai-style dictation: record from the browser microphone, then send
     // the audio through the same upload + transcribe path as file uploads.
     setVoiceError(null);
@@ -2240,20 +2789,82 @@ function ChatScreen({
       const mimeType = MediaRecorder.isTypeSupported?.("audio/webm") ? "audio/webm" : undefined;
       const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
       const chunks: BlobPart[] = [];
+      let speechDetected = false;
+      let stopped = false;
+      let silenceStartedAt = 0;
+      let recordingStartedAt = 0;
+      let frame = 0;
+      let audioContext: AudioContext | null = null;
       recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+      recorder.onstart = () => { recordingStartedAt = window.performance.now(); };
       recorder.onstop = () => {
+        if (stopped) return;
+        stopped = true;
+        recordingCleanupRef.current?.();
+        recordingCleanupRef.current = null;
         stream.getTracks().forEach(track => track.stop());
         mediaRecorderRef.current = null;
         setRecording(false);
         const type = recorder.mimeType || "audio/webm";
         const ext = type.includes("ogg") ? "ogg" : type.includes("mp4") ? "m4a" : "webm";
         const blob = new Blob(chunks, { type });
-        if (blob.size > 0) void uploadVoice(new File([blob], `voice-note.${ext}`, { type }));
+        if (blob.size > 0 && (!autoHandsFree || (speechDetected && handsFreeRef.current))) {
+          void uploadVoice(new File([blob], `voice-note.${ext}`, { type }), autoHandsFree);
+        } else if (autoHandsFree && handsFreeRef.current) {
+          window.setTimeout(() => { if (handsFreeRef.current) void startRecording(true); }, 350);
+        }
+      };
+      if (autoHandsFree) {
+        audioContext = new AudioContext();
+        const source = audioContext.createMediaStreamSource(stream);
+        const analyser = audioContext.createAnalyser();
+        analyser.fftSize = 1024;
+        source.connect(analyser);
+        const waveform = new Uint8Array(analyser.fftSize);
+        const monitorSilence = () => {
+          if (recorder.state === "inactive") return;
+          if (!recordingStartedAt) {
+            frame = window.requestAnimationFrame(monitorSilence);
+            return;
+          }
+          analyser.getByteTimeDomainData(waveform);
+          let energy = 0;
+          for (const sample of waveform) {
+            const centered = (sample - 128) / 128;
+            energy += centered * centered;
+          }
+          const rms = Math.sqrt(energy / waveform.length);
+          const now = performance.now();
+          if (rms >= 0.035) {
+            speechDetected = true;
+            silenceStartedAt = 0;
+          } else if (speechDetected) {
+            if (!silenceStartedAt) silenceStartedAt = now;
+            if (now - silenceStartedAt >= 1_250 && now - recordingStartedAt >= 800) {
+              recorder.stop();
+              return;
+            }
+          }
+          if (now - recordingStartedAt >= 45_000) {
+            recorder.stop();
+            return;
+          }
+          frame = window.requestAnimationFrame(monitorSilence);
+        };
+        frame = window.requestAnimationFrame(monitorSilence);
+      }
+      recordingCleanupRef.current = () => {
+        if (frame) window.cancelAnimationFrame(frame);
+        if (audioContext && audioContext.state !== "closed") void audioContext.close();
       };
       mediaRecorderRef.current = recorder;
       recorder.start();
       setRecording(true);
     } catch (err) {
+      if (autoHandsFree) {
+        handsFreeRef.current = false;
+        setHandsFree(false);
+      }
       setVoiceError(err instanceof DOMException && (err.name === "NotAllowedError" || err.name === "SecurityError")
         ? "Microphone access was denied. Allow microphone access or upload an audio file instead."
         : "Could not start recording — upload an audio file instead.");
@@ -2264,6 +2875,78 @@ function ChatScreen({
     const recorder = mediaRecorderRef.current;
     if (recorder && recorder.state !== "inactive") recorder.stop();
   }
+
+  function startHandsFree() {
+    handsFreeRef.current = true;
+    handsFreeAwaitingReplyRef.current = false;
+    handsFreeSpokenMessageRef.current = null;
+    setHandsFree(true);
+    void startRecording(true);
+  }
+
+  function stopHandsFree() {
+    handsFreeRef.current = false;
+    handsFreeAwaitingReplyRef.current = false;
+    setHandsFree(false);
+    stopRecording();
+    handsFreeAudioRef.current?.pause();
+    handsFreeAudioRef.current = null;
+    if (handsFreeAudioUrlRef.current) URL.revokeObjectURL(handsFreeAudioUrlRef.current);
+    handsFreeAudioUrlRef.current = null;
+  }
+
+  async function playHandsFreeReply(text: string) {
+    const response = await apiFetch("/chat/voice/speak", {
+      method: "POST",
+      body: JSON.stringify({ text: text.slice(0, 4096), conversation_id: activeConvoId ?? undefined }),
+    });
+    const payload = await response.json() as { audio_artifact_id?: string };
+    if (!payload.audio_artifact_id) throw new Error("The voice provider returned no audio.");
+    const audioResponse = await apiFetch(`/artifacts/${payload.audio_artifact_id}/content`);
+    const audioBlob = await audioResponse.blob();
+    const url = URL.createObjectURL(audioBlob);
+    handsFreeAudioUrlRef.current = url;
+    const audio = new Audio(url);
+    handsFreeAudioRef.current = audio;
+    await new Promise<void>((resolve, reject) => {
+      audio.addEventListener("ended", () => resolve(), { once: true });
+      audio.addEventListener("error", () => reject(new Error("Audio playback failed.")), { once: true });
+      void audio.play().catch(reject);
+    });
+    handsFreeAudioRef.current = null;
+    URL.revokeObjectURL(url);
+    if (handsFreeAudioUrlRef.current === url) handsFreeAudioUrlRef.current = null;
+  }
+
+  useEffect(() => {
+    if (!handsFree || streaming || voiceBusy || recording || !handsFreeAwaitingReplyRef.current) return;
+    const reply = [...messages].reverse().find(message => message.role === "assistant" && message.status !== "streaming");
+    if (!reply) return;
+    const identity = reply.id || `${reply.status}:${reply.content}`;
+    if (handsFreeSpokenMessageRef.current === identity) return;
+    handsFreeSpokenMessageRef.current = identity;
+    handsFreeAwaitingReplyRef.current = false;
+    const responseText = reply.content.trim();
+    void (responseText ? playHandsFreeReply(responseText) : Promise.resolve())
+      .catch(error => {
+        setVoiceError(error instanceof Error ? error.message : "Hands-free audio playback failed.");
+      })
+      .finally(() => {
+        if (handsFreeRef.current) window.setTimeout(() => { if (handsFreeRef.current) void startRecording(true); }, 300);
+      });
+    // The helper functions intentionally read the current conversation and
+    // provider state; this effect is keyed to the completed reply lifecycle.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [handsFree, messages, recording, streaming, voiceBusy]);
+
+  useEffect(() => () => {
+    handsFreeRef.current = false;
+    recordingCleanupRef.current?.();
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state !== "inactive") recorder.stop();
+    handsFreeAudioRef.current?.pause();
+    if (handsFreeAudioUrlRef.current) URL.revokeObjectURL(handsFreeAudioUrlRef.current);
+  }, []);
 
   function removeAttachment(id: string) {
     setAttachments(prev => {
@@ -2325,6 +3008,10 @@ function ChatScreen({
   }
 
   async function sendMessage(textOverride?: string) {
+    if (!canMutateConversation) {
+      setUploadError(readOnlyConversationReason);
+      return;
+    }
     const source = textOverride ?? draft;
     if (!source.trim()) return;
     if (attachmentsBusy()) {
@@ -2477,7 +3164,7 @@ function ChatScreen({
         const te = ev.event;
         const traceType = te.type ?? "";
         const tool = traceToolLabel(traceType, te);
-        let summary = traceSummary(traceType, te);
+        const summary = traceSummary(traceType, te);
         let traceStatus: MessageStatus = "complete";
         if (traceType === "tool_call" || traceType === "step_start" || traceType === "sub_agent_spawned" || traceType === "model_step" || traceType === "thinking") {
           traceStatus = "streaming";
@@ -2654,6 +3341,8 @@ function ChatScreen({
         body: JSON.stringify({
           message: text,
           conversation_id: targetConversationId,
+          workspace_id: selectedWorkspace?.id,
+          project_id: effectiveProjectId ?? undefined,
           model: selectedModel,
           mode: selectedMode,
           reasoning_effort: selectedReasoningEffort,
@@ -2769,11 +3458,22 @@ function ChatScreen({
     }
   }
 
+  async function commitConversationTitle() {
+    const title = titleDraft.trim();
+    if (!activeConvoId || !title || !canMutateConversation) {
+      setTitleEditing(false);
+      setTitleDraft(activeConversation?.title ?? "");
+      return;
+    }
+    await onRenameConversation(activeConvoId, title);
+    setTitleEditing(false);
+  }
+
   return (
     <div className="flex-1 flex min-w-0 relative overflow-hidden">
       <div className="flex-1 flex flex-col min-w-0">
         {/* Header */}
-        <div className="px-6 h-[52px] flex items-center justify-between flex-shrink-0 border-b hairline" style={{ background: "var(--bg)" }}>
+        <div className="h-[52px] flex items-center justify-between flex-shrink-0 border-b hairline px-3 md:px-6" style={{ background: "var(--bg)" }}>
           <div className="flex items-center gap-3 min-w-0">
             <div className="relative">
             <button
@@ -2820,15 +3520,71 @@ function ChatScreen({
               </div>
             )}
             </div>
+            {activeConvoId && (
+              <div className="hidden min-w-0 items-center border-l border-soft pl-3 lg:flex">
+                {titleEditing ? (
+                  <input
+                    autoFocus
+                    value={titleDraft}
+                    maxLength={80}
+                    onChange={event => setTitleDraft(event.target.value)}
+                    onKeyDown={event => {
+                      if (event.key === "Enter") event.currentTarget.blur();
+                      if (event.key === "Escape") { cancelTitleEditRef.current = true; event.currentTarget.blur(); }
+                    }}
+                    onBlur={() => {
+                      if (cancelTitleEditRef.current) {
+                        cancelTitleEditRef.current = false;
+                        setTitleEditing(false);
+                        setTitleDraft(activeConversation?.title ?? "");
+                        return;
+                      }
+                      void commitConversationTitle();
+                    }}
+                    aria-label="Conversation title"
+                    className="surface w-[min(30vw,320px)] rounded-md border border-soft px-2 py-1 text-[13px] outline-none"
+                  />
+                ) : canMutateConversation ? (
+                  <button type="button" onClick={() => { cancelTitleEditRef.current = false; setTitleEditing(true); }} className="max-w-[min(30vw,320px)] truncate rounded-md px-2 py-1 text-[13px] smooth hover:bg-[var(--surface-2)]" title="Rename conversation">
+                    {activeConversation?.title ?? "Untitled conversation"}
+                  </button>
+                ) : (
+                  <span className="max-w-[min(30vw,320px)] truncate px-2 py-1 text-[13px]" style={{ color: "var(--text-muted)" }}>{activeConversation?.title ?? "Untitled conversation"}</span>
+                )}
+              </div>
+            )}
           </div>
           <div className="flex items-center gap-1">
+            <label
+              className="surface flex min-w-0 items-center gap-1.5 rounded-md border border-soft px-2 py-1.5"
+              title={activeConvoId ? "A conversation stays bound to the workspace where it was created." : "Choose where this conversation, its tasks, and its artifacts belong."}
+            >
+              <IC.Briefcase size={13} style={{ color: "var(--text-dim)", flexShrink: 0 }}/>
+              <span className="sr-only">Workspace</span>
+              <select
+                aria-label="Workspace"
+                value={selectedWorkspace?.id ?? selectedWorkspaceId ?? ""}
+                disabled={Boolean(activeConvoId) || Boolean(workspaceLoadError) || accessibleWorkspaces.length === 0}
+                onChange={event => setSelectedWorkspaceId(event.target.value || null)}
+                className="min-w-0 max-w-[112px] bg-transparent text-[12px] outline-none sm:max-w-[180px]"
+                style={{ color: selectedWorkspace?.status === "archived" ? "var(--warn)" : "var(--text-muted)" }}
+              >
+                {!selectedWorkspace && <option value="">No workspace</option>}
+                {accessibleWorkspaces.map(workspace => (
+                  <option key={workspace.id} value={workspace.id} disabled={workspace.status !== "active" && !activeConvoId}>
+                    {workspace.name}{workspace.status === "archived" ? " (archived)" : ""}
+                  </option>
+                ))}
+              </select>
+              {activeConvoId && <IC.Lock size={11} style={{ color: "var(--text-dim)", flexShrink: 0 }}/>} {/* immutable binding */}
+            </label>
             <button
               onClick={onOpenAgentMenu}
               className="flex items-center gap-2 px-2.5 py-1.5 rounded-md smooth hover:bg-[var(--surface-2)]"
               title="Agents and assistants"
             >
               <IC.Sparkles size={13} style={{ color: "var(--text-dim)" }}/>
-              <span className="text-[12.5px]" style={{ color: "var(--text-muted)" }}>
+              <span className="hidden text-[12.5px] sm:inline" style={{ color: "var(--text-muted)" }}>
                 Agents
               </span>
             </button>
@@ -2838,7 +3594,7 @@ function ChatScreen({
               title="Live browser and computer"
             >
               <IC.Eye size={13} style={{ color: "var(--text-dim)" }}/>
-              <span className="text-[12.5px]" style={{ color: "var(--text-muted)" }}>
+              <span className="hidden text-[12.5px] sm:inline" style={{ color: "var(--text-muted)" }}>
                 Live
               </span>
               {(browserSessions.some(session => session.takeover_state === "requested") || computerSessions.some(session => session.status === "active")) && (
@@ -2849,26 +3605,33 @@ function ChatScreen({
               <button onClick={() => setActivityOpen(true)}
                       className="flex items-center gap-2 px-2.5 py-1.5 rounded-md smooth hover:bg-[var(--surface-2)]">
                 {streaming ? <StatusDot status="working"/> : <IC.Activity size={13} style={{ color: "var(--text-dim)" }}/>}
-                <span className="text-[12.5px]" style={{ color: "var(--text-muted)" }}>
+                <span className="hidden text-[12.5px] sm:inline" style={{ color: "var(--text-muted)" }}>
                   {streaming ? "Working" : "Task"}
                 </span>
               </button>
             )}
-            <button className="btn btn-ghost btn-icon"><IC.More size={15}/></button>
+            {activeConvoId && (
+              <ConversationCollaboration
+                conversationId={activeConvoId}
+                ownerMemberId={activeConversation?.member_id}
+                currentMember={currentMember}
+                onAccessChange={setConversationAccess}
+              />
+            )}
           </div>
         </div>
 
         {/* Messages or empty state */}
         {isEmpty ? (
-          <EmptyChatState persona={activePersona} onSubmit={q => { setDraft(q); setTimeout(() => void sendMessage(), 0); }} />
+          <EmptyChatState persona={activePersona} onSubmit={q => void sendMessage(q)} />
         ) : (
-          <div className="flex-1 overflow-y-auto px-6 py-10">
+          <div className="flex-1 overflow-y-auto px-4 py-6 md:px-6 md:py-10">
             <div className="max-w-[1120px] mx-auto space-y-8">
               {messages.map((m, i) => (
                 <div key={m.id ?? `${m.role}-${i}`} className="fadeup">
                   {m.role === "user"
-                    ? <UserMessage message={m} conversationId={activeConvoId ?? ""} onRefresh={() => { if (activeConvoId) void loadMessagesFromServer(activeConvoId); }} onBranch={(newConvoId) => { onConvoCreated(newConvoId); }}/>
-                    : <AssistantMessage message={m} content={m.content} conversationId={activeConvoId ?? ""} status={m.status ?? "complete"} persona={activePersona} toolTraces={m.tool_traces} reasoningSummaries={m.reasoning_summaries} artifacts={m.artifacts} thinking={m.thinking} mode={m.mode} structuredResponse={m.structured_response} onRefresh={() => { if (activeConvoId) void loadMessagesFromServer(activeConvoId); }} onBranch={(newConvoId) => { onConvoCreated(newConvoId); }} onClarificationReply={replyToClarification} onRetry={i === messages.length - 1 && m.status === "error" ? () => void retryLastTurn() : undefined} retryBusy={retryBusy}/>}
+                    ? <UserMessage message={m} conversationId={activeConvoId ?? ""} canEdit={canMutateConversation} onRefresh={() => { if (activeConvoId) void loadMessagesFromServer(activeConvoId); }} onBranch={(newConvoId) => { onConvoCreated(newConvoId); }}/>
+                    : <AssistantMessage message={m} content={m.content} conversationId={activeConvoId ?? ""} canEdit={canMutateConversation} status={m.status ?? "complete"} persona={activePersona} toolTraces={m.tool_traces} reasoningSummaries={m.reasoning_summaries} artifacts={m.artifacts} thinking={m.thinking} mode={m.mode} structuredResponse={m.structured_response} onRefresh={() => { if (activeConvoId) void loadMessagesFromServer(activeConvoId); }} onBranch={(newConvoId) => { onConvoCreated(newConvoId); }} onClarificationReply={replyToClarification} onRetry={canMutateConversation && i === messages.length - 1 && m.status === "error" ? () => void retryLastTurn() : undefined} retryBusy={retryBusy}/>}
                 </div>
               ))}
               {streaming && messages[messages.length - 1]?.role !== "assistant" && (
@@ -2879,7 +3642,6 @@ function ChatScreen({
               )}
               <InlineTaskApprovals
                 approvalIds={inlineApprovalIds}
-                taskId={activeTaskId}
                 onChanged={() => {
                   onApprovalsChanged();
                   if (activeConvoId) void loadMessagesFromServer(activeConvoId, { preserveLocal: true });
@@ -2891,7 +3653,7 @@ function ChatScreen({
         )}
 
         {/* Composer */}
-        <div className="px-6 pb-6 pt-2" style={{ background: "var(--bg)" }}>
+        <div className="mobile-safe-bottom px-3 pb-3 pt-2 md:px-6 md:pb-6" style={{ background: "var(--bg)" }}>
           <div className="max-w-[1120px] mx-auto">
             <input
               ref={fileInputRef}
@@ -2915,6 +3677,18 @@ function ChatScreen({
               className="hidden"
               onChange={e => { void uploadVoice(e.target.files?.[0]); e.target.value = ""; }}
             />
+            {effectiveProjectId && (
+              <div
+                className="mb-2 flex items-center gap-2 rounded-lg border border-soft px-3 py-2 text-[12.5px]"
+                style={{ background: "var(--accent-soft)", color: "var(--accent-text)" }}
+                role="status"
+              >
+                <IC.Folder size={13}/>
+                <span className="font-medium">Project context:</span>
+                <span className="min-w-0 truncate">{projectContext?.name ?? "Loading project…"}</span>
+                <span className="ml-auto hidden sm:inline" style={{ color: "var(--text-dim)" }}>Messages and uploads stay linked to this project.</span>
+              </div>
+            )}
             {memoryNotice && (
               <div
                 className="mb-2 flex items-center gap-2.5 rounded-lg border px-3 py-2 text-[12.5px] fadein"
@@ -2935,6 +3709,12 @@ function ChatScreen({
                 <button type="button" aria-label="Dismiss" onClick={() => setMemoryNotice(null)} className="smooth hover:opacity-70 flex-shrink-0"><IC.X size={12}/></button>
               </div>
             )}
+            {!canMutateConversation && (
+              <div id="conversation-read-only-notice" role="status" className="mb-2 rounded-lg border border-soft px-3 py-2.5 text-[12.5px] leading-relaxed" style={{ background: "var(--surface)", color: "var(--text-muted)" }}>
+                <span className="font-semibold" style={{ color: "var(--text)" }}>Read only.</span>{" "}{readOnlyConversationReason}
+              </div>
+            )}
+            <fieldset disabled={!canMutateConversation} aria-describedby={!canMutateConversation ? "conversation-read-only-notice" : undefined} className="m-0 min-w-0 border-0 p-0 disabled:opacity-60">
             <div className="composer-shell">
               {uploadError && (
                 <div
@@ -2959,11 +3739,11 @@ function ChatScreen({
                 </div>
               )}
               {attachments.length > 0 && (
-                <div className="flex gap-2 overflow-x-auto px-4 pt-3 pb-2">
+                <div className="no-scrollbar flex gap-2 overflow-x-auto px-3 pt-3 pb-2 sm:px-4">
                   {attachments.map(a => (
                     <div
                       key={a.id}
-                      className="relative flex h-[72px] min-w-[168px] max-w-[220px] items-center gap-2 rounded-md border border-soft surface px-2 py-2"
+                      className="relative flex h-[72px] min-w-[150px] max-w-[220px] items-center gap-2 rounded-md border border-soft surface px-2 py-2 sm:min-w-[168px]"
                     >
                       <div className="flex h-12 w-12 flex-shrink-0 items-center justify-center overflow-hidden rounded-md border border-soft" style={{ background: "var(--surface-2)" }}>
                         {a.previewUrl ? (
@@ -2999,11 +3779,11 @@ function ChatScreen({
                 onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void sendMessage(); } }}
                 placeholder={isEmpty ? "Ask Chronos anything…" : "Reply…"}
                 rows={1}
-                className="w-full bg-transparent px-5 pt-4 pb-2 text-[15px] outline-none resize-none"
+                className="w-full bg-transparent px-4 pt-4 pb-2 text-[16px] outline-none resize-none sm:px-5 sm:text-[15px]"
                 style={{ minHeight: 52, maxHeight: 200, color: "var(--text)" }}
               />
-              <div className="flex items-center justify-between px-3 pb-2.5 pt-1">
-                <div className="flex items-center gap-1">
+              <div className="flex min-w-0 items-center justify-between gap-2 px-2 pb-2.5 pt-1 sm:px-3">
+                <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1 overflow-visible sm:flex-nowrap sm:overflow-x-auto">
                   <ComposerMenu
                     ariaLabel="Attach"
                     title="Attach files"
@@ -3028,7 +3808,18 @@ function ChatScreen({
                       </>
                     )}
                   </ComposerMenu>
-                  {recording ? (
+                  {handsFree ? (
+                    <button
+                      type="button"
+                      aria-label="Stop hands-free voice mode"
+                      className="btn btn-ghost btn-sm"
+                      style={{ color: recording ? "var(--danger)" : "var(--accent-text)" }}
+                      onClick={stopHandsFree}
+                    >
+                      <span className="pulse-dot inline-block h-2 w-2 rounded-full" style={{ background: recording ? "var(--danger)" : "var(--accent)" }}/>
+                      {recording ? "Listening" : voiceBusy ? "Transcribing" : streaming ? "Thinking" : "Speaking"} · Stop
+                    </button>
+                  ) : recording ? (
                     <button
                       type="button"
                       aria-label="Stop recording"
@@ -3055,6 +3846,12 @@ function ChatScreen({
                             label="Record voice"
                             description="Dictate with your microphone; stops on click"
                             onSelect={() => { close(); void startRecording(); }}
+                          />
+                          <ComposerMenuItem
+                            icon={<IC.Volume size={14}/>}
+                            label="Hands-free conversation"
+                            description="Detect a pause, send, read the reply aloud, and keep listening"
+                            onSelect={() => { close(); startHandsFree(); }}
                           />
                           <ComposerMenuItem
                             icon={<IC.Volume size={14}/>}
@@ -3233,13 +4030,18 @@ function ChatScreen({
                     )}
                   </ComposerMenu>
                 </div>
-                <div className="flex items-center gap-2">
+                <div className="flex flex-shrink-0 items-center gap-2">
                   {streaming ? (
-                    <button onClick={() => abortRef.current?.abort()} className="btn btn-ghost btn-sm">
-                      <IC.Stop size={14}/> Stop
+                    <button
+                      onClick={() => abortRef.current?.abort()}
+                      className="btn btn-ghost btn-sm"
+                      title="Stop this response stream. Durable task work continues until you cancel it from the Task panel."
+                    >
+                      <IC.Stop size={14}/> Stop response
                     </button>
                   ) : (
                     <button onClick={() => void sendMessage()} disabled={!draft.trim() || attachmentsBusy()}
+                            aria-label="Send message"
                             className="btn btn-accent btn-sm">
                       <IC.ArrowUp size={14} stroke={2.2}/>
                     </button>
@@ -3247,7 +4049,8 @@ function ChatScreen({
                 </div>
               </div>
             </div>
-            <p className="text-center text-[11.5px] mt-3" style={{ color: "var(--text-faint)" }}>
+            </fieldset>
+            <p className="mt-2 hidden text-center text-[11.5px] sm:block" style={{ color: "var(--text-faint)" }}>
               Chronos requires approval for external sends (email, social posts, publishing) and reports failed searches honestly.
             </p>
           </div>
@@ -3284,6 +4087,9 @@ function ChatScreen({
           onClick={() => onPaletteOpenChange(false)}
         >
           <div
+            ref={paletteDialogRef}
+            tabIndex={-1}
+            aria-label="Search Chronos"
             className="surface border rounded-2xl w-full max-w-[560px] mx-4 overflow-hidden pop-in"
             style={{ borderColor: "var(--border)", boxShadow: "var(--shadow-xl)" }}
             onClick={e => e.stopPropagation()}
@@ -3297,8 +4103,13 @@ function ChatScreen({
                 value={paletteQuery}
                 onChange={e => setPaletteQuery(e.target.value)}
                 onKeyDown={handlePaletteKeyDown}
-                placeholder="Search previous chats..."
-                aria-label="Search previous chats"
+                placeholder="Search conversations, tasks, artifacts, memory, and sources…"
+                aria-label="Search all Chronos content"
+                role="combobox"
+                aria-autocomplete="list"
+                aria-controls="chronos-search-results"
+                aria-expanded="true"
+                aria-activedescendant={paletteSelectedIdx >= 0 ? `chronos-search-option-${paletteSelectedIdx}` : undefined}
                 className="flex-1 bg-transparent text-[14px] outline-none"
                 style={{ color: "var(--text)" }}
               />
@@ -3307,15 +4118,15 @@ function ChatScreen({
             </div>
 
             {/* Results */}
-            <div className="max-h-[400px] overflow-y-auto">
+            <div id="chronos-search-results" className="max-h-[400px] overflow-y-auto" role="listbox" aria-label="Search results" aria-live="polite">
               {paletteQuery.trim() && paletteGroupsWithIdx.length === 0 && (
                 <div className="px-4 py-8 text-center text-[13.5px]" style={{ color: "var(--text-dim)" }}>
                   No results for &ldquo;{paletteQuery}&rdquo;
                 </div>
               )}
               {paletteGroupsWithIdx.map(group => (
-                <div key={group.type}>
-                  <div className="px-4 pt-3 pb-1 text-[11.5px] font-medium uppercase tracking-wider"
+                <div key={group.type} role="group" aria-labelledby={`chronos-search-group-${group.type}`}>
+                  <div id={`chronos-search-group-${group.type}`} className="px-4 pt-3 pb-1 text-[11.5px] font-medium uppercase tracking-wider"
                        style={{ color: "var(--text-dim)" }}>
                     {group.label}
                   </div>
@@ -3324,7 +4135,10 @@ function ChatScreen({
                     return (
                       <button
                         key={`${result.type}-${result.id}`}
+                        id={`chronos-search-option-${flatIdx}`}
                         onClick={() => handlePaletteSelect(result)}
+                        role="option"
+                        aria-selected={isSelected}
                         className="w-full flex items-start gap-3 px-4 py-2.5 text-left smooth hover:bg-[var(--surface-2)]"
                         style={{ background: isSelected ? "var(--accent-soft)" : undefined }}
                       >
@@ -3351,7 +4165,7 @@ function ChatScreen({
               ))}
               {!paletteQuery.trim() && (
                 <div className="px-4 py-6 text-center text-[13px]" style={{ color: "var(--text-dim)" }}>
-                  Type a keyword from a previous conversation.
+                  Search across your authorized Chronos workspace.
                 </div>
               )}
             </div>
@@ -3367,11 +4181,12 @@ function ChatScreen({
 type MessageActionMenuProps = {
   message: Message;
   conversationId: string;
+  canEdit: boolean;
   onRefresh: () => void;
   onBranch: (newConvoId: string) => void;
 };
 
-function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: MessageActionMenuProps) {
+function MessageActionMenu({ message, conversationId, canEdit, onRefresh, onBranch }: MessageActionMenuProps) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
@@ -3382,6 +4197,7 @@ function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: Mes
   const menuRef = useRef<HTMLDivElement>(null);
   // Fix 5: keep a ref to the trigger so we can return focus after Escape
   const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuWasOpenRef = useRef(false);
   const mid = message.id;
 
   // Close menu on outside click
@@ -3392,6 +4208,20 @@ function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: Mes
     }
     document.addEventListener("mousedown", onDown);
     return () => document.removeEventListener("mousedown", onDown);
+  }, [open]);
+
+  useEffect(() => {
+    if (open) {
+      menuWasOpenRef.current = true;
+      const frame = window.requestAnimationFrame(() => {
+        menuRef.current?.querySelector<HTMLElement>('[role="menuitem"]')?.focus();
+      });
+      return () => window.cancelAnimationFrame(frame);
+    }
+    if (menuWasOpenRef.current) {
+      menuWasOpenRef.current = false;
+      window.requestAnimationFrame(() => triggerRef.current?.focus());
+    }
   }, [open]);
 
   // Fix 6: wrap toast cleanup in useEffect so the timer is cancelled on unmount
@@ -3562,6 +4392,8 @@ function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: Mes
       e.stopPropagation();
       setOpen(false);
       triggerRef.current?.focus();
+    } else if (open && menuRef.current) {
+      moveMenuFocus(menuRef.current, e);
     }
   }
 
@@ -3569,6 +4401,7 @@ function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: Mes
     return (
       <div className="mt-2">
         <textarea
+          aria-label="Edit message"
           value={editContent}
           onChange={e => setEditContent(e.target.value)}
           className="w-full border rounded-lg px-3 py-2 text-[14px] outline-none resize-none"
@@ -3588,7 +4421,7 @@ function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: Mes
     // and when keyboard focus moves inside the menu, without needing JS state.
     <div className="relative inline-block" ref={menuRef} onKeyDown={handleKeyDown}>
       {toast && (
-        <div className="absolute -top-9 right-0 text-[12px] px-2.5 py-1 rounded-md whitespace-nowrap z-50"
+        <div role="status" aria-live="polite" className="absolute -top-9 right-0 text-[12px] px-2.5 py-1 rounded-md whitespace-nowrap z-50"
              style={{ background: "var(--surface-2)", color: "var(--text-muted)", border: "1px solid var(--border-soft)" }}>
           {toast}
         </div>
@@ -3611,11 +4444,12 @@ function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: Mes
         <div role="menu" className="absolute right-0 top-7 z-40 rounded-xl shadow-lg border py-1 min-w-[160px]"
              style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
           {/* Fix 3 + Fix 5: role="menuitem" + disabled when in-flight */}
-          <button role="menuitem" onClick={handlePin} disabled={isBusy("pin")} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5 disabled:opacity-50" style={{ color: "var(--text)" }}>
-            <IC.Lock size={13}/>{message.pinned ? "Unpin" : "Pin"}
-          </button>
           <button role="menuitem" onClick={handleCopy} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5" style={{ color: "var(--text)" }}>
             <IC.External size={13}/>Copy
+          </button>
+          {canEdit && <>
+          <button role="menuitem" onClick={handlePin} disabled={isBusy("pin")} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5 disabled:opacity-50" style={{ color: "var(--text)" }}>
+            <IC.Lock size={13}/>{message.pinned ? "Unpin" : "Pin"}
           </button>
           {message.role === "user" && (
             <button role="menuitem" onClick={handleEdit} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5" style={{ color: "var(--text)" }}>
@@ -3642,6 +4476,7 @@ function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: Mes
           <button role="menuitem" onClick={handleConvertWorkflow} disabled={isBusy("convert-workflow")} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5 disabled:opacity-50" style={{ color: "var(--text)" }}>
             <IC.Refresh size={13}/>Convert to workflow
           </button>
+          </>}
           <div className="mx-2 my-1 border-t" style={{ borderColor: "var(--border-soft)" }}/>
           <button role="menuitem" onClick={handleExport} className="w-full text-left px-3 py-1.5 text-[13px] smooth hover:bg-[var(--surface-2)] flex items-center gap-2.5" style={{ color: "var(--text-dim)" }}>
             <IC.Folder size={13}/>Export
@@ -3654,7 +4489,7 @@ function MessageActionMenu({ message, conversationId, onRefresh, onBranch }: Mes
 
 // ─── User Message ─────────────────────────────────────────────────────────────
 
-type MsgProps = { message: Message; conversationId: string; onRefresh: () => void; onBranch: (id: string) => void };
+type MsgProps = { message: Message; conversationId: string; canEdit: boolean; onRefresh: () => void; onBranch: (id: string) => void };
 
 /** Chip for a single persisted attachment on a user message.
  *  Image attachments: fetches the blob via apiFetch (Bearer-authed) and renders
@@ -3680,7 +4515,7 @@ function AttachmentChip({ artifact }: { artifact: ArtifactRef }) {
       cancelled = true;
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+
   }, [artifact.id, isImage]);
 
   if (isImage && thumbUrl) {
@@ -3690,7 +4525,7 @@ function AttachmentChip({ artifact }: { artifact: ArtifactRef }) {
         style={{ borderColor: "var(--border-soft)", width: 56, height: 56, flexShrink: 0 }}
         title={artifact.title}
       >
-        {/* eslint-disable-next-line @next/next/no-img-element */}
+        { }
         <img src={thumbUrl} alt={artifact.title} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
       </div>
     );
@@ -3707,7 +4542,7 @@ function AttachmentChip({ artifact }: { artifact: ArtifactRef }) {
   );
 }
 
-function UserMessage({ message, conversationId, onRefresh, onBranch }: MsgProps) {
+function UserMessage({ message, conversationId, canEdit, onRefresh, onBranch }: MsgProps) {
   return (
     <div className="flex justify-end fadein group">
       <div className="max-w-[72%] min-w-0">
@@ -3723,68 +4558,9 @@ function UserMessage({ message, conversationId, onRefresh, onBranch }: MsgProps)
         </div>
         <div className="mt-1.5 flex justify-end transition-opacity opacity-0 group-hover:opacity-100 focus-within:opacity-100">
           {message.pinned && <IC.Lock size={12} style={{ color: "var(--accent)" }}/>}
-          <MessageActionMenu message={message} conversationId={conversationId} onRefresh={onRefresh} onBranch={onBranch}/>
+          <MessageActionMenu message={message} conversationId={conversationId} canEdit={canEdit} onRefresh={onRefresh} onBranch={onBranch}/>
         </div>
       </div>
-    </div>
-  );
-}
-
-function TraceRow({ trace }: { trace: ToolTrace }) {
-  const [open, setOpen] = useState(false);
-  const isRunning = trace.status === "streaming";
-  const isError = trace.status === "error";
-  const isPending = trace.status === "approval_pending";
-  const dotColor = isRunning ? "var(--accent)" : isError ? "var(--danger)" : isPending ? "var(--warn)" : "var(--ok)";
-  const toolLabel = trace.tool.replace(/[_]/g, ".").replace(/\./g, " › ");
-
-  return (
-    <div className="rounded-lg border overflow-hidden" style={{ borderColor: "var(--border-soft)" }}>
-      <button
-        className="w-full flex items-center gap-2.5 px-3 py-2 text-left smooth hover:bg-[var(--surface-2)]"
-        style={{ background: "var(--surface)", color: "var(--text-muted)" }}
-        onClick={() => setOpen(o => !o)}
-      >
-        <Dot color={dotColor} size={6} pulse={isRunning} ring={isRunning} />
-        <span className="font-mono text-[11px]" style={{ color: "var(--text-dim)" }}>{toolLabel}</span>
-        <span className="flex-1 text-[12.5px] truncate" style={{ color: "var(--text-muted)" }}>{trace.summary}</span>
-        <IC.ChevronDown size={12} style={{ color: "var(--text-dim)", transform: open ? "rotate(180deg)" : undefined, transition: "transform .15s", flexShrink: 0 }}/>
-      </button>
-    </div>
-  );
-}
-
-function ReasoningPanel({ summaries, streaming }: { summaries: ReasoningSummary[]; streaming: boolean }) {
-  const [open, setOpen] = useState(true);
-  if (!summaries.length) return null;
-  const latest = summaries[summaries.length - 1];
-  const isRunning = streaming && summaries.some(item => item.status === "streaming");
-
-  return (
-    <div className="mb-3 rounded-lg border overflow-hidden" style={{ borderColor: "var(--border-soft)", background: "var(--surface)" }}>
-      <button
-        type="button"
-        onClick={() => setOpen(value => !value)}
-        className="w-full flex items-center gap-2.5 px-3 py-2 text-left smooth hover:bg-[var(--surface-2)]"
-        style={{ color: "var(--text-muted)" }}
-      >
-        <Dot color="var(--accent)" size={6} pulse={isRunning} ring={isRunning} />
-        <span className="font-mono text-[11px]" style={{ color: "var(--text-dim)" }}>reasoning</span>
-        <span className="flex-1 text-[12.5px] truncate" style={{ color: "var(--text-muted)" }}>
-          {latest.iteration ? `Iteration ${latest.iteration}: ` : ""}{latest.summary.split("\n")[0].replace(/^[-*]\s*/, "")}
-        </span>
-        <IC.ChevronDown size={12} style={{ color: "var(--text-dim)", transform: open ? "rotate(180deg)" : undefined, transition: "transform .15s", flexShrink: 0 }}/>
-      </button>
-      {open && (
-        <div className="px-3 pb-3 pt-1 space-y-2 border-t hairline">
-          {summaries.map(item => (
-            <div key={item.id} className="text-[12.5px] leading-relaxed whitespace-pre-wrap" style={{ color: "var(--text-muted)" }}>
-              {item.iteration && <span className="font-mono text-[11px] mr-2" style={{ color: "var(--text-dim)" }}>#{item.iteration}</span>}
-              {item.summary}
-            </div>
-          ))}
-        </div>
-      )}
     </div>
   );
 }
@@ -3966,11 +4742,9 @@ function InlineApprovalCard({ sr }: { sr: StructuredResponse }) {
 
 function InlineTaskApprovals({
   approvalIds,
-  taskId,
   onChanged,
 }: {
   approvalIds: string[];
-  taskId: string | null;
   onChanged: () => void;
 }) {
   const [approvals, setApprovals] = useState<Approval[]>([]);
@@ -4256,7 +5030,7 @@ function ClarificationCard({
   );
 }
 
-function AssistantMessage({ message, content, status, persona, toolTraces, reasoningSummaries, artifacts, thinking, mode, structuredResponse, conversationId, onRefresh, onBranch, onClarificationReply, onRetry, retryBusy }: { message: Message; content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[]; reasoningSummaries?: ReasoningSummary[]; artifacts?: ArtifactRef[]; thinking?: boolean; mode?: string; structuredResponse?: StructuredResponse | null; conversationId: string; onRefresh: () => void; onBranch: (id: string) => void; onClarificationReply: (text: string) => void; onRetry?: () => void; retryBusy?: boolean }) {
+function AssistantMessage({ message, content, status, persona, toolTraces, reasoningSummaries, artifacts, thinking, mode, structuredResponse, conversationId, canEdit, onRefresh, onBranch, onClarificationReply, onRetry, retryBusy }: { message: Message; content: string; status: MessageStatus; persona: typeof PERSONAS[0]; toolTraces?: ToolTrace[]; reasoningSummaries?: ReasoningSummary[]; artifacts?: ArtifactRef[]; thinking?: boolean; mode?: string; structuredResponse?: StructuredResponse | null; conversationId: string; canEdit: boolean; onRefresh: () => void; onBranch: (id: string) => void; onClarificationReply: (text: string) => void; onRetry?: () => void; retryBusy?: boolean }) {
   const hasTraces = !!(toolTraces && toolTraces.length > 0);
   const hasReasoning = !!(reasoningSummaries && reasoningSummaries.length > 0);
   const isStreaming = status === "streaming";
@@ -4277,8 +5051,8 @@ function AssistantMessage({ message, content, status, persona, toolTraces, reaso
           {/* Fix 7: rely on Tailwind group-hover + focus-within instead of JS state */}
           {!isStreaming && (
             <div className="ml-auto flex items-center gap-1 transition-opacity opacity-0 group-hover:opacity-100 focus-within:opacity-100">
-              {content && <VoicePlayButton text={content} conversationId={conversationId}/>}
-              <MessageActionMenu message={message} conversationId={conversationId} onRefresh={onRefresh} onBranch={onBranch}/>
+              {content && canEdit && <VoicePlayButton text={content} conversationId={conversationId}/>}
+              <MessageActionMenu message={message} conversationId={conversationId} canEdit={canEdit} onRefresh={onRefresh} onBranch={onBranch}/>
             </div>
           )}
         </div>
@@ -4339,6 +5113,41 @@ function AssistantMessage({ message, content, status, persona, toolTraces, reaso
 
         {showCards && <InlineApprovalCard sr={sr!} />}
 
+        {/* Memory evidence — the exact authorized memories assembled for this answer. */}
+        {message.memory_refs && message.memory_refs.length > 0 && (
+          <details className="mt-3 max-w-[680px] surface border border-soft rounded-lg p-2.5">
+            <summary className="flex cursor-pointer list-none items-center gap-2 text-[11.5px] font-medium" style={{ color: "var(--text-dim)" }}>
+              <IC.Memory size={13} style={{ color: "var(--accent)" }}/>
+              Memory used
+              <span className="rounded-full px-1.5 py-0.5 text-[10px]" style={{ background: "var(--accent-soft)", color: "var(--accent-text)" }}>
+                {message.memory_refs.length}
+              </span>
+              <IC.ChevronDown size={11} style={{ marginLeft: "auto" }}/>
+            </summary>
+            <ul className="mt-2 space-y-1.5" aria-label="Memories used for this answer">
+              {message.memory_refs.map((memory, index) => (
+                <li key={memory.id || index} className="rounded-md border border-soft px-2.5 py-2 text-[12px]" style={{ background: "var(--surface-2)", color: "var(--text-muted)" }}>
+                  <div className="whitespace-pre-wrap break-words">{String(memory.content || "Memory reference")}</div>
+                  {(memory.scope || memory.source) && (
+                    <div className="mt-1 text-[10.5px]" style={{ color: "var(--text-dim)" }}>
+                      {[memory.scope, memory.source].filter(Boolean).join(" · ")}
+                    </div>
+                  )}
+                  {memory.id && (
+                    <a
+                      href={`/memory?memory=${encodeURIComponent(memory.id)}`}
+                      className="mt-1.5 inline-flex items-center gap-1 text-[11px] font-medium hover:underline"
+                      style={{ color: "var(--accent-text)" }}
+                    >
+                      <IC.Pencil size={11}/> Inspect or edit
+                    </a>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </details>
+        )}
+
         {/* Sources — project knowledge citations grounding this answer */}
         {message.citations && message.citations.length > 0 && (
           <div className="mt-3 surface border border-soft rounded-lg p-2.5">
@@ -4381,8 +5190,13 @@ function AssistantMessage({ message, content, status, persona, toolTraces, reaso
 
 function EmptyChatState({ persona, onSubmit }: { persona: typeof PERSONAS[0]; onSubmit: (q: string) => void }) {
   const [showIntro, setShowIntro] = useState(false);
+  const [firstUseGuide, setFirstUseGuide] = useState<{ complete: number; total: number; steps: Array<{ id: string; label: string; description: string; href: string; complete: boolean }> } | null>(null);
   useEffect(() => {
     setShowIntro(window.localStorage.getItem("chronos.onboarding.dismissed") !== "1");
+    apiFetch("/settings/onboarding/guide")
+      .then(response => response.json())
+      .then(data => setFirstUseGuide(data))
+      .catch(() => setFirstUseGuide(null));
   }, []);
   function dismissIntro() {
     window.localStorage.setItem("chronos.onboarding.dismissed", "1");
@@ -4395,8 +5209,8 @@ function EmptyChatState({ persona, onSubmit }: { persona: typeof PERSONAS[0]; on
     { icon: <IC.Sparkles size={16}/>, label: "Rewrite our ICP from recent calls", q: "Rewrite our ICP based on recent customer calls." },
   ];
   return (
-    <div className="flex-1 flex flex-col items-center justify-center px-6 overflow-y-auto">
-      <div className="max-w-[680px] w-full pb-20">
+    <div className="flex-1 flex flex-col items-center justify-center overflow-y-auto px-4 sm:px-6">
+      <div className="max-w-[680px] w-full py-6 md:pb-20 md:pt-0">
         <div className="flex items-center gap-3 mb-6">
           <PersonaAvatar name={persona.name} color={persona.color} size={44}/>
           <div className="text-[13px]" style={{ color: "var(--text-dim)" }}>
@@ -4408,19 +5222,28 @@ function EmptyChatState({ persona, onSubmit }: { persona: typeof PERSONAS[0]; on
         {showIntro && (
           <div className="mb-6 surface border border-soft rounded-xl p-4 fadein" role="note">
             <div className="flex items-start justify-between gap-3">
-              <div className="space-y-1.5 text-[13.5px]" style={{ color: "var(--text-muted)" }}>
-                <div className="flex items-center gap-2"><IC.Chat size={14} style={{ color: "var(--accent)", flexShrink: 0 }}/> Ask normal questions — Chronos answers right away.</div>
-                <div className="flex items-center gap-2"><IC.Activity size={14} style={{ color: "var(--accent)", flexShrink: 0 }}/> Longer work runs as a task with visible progress you can check anytime.</div>
-                <div className="flex items-center gap-2"><IC.Approvals size={14} style={{ color: "var(--accent)", flexShrink: 0 }}/> Sensitive actions like sending email always wait for your approval.</div>
-                <div className="pt-1 text-[12.5px]" style={{ color: "var(--text-dim)" }}>
-                  Optional: <a href="/connectors" className="underline hover:opacity-80" style={{ color: "var(--accent-text)" }}>connect Gmail, Calendar, or Drive</a> to let Chronos work with them.
-                </div>
+              <div className="min-w-0 flex-1 text-[13.5px]" style={{ color: "var(--text-muted)" }}>
+                <div className="font-semibold" style={{ color: "var(--text)" }}>Complete your first workflow</div>
+                <p className="mt-1 text-[12.5px]" style={{ color: "var(--text-dim)" }}>Connect a provider, ground a project, run cited research, review an approval, and schedule the result.</p>
+                {firstUseGuide ? (
+                  <div className="mt-3 grid gap-1.5">
+                    {firstUseGuide.steps.filter(item => !item.complete).slice(0, 3).map(item => (
+                      <a key={item.id} href={item.href} className="flex items-center justify-between gap-3 rounded-lg border border-soft px-3 py-2 hover:border-[var(--accent)]">
+                        <span className="truncate">{item.label}</span>
+                        <span className="text-[11.5px] font-semibold" style={{ color: "var(--accent-text)" }}>Open</span>
+                      </a>
+                    ))}
+                    <div className="text-[11.5px]" role="status" style={{ color: "var(--text-faint)" }}>{firstUseGuide.complete} of {firstUseGuide.total} complete</div>
+                  </div>
+                ) : (
+                  <a href="/connectors?onboarding=connector" className="mt-3 inline-block underline hover:opacity-80" style={{ color: "var(--accent-text)" }}>Start with a connector</a>
+                )}
               </div>
               <button type="button" aria-label="Dismiss intro" onClick={dismissIntro} className="btn btn-ghost btn-icon flex-shrink-0"><IC.X size={14}/></button>
             </div>
           </div>
         )}
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           {suggestions.map((s, i) => (
             <button key={i} className="suggestion fadeup" style={{ animationDelay: `${i * 50}ms` }}
                     onClick={() => onSubmit(s.q)}>
@@ -4455,8 +5278,12 @@ function LiveOperationsDrawer({
   const liveBrowsers = browserSessions.filter(isLive);
   const [activeBrowserId, setActiveBrowserId] = useState<string | null>(liveBrowsers[0]?.id ?? null);
   const [handBackSummary, setHandBackSummary] = useState("");
+  const drawerRef = useRef<HTMLElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
   const activeBrowser = browserSessions.find(session => session.id === activeBrowserId) ?? liveBrowsers[0] ?? null;
   const activeComputer = computerSessions.find(session => session.status === "active") ?? null;
+
+  useDialogFocus({ active: true, containerRef: drawerRef, initialFocusRef: closeButtonRef, onClose });
 
   useEffect(() => {
     setActiveBrowserId(current =>
@@ -4478,18 +5305,22 @@ function LiveOperationsDrawer({
 
   return (
     <aside
-      className="w-[430px] max-w-[46vw] border-l hairline surface flex flex-col z-30 fadein"
+      ref={drawerRef}
+      tabIndex={-1}
+      className="surface hairline fixed inset-0 z-[60] flex w-full flex-col fadein md:relative md:inset-auto md:z-30 md:w-[430px] md:max-w-[46vw] md:border-l"
       style={{ boxShadow: "-10px 0 28px color-mix(in oklch, var(--text) 8%, transparent)" }}
-      aria-label="Live browser and computer"
+      aria-labelledby="live-work-heading"
+      aria-modal="true"
+      role="dialog"
     >
       <div className="px-4 py-3 border-b hairline flex items-center justify-between gap-3">
         <div className="min-w-0">
-          <div className="text-[14px] font-semibold">Live work</div>
+          <div id="live-work-heading" className="text-[14px] font-semibold">Live work</div>
           <div className="text-[12px]" style={{ color: "var(--text-dim)" }}>Browser feed, approvals, and takeover stay in chat.</div>
         </div>
         <div className="flex items-center gap-1">
-          <button className="btn btn-ghost btn-icon" onClick={onRefresh} title="Refresh live work"><IC.Refresh size={14}/></button>
-          <button className="btn btn-ghost btn-icon" onClick={onClose} title="Close live work"><IC.X size={14}/></button>
+          <button className="btn btn-ghost btn-icon" onClick={onRefresh} title="Refresh live work" aria-label="Refresh live work"><IC.Refresh size={14}/></button>
+          <button ref={closeButtonRef} className="btn btn-ghost btn-icon" onClick={onClose} title="Close live work" aria-label="Close live work"><IC.X size={14}/></button>
         </div>
       </div>
 
@@ -4503,7 +5334,7 @@ function LiveOperationsDrawer({
           </div>
           {browserSessions.length > 1 && (
             <div className="px-3 py-2 border-b hairline">
-              <select className="surface border border-soft rounded-md px-2 py-1.5 text-[12.5px] w-full" value={activeBrowser?.id ?? ""} onChange={event => setActiveBrowserId(event.target.value)}>
+              <select aria-label="Active browser session" className="surface border border-soft rounded-md px-2 py-1.5 text-[12.5px] w-full" value={activeBrowser?.id ?? ""} onChange={event => setActiveBrowserId(event.target.value)}>
                 {browserSessions.map(session => <option key={session.id} value={session.id}>{session.title || session.current_url || session.id}</option>)}
               </select>
             </div>
@@ -4511,7 +5342,7 @@ function LiveOperationsDrawer({
           <div className="p-3">
             <div className="rounded-lg border border-soft overflow-hidden bg-black" style={{ aspectRatio: "16 / 10" }}>
               {activeBrowser?.screenshot_data_url ? (
-                // eslint-disable-next-line @next/next/no-img-element
+
                 <img src={activeBrowser.screenshot_data_url} alt="Live browser feed" className="w-full h-full object-contain" />
               ) : (
                 <div className="w-full h-full flex items-center justify-center px-4 text-center text-[13px]" style={{ color: "rgba(255,255,255,.74)" }}>
@@ -4529,8 +5360,9 @@ function LiveOperationsDrawer({
               <div className="mt-3 rounded-lg border px-3 py-3" style={{ borderColor: "var(--warn)", background: "var(--warn-soft)" }}>
                 <div className="text-[13px] font-medium" style={{ color: "var(--warn)" }}>Take over in chat</div>
                 <div className="mt-1 text-[12.5px]" style={{ color: "var(--text-dim)" }}>{activeBrowser.takeover_reason || "Credentials, MFA, CAPTCHA, or another human-only step is needed."}</div>
-                <div className="mt-3 flex gap-2">
+                <div className="mt-3 flex flex-col gap-2 sm:flex-row">
                   <input
+                    aria-label="Browser takeover hand-back summary"
                     value={handBackSummary}
                     onChange={event => setHandBackSummary(event.target.value)}
                     placeholder="What did you complete?"
@@ -4597,37 +5429,23 @@ function ActivityDrawer({
 }) {
   const steps = Array.isArray(task?.plan) ? task.plan : task?.plan?.steps ?? [];
   const currentStep = task?.current_step ?? 0;
-  const status = taskStatus(task, events, streamError);
+  const status = taskStatus(task, streamError);
   const approvalEvent = [...events].reverse().find(event => event.type === "awaiting_approval");
   const failureEvent = [...events].reverse().find(event => event.type === "task_failed");
   const completionEvent = [...events].reverse().find(event => event.type === "task_complete");
-  const [controlBusy, setControlBusy] = useState(false);
-  const [controlError, setControlError] = useState("");
-  const isTerminal = task ? ["complete", "failed", "cancelled"].includes(task.status) : false;
-  const canRetry = task ? ["failed", "cancelled"].includes(task.status) : false;
+  const drawerRef = useRef<HTMLElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
 
-  async function taskControl(action: "cancel" | "retry") {
-    if (!taskId || controlBusy) return;
-    setControlBusy(true);
-    setControlError("");
-    try {
-      await apiFetch(`/tasks/${taskId}/${action}`, { method: "POST" });
-      onReconnect?.();
-    } catch {
-      setControlError(action === "cancel" ? "Couldn't cancel the task — try again." : "Couldn't retry the task — try again.");
-    } finally {
-      setControlBusy(false);
-    }
-  }
+  useDialogFocus({ active: true, containerRef: drawerRef, initialFocusRef: closeButtonRef, onClose });
 
   return (
-    <aside className="flex-shrink-0 flex flex-col border-l hairline slidein" style={{ width: 400, background: "var(--bg)" }}>
+    <aside ref={drawerRef} tabIndex={-1} className="hairline fixed inset-0 z-[60] flex w-full flex-shrink-0 flex-col slidein md:relative md:inset-auto md:z-auto md:w-[400px] md:border-l" style={{ background: "var(--bg)" }} role="dialog" aria-modal="true" aria-labelledby="task-activity-heading">
       <div className="px-5 h-[52px] flex items-center justify-between border-b hairline">
         <div className="flex items-center gap-2.5">
           <StatusDot status={status.dot}/>
-          <span className="text-[14px] font-semibold">{status.label}</span>
+          <span id="task-activity-heading" className="text-[14px] font-semibold" role="status" aria-live="polite">{status.label}</span>
         </div>
-        <button onClick={onClose} className="btn btn-ghost btn-icon"><IC.X size={16}/></button>
+        <button ref={closeButtonRef} onClick={onClose} className="btn btn-ghost btn-icon" aria-label="Close task activity"><IC.X size={16}/></button>
       </div>
 
       <div className="flex-1 overflow-y-auto p-5">
@@ -4643,25 +5461,15 @@ function ActivityDrawer({
               <div className="mt-2 flex items-center gap-2 text-[12px]" style={{ color: "var(--text-dim)" }}>
                 <span>Step {Math.min(currentStep, steps.length)} of {steps.length || "..."}</span>
               </div>
-              {task && (!isTerminal || canRetry) && (
-                <div className="mt-3 flex items-center gap-2">
-                  {!isTerminal && (
-                    <button onClick={() => void taskControl("cancel")} disabled={controlBusy} className="btn btn-danger-soft btn-sm disabled:opacity-50">
-                      <IC.X size={13}/> {controlBusy ? "Working…" : "Cancel task"}
-                    </button>
-                  )}
-                  {canRetry && (
-                    <button onClick={() => void taskControl("retry")} disabled={controlBusy} className="btn btn-secondary btn-sm disabled:opacity-50">
-                      <IC.Refresh size={13}/> {controlBusy ? "Working…" : "Retry task"}
-                    </button>
-                  )}
+              {task && (
+                <div className="mt-3">
+                  <TaskControls task={task} onRefresh={onReconnect} compact/>
                 </div>
               )}
-              {controlError && <div className="mt-2 text-[12px]" style={{ color: "var(--danger)" }}>{controlError}</div>}
             </div>
 
             {streamError ? (
-              <div className="rounded-lg border px-3 py-2.5" style={{ borderColor: "var(--danger)" }}>
+              <div role="alert" className="rounded-lg border px-3 py-2.5" style={{ borderColor: "var(--danger)" }}>
                 <div className="flex items-center justify-between gap-3">
                   <span className="text-[12.5px]" style={{ color: "var(--text-muted)" }}>
                     The live progress feed disconnected. The task keeps running in the background.
@@ -4772,21 +5580,26 @@ function mergeTaskEvent(task: Task | null, event: TaskStreamEvent): Task | null 
   return task;
 }
 
-function taskStatus(task: Task | null, events: TaskStreamEvent[], streamError: string) {
-  if (streamError) return { label: "Stream interrupted", dot: "error" };
+function taskStatus(task: Task | null, streamError: string) {
   if (!task) return { label: "Connecting...", dot: "working" };
-  if (task.status === "awaiting_approval" || events.some(event => event.type === "awaiting_approval")) return { label: "Waiting on approval", dot: "awaiting" };
+  if (task.status === "paused") return { label: "Paused", dot: "paused" };
+  if (task.status === "awaiting_approval") return { label: "Waiting on approval", dot: "awaiting" };
   if (task.status === "failed") return { label: "Stopped", dot: "failed" };
+  if (task.status === "cancelled") return { label: "Cancelled", dot: "cancelled" };
   if (task.status === "complete") return { label: "Complete", dot: "done" };
+  if (streamError) return { label: "Stream interrupted", dot: "error" };
   if (task.status === "queued" || task.status === "pending" || task.status === "planning") return { label: "Queued", dot: "queued" };
   return { label: "Working...", dot: "working" };
 }
 
 function stepState(step: TaskStep, index: number, currentStep: number, taskStatusValue: string | undefined, events: TaskStreamEvent[]) {
   if (events.some(event => event.type === "task_failed" && event.step?.id === step.id)) return "failed";
-  if (events.some(event => event.type === "awaiting_approval" && event.step_id === step.id)) return "waiting";
-  if (taskStatusValue === "awaiting_approval" && step.action === "approval_gate" && index === currentStep) return "waiting";
+  if (taskStatusValue === "awaiting_approval" && (
+    events.some(event => event.type === "awaiting_approval" && event.step_id === step.id)
+    || (step.action === "approval_gate" && index === currentStep)
+  )) return "waiting";
   if (taskStatusValue === "complete" || index < currentStep) return "done";
+  if (index === currentStep && taskStatusValue === "paused") return "paused";
   if (index === currentStep && taskStatusValue === "running") return "active";
   return "queued";
 }
@@ -4794,13 +5607,14 @@ function stepState(step: TaskStep, index: number, currentStep: number, taskStatu
 function StepIcon({ state }: { state: string }) {
   if (state === "done") return <IC.Check size={16} stroke={2.2} style={{ color: "var(--ok)" }}/>;
   if (state === "waiting") return <IC.Approvals size={16} style={{ color: "var(--warn)" }}/>;
+  if (state === "paused") return <IC.Pause size={16} style={{ color: "var(--warn)" }}/>;
   if (state === "failed") return <IC.Info size={16} style={{ color: "var(--danger)" }}/>;
   if (state === "active") return <Dot color="var(--accent)" size={10} pulse ring/>;
   return <Dot color="var(--text-faint)" size={8}/>;
 }
 
 function stepStateLabel(state: string) {
-  return ({ done: "Finished", waiting: "Waiting for approval", failed: "Failed", active: "In progress", queued: "Queued" } as Record<string, string>)[state] ?? state;
+  return ({ done: "Finished", waiting: "Waiting for approval", paused: "Paused", failed: "Failed", active: "In progress", queued: "Queued" } as Record<string, string>)[state] ?? state;
 }
 
 // Human-readable labels for internal activity event types. Anything unmapped
@@ -4852,18 +5666,33 @@ type OpsTab = typeof OPS_TABS[number]["id"];
 
 // Activity is the unified Operations surface: jobs/actions plus the live
 // research, browser, and computer sessions that used to live on dead-end routes.
-function ActivityScreen() {
-  const [tab, setTab] = useState<OpsTab>("tasks");
+function ActivityScreen({ currentMember }: { currentMember: AuthenticatedMember }) {
+  const router = useRouter();
+  const [tab, setTab] = useState<OpsTab>(() => {
+    if (typeof window === "undefined") return "tasks";
+    const requested = new URLSearchParams(window.location.search).get("tab");
+    return OPS_TABS.some(item => item.id === requested) ? requested as OpsTab : "tasks";
+  });
+  function selectActivityTab(next: OpsTab) {
+    setTab(next);
+    const params = new URLSearchParams(window.location.search);
+    params.set("tab", next);
+    if (next !== "tasks") params.delete("task_id");
+    router.replace(`/activity?${params.toString()}`, { scroll: false });
+  }
   return (
     <div className="flex-1 flex flex-col min-h-0">
-      <div role="tablist" className="flex gap-0.5 px-10 pt-5 border-b hairline flex-shrink-0">
+      <div role="tablist" aria-label="Activity sections" onKeyDown={handleHorizontalTabKeyDown} className="no-scrollbar flex flex-shrink-0 gap-0.5 overflow-x-auto border-b hairline px-2 pt-2 sm:px-4 md:px-10 md:pt-5">
         {OPS_TABS.map(t => (
           <button
             key={t.id}
             role="tab"
+            id={`activity-tab-${t.id}`}
+            aria-controls={`activity-panel-${t.id}`}
             aria-selected={tab === t.id}
-            onClick={() => setTab(t.id)}
-            className="px-4 py-2.5 text-[13.5px] font-medium transition-colors"
+            tabIndex={tab === t.id ? 0 : -1}
+            onClick={() => selectActivityTab(t.id)}
+            className="flex-shrink-0 px-3 py-2.5 text-[13.5px] font-medium transition-colors sm:px-4"
             style={{
               color: tab === t.id ? "var(--text)" : "var(--text-dim)",
               borderBottom: tab === t.id ? "2px solid var(--accent)" : "2px solid transparent",
@@ -4874,8 +5703,8 @@ function ActivityScreen() {
           </button>
         ))}
       </div>
-      <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
-        {tab === "tasks"    && <TasksActivityView />}
+      <div id={`activity-panel-${tab}`} role="tabpanel" aria-labelledby={`activity-tab-${tab}`} tabIndex={0} className="flex-1 min-h-0 flex flex-col overflow-hidden">
+        {tab === "tasks"    && <TasksActivityView currentMember={currentMember} />}
         {tab === "research" && <ResearchScreen />}
         {tab === "browser"  && <BrowserOperatorScreen />}
         {tab === "computer" && <ComputerScreen />}
@@ -4885,18 +5714,23 @@ function ActivityScreen() {
   );
 }
 
-function TasksActivityView() {
+function TasksActivityView({ currentMember }: { currentMember: AuthenticatedMember }) {
   const [mode, setMode] = useState<"jobs" | "actions">("jobs");
   const [tasks, setTasks] = useState<Task[]>([]);
   const [actions, setActions] = useState<ActivityAction[]>([]);
   const [events, setEvents] = useState<ActivityAction[]>([]);
-  const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
+  const [activeTaskId, setActiveTaskId] = useState<string | null>(() => {
+    if (typeof window === "undefined") return null;
+    return new URLSearchParams(window.location.search).get("task_id");
+  });
   const [activeTask, setActiveTask] = useState<Task | null>(null);
   const [loading, setLoading] = useState(true);
   const [actionsLoading, setActionsLoading] = useState(true);
   const [actionType, setActionType] = useState("all");
   const [actionStatus, setActionStatus] = useState("all");
   const [actionQuery, setActionQuery] = useState("");
+  const [recoveringTaskId, setRecoveringTaskId] = useState<string | null>(null);
+  const [recoveryError, setRecoveryError] = useState("");
 
   const loadTasks = useCallback(async () => {
     setLoading(true);
@@ -4924,6 +5758,24 @@ function TasksActivityView() {
   useEffect(() => { void loadTasks(); }, [loadTasks]);
   useEffect(() => { void loadActions(); }, [loadActions]);
 
+  async function recoverTask(taskId: string) {
+    if (recoveringTaskId) return;
+    setRecoveringTaskId(taskId);
+    setRecoveryError("");
+    try {
+      await apiFetch(`/tasks/${encodeURIComponent(taskId)}/retry`, { method: "POST" });
+      await loadTasks();
+      if (activeTaskId === taskId) {
+        const refreshed = await apiFetch(`/tasks/${encodeURIComponent(taskId)}`).then(response => response.json()) as Task;
+        setActiveTask(refreshed);
+      }
+    } catch (requestError) {
+      setRecoveryError(requestError instanceof Error ? requestError.message : "The task could not be recovered.");
+    } finally {
+      setRecoveringTaskId(null);
+    }
+  }
+
   useEffect(() => {
     if (!activeTaskId) { setActiveTask(null); setEvents([]); return; }
     apiFetch(`/tasks/${activeTaskId}`)
@@ -4938,16 +5790,26 @@ function TasksActivityView() {
 
   const jobFilters = [
     { id: "all", label: "All", count: tasks.length },
+    { id: "queued", label: "Queued", count: tasks.filter(t => ["queued", "pending", "planning"].includes(t.status)).length },
     { id: "running", label: "Working", count: tasks.filter(t => t.status === "running").length },
+    { id: "paused", label: "Paused", count: tasks.filter(t => t.status === "paused").length },
     { id: "awaiting_approval", label: "Waiting on you", count: tasks.filter(t => t.status === "awaiting_approval").length },
     { id: "complete", label: "Done", count: tasks.filter(t => t.status === "complete").length },
     { id: "failed", label: "Stopped", count: tasks.filter(t => t.status === "failed").length },
+    { id: "cancelled", label: "Cancelled", count: tasks.filter(t => t.status === "cancelled").length },
+    { id: "dead_letter", label: "Needs recovery", count: tasks.filter(t => t.dead_letter).length },
   ];
   const [jobFilter, setJobFilter] = useState("all");
-  const filteredTasks = jobFilter === "all" ? tasks : tasks.filter(t => t.status === jobFilter);
+  const filteredTasks = jobFilter === "all"
+    ? tasks
+    : tasks.filter(t => jobFilter === "dead_letter"
+      ? t.dead_letter
+      : jobFilter === "queued"
+        ? ["queued", "pending", "planning"].includes(t.status)
+        : t.status === jobFilter);
 
   const statusLabel: Record<string, string> = {
-    queued: "Queued", running: "Working", awaiting_approval: "Waiting on you", complete: "Done", failed: "Stopped", pending: "Queued",
+    queued: "Queued", pending: "Queued", planning: "Planning", running: "Working", paused: "Paused", awaiting_approval: "Waiting on you", complete: "Done", failed: "Stopped", cancelled: "Cancelled",
   };
 
   return (
@@ -4970,7 +5832,7 @@ function TasksActivityView() {
 
       {mode === "jobs" && (
         <>
-          <div className="px-10 pb-4 flex items-center gap-1 flex-wrap">
+          <div className="flex flex-wrap items-center gap-1 px-4 pb-4 md:px-10">
             {jobFilters.map(f => (
               <button key={f.id} onClick={() => setJobFilter(f.id)}
                       className="px-3 py-1.5 rounded-md text-[13px] font-medium smooth whitespace-nowrap"
@@ -4980,29 +5842,47 @@ function TasksActivityView() {
               </button>
             ))}
           </div>
-          <div key={jobFilter} className="px-10 pb-10 space-y-2.5 stagger">
+          <div key={jobFilter} className="space-y-2.5 px-4 pb-8 stagger md:px-10 md:pb-10">
             {loading && <p className="text-[13.5px]" style={{ color: "var(--text-dim)" }}>Loading…</p>}
             {!loading && filteredTasks.length === 0 && (
               <EmptyState icon={<IC.Activity size={20}/>} title="No jobs yet" sub="Jobs appear here when you ask Chronos to do something."/>
             )}
             {filteredTasks.map(t => {
               const sl = statusLabel[t.status] ?? t.status;
-              const statusColor = { running: "var(--accent-text)", awaiting_approval: "var(--warn)", failed: "var(--danger)", complete: "var(--ok)" }[t.status] ?? "var(--text-muted)";
+              const statusColor = { running: "var(--accent-text)", paused: "var(--warn)", awaiting_approval: "var(--warn)", failed: "var(--danger)", complete: "var(--ok)", cancelled: "var(--text-dim)" }[t.status] ?? "var(--text-muted)";
               const isOpen = activeTaskId === t.id;
               return (
                 <div key={t.id} className="surface border border-soft rounded-xl overflow-hidden smooth" style={{ boxShadow: "var(--shadow-sm)", borderColor: isOpen ? "var(--border)" : undefined }}>
                   <button onClick={() => setActiveTaskId(isOpen ? null : t.id)} className="w-full p-4 smooth hover:bg-[var(--surface-2)] cursor-pointer flex items-center gap-4 text-left">
                     <div className="flex-shrink-0">
-                      {t.status === "running"             && <Dot color="var(--accent)" size={10} pulse ring/>}
-                      {t.status === "awaiting_approval"   && <Dot color="var(--warn)" size={10}/>}
-                      {t.status === "complete"            && <IC.Check size={16} stroke={2.2} style={{ color: "var(--ok)" }}/>}
-                      {t.status === "failed"              && <IC.Info size={16} style={{ color: "var(--danger)" }}/>}
-                      {(t.status === "queued" || t.status === "pending") && <Dot color="var(--text-faint)" size={8}/>}
+                      {t.status === "running" && (
+                        <Dot color="var(--accent)" size={10} pulse ring/>
+                      )}
+                      {t.status === "paused" && (
+                        <IC.Pause size={16} style={{ color: "var(--warn)" }}/>
+                      )}
+                      {t.status === "awaiting_approval" && (
+                        <Dot color="var(--warn)" size={10}/>
+                      )}
+                      {t.status === "complete" && (
+                        <IC.Check size={16} stroke={2.2} style={{ color: "var(--ok)" }}/>
+                      )}
+                      {t.status === "failed" && (
+                        <IC.Info size={16} style={{ color: "var(--danger)" }}/>
+                      )}
+                      {t.status === "cancelled" && (
+                        <IC.X size={16} style={{ color: "var(--text-dim)" }}/>
+                      )}
+                      {["queued", "pending", "planning"].includes(t.status) && (
+                        <Dot color="var(--text-faint)" size={8}/>
+                      )}
                     </div>
                     <div className="flex-1 min-w-0">
                       <div className="text-[14.5px] font-medium mb-1 truncate">{t.goal}</div>
                       <div className="flex items-center gap-2 text-[12.5px]" style={{ color: "var(--text-dim)" }}>
                         <span style={{ color: statusColor }}>{sl}</span>
+                        {t.dead_letter && <><span>·</span><span style={{ color: "var(--danger)" }}>Needs recovery</span></>}
+                        {t.assignee_member_id && <><span>·</span><span>Assigned</span></>}
                         <span>·</span>
                         <span>{t.iteration_count ?? 0} iterations</span>
                       </div>
@@ -5012,8 +5892,34 @@ function TasksActivityView() {
                   {isOpen && (
                     <div className="border-t hairline px-5 py-4 space-y-3 fadeup">
                       {activeTask?.error && <div className="text-[12.5px]" style={{ color: "var(--danger)" }}>{activeTask.error}</div>}
+                      {(activeTask || t).dead_letter && (
+                        <div className="flex flex-col gap-2 rounded-lg border px-3 py-3 sm:flex-row sm:items-center sm:justify-between" style={{ borderColor: "var(--danger)", background: "var(--danger-soft)" }}>
+                          <div>
+                            <div className="text-[13px] font-semibold" style={{ color: "var(--danger)" }}>Recovery required</div>
+                            <p className="mt-0.5 text-[12px]" style={{ color: "var(--text-muted)" }}>This task exhausted automatic retries. Restart it only after reviewing the error and inputs.</p>
+                          </div>
+                          <button type="button" disabled={recoveringTaskId === t.id} className="btn btn-secondary btn-sm self-start sm:self-auto" onClick={() => void recoverTask(t.id)}>{recoveringTaskId === t.id ? "Restarting…" : "Retry task"}</button>
+                        </div>
+                      )}
+                      {recoveryError && activeTaskId === t.id && <div role="alert" className="text-[12.5px]" style={{ color: "var(--danger)" }}>{recoveryError}</div>}
+                      <TaskControls
+                        task={activeTask || t}
+                        showRetry={!(activeTask || t).dead_letter}
+                        onTaskChanged={change => {
+                          setActiveTask(previous => previous && previous.id === change.task_id ? { ...previous, status: change.status } : previous);
+                          setTasks(previous => previous.map(taskRow => taskRow.id === change.task_id ? { ...taskRow, status: change.status } : taskRow));
+                        }}
+                      />
                       <TaskTimeline task={activeTask || t} events={events}/>
                       <TaskResult task={activeTask || t}/>
+                      <TaskAssignmentPanel
+                        task={activeTask || t}
+                        currentMember={currentMember}
+                        onTaskChanged={nextTask => {
+                          setActiveTask(previous => previous ? { ...previous, ...nextTask } : previous);
+                          setTasks(previous => previous.map(taskRow => taskRow.id === nextTask.id ? { ...taskRow, ...nextTask } : taskRow));
+                        }}
+                      />
                     </div>
                   )}
                 </div>
@@ -5024,9 +5930,9 @@ function TasksActivityView() {
       )}
 
       {mode === "actions" && (
-        <div className="px-10 pb-10 space-y-4">
+        <div className="space-y-4 px-4 pb-8 md:px-10 md:pb-10">
           <div className="surface border border-soft rounded-lg p-3 flex items-center gap-2 flex-wrap">
-            <select value={actionType} onChange={e => setActionType(e.target.value)} className="surface border border-soft rounded-md px-2.5 py-1.5 text-[12.5px] outline-none" style={{ color: "var(--text)" }}>
+            <select aria-label="Filter actions by event type" value={actionType} onChange={e => setActionType(e.target.value)} className="surface border border-soft rounded-md px-2.5 py-1.5 text-[12.5px] outline-none" style={{ color: "var(--text)" }}>
               <option value="all">All event types</option>
               <option value="tool_call">Tool calls</option>
               <option value="tool_result">Tool results</option>
@@ -5037,7 +5943,7 @@ function TasksActivityView() {
               <option value="task_complete">Completed tasks</option>
               <option value="task_failed">Failed tasks</option>
             </select>
-            <select value={actionStatus} onChange={e => setActionStatus(e.target.value)} className="surface border border-soft rounded-md px-2.5 py-1.5 text-[12.5px] outline-none" style={{ color: "var(--text)" }}>
+            <select aria-label="Filter actions by status" value={actionStatus} onChange={e => setActionStatus(e.target.value)} className="surface border border-soft rounded-md px-2.5 py-1.5 text-[12.5px] outline-none" style={{ color: "var(--text)" }}>
               <option value="all">All statuses</option>
               <option value="running">Running</option>
               <option value="complete">Complete</option>
@@ -5046,9 +5952,9 @@ function TasksActivityView() {
               <option value="rejected">Rejected</option>
               <option value="error">Error</option>
             </select>
-            <div className="flex-1 min-w-[220px] relative">
+            <div className="relative w-full min-w-0 flex-1 sm:min-w-[220px]">
               <IC.Search size={13} style={{ position: "absolute", left: 10, top: 9, color: "var(--text-dim)" }}/>
-              <input value={actionQuery} onChange={e => setActionQuery(e.target.value)} placeholder="Search actions, tools, or task goals"
+              <input aria-label="Search actions" value={actionQuery} onChange={e => setActionQuery(e.target.value)} placeholder="Search actions, tools, or task goals"
                      className="w-full surface border border-soft rounded-md pl-8 pr-3 py-1.5 text-[12.5px] outline-none"
                      style={{ color: "var(--text)" }}/>
             </div>
@@ -5260,13 +6166,14 @@ function TaskResult({ task }: { task: Task }) {
 }
 
 // ─── Approvals Screen ─────────────────────────────────────────────────────────
-function ApprovalsScreen({ onDecision }: { onDecision: () => void }) {
+function ApprovalsScreen({ onDecision, currentMemberRole }: { onDecision: () => void; currentMemberRole: string }) {
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [loading, setLoading] = useState(true);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [decisions, setDecisions] = useState<Record<string, "approved" | "rejected">>({});
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState("");
+  const canDecide = ["admin", "owner", "approver"].includes(currentMemberRole);
 
   async function loadApprovals(preferredId?: string | null) {
     setLoading(true);
@@ -5289,6 +6196,8 @@ function ApprovalsScreen({ onDecision }: { onDecision: () => void }) {
   const active = approvals.find(a => a.id === activeId);
 
   async function decide(id: string, decision: "approved" | "rejected", batch = false) {
+    if (!canDecide) return;
+    if (batch && !window.confirm(`${decision === "approved" ? "Approve" : "Reject"} all ${pending.length} pending actions? Review the action details and blast radius before continuing.`)) return;
     const busyKey = batch ? `batch-${decision}` : id;
     setBusyId(busyKey);
     setError("");
@@ -5306,18 +6215,21 @@ function ApprovalsScreen({ onDecision }: { onDecision: () => void }) {
   }
 
   const pending = approvals.filter(a => !decisions[a.id] && a.status === "pending");
-  const decided = approvals.filter(a => decisions[a.id] || a.status !== "pending");
-
   return (
-    <div className="flex-1 flex min-w-0 overflow-hidden">
+    <div className="flex-1 flex min-w-0 flex-col overflow-y-auto md:flex-row md:overflow-hidden">
       {/* Inbox list */}
-      <div className="flex-shrink-0 flex flex-col border-r hairline" style={{ width: 380, background: "var(--bg)" }}>
+      <div className="flex max-h-[46vh] w-full flex-shrink-0 flex-col border-b hairline md:max-h-none md:w-[380px] md:border-b-0 md:border-r" style={{ background: "var(--bg)" }}>
         <div className="px-5 pt-5 pb-3 flex-shrink-0">
           <h1 className="h-section">Approvals</h1>
           <p className="text-[12.5px] mt-0.5" style={{ color: "var(--text-dim)" }}>
-            {pending.length} waiting · approved drafts are created after the batch is decided
+            {pending.length} waiting · each decision can authorize an external or destructive action
           </p>
-          {pending.length > 0 && (
+          {!canDecide && (
+            <p className="mt-3 rounded-lg border px-3 py-2 text-[12.5px]" style={{ borderColor: "var(--border)", color: "var(--text-muted)" }} role="status">
+              Read-only access. An approver, administrator, or owner must decide these requests.
+            </p>
+          )}
+          {canDecide && pending.length > 0 && (
             <div className="flex items-center gap-2 mt-4">
               <button
                 onClick={() => void decide(active?.id ?? pending[0].id, "approved", true)}
@@ -5355,11 +6267,6 @@ function ApprovalsScreen({ onDecision }: { onDecision: () => void }) {
               ))}
             </div>
           )}
-          {!loading && approvals.length === 0 && (
-            <div className="px-5 py-8">
-              <EmptyState icon={<IC.Approvals size={20}/>} title="All caught up" sub="When Chronos needs your go-ahead on a draft or action, it shows up here."/>
-            </div>
-          )}
           {approvals.map(a => {
             const d = decisions[a.id];
             const isSelected = a.id === activeId;
@@ -5390,12 +6297,16 @@ function ApprovalsScreen({ onDecision }: { onDecision: () => void }) {
 
       {/* Detail pane */}
       <div className="flex-1 flex flex-col min-w-0 overflow-y-auto" style={{ background: "var(--bg)" }}>
-        {!active ? (
+        {!active && approvals.length === 0 ? (
+          <div className="flex-1 flex items-center justify-center px-4 py-8">
+            <EmptyState icon={<IC.Approvals size={24}/>} title="All caught up" sub="When Chronos needs your go-ahead on a draft or action, it shows up here."/>
+          </div>
+        ) : !active ? (
           <div className="flex-1 flex items-center justify-center">
             <EmptyState icon={<IC.Approvals size={24}/>} title="Select an approval" sub="Click one on the left to review it."/>
           </div>
         ) : (
-          <div className="px-8 py-8 max-w-[680px]">
+          <div className="max-w-[680px] px-4 py-6 sm:px-6 md:px-8 md:py-8">
             <div className="mb-6">
               <div className="flex items-center gap-2 mb-1">
                 <Tag variant="warn">{humanizeActionType(active.action_type)}</Tag>
@@ -5449,15 +6360,17 @@ function ApprovalsScreen({ onDecision }: { onDecision: () => void }) {
             </div>
 
             {/* Decisions */}
-            {!decisions[active.id] && active.status === "pending" ? (
+            {canDecide && !decisions[active.id] && active.status === "pending" ? (
               <div className="flex items-center gap-3">
                 <button onClick={() => void decide(active.id, "approved")} disabled={busyId === active.id} className="btn btn-ok-soft flex-1 justify-center disabled:opacity-50">
-                  <IC.Check size={15} stroke={2.2}/> {busyId === active.id ? "Approving..." : "Approve draft"}
+                  <IC.Check size={15} stroke={2.2}/> {busyId === active.id ? "Approving..." : "Approve action"}
                 </button>
                 <button onClick={() => void decide(active.id, "rejected")} disabled={busyId === active.id} className="btn btn-danger-soft flex-1 justify-center disabled:opacity-50">
-                  <IC.X size={15}/> {busyId === active.id ? "Rejecting..." : "Reject draft"}
+                  <IC.X size={15}/> {busyId === active.id ? "Rejecting..." : "Reject action"}
                 </button>
               </div>
+            ) : !canDecide && active.status === "pending" ? (
+              <Tag variant="warn">Awaiting an authorized approver</Tag>
             ) : (
               <Tag variant={decisions[active.id] === "approved" || active.status === "approved" ? "ok" : "danger"}>
                 {decisions[active.id] ?? active.status}
@@ -5477,28 +6390,44 @@ const MEMORY_SCOPES = [
   { id: "personal", label: "Personal", description: "Private to you" },
 ];
 
-function MemoryScreen({ embedded = false }: { embedded?: boolean }) {
+function MemoryScreen({ embedded = false, canManageOrganization = false }: { embedded?: boolean; canManageOrganization?: boolean }) {
   const [memories, setMemories] = useState<MemoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState("all");
   const [search, setSearch] = useState("");
   const [adding, setAdding] = useState(false);
   const [newContent, setNewContent] = useState("");
-  const [newScope, setNewScope] = useState("org");
+  const [newScope, setNewScope] = useState("personal");
   const [toast, setToast] = useState<{ kind: "ok" | "danger"; text: string } | null>(null);
+  const [loadError, setLoadError] = useState("");
+  const [focusedMemoryId] = useState(() => {
+    if (typeof window === "undefined") return "";
+    return new URL(window.location.href).searchParams.get("memory") || "";
+  });
 
   const loadMemories = useCallback(() => {
     setLoading(true);
+    setLoadError("");
     apiFetch("/memory/")
       .then(r => r.json())
       .then((data: MemoryEntry[]) => setMemories(data))
-      .catch(() => {})
+      .catch(error => {
+        setMemories([]);
+        setLoadError(error instanceof Error ? error.message : "Memories could not be loaded.");
+      })
       .finally(() => setLoading(false));
   }, []);
 
   useEffect(() => {
     loadMemories();
   }, [loadMemories]);
+
+  useEffect(() => {
+    if (loading || !focusedMemoryId) return;
+    window.requestAnimationFrame(() => {
+      document.getElementById(`memory-${focusedMemoryId}`)?.scrollIntoView({ block: "center" });
+    });
+  }, [focusedMemoryId, loading]);
 
   useEffect(() => {
     if (!toast) return;
@@ -5522,7 +6451,7 @@ function MemoryScreen({ embedded = false }: { embedded?: boolean }) {
     try {
       await apiFetch("/memory/", {
         method: "POST",
-        body: JSON.stringify({ content: newContent, scope: newScope, scope_id: "default", source: "manual" }),
+        body: JSON.stringify({ content: newContent, scope: newScope }),
       });
       await loadMemories();
       setAdding(false);
@@ -5543,10 +6472,14 @@ function MemoryScreen({ embedded = false }: { embedded?: boolean }) {
   }
 
   async function deleteMemory(id: string) {
+    if (!window.confirm("Delete this memory? It will stop being available to Chronos.")) return;
     try {
       await apiFetch(`/memory/${id}`, { method: "DELETE" });
       setMemories(prev => prev.filter(m => m.id !== id));
-    } catch { /* silently */ }
+      setToast({ kind: "ok", text: "Memory deleted." });
+    } catch (error) {
+      setToast({ kind: "danger", text: error instanceof Error ? error.message : "Memory could not be deleted." });
+    }
   }
 
   const [conflicts, setConflicts] = useState<MemoryConflict[]>([]);
@@ -5578,6 +6511,7 @@ function MemoryScreen({ embedded = false }: { embedded?: boolean }) {
   }
 
   async function resolveConflict(c: MemoryConflict) {
+    if (!window.confirm("Supersede the older memory? It will no longer be used for retrieval.")) return;
     try {
       await apiFetch("/memory/resolve-conflict", {
         method: "POST",
@@ -5616,15 +6550,30 @@ function MemoryScreen({ embedded = false }: { embedded?: boolean }) {
     }
   }
 
-  const [captureEnabled, setCaptureEnabled] = useState(true);
+  const [captureEnabled, setCaptureEnabled] = useState<boolean | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [mergeMode, setMergeMode] = useState(false);
 
+  useEffect(() => {
+    let cancelled = false;
+    apiFetch("/memory/policy?scope=member")
+      .then(response => response.json())
+      .then((policy: { effective_enabled?: boolean; enabled?: boolean }) => {
+        if (!cancelled) setCaptureEnabled(policy.effective_enabled ?? policy.enabled ?? true);
+      })
+      .catch(() => {
+        if (!cancelled) setCaptureEnabled(null);
+      });
+    return () => { cancelled = true; };
+  }, []);
+
   async function changeScope(id: string, scope: string) {
     try {
-      const scope_id = scope === "personal" || scope === "restricted" ? "me" : "default";
-      await apiFetch(`/memory/${id}/scope`, { method: "POST", body: JSON.stringify({ scope, scope_id }) });
-      setMemories(prev => prev.map(m => m.id === id ? { ...m, scope } : m));
+      const updated = await apiFetch(`/memory/${id}/scope`, {
+        method: "POST",
+        body: JSON.stringify({ scope }),
+      }).then(r => r.json()) as { scope: string; scope_id: string };
+      setMemories(prev => prev.map(m => m.id === id ? { ...m, scope: updated.scope, scope_id: updated.scope_id } : m));
       setToast({ kind: "ok", text: `Moved to "${scope}" scope.` });
     } catch {
       setToast({ kind: "danger", text: "Could not change scope." });
@@ -5636,9 +6585,13 @@ function MemoryScreen({ embedded = false }: { embedded?: boolean }) {
   }
 
   async function toggleCapture() {
+    if (captureEnabled === null) return;
     const next = !captureEnabled;
     try {
-      await apiFetch("/memory/policy", { method: "POST", body: JSON.stringify({ scope: "org", scope_id: "default", enabled: next }) });
+      // The backend binds member scope to the authenticated member. Never send
+      // placeholder ids such as "default" or attempt to change the whole
+      // organization's policy from a personal control-center toggle.
+      await apiFetch("/memory/policy", { method: "POST", body: JSON.stringify({ scope: "member", enabled: next }) });
       setCaptureEnabled(next);
       setToast({ kind: "ok", text: next ? "Automatic capture resumed." : "Automatic capture paused." });
     } catch {
@@ -5658,6 +6611,7 @@ function MemoryScreen({ embedded = false }: { embedded?: boolean }) {
     const ids = [...selected];
     if (ids.length < 2) return;
     const [primary_id, ...duplicate_ids] = ids;
+    if (!window.confirm(`Merge ${duplicate_ids.length} duplicate ${duplicate_ids.length === 1 ? "memory" : "memories"} into the first selected memory? The duplicates will be superseded.`)) return;
     try {
       await apiFetch("/memory/merge", { method: "POST", body: JSON.stringify({ primary_id, duplicate_ids }) });
       setMemories(prev => prev.filter(m => !duplicate_ids.includes(m.id)));
@@ -5669,7 +6623,8 @@ function MemoryScreen({ embedded = false }: { embedded?: boolean }) {
     }
   }
 
-  const padX = embedded ? "px-0" : "px-10";
+  const padX = embedded ? "px-0" : "px-4 md:px-10";
+  const writableScopes = canManageOrganization ? MEMORY_SCOPES : MEMORY_SCOPES.filter(scope => scope.id === "personal");
 
   return (
     <div className={embedded ? "flex flex-col min-w-0" : "flex-1 flex flex-col min-w-0 overflow-y-auto"}>
@@ -5701,9 +6656,10 @@ function MemoryScreen({ embedded = false }: { embedded?: boolean }) {
       )}
 
       <div className={`${padX} pb-4 flex items-center gap-3 flex-wrap`}>
-        <div className="flex items-center gap-1 surface border border-soft rounded-lg p-1">
+        <div className="flex items-center gap-1 surface border border-soft rounded-lg p-1" aria-label="Filter memories by source">
           {[{ id: "all", label: "All" }, { id: "auto", label: "Saved by Chronos" }, { id: "you", label: "Saved by you" }].map(f => (
             <button key={f.id} onClick={() => setFilter(f.id)}
+                    aria-pressed={filter === f.id}
                     className="px-3 py-1 rounded-md text-[13px] font-medium smooth"
                     style={{ background: filter === f.id ? "var(--surface-2)" : "transparent", color: filter === f.id ? "var(--text)" : "var(--text-muted)" }}>
               {f.label}
@@ -5713,13 +6669,13 @@ function MemoryScreen({ embedded = false }: { embedded?: boolean }) {
 
         <div className="flex items-center gap-1.5 px-3 py-1.5 surface border border-soft rounded-lg">
           <IC.Search size={14} style={{ color: "var(--text-dim)" }}/>
-          <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search memories…"
+          <input aria-label="Search memories" value={search} onChange={e => setSearch(e.target.value)} placeholder="Search memories…"
                  className="bg-transparent text-[13.5px] outline-none w-48" style={{ color: "var(--text)" }}/>
         </div>
 
         <div className="ml-auto flex items-center gap-2">
-          <button onClick={() => void toggleCapture()} className="btn btn-ghost btn-sm" title="Pause or resume automatic memory capture for the organization">
-            {captureEnabled ? "Pause capture" : "Resume capture"}
+          <button onClick={() => void toggleCapture()} disabled={captureEnabled === null} className="btn btn-ghost btn-sm disabled:opacity-50" title="Pause or resume automatic memory capture for your account">
+            {captureEnabled === null ? "Capture status unavailable" : captureEnabled ? "Pause capture" : "Resume capture"}
           </button>
           <button onClick={() => { setMergeMode(m => !m); setSelected(new Set()); }} className="btn btn-ghost btn-sm" title="Select duplicates to merge into one">
             {mergeMode ? "Cancel merge" : "Merge duplicates"}
@@ -5745,6 +6701,7 @@ function MemoryScreen({ embedded = false }: { embedded?: boolean }) {
         <div className={`${padX} pb-3 flex items-center gap-1.5 flex-wrap`}>
           {["all", ...scopes].map(s => (
             <button key={s} onClick={() => setScopeFilter(s)}
+                    aria-pressed={scopeFilter === s}
                     className="px-2.5 py-1 rounded-full text-[12.5px] font-medium smooth"
                     style={{ background: scopeFilter === s ? "var(--text)" : "transparent", color: scopeFilter === s ? "var(--bg)" : "var(--text-muted)", border: "1px solid", borderColor: scopeFilter === s ? "var(--text)" : "var(--border-soft)" }}>
               {s === "all" ? "All scopes" : s}
@@ -5754,8 +6711,14 @@ function MemoryScreen({ embedded = false }: { embedded?: boolean }) {
       )}
 
       <div className={`${padX} pb-10 space-y-3`}>
+        {loadError && (
+          <div className="flex items-start justify-between gap-3 rounded-xl border px-4 py-3 text-[13px]" style={{ borderColor: "var(--danger)", color: "var(--danger)" }} role="alert">
+            <span>Couldn&apos;t load memories: {loadError}</span>
+            <button className="btn btn-ghost btn-sm" onClick={loadMemories}>Try again</button>
+          </div>
+        )}
         {toast && (
-          <div className="flex items-center gap-2 px-4 py-2.5 rounded-xl text-[13px] fadeup"
+          <div role={toast.kind === "danger" ? "alert" : "status"} aria-live={toast.kind === "danger" ? "assertive" : "polite"} className="flex items-center gap-2 px-4 py-2.5 rounded-xl text-[13px] fadeup"
                style={{ background: toast.kind === "ok" ? "var(--ok-soft)" : "var(--danger-soft)", color: toast.kind === "ok" ? "var(--ok)" : "var(--danger)" }}>
             {toast.kind === "ok" ? <IC.Check size={15} stroke={2.2}/> : <IC.Info size={15}/>}
             {toast.text}
@@ -5764,17 +6727,17 @@ function MemoryScreen({ embedded = false }: { embedded?: boolean }) {
 
         {adding && (
           <div className="mem-card p-4 fadeup" style={{ borderColor: "var(--accent)" }}>
-            <textarea value={newContent} onChange={e => setNewContent(e.target.value)} autoFocus
+            <textarea aria-label="New memory" value={newContent} onChange={e => setNewContent(e.target.value)} autoFocus
                       placeholder="Something Chronos should remember…" rows={2}
                       className="w-full bg-transparent outline-none text-[14.5px] resize-none"
                       style={{ color: "var(--text)" }}/>
             <div className="flex items-center justify-between mt-2">
               <div className="flex items-center gap-2">
-                <label className="text-[12.5px]" style={{ color: "var(--text-dim)" }}>Scope:</label>
-                <select value={newScope} onChange={e => setNewScope(e.target.value)}
+                <label htmlFor="new-memory-scope" className="text-[12.5px]" style={{ color: "var(--text-dim)" }}>Scope:</label>
+                <select id="new-memory-scope" value={newScope} onChange={e => setNewScope(e.target.value)}
                         className="text-[12.5px] surface border border-soft rounded-md px-2 py-1 outline-none"
                         style={{ color: "var(--text)" }}>
-                  {MEMORY_SCOPES.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}
+                  {writableScopes.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}
                 </select>
                 {newScope !== "org" && (
                   <span className="text-[11.5px]" style={{ color: "var(--text-dim)" }}>
@@ -5805,7 +6768,7 @@ function MemoryScreen({ embedded = false }: { embedded?: boolean }) {
             ))}
           </div>
         )}
-        {!loading && filtered.length === 0 && (
+        {!loading && !loadError && filtered.length === 0 && (
           <EmptyState icon={<IC.Memory size={20}/>} title="No memories yet"
                       sub={memories.length === 0 ? "Chronos saves memories automatically during conversations. You can also add them manually." : "No memories match your current filter."}/>
         )}
@@ -5833,7 +6796,21 @@ function MemoryScreen({ embedded = false }: { embedded?: boolean }) {
           </div>
         )}
 
-        {filtered.map(m => <MemoryCard key={m.id} m={m} onDelete={deleteMemory} onUpdate={updateMemory} onFlag={flagMemory} onChangeScope={changeScope} onLoadUsage={loadUsage} selectable={mergeMode} selected={selected.has(m.id)} onToggleSelect={toggleSelect}/>)}
+        {filtered.map(m => (
+          <MemoryCard
+            key={m.id}
+            m={m}
+            onDelete={deleteMemory}
+            onUpdate={updateMemory}
+            onFlag={flagMemory}
+            onChangeScope={canManageOrganization ? changeScope : undefined}
+            onLoadUsage={loadUsage}
+            selectable={mergeMode}
+            selected={selected.has(m.id)}
+            onToggleSelect={toggleSelect}
+            focusOnMount={focusedMemoryId === m.id}
+          />
+        ))}
       </div>
     </div>
   );
@@ -5858,9 +6835,9 @@ function MemoryPageActions({ onReviewConflicts, onExport, onImport, onAdd }: { o
   );
 }
 
-function MemoryCard({ m, onDelete, onUpdate, onFlag, onChangeScope, onLoadUsage, selectable = false, selected = false, onToggleSelect }: { m: MemoryEntry; onDelete: (id: string) => void; onUpdate: (id: string, content: string, importance_score?: number) => Promise<void>; onFlag: (id: string, kind: "archive" | "pin" | "sensitive", value: boolean) => Promise<void>; onChangeScope?: (id: string, scope: string) => Promise<void>; onLoadUsage?: (id: string) => Promise<Array<Record<string, unknown>>>; selectable?: boolean; selected?: boolean; onToggleSelect?: (id: string) => void }) {
+function MemoryCard({ m, onDelete, onUpdate, onFlag, onChangeScope, onLoadUsage, selectable = false, selected = false, onToggleSelect, focusOnMount = false }: { m: MemoryEntry; onDelete: (id: string) => void; onUpdate: (id: string, content: string, importance_score?: number) => Promise<void>; onFlag: (id: string, kind: "archive" | "pin" | "sensitive", value: boolean) => Promise<void>; onChangeScope?: (id: string, scope: string) => Promise<void>; onLoadUsage?: (id: string) => Promise<Array<Record<string, unknown>>>; selectable?: boolean; selected?: boolean; onToggleSelect?: (id: string) => void; focusOnMount?: boolean }) {
   const [hover, setHover] = useState(false);
-  const [editing, setEditing] = useState(false);
+  const [editing, setEditing] = useState(focusOnMount);
   const [draft, setDraft] = useState(m.content);
   const [saving, setSaving] = useState(false);
   const [usage, setUsage] = useState<Array<Record<string, unknown>> | null>(null);
@@ -5889,8 +6866,8 @@ function MemoryCard({ m, onDelete, onUpdate, onFlag, onChangeScope, onLoadUsage,
   }
 
   return (
-    <div className="mem-card p-4" onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)}
-         style={selectable && selected ? { borderColor: "var(--accent)" } : undefined}>
+    <div id={`memory-${m.id}`} className="mem-card group p-4" onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)}
+         style={focusOnMount || (selectable && selected) ? { borderColor: "var(--accent)" } : undefined}>
       <div className="flex items-start gap-3">
         {selectable && (
           <input type="checkbox" checked={selected} onChange={() => onToggleSelect?.(m.id)} className="mt-2 flex-shrink-0" aria-label="Select memory for merge" />
@@ -5902,7 +6879,7 @@ function MemoryCard({ m, onDelete, onUpdate, onFlag, onChangeScope, onLoadUsage,
         <div className="flex-1 min-w-0">
           {editing ? (
             <div>
-              <textarea value={draft} onChange={e => setDraft(e.target.value)} rows={3} autoFocus
+              <textarea aria-label="Edit memory" value={draft} onChange={e => setDraft(e.target.value)} rows={3} autoFocus
                         className="w-full bg-transparent outline-none text-[14.5px] leading-relaxed resize-none border border-soft rounded-md p-2"
                         style={{ color: "var(--text)" }}/>
               <div className="mt-2 flex items-center gap-2">
@@ -5928,7 +6905,6 @@ function MemoryCard({ m, onDelete, onUpdate, onFlag, onChangeScope, onLoadUsage,
               ) : <span>{m.scope}</span>}</>
             )}
             {typeof m.importance_score === "number" && <><span>·</span><span>{m.importance_score >= 0.75 ? "High" : m.importance_score >= 0.45 ? "Medium" : "Low"} importance</span></>}
-            {m.created_by && <><span>·</span><span>by {m.created_by}</span></>}
             {m.is_pinned && <><span>·</span><span style={{ color: "var(--accent)" }}>Pinned</span></>}
             {m.is_sensitive && <><span>·</span><span style={{ color: "var(--danger)" }}>Sensitive</span></>}
           </div>
@@ -5946,25 +6922,25 @@ function MemoryCard({ m, onDelete, onUpdate, onFlag, onChangeScope, onLoadUsage,
             </div>
           )}
         </div>
-        <div className="flex items-center gap-1 flex-shrink-0" style={{ opacity: hover ? 1 : 0, transition: "opacity 0.15s" }}>
-          <button onClick={() => void onFlag(m.id, "pin", !m.is_pinned)} className="btn btn-ghost btn-sm btn-icon" title={m.is_pinned ? "Unpin" : "Pin"}>
+        <div className="flex items-center gap-1 flex-shrink-0 opacity-100 md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100" style={{ opacity: hover ? 1 : undefined, transition: "opacity 0.15s" }}>
+          <button onClick={() => void onFlag(m.id, "pin", !m.is_pinned)} className="btn btn-ghost btn-sm btn-icon" title={m.is_pinned ? "Unpin" : "Pin"} aria-label={m.is_pinned ? "Unpin memory" : "Pin memory"}>
             <IC.ArrowUp size={13}/>
           </button>
-          <button onClick={() => void onFlag(m.id, "sensitive", !m.is_sensitive)} className="btn btn-ghost btn-sm btn-icon" title={m.is_sensitive ? "Unmark sensitive" : "Mark sensitive"}>
+          <button onClick={() => void onFlag(m.id, "sensitive", !m.is_sensitive)} className="btn btn-ghost btn-sm btn-icon" title={m.is_sensitive ? "Unmark sensitive" : "Mark sensitive"} aria-label={m.is_sensitive ? "Unmark memory as sensitive" : "Mark memory as sensitive"}>
             <IC.Lock size={13}/>
           </button>
           {onLoadUsage && (
-            <button onClick={() => void toggleUsage()} className="btn btn-ghost btn-sm btn-icon" title="Where this memory has been used">
+            <button onClick={() => void toggleUsage()} className="btn btn-ghost btn-sm btn-icon" title="Where this memory has been used" aria-label="Show where this memory has been used">
               <IC.Info size={13}/>
             </button>
           )}
-          <button onClick={() => setEditing(true)} className="btn btn-ghost btn-sm btn-icon" title="Edit">
+          <button onClick={() => setEditing(true)} className="btn btn-ghost btn-sm btn-icon" title="Edit" aria-label="Edit memory">
             <IC.Pencil size={13}/>
           </button>
-          <button onClick={() => void onFlag(m.id, "archive", true)} className="btn btn-ghost btn-sm btn-icon" title="Archive">
+          <button onClick={() => void onFlag(m.id, "archive", true)} className="btn btn-ghost btn-sm btn-icon" title="Archive" aria-label="Archive memory">
             <IC.Folder size={13}/>
           </button>
-          <button onClick={() => onDelete(m.id)} className="btn btn-ghost btn-sm btn-icon" title="Delete">
+          <button onClick={() => onDelete(m.id)} className="btn btn-ghost btn-sm btn-icon" title="Delete" aria-label="Delete memory">
             <IC.Trash size={13}/>
           </button>
         </div>
@@ -5974,19 +6950,39 @@ function MemoryCard({ m, onDelete, onUpdate, onFlag, onChangeScope, onLoadUsage,
 }
 
 // ─── Assistants Screen ────────────────────────────────────────────────────────
-function AgentMenuModal({ onClose }: { onClose: () => void }) {
+function AgentMenuModal({ onClose, memberRole }: { onClose: () => void; memberRole: string }) {
   const ref = useRef<HTMLDivElement>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    previousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    return () => previousFocusRef.current?.focus();
+  }, []);
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
       if (event.key === "Escape") onClose();
+      if (event.key === "Tab" && ref.current) {
+        const focusable = [...ref.current.querySelectorAll<HTMLElement>('button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])')]
+          .filter(element => element.offsetParent !== null);
+        if (!focusable.length) return;
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first.focus();
+        }
+      }
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [onClose]);
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center px-4 py-6 glass overlay-in" style={{ background: "color-mix(in oklch, var(--text) 16%, transparent)" }}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center px-4 py-6 glass overlay-in" style={{ background: "color-mix(in oklch, var(--text) 16%, transparent)" }} onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}>
       <div
         ref={ref}
         className="surface border rounded-2xl flex flex-col overflow-hidden w-full max-w-[1120px] max-h-[88vh] pop-in"
@@ -6000,52 +6996,53 @@ function AgentMenuModal({ onClose }: { onClose: () => void }) {
             <IC.Sparkles size={15} style={{ color: "var(--accent)" }}/>
             <div className="text-[14px] font-semibold">Agents and assistants</div>
           </div>
-          <button type="button" onClick={onClose} className="btn btn-ghost btn-icon" aria-label="Close agent menu">
+          <button type="button" autoFocus onClick={onClose} className="btn btn-ghost btn-icon" aria-label="Close agent menu">
             <IC.X size={14}/>
           </button>
         </div>
         <div className="min-h-0 flex-1 overflow-hidden">
-          <AgentsScreen />
+          <AgentsScreen memberRole={memberRole} />
         </div>
       </div>
     </div>
   );
 }
 
-function AssistantsScreen({ onStartConversation }: { onStartConversation: (personaId: string) => void }) {
-  const [tab, setTab] = useState<"assistants" | "agents">("assistants");
+function AssistantsScreen({ onStartConversation, memberRole }: { onStartConversation: (personaId: string) => void; memberRole: string }) {
+  const pathname = usePathname();
+  const [tab, setTab] = useState<"assistants" | "agents">(() => pathname === "/agents" ? "agents" : "assistants");
   const [activePersonaId, setActivePersonaId] = useState<string | null>(null);
   const activePersona = PERSONAS.find(p => p.id === activePersonaId);
 
   if (activePersona) {
     return (
       <div className="flex-1 flex flex-col min-w-0 overflow-y-auto">
-        <div className="px-10 pt-6 pb-2 flex-shrink-0">
+        <div className="flex-shrink-0 px-4 pb-2 pt-5 md:px-10 md:pt-6">
           <button onClick={() => setActivePersonaId(null)} className="btn btn-ghost btn-sm -ml-2 mb-3">
             <IC.Chevron size={14} style={{ transform: "rotate(180deg)" }}/> Assistants
           </button>
         </div>
-        <div className="px-10 pb-6 flex items-center gap-5 flex-shrink-0">
+        <div className="flex flex-shrink-0 flex-col items-start gap-4 px-4 pb-6 sm:flex-row sm:items-center sm:gap-5 md:px-10">
           <PersonaAvatar name={activePersona.name} color={activePersona.color} size={64}/>
           <div>
             <h1 className="h-page">{activePersona.name}</h1>
             <p className="text-[14px]" style={{ color: "var(--text-dim)" }}>{activePersona.role}</p>
           </div>
-          <div className="ml-auto flex items-center gap-2">
-            <button className="btn btn-secondary btn-sm">Edit</button>
+          <div className="flex flex-wrap items-center gap-2 sm:ml-auto">
+            <Tag>Built-in · read only</Tag>
             <button onClick={() => onStartConversation(activePersona.id)} className="btn btn-accent btn-sm">Start a conversation</button>
           </div>
         </div>
-        <div className="px-10 pb-10 max-w-[820px] space-y-7">
+        <div className="max-w-[820px] space-y-7 px-4 pb-10 md:px-10">
           <div>
             <h2 className="text-[15px] font-semibold mb-3">Personality</h2>
-            <textarea defaultValue={activePersona.prompt} rows={3}
-                      className="w-full surface border border-soft rounded-lg px-4 py-3 text-[14px] leading-relaxed outline-none"
-                      style={{ color: "var(--text)" }}/>
+            <div className="w-full surface border border-soft rounded-lg px-4 py-3 text-[14px] leading-relaxed" style={{ color: "var(--text)" }}>
+              {activePersona.prompt}
+            </div>
           </div>
           <div>
             <h2 className="text-[15px] font-semibold mb-3">Skills</h2>
-            <div className="grid grid-cols-2 gap-2.5">
+            <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
               {SKILLS.map(s => {
                 const on = activePersona.skills.includes(s.id);
                 return (
@@ -6072,12 +7069,15 @@ function AssistantsScreen({ onStartConversation }: { onStartConversation: (perso
 
   return (
     <div className="flex-1 flex flex-col min-w-0 min-h-0 overflow-hidden">
-      <div role="tablist" className="flex gap-0.5 px-10 pt-5 border-b hairline flex-shrink-0">
+      <div role="tablist" aria-label="Assistant views" onKeyDown={handleHorizontalTabKeyDown} className="flex flex-shrink-0 gap-0.5 border-b hairline px-4 pt-3 md:px-10 md:pt-5">
         {([{ id: "assistants", label: "Assistants" }, { id: "agents", label: "Agents" }] as const).map(t => (
           <button
             key={t.id}
+            id={`assistant-tab-${t.id}`}
             role="tab"
             aria-selected={tab === t.id}
+            aria-controls={`assistant-panel-${t.id}`}
+            tabIndex={tab === t.id ? 0 : -1}
             onClick={() => setTab(t.id)}
             className="px-4 py-2.5 text-[13.5px] font-medium transition-colors"
             style={{
@@ -6091,15 +7091,15 @@ function AssistantsScreen({ onStartConversation }: { onStartConversation: (perso
         ))}
       </div>
       {tab === "agents" ? (
-        <div className="flex-1 min-h-0 flex flex-col overflow-hidden"><AgentsScreen /></div>
+        <div id="assistant-panel-agents" role="tabpanel" aria-labelledby="assistant-tab-agents" tabIndex={0} className="flex-1 min-h-0 flex flex-col overflow-hidden"><AgentsScreen memberRole={memberRole} /></div>
       ) : (
-      <div className="flex-1 min-w-0 overflow-y-auto">
+      <div id="assistant-panel-assistants" role="tabpanel" aria-labelledby="assistant-tab-assistants" tabIndex={0} className="flex-1 min-w-0 overflow-y-auto">
       <PageHeader
         title="Assistants"
-        subtitle="Saved configurations of Chronos. Each has its own role, skills, and personality."
-        right={<button className="btn btn-secondary btn-sm"><IC.Plus size={14}/> New assistant</button>}
+        subtitle="Built-in read-only conversation presets. Create and govern custom workers from Agents."
+        right={<button className="btn btn-secondary btn-sm" onClick={() => setTab("agents")}><IC.ArrowRight size={14}/> Manage agents</button>}
       />
-      <div className="px-10 pb-10 grid grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 gap-4 px-4 pb-10 sm:grid-cols-2 md:px-10 xl:grid-cols-3">
         {PERSONAS.map(p => (
           <button key={p.id} onClick={() => setActivePersonaId(p.id)}
                   className="surface border border-soft rounded-xl p-5 text-left smooth hover:border-[var(--border)]">
@@ -6126,6 +7126,7 @@ type SettingsGroup = "You" | "Workspace" | "Advanced";
 const SETTING_TABS: Array<{ id: SettingsTab; label: string; icon: ReactNode; keywords: string; group: SettingsGroup }> = [
   { id: "general", label: "General", icon: <IC.Settings size={15}/>, keywords: "workspace name timezone language theme notifications landing appearance", group: "You" },
   { id: "profile", label: "Profile", icon: <IC.Personas size={15}/>, keywords: "name avatar email role response citations interaction", group: "You" },
+  { id: "devices", label: "Desktop devices", icon: <IC.Briefcase size={15}/>, keywords: "desktop app mac device pair pairing code local folders grants revoke offline", group: "You" },
   { id: "memory-settings", label: "Memory", icon: <IC.Memory size={15}/>, keywords: "retention review auto save sensitive export purge privacy", group: "You" },
   { id: "data", label: "Data", icon: <IC.Filter size={15}/>, keywords: "documents uploads attachments files data download delete chat", group: "You" },
   { id: "notifications", label: "Notifications", icon: <IC.Bell size={15}/>, keywords: "email in app runtime alerts approval task weekly digest security", group: "You" },
@@ -6144,6 +7145,32 @@ const SETTING_TABS: Array<{ id: SettingsTab; label: string; icon: ReactNode; key
   { id: "danger", label: "Danger zone", icon: <IC.Trash size={15}/>, keywords: "reset delete leave transfer ownership irreversible", group: "Advanced" },
 ];
 
+const SAVEABLE_SETTINGS_TABS = new Set<SettingsTab>([
+  "general",
+  "profile",
+  "organization",
+  "permissions",
+  "employees",
+  "runtime",
+  "memory-settings",
+  "tools-settings",
+  "approval-settings",
+  "notifications",
+  "developer",
+]);
+
+function canViewSettingsTab(tab: SettingsTab, role: string) {
+  if (hasMinimumRole(role, "admin")) return true;
+  if (tab === "memory-settings" || tab === "devices") return hasMinimumRole(role, "operator");
+  return ["general", "profile", "data", "notifications", "organization", "members", "security", "billing"].includes(tab);
+}
+
+function settingsAccessReason(tab: SettingsTab) {
+  if (tab === "memory-settings") return "Memory controls require an operator, manager, admin, or owner role.";
+  if (tab === "devices") return "Desktop-device pairing requires an operator, manager, admin, or owner role.";
+  return "This workspace-governance section is restricted to administrators and owners.";
+}
+
 // ─── Projects ─────────────────────────────────────────────────────────────────
 
 type Project = {
@@ -6152,14 +7179,35 @@ type Project = {
   instructions?: string | null;
   visibility?: string | null;
   memory_policy?: string | null;
-  default_tools?: unknown[];
+  default_tools?: string[];
+  access_role?: "owner" | "member" | "viewer";
   created_at?: string;
   created_by?: string | null;
 };
 
-type ProjectTab = "chat" | "sources" | "artifacts" | "tasks" | "data" | "research";
+const PROJECT_BUILT_IN_TOOLS = [
+  { id: "browser", label: "Web search and browser" },
+  { id: "chat_history", label: "Past chats" },
+  { id: "fs", label: "Workspace files" },
+  { id: "code", label: "Code execution" },
+  { id: "computer", label: "Cloud computer" },
+  { id: "local_computer", label: "Paired Mac" },
+  { id: "desktop", label: "Desktop operator" },
+  { id: "repo", label: "Repository workspace" },
+  { id: "doc", label: "Documents and exports" },
+  { id: "image", label: "Image generation" },
+  { id: "voice", label: "Voice" },
+  { id: "data", label: "Data analysis" },
+  { id: "platform", label: "Custom integrations" },
+  { id: "canva", label: "Canva" },
+];
 
-function ProjectsScreen() {
+type ProjectMember = { member_id: string; role: "member" | "owner"; name?: string | null; email: string; created_at?: string };
+type ProjectInstructionVersion = { id: string; version: number; instructions?: string | null; changed_by?: string | null; created_at?: string };
+type DirectoryMember = { id: string; name: string; email: string; role: string };
+type ProjectTab = "chat" | "sources" | "artifacts" | "tasks" | "data" | "research" | "comments" | "settings";
+
+function ProjectsScreen({ canCreate, currentMember }: { canCreate: boolean; currentMember: AuthenticatedMember }) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [loading, setLoading] = useState(true);
   // null = list view; string = detail view for that project id
@@ -6169,6 +7217,9 @@ function ProjectsScreen() {
   const [createInstructions, setCreateInstructions] = useState("");
   const [creating, setCreating] = useState(false);
   const [toast, setToast] = useState<{ kind: "ok" | "danger"; text: string } | null>(null);
+  const handleProjectUpdated = useCallback((updated: Project) => {
+    setProjects(rows => rows.map(row => row.id === updated.id ? updated : row));
+  }, []);
 
   // URL-based project detail: /projects?id=<uuid>
   const pathname = usePathname();
@@ -6250,7 +7301,9 @@ function ProjectsScreen() {
       <ProjectDetailScreen
         projectId={activeProjectId}
         project={activeProject}
+        currentMember={currentMember}
         onBack={closeProject}
+        onProjectUpdated={handleProjectUpdated}
       />
     );
   }
@@ -6260,30 +7313,32 @@ function ProjectsScreen() {
       <PageHeader
         title="Projects"
         subtitle="Organize conversations, tasks, and artifacts by project"
-        right={
+        right={canCreate ? (
           <button className="btn btn-primary btn-sm" onClick={() => setShowCreate(v => !v)}>
             <IC.Plus size={14} /> New project
           </button>
-        }
+        ) : <Tag>Read only</Tag>}
       />
       {toast && (
-        <div className={`mx-10 mb-4 px-4 py-2.5 rounded-lg text-[13.5px] font-medium ${toast.kind === "ok" ? "bg-[var(--ok-soft)] text-[var(--ok-text)]" : "bg-[var(--danger-soft)] text-[var(--danger)]"}`}>
+        <div role={toast.kind === "danger" ? "alert" : "status"} aria-live={toast.kind === "danger" ? "assertive" : "polite"} className={`mx-4 mb-4 px-4 py-2.5 rounded-lg text-[13.5px] font-medium md:mx-10 ${toast.kind === "ok" ? "bg-[var(--ok-soft)] text-[var(--ok-text)]" : "bg-[var(--danger-soft)] text-[var(--danger)]"}`}>
           {toast.text}
-          <button className="ml-3 opacity-60 hover:opacity-100" onClick={() => setToast(null)}>✕</button>
+          <button type="button" className="ml-3 opacity-60 hover:opacity-100" onClick={() => setToast(null)} aria-label="Dismiss project notification"><IC.X size={14}/></button>
         </div>
       )}
-      {showCreate && (
-        <div className="mx-10 mb-6 surface border border-soft rounded-xl p-5 flex flex-col gap-3">
+      {showCreate && canCreate && (
+        <div className="mx-4 mb-6 surface border border-soft rounded-xl p-5 flex flex-col gap-3 md:mx-10">
           <div className="font-medium text-[14px]">New project</div>
           <input
-            className="input-field"
+            aria-label="Project name"
+            className="input-field w-full"
             placeholder="Project name"
             value={createName}
             onChange={e => setCreateName(e.target.value)}
             onKeyDown={e => { if (e.key === "Enter" && !creating) void createProject(); }}
           />
           <textarea
-            className="input-field resize-none"
+            aria-label="Project instructions"
+            className="input-field w-full resize-none"
             rows={3}
             placeholder="Instructions (optional) — describe the project goal, context, or constraints"
             value={createInstructions}
@@ -6299,15 +7354,15 @@ function ProjectsScreen() {
           </div>
         </div>
       )}
-      <div className="flex-1 overflow-auto px-10 pb-10">
+      <div className="flex-1 overflow-auto px-4 pb-10 md:px-10">
         {loading ? (
           <div className="text-[13.5px] mt-6" style={{ color: "var(--text-dim)" }}>Loading projects…</div>
         ) : projects.length === 0 ? (
           <EmptyState
             icon={<IC.Folder size={22} />}
             title="No projects yet"
-            sub="Create a project to organize conversations, tasks, and artifacts."
-            action={<button className="btn btn-primary btn-sm" onClick={() => setShowCreate(true)}><IC.Plus size={14} /> New project</button>}
+            sub={canCreate ? "Create a project to organize conversations, tasks, and artifacts." : "No projects are currently available to your account."}
+            action={canCreate ? <button className="btn btn-primary btn-sm" onClick={() => setShowCreate(true)}><IC.Plus size={14} /> New project</button> : undefined}
           />
         ) : (
           <div className="grid gap-3 mt-2" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))" }}>
@@ -6344,29 +7399,90 @@ const PROJECT_TABS: { id: ProjectTab; label: string }[] = [
   { id: "tasks",    label: "Tasks" },
   { id: "data",     label: "Data" },
   { id: "research", label: "Research" },
+  { id: "comments", label: "Comments" },
+  { id: "settings", label: "Settings" },
 ];
 
 function ProjectDetailScreen({
   projectId,
   project,
+  currentMember,
   onBack,
+  onProjectUpdated,
 }: {
   projectId: string;
   project: Project | null;
+  currentMember: AuthenticatedMember;
   onBack: () => void;
+  onProjectUpdated: (project: Project) => void;
 }) {
-  const [tab, setTab] = useState<ProjectTab>("chat");
+  const router = useRouter();
+  const [tab, setTab] = useState<ProjectTab>(() => {
+    if (typeof window === "undefined") return "chat";
+    const requested = new URLSearchParams(window.location.search).get("tab");
+    return PROJECT_TABS.some(item => item.id === requested) ? requested as ProjectTab : "chat";
+  });
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [artifacts, setArtifacts] = useState<ArtifactRef[]>([]);
   const [sources, setSources] = useState<ProjectSource[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
+  const [projectExporting, setProjectExporting] = useState(false);
+  const [projectExportStatus, setProjectExportStatus] = useState<{ kind: "ok" | "danger"; text: string; artifactId?: string } | null>(null);
+  const requestedSourceId = typeof window === "undefined" ? null : new URLSearchParams(window.location.search).get("source");
+  const canExportProject = hasMinimumRole(currentMember.role, "operator");
+  const canEditProject = project?.access_role === "owner" || project?.access_role === "member";
 
   const refreshSources = useCallback(async () => {
     const rows = (await (await apiFetch(`/projects/${projectId}/sources`)).json()) as ProjectSource[];
     setSources(rows);
   }, [projectId]);
+
+  function selectProjectTab(next: ProjectTab) {
+    setTab(next);
+    const params = new URLSearchParams(window.location.search);
+    params.set("id", projectId);
+    params.set("tab", next);
+    params.delete("source");
+    router.replace(`/projects?${params.toString()}`, { scroll: false });
+  }
+
+  async function exportProjectBundle() {
+    setProjectExporting(true);
+    setProjectExportStatus(null);
+    try {
+      const result = await apiFetch(`/projects/${projectId}/export`, { method: "POST" }).then(response => response.json()) as {
+        artifact: ArtifactRef;
+        summary: { artifact_count?: number };
+      };
+      if (!result.artifact?.id) throw new Error("Chronos returned an invalid project export receipt.");
+      setArtifacts(previous => previous.some(item => item.id === result.artifact.id)
+        ? previous
+        : [result.artifact, ...previous]);
+      const blob = await apiFetch(`/artifacts/${result.artifact.id}/content`).then(response => response.blob());
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = result.artifact.title || `chronos-project-${projectId}.zip`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 5_000);
+      setProjectExportStatus({
+        kind: "ok",
+        text: `Project bundle saved with ${result.summary.artifact_count ?? 0} explicitly shared artifacts and downloaded.`,
+        artifactId: result.artifact.id,
+      });
+    } catch (error) {
+      setProjectExportStatus({
+        kind: "danger",
+        text: error instanceof Error ? error.message : "Project bundle could not be exported.",
+      });
+    } finally {
+      setProjectExporting(false);
+    }
+  }
 
   useEffect(() => {
     setLoading(true);
@@ -6393,19 +7509,25 @@ function ProjectDetailScreen({
         title={project?.name ?? "Project"}
         subtitle={project?.instructions ?? undefined}
         right={
-          <button className="btn btn-sm" onClick={onBack}>
-            ← Back
-          </button>
+          <div className="flex items-center gap-2">
+            <button className="btn btn-primary btn-sm" disabled={!canEditProject} title={canEditProject ? "Start a project chat" : "Join this project to create conversations"} onClick={() => router.push(`/chat?new=1&project_id=${encodeURIComponent(projectId)}`)}>
+              <IC.Chat size={14}/> Start project chat
+            </button>
+            <button className="btn btn-sm" onClick={onBack}>← Back</button>
+          </div>
         }
       />
       {/* Tab bar */}
-      <div role="tablist" className="flex gap-0.5 px-10 mb-6 border-b hairline">
+      <div role="tablist" aria-label="Project sections" onKeyDown={handleHorizontalTabKeyDown} className="no-scrollbar mb-6 flex gap-0.5 overflow-x-auto border-b hairline px-2 sm:px-4 md:px-10">
         {PROJECT_TABS.map(t => (
           <button
             key={t.id}
             role="tab"
+            id={`project-tab-${t.id}`}
+            aria-controls={`project-panel-${t.id}`}
             aria-selected={tab === t.id}
-            onClick={() => setTab(t.id)}
+            tabIndex={tab === t.id ? 0 : -1}
+            onClick={() => selectProjectTab(t.id)}
             className="px-4 py-2.5 text-[13.5px] font-medium transition-colors"
             style={{
               color: tab === t.id ? "var(--text)" : "var(--text-dim)",
@@ -6418,11 +7540,11 @@ function ProjectDetailScreen({
         ))}
       </div>
       {tab === "data" ? (
-        <div className="flex-1 min-h-0"><DataScreen /></div>
+        <div id="project-panel-data" role="tabpanel" aria-labelledby="project-tab-data" tabIndex={0} className="flex-1 min-h-0"><DataScreen projectId={projectId} /></div>
       ) : (
-      <div className="flex-1 overflow-auto px-10 pb-10">
+      <div id={`project-panel-${tab}`} role="tabpanel" aria-labelledby={`project-tab-${tab}`} tabIndex={0} className="flex-1 overflow-auto px-4 pb-10 md:px-10">
         {loadError ? (
-          <div className="text-[13.5px] mt-4" style={{ color: "var(--danger)" }}>Couldn't load project details.</div>
+          <div className="text-[13.5px] mt-4" style={{ color: "var(--danger)" }}>Could not load project details.</div>
         ) : loading ? (
           <div className="text-[13.5px]" style={{ color: "var(--text-dim)" }}>Loading…</div>
         ) : tab === "chat" ? (
@@ -6431,50 +7553,78 @@ function ProjectDetailScreen({
           ) : (
             <div className="flex flex-col gap-2">
               {conversations.map(conv => (
-                <div key={conv.id} className="surface border border-soft rounded-xl px-5 py-4">
+                <button key={conv.id} onClick={() => router.push(`/chat?c=${encodeURIComponent(conv.id)}`)} className="surface border border-soft rounded-xl px-5 py-4 text-left hover:border-[var(--accent)] transition-colors">
                   <div className="font-medium text-[14px]">{conv.title ?? "Untitled conversation"}</div>
                   {conv.updated_at && <div className="text-[12px] mt-1" style={{ color: "var(--text-faint)" }}>{new Date(conv.updated_at).toLocaleString()}</div>}
-                </div>
+                </button>
               ))}
             </div>
           )
         ) : tab === "sources" ? (
-          <ProjectSourcesTab projectId={projectId} sources={sources} refresh={refreshSources} />
+          <ProjectSourcesTab projectId={projectId} sources={sources} refresh={refreshSources} initialSourceId={requestedSourceId} canEdit={canEditProject} />
         ) : tab === "artifacts" ? (
-          artifacts.length === 0 ? (
-            <EmptyState icon={<IC.Folder size={22} />} title="No artifacts" sub="Artifacts created in project conversations and tasks appear here." />
-          ) : (
-            <div className="flex flex-col gap-2">
-              {artifacts.map(art => (
-                <div key={art.id} className="surface border border-soft rounded-xl px-5 py-4 flex items-center gap-4">
-                  <div className="flex-1 min-w-0">
-                    <div className="font-medium text-[14px] truncate">{art.title ?? "Untitled"}</div>
-                    <div className="text-[12px] mt-0.5" style={{ color: "var(--text-faint)" }}>{art.kind}</div>
-                  </div>
-                </div>
-              ))}
+          <div className="space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-soft p-4 surface">
+              <div>
+                <div className="text-[13.5px] font-medium">Portable project bundle</div>
+                <div className="mt-0.5 text-[12px]" style={{ color: "var(--text-dim)" }}>Creates a durable ZIP with a checksum manifest and only artifacts explicitly shared to this project.</div>
+              </div>
+              <button
+                type="button"
+                className="btn btn-secondary btn-sm"
+                disabled={!canExportProject || projectExporting}
+                title={canExportProject ? "Create and download a project ZIP" : "Operator role required to export project artifacts"}
+                onClick={() => void exportProjectBundle()}
+              >
+                {projectExporting ? "Creating bundle…" : "Export project ZIP"}
+              </button>
             </div>
-          )
+            {projectExportStatus && (
+              <div role={projectExportStatus.kind === "danger" ? "alert" : "status"} aria-live="polite" className="flex flex-wrap items-center gap-2 rounded-lg border px-3 py-2 text-[12.5px]" style={{ borderColor: projectExportStatus.kind === "danger" ? "var(--danger)" : "var(--border)", color: projectExportStatus.kind === "danger" ? "var(--danger)" : "var(--ok-text)", background: projectExportStatus.kind === "danger" ? "transparent" : "var(--ok-soft)" }}>
+                <span>{projectExportStatus.text}</span>
+                {projectExportStatus.artifactId && <button type="button" className="font-semibold underline" onClick={() => router.push(`/artifacts?artifact=${encodeURIComponent(projectExportStatus.artifactId!)}`)}>Open artifact</button>}
+              </div>
+            )}
+            {artifacts.length === 0 ? (
+              <EmptyState icon={<IC.Folder size={22} />} title="No artifacts" sub="Artifacts created in project conversations and tasks appear here." />
+            ) : (
+              <div className="flex flex-col gap-2">
+                {artifacts.map(art => (
+                  <button key={art.id} type="button" onClick={() => router.push(`/artifacts?artifact=${encodeURIComponent(art.id)}`)} className="surface border border-soft rounded-xl px-5 py-4 flex w-full items-center gap-4 text-left hover:border-[var(--accent)] transition-colors">
+                    <div className="flex-1 min-w-0">
+                      <div className="font-medium text-[14px] truncate">{art.title ?? "Untitled"}</div>
+                      <div className="text-[12px] mt-0.5" style={{ color: "var(--text-faint)" }}>{art.kind}</div>
+                    </div>
+                    <span className="text-[12px]" style={{ color: "var(--text-dim)" }}>Open</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
         ) : tab === "tasks" ? (
           tasks.length === 0 ? (
             <EmptyState icon={<IC.Activity size={22} />} title="No tasks" sub="Tasks linked to this project appear here." />
           ) : (
             <div className="flex flex-col gap-2">
               {tasks.map(task => (
-                <div key={task.id} className="surface border border-soft rounded-xl px-5 py-4">
+                <button key={task.id} type="button" onClick={() => router.push(`/activity?task_id=${encodeURIComponent(task.id)}`)} className="surface border border-soft rounded-xl px-5 py-4 w-full text-left hover:border-[var(--accent)] transition-colors">
                   <div className="font-medium text-[14px] truncate">{task.goal}</div>
                   <div className="flex gap-3 mt-1 text-[12px]" style={{ color: "var(--text-faint)" }}>
                     <span>{task.status}</span>
                     {task.created_at && <span>{new Date(task.created_at).toLocaleString()}</span>}
                   </div>
-                </div>
+                </button>
               ))}
             </div>
           )
         ) : tab === "research" ? (
-          <ProjectResearchTab tasks={tasks} artifacts={artifacts} sources={sources} />
+          <ProjectResearchTab projectId={projectId} tasks={tasks} artifacts={artifacts} sources={sources} />
+        ) : tab === "comments" ? (
+          <CommentsThread targetType="project" targetId={projectId} currentMember={currentMember} />
+        ) : tab === "settings" ? (
+          <ProjectSettingsTab projectId={projectId} project={project} currentMember={currentMember} onProjectUpdated={onProjectUpdated} />
         ) : (
-          <EmptyState title="Nothing here yet" sub="This feature is coming soon." />
+          <EmptyState title="Section unavailable" sub="Return to the project overview and try again." />
         )}
       </div>
       )}
@@ -6482,15 +7632,251 @@ function ProjectDetailScreen({
   );
 }
 
+function ProjectSettingsTab({
+  projectId,
+  project,
+  currentMember,
+  onProjectUpdated,
+}: {
+  projectId: string;
+  project: Project | null;
+  currentMember: AuthenticatedMember;
+  onProjectUpdated: (project: Project) => void;
+}) {
+  const [name, setName] = useState(project?.name ?? "");
+  const [instructions, setInstructions] = useState(project?.instructions ?? "");
+  const [visibility, setVisibility] = useState<"private" | "organization">(project?.visibility === "organization" ? "organization" : "private");
+  const [defaultTools, setDefaultTools] = useState<string[]>(project?.default_tools ?? []);
+  const [useProjectToolPolicy, setUseProjectToolPolicy] = useState(Boolean(project?.default_tools?.length));
+  const [connectorToolOptions, setConnectorToolOptions] = useState<Array<{ id: string; label: string }>>([]);
+  const [members, setMembers] = useState<ProjectMember[]>([]);
+  const [directory, setDirectory] = useState<DirectoryMember[]>([]);
+  const [versions, setVersions] = useState<ProjectInstructionVersion[]>([]);
+  const [selectedMemberId, setSelectedMemberId] = useState("");
+  const [selectedRole, setSelectedRole] = useState<"member" | "owner">("member");
+  const [busy, setBusy] = useState<string | null>(null);
+  const [notice, setNotice] = useState<{ kind: "ok" | "danger"; text: string } | null>(null);
+
+  const loadSettings = useCallback(async () => {
+    try {
+      const [projectRow, memberRows, versionRows, directoryResult, connectorRows] = await Promise.all([
+        apiFetch(`/projects/${projectId}`).then(response => response.json()) as Promise<Project>,
+        apiFetch(`/projects/${projectId}/members`).then(response => response.json()) as Promise<ProjectMember[]>,
+        apiFetch(`/projects/${projectId}/instruction-versions`).then(response => response.json()) as Promise<ProjectInstructionVersion[]>,
+        apiFetch("/settings/member-directory").then(response => response.json()) as Promise<{ members: DirectoryMember[] }>,
+        apiFetch("/connectors/catalog").then(response => response.json()) as Promise<Array<{ id: string; name: string; connected?: boolean }>>,
+      ]);
+      setName(projectRow.name ?? "");
+      setInstructions(projectRow.instructions ?? "");
+      setVisibility(projectRow.visibility === "organization" ? "organization" : "private");
+      setDefaultTools(projectRow.default_tools ?? []);
+      setUseProjectToolPolicy(Boolean(projectRow.default_tools?.length));
+      setMembers(memberRows);
+      setVersions(versionRows);
+      setDirectory(directoryResult.members ?? []);
+      setConnectorToolOptions((connectorRows ?? []).filter(row => row.connected).map(row => ({ id: row.id, label: row.name })));
+      onProjectUpdated(projectRow);
+    } catch (error) {
+      setNotice({ kind: "danger", text: error instanceof Error ? error.message : "Project settings could not be loaded." });
+    }
+  }, [onProjectUpdated, projectId]);
+
+  useEffect(() => { void loadSettings(); }, [loadSettings]);
+
+  const callerMembership = members.find(member => member.member_id === currentMember.id);
+  const canManage = callerMembership?.role === "owner";
+  const availableMembers = directory.filter(candidate => !members.some(member => member.member_id === candidate.id));
+
+  async function saveProject() {
+    if (!canManage || !name.trim()) return;
+    setBusy("project"); setNotice(null);
+    try {
+      await apiFetch(`/projects/${projectId}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          name: name.trim(),
+          instructions: instructions.trim() || null,
+          visibility,
+          default_tools: useProjectToolPolicy ? defaultTools : [],
+        }),
+      });
+      await loadSettings();
+      setNotice({ kind: "ok", text: "Project details and instruction history were updated." });
+    } catch (error) {
+      setNotice({ kind: "danger", text: error instanceof Error ? error.message : "Project changes were not saved." });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function upsertMember(memberId: string, role: "member" | "owner") {
+    if (!canManage || !memberId) return;
+    setBusy(`member-${memberId}`); setNotice(null);
+    try {
+      await apiFetch(`/projects/${projectId}/members`, {
+        method: "POST",
+        body: JSON.stringify({ member_id: memberId, role }),
+      });
+      setSelectedMemberId("");
+      await loadSettings();
+      setNotice({ kind: "ok", text: "Project membership was updated." });
+    } catch (error) {
+      setNotice({ kind: "danger", text: error instanceof Error ? error.message : "Membership was not updated." });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function removeMember(memberId: string) {
+    if (!canManage) return;
+    setBusy(`member-${memberId}`); setNotice(null);
+    try {
+      await apiFetch(`/projects/${projectId}/members/${memberId}`, { method: "DELETE" });
+      await loadSettings();
+      setNotice({ kind: "ok", text: "Member removed from the project." });
+    } catch (error) {
+      setNotice({ kind: "danger", text: error instanceof Error ? error.message : "Member was not removed." });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-5">
+      {notice && (
+        <div role={notice.kind === "danger" ? "alert" : "status"} className="rounded-lg border border-soft px-4 py-3 text-[13px]" style={{ background: notice.kind === "danger" ? "var(--danger-soft)" : "var(--ok-soft)", color: notice.kind === "danger" ? "var(--danger)" : "var(--ok-text)" }}>
+          {notice.text}
+        </div>
+      )}
+
+      <section className="surface rounded-xl border border-soft p-5">
+        <div className="mb-4">
+          <h3 className="text-[15px] font-semibold">Project instructions</h3>
+          <p className="mt-1 text-[12.5px]" style={{ color: "var(--text-dim)" }}>These instructions are added to every project conversation and task. Each change is retained below.</p>
+        </div>
+        <div className="flex flex-col gap-3">
+          <label className="block text-[12px] font-medium" style={{ color: "var(--text-dim)" }}>Name
+            <input className="input-field mt-1.5 block w-full" value={name} onChange={event => setName(event.target.value)} disabled={!canManage}/>
+          </label>
+          <label className="block text-[12px] font-medium" style={{ color: "var(--text-dim)" }}>Instructions
+            <textarea className="input-field mt-1.5 block min-h-[130px] w-full resize-y" value={instructions} onChange={event => setInstructions(event.target.value)} disabled={!canManage} placeholder="Goals, source-of-truth rules, constraints, and preferred output style"/>
+          </label>
+          <div className="flex items-center justify-between gap-3">
+            {!canManage && <span className="text-[12px]" style={{ color: "var(--text-faint)" }}>Only project owners can edit these settings.</span>}
+            <button className="btn btn-primary btn-sm ml-auto" disabled={!canManage || busy === "project" || !name.trim() || (useProjectToolPolicy && defaultTools.length === 0)} onClick={() => void saveProject()}>
+              {busy === "project" ? "Saving…" : "Save changes"}
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <section className="surface rounded-xl border border-soft p-5">
+        <div>
+          <h3 className="text-[15px] font-semibold">Access and default tools</h3>
+          <p className="mt-1 text-[12.5px]" style={{ color: "var(--text-dim)" }}>Organization visibility is read-only for teammates who are not explicit project members. A project tool allowlist is enforced for project chats and tasks; approvals and global connector policy still apply.</p>
+        </div>
+        <label className="mt-4 block text-[12px] font-medium" style={{ color: "var(--text-dim)" }}>Visibility
+          <select className="input-field mt-1.5 block w-full" value={visibility} onChange={event => setVisibility(event.target.value as "private" | "organization")} disabled={!canManage}>
+            <option value="private">Private — project members only</option>
+            <option value="organization">Organization — all workspace members can view</option>
+          </select>
+        </label>
+        <label className="mt-4 flex items-start gap-2 text-[13px]">
+          <input type="checkbox" className="mt-0.5" checked={useProjectToolPolicy} disabled={!canManage} onChange={event => {
+            const enabled = event.target.checked;
+            setUseProjectToolPolicy(enabled);
+            if (enabled && defaultTools.length === 0) setDefaultTools(["browser", "chat_history"]);
+          }}/>
+          <span><span className="font-medium">Use a project-specific tool allowlist</span><span className="mt-0.5 block text-[12px]" style={{ color: "var(--text-dim)" }}>When off, the project inherits workspace and connector defaults.</span></span>
+        </label>
+        {useProjectToolPolicy && (
+          <fieldset className="mt-4" disabled={!canManage}>
+            <legend className="text-[12px] font-medium" style={{ color: "var(--text-dim)" }}>Tools available to the project</legend>
+            <div className="mt-2 grid gap-2 sm:grid-cols-2">
+              {[...PROJECT_BUILT_IN_TOOLS, ...connectorToolOptions].filter((item, index, rows) => rows.findIndex(candidate => candidate.id === item.id) === index).map(option => (
+                <label key={option.id} className="flex items-center gap-2 rounded-lg border border-soft px-3 py-2 text-[12.5px]">
+                  <input type="checkbox" checked={defaultTools.includes(option.id)} onChange={event => setDefaultTools(current => event.target.checked ? [...current, option.id] : current.filter(value => value !== option.id))}/>
+                  <span>{option.label}</span>
+                </label>
+              ))}
+            </div>
+            {defaultTools.length === 0 && <p role="alert" className="mt-2 text-[12px]" style={{ color: "var(--danger)" }}>Select at least one tool or turn off the project-specific allowlist.</p>}
+          </fieldset>
+        )}
+        <div className="mt-4 flex justify-end">
+          <button className="btn btn-primary btn-sm" disabled={!canManage || busy === "project" || !name.trim() || (useProjectToolPolicy && defaultTools.length === 0)} onClick={() => void saveProject()}>
+            {busy === "project" ? "Saving…" : "Save access and tools"}
+          </button>
+        </div>
+      </section>
+
+      <section className="surface rounded-xl border border-soft p-5">
+        <h3 className="text-[15px] font-semibold">Instruction history</h3>
+        <div className="mt-3 flex flex-col gap-2">
+          {versions.length === 0 ? <p className="text-[12.5px]" style={{ color: "var(--text-faint)" }}>No instruction versions are available.</p> : versions.map(version => (
+            <details key={version.id} className="rounded-lg border border-soft px-3 py-2.5">
+              <summary className="cursor-pointer text-[12.5px] font-medium">Version {version.version}{version.created_at ? ` · ${new Date(version.created_at).toLocaleString()}` : ""}</summary>
+              <pre className="mt-2 whitespace-pre-wrap font-sans text-[12.5px] leading-relaxed" style={{ color: "var(--text-muted)" }}>{version.instructions || "No project instructions"}</pre>
+            </details>
+          ))}
+        </div>
+      </section>
+
+      <section className="surface rounded-xl border border-soft p-5">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <h3 className="text-[15px] font-semibold">Members</h3>
+            <p className="mt-1 text-[12.5px]" style={{ color: "var(--text-dim)" }}>Owners can manage sources, instructions, and membership. Members can use project context.</p>
+          </div>
+          <Tag>{members.length} member{members.length === 1 ? "" : "s"}</Tag>
+        </div>
+        {canManage && availableMembers.length > 0 && (
+          <div className="mt-4 flex flex-col gap-2 sm:flex-row">
+            <select aria-label="Add project member" className="input-field flex-1" value={selectedMemberId} onChange={event => setSelectedMemberId(event.target.value)}>
+              <option value="">Choose a teammate…</option>
+              {availableMembers.map(candidate => <option key={candidate.id} value={candidate.id}>{candidate.name} ({candidate.email})</option>)}
+            </select>
+            <select aria-label="Project role" className="input-field sm:w-[130px]" value={selectedRole} onChange={event => setSelectedRole(event.target.value as "member" | "owner")}>
+              <option value="member">Member</option><option value="owner">Owner</option>
+            </select>
+            <button className="btn btn-primary btn-sm" disabled={!selectedMemberId || busy !== null} onClick={() => void upsertMember(selectedMemberId, selectedRole)}>Add member</button>
+          </div>
+        )}
+        <div className="mt-4 divide-y hairline">
+          {members.map(member => (
+            <div key={member.member_id} className="flex flex-wrap items-center gap-3 py-3 first:pt-0 last:pb-0">
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-[13.5px] font-medium">{member.name || member.email}</div>
+                <div className="truncate text-[12px]" style={{ color: "var(--text-faint)" }}>{member.email}</div>
+              </div>
+              {canManage ? (
+                <select aria-label={`Role for ${member.email}`} className="input-field w-[120px]" value={member.role} disabled={busy === `member-${member.member_id}`} onChange={event => void upsertMember(member.member_id, event.target.value as "member" | "owner")}>
+                  <option value="member">Member</option><option value="owner">Owner</option>
+                </select>
+              ) : <Tag>{member.role}</Tag>}
+              {canManage && member.member_id !== currentMember.id && (
+                <button className="btn btn-sm btn-danger-soft" disabled={busy === `member-${member.member_id}`} onClick={() => void removeMember(member.member_id)}>Remove</button>
+              )}
+            </div>
+          ))}
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function ProjectResearchTab({
+  projectId,
   tasks,
   artifacts,
   sources,
 }: {
+  projectId: string;
   tasks: Task[];
   artifacts: ArtifactRef[];
   sources: ProjectSource[];
 }) {
+  const router = useRouter();
   const rows = [
     ...tasks.map(task => ({
       id: `task-${task.id}`,
@@ -6547,7 +7933,11 @@ function ProjectResearchTab({
           <div className="text-[12px]" style={{ color: "var(--text-faint)" }}>{rows.length} items</div>
         </div>
         {rows.map(row => (
-          <div key={row.id} className="px-5 py-4 border-b hairline last:border-b-0 flex items-start gap-3">
+          <button key={row.id} type="button" onClick={() => {
+            if (row.id.startsWith("task-")) router.push(`/activity?task_id=${encodeURIComponent(row.id.slice(5))}`);
+            else if (row.id.startsWith("artifact-")) router.push(`/artifacts?artifact=${encodeURIComponent(row.id.slice(9))}`);
+            else router.push(`/projects?id=${encodeURIComponent(projectId)}&tab=sources&source=${encodeURIComponent(row.id.slice(7))}`);
+          }} className="px-5 py-4 border-b hairline last:border-b-0 flex w-full items-start gap-3 text-left hover:bg-[var(--surface-2)]">
             <div className="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0" style={{ background: "var(--surface-2)", color: "var(--text-dim)" }}>
               {row.icon}
             </div>
@@ -6562,7 +7952,7 @@ function ProjectResearchTab({
                 {row.date && <span>{new Date(row.date).toLocaleString()}</span>}
               </div>
             </div>
-          </div>
+          </button>
         ))}
       </div>
     </div>
@@ -6585,33 +7975,58 @@ const SOURCE_STATUS_COLOR: Record<string, string> = {
   pending: "var(--text-faint)",
   failed: "var(--danger)",
   revoked: "var(--danger)",
+  quarantined: "var(--danger)",
 };
 
 function ProjectSourcesTab({
   projectId,
   sources,
   refresh,
+  initialSourceId,
+  canEdit,
 }: {
   projectId: string;
   sources: ProjectSource[];
   refresh: () => Promise<void>;
+  initialSourceId?: string | null;
+  canEdit: boolean;
 }) {
-  const [adding, setAdding] = useState(false);
+  const [adding, setAdding] = useState<"url" | "connector" | null>(null);
   const [title, setTitle] = useState("");
   const [tool, setTool] = useState("");
+  const [connectorId, setConnectorId] = useState("");
+  const [urlValue, setUrlValue] = useState("");
+  const [connectors, setConnectors] = useState<Array<{ id: string; name: string; connector_id?: string | null; tools?: Array<{ broker_name?: string; name?: string; description?: string }> }>>([]);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [detail, setDetail] = useState<SourceDetail | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement | null>(null) as { current: HTMLInputElement | null };
+
+  useEffect(() => {
+    apiFetch("/connectors/catalog")
+      .then(response => response.json())
+      .then((rows: Array<{ id: string; name: string; connected?: boolean; connector_id?: string | null; tools?: Array<{ broker_name?: string; name?: string; description?: string }> }>) => {
+        setConnectors(rows.filter(row => row.connected && row.connector_id));
+      })
+      .catch(() => setConnectors([]));
+  }, []);
+
+  useEffect(() => {
+    if (!sources.some(source => ["pending", "processing"].includes(source.index_status ?? "") || source.parse_status === "pending")) return;
+    const timer = window.setInterval(() => { void refresh(); }, 3_000);
+    return () => window.clearInterval(timer);
+  }, [refresh, sources]);
 
   const addConnector = async () => {
-    if (!title.trim() || !tool.trim()) return;
+    if (!canEdit || !title.trim() || !tool.trim() || !connectorId) return;
     setBusyId("add"); setError(null);
     try {
       await apiFetch(`/projects/${projectId}/sources/connector`, {
         method: "POST",
-        body: JSON.stringify({ title: title.trim(), tool: tool.trim(), args: {} }),
+        body: JSON.stringify({ title: title.trim(), tool: tool.trim(), connector_id: connectorId, args: {} }),
       });
-      setTitle(""); setTool(""); setAdding(false);
+      setTitle(""); setTool(""); setConnectorId(""); setAdding(null);
       await refresh();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Couldn't add connector source");
@@ -6620,7 +8035,43 @@ function ProjectSourcesTab({
     }
   };
 
+  const uploadProjectFiles = async (files: FileList | null) => {
+    if (!canEdit || !files?.length) return;
+    setBusyId("upload"); setError(null);
+    try {
+      for (const file of Array.from(files)) {
+        const form = new FormData();
+        form.append("file", file);
+        form.append("project_id", projectId);
+        await apiFetch("/attachments", { method: "POST", body: form });
+      }
+      await refresh();
+    } catch (uploadFailure) {
+      setError(uploadFailure instanceof Error ? uploadFailure.message : "One or more sources could not be uploaded.");
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const addUrlSource = async () => {
+    if (!canEdit || !urlValue.trim()) return;
+    setBusyId("url"); setError(null);
+    try {
+      await apiFetch(`/projects/${projectId}/sources/url`, {
+        method: "POST",
+        body: JSON.stringify({ url: urlValue.trim(), title: title.trim() || undefined }),
+      });
+      setUrlValue(""); setTitle(""); setAdding(null);
+      await refresh();
+    } catch (urlFailure) {
+      setError(urlFailure instanceof Error ? urlFailure.message : "The website could not be added as a live source.");
+    } finally {
+      setBusyId(null);
+    }
+  };
+
   const syncSource = async (sid: string) => {
+    if (!canEdit) return;
     setBusyId(sid); setError(null);
     try {
       await apiFetch(`/projects/${projectId}/sources/${sid}/sync`, { method: "POST" });
@@ -6633,17 +8084,26 @@ function ProjectSourcesTab({
     }
   };
 
-  const openDetail = async (sid: string) => {
+  const openDetail = async (sid: string, chunkOffset = 0) => {
     setError(null);
     try {
-      const d = (await (await apiFetch(`/projects/${projectId}/sources/${sid}`)).json()) as SourceDetail;
-      setDetail(d);
+      const d = (await (await apiFetch(`/projects/${projectId}/sources/${sid}?chunk_offset=${chunkOffset}&chunk_limit=20`)).json()) as SourceDetail;
+      setDetail(current => chunkOffset > 0 && current?.id === sid
+        ? { ...d, chunks: [...current.chunks, ...d.chunks] }
+        : d);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Couldn't load source");
     }
   };
 
+  useEffect(() => {
+    if (initialSourceId) void openDetail(initialSourceId);
+    // Open a search deep-link once when this project source tab mounts.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialSourceId, projectId]);
+
   const reindexSource = async (sid: string) => {
+    if (!canEdit) return;
     setBusyId(sid); setError(null);
     try {
       await apiFetch(`/projects/${projectId}/sources/${sid}/reindex`, { method: "POST" });
@@ -6657,6 +8117,8 @@ function ProjectSourcesTab({
   };
 
   const deleteSource = async (sid: string) => {
+    if (!canEdit) return;
+    if (!window.confirm("Delete this project source? Indexed chunks will be removed from future project answers.")) return;
     setBusyId(sid); setError(null);
     try {
       await apiFetch(`/projects/${projectId}/sources/${sid}`, { method: "DELETE" });
@@ -6669,9 +8131,9 @@ function ProjectSourcesTab({
     }
   };
 
-  const downloadOriginal = async (artifactId: string, name: string) => {
+  const downloadOriginal = async (downloadUrl: string, name: string) => {
     try {
-      const blob = await (await apiFetch(`/artifacts/${artifactId}/content`)).blob();
+      const blob = await (await apiFetch(downloadUrl)).blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url; a.download = name;
@@ -6689,15 +8151,15 @@ function ProjectSourcesTab({
         <div className="flex items-center justify-between">
           <button className="btn btn-sm" onClick={() => setDetail(null)}>← All sources</button>
           <div className="flex gap-2">
-            {detail.artifact_id && (
-              <button className="btn btn-sm" onClick={() => downloadOriginal(detail.artifact_id!, detail.title ?? "source")}>
+            {detail.download_url && (
+              <button className="btn btn-sm" onClick={() => downloadOriginal(detail.download_url!, detail.title ?? "source")}>
                 Download original
               </button>
             )}
-            <button className="btn btn-sm" onClick={() => reindexSource(detail.id)} disabled={busyId === detail.id}>
+            <button className="btn btn-sm" onClick={() => reindexSource(detail.id)} disabled={!canEdit || busyId === detail.id}>
               {busyId === detail.id ? "Working…" : "Reindex"}
             </button>
-            <button className="btn btn-sm btn-danger-soft" onClick={() => deleteSource(detail.id)} disabled={busyId === detail.id}>
+            <button className="btn btn-sm btn-danger-soft" onClick={() => deleteSource(detail.id)} disabled={!canEdit || busyId === detail.id}>
               Delete
             </button>
           </div>
@@ -6733,23 +8195,79 @@ function ProjectSourcesTab({
             ))}
           </div>
         )}
+        {detail.next_offset != null && (
+          <button className="btn btn-sm self-center" disabled={busyId === detail.id} onClick={() => void openDetail(detail.id, detail.next_offset ?? 0)}>
+            Load more extracted text
+          </button>
+        )}
       </div>
     );
   }
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex items-center justify-between">
+      <input ref={fileInputRef} type="file" multiple className="hidden" onChange={event => { void uploadProjectFiles(event.target.files); event.target.value = ""; }}/>
+      <input
+        ref={node => {
+          folderInputRef.current = node;
+          if (node) node.setAttribute("webkitdirectory", "");
+        }}
+        type="file"
+        multiple
+        className="hidden"
+        onChange={event => { void uploadProjectFiles(event.target.files); event.target.value = ""; }}
+      />
+      <div className="flex flex-col items-start justify-between gap-3 sm:flex-row sm:items-center">
         <div className="text-[13px]" style={{ color: "var(--text-dim)" }}>
-          Uploaded files and connector feeds indexed for this project.
+          Files, code folders, websites, and connector feeds indexed only for authorized project members.
         </div>
-        <button className="btn btn-sm" onClick={() => setAdding(a => !a)}>
-          {adding ? "Cancel" : "Add connector source"}
-        </button>
+        <div className="flex flex-wrap gap-2">
+          <button className="btn btn-sm" disabled={!canEdit || busyId === "upload"} onClick={() => fileInputRef.current?.click()}><IC.Attach size={13}/>{busyId === "upload" ? "Uploading…" : "Upload files"}</button>
+          <button className="btn btn-sm" disabled={!canEdit || busyId === "upload"} onClick={() => folderInputRef.current?.click()}><IC.Folder size={13}/>Upload folder</button>
+          <button className="btn btn-sm" disabled={!canEdit} onClick={() => setAdding(value => value === "url" ? null : "url")}><IC.Globe size={13}/>Add website</button>
+          <button className="btn btn-sm" disabled={!canEdit} onClick={() => setAdding(value => value === "connector" ? null : "connector")}><IC.Plus size={13}/>Add connector</button>
+        </div>
       </div>
 
-      {adding && (
+      {!canEdit && <div role="status" className="rounded-lg border border-soft px-3 py-2 text-[12.5px]" style={{ color: "var(--text-dim)" }}>This organization-visible project is read-only. Ask an owner to add you as a project member before changing sources.</div>}
+
+      {adding === "url" && (
         <div className="surface border border-soft rounded-xl px-5 py-4 flex flex-col gap-3">
+          <div>
+            <div className="font-medium text-[14px]">Add website source</div>
+            <p className="mt-1 text-[12px]" style={{ color: "var(--text-dim)" }}>Chronos fetches live readable text, scans it as untrusted content, and reports unsupported or blocked pages honestly.</p>
+          </div>
+          <input className="input" aria-label="Website URL" placeholder="https://example.com/handbook" value={urlValue} onChange={event => setUrlValue(event.target.value)}/>
+          <input className="input" aria-label="Website source title" placeholder="Title (optional)" value={title} onChange={event => setTitle(event.target.value)}/>
+          <div className="flex justify-end gap-2">
+            <button className="btn btn-sm" onClick={() => setAdding(null)}>Cancel</button>
+            <button className="btn btn-sm btn-primary" onClick={() => void addUrlSource()} disabled={busyId === "url" || !urlValue.trim()}>{busyId === "url" ? "Fetching…" : "Add website"}</button>
+          </div>
+        </div>
+      )}
+
+      {adding === "connector" && (
+        <div className="surface border border-soft rounded-xl px-5 py-4 flex flex-col gap-3">
+          <div>
+            <div className="font-medium text-[14px]">Add connector feed</div>
+            <p className="mt-1 text-[12px]" style={{ color: "var(--text-dim)" }}>Feeds run with your connected account and stop syncing if your membership or credential is revoked.</p>
+          </div>
+          <select
+            className="input"
+            aria-label="Connected account"
+            value={connectorId}
+            onChange={event => {
+              const nextId = event.target.value;
+              setConnectorId(nextId);
+              const connector = connectors.find(item => item.connector_id === nextId);
+              const firstTool = connector?.tools?.find(item => item.broker_name)?.broker_name;
+              if (firstTool) setTool(firstTool);
+              if (connector && !title) setTitle(connector.name);
+            }}
+          >
+            <option value="">Choose a connected account…</option>
+            {connectors.map(connector => <option key={connector.connector_id ?? connector.id} value={connector.connector_id ?? ""}>{connector.name}</option>)}
+          </select>
           <input
             className="input"
             placeholder="Source title (e.g. Sales inbox)"
@@ -6762,11 +8280,12 @@ function ProjectSourcesTab({
             value={tool}
             onChange={e => setTool(e.target.value)}
           />
+          {connectors.length === 0 && <div className="text-[12px]" style={{ color: "var(--danger)" }}>No connected accounts are available. Connect an app before adding a feed.</div>}
           <div className="flex justify-end">
             <button
               className="btn btn-sm btn-primary"
               onClick={addConnector}
-              disabled={busyId === "add" || !title.trim() || !tool.trim()}
+              disabled={busyId === "add" || !connectorId || !title.trim() || !tool.trim()}
             >
               {busyId === "add" ? "Adding…" : "Add source"}
             </button>
@@ -6777,7 +8296,7 @@ function ProjectSourcesTab({
       {error && <div className="text-[12.5px]" style={{ color: "var(--danger)" }}>{error}</div>}
 
       {sources.length === 0 ? (
-        <EmptyState icon={<IC.Folder size={22} />} title="No sources" sub="Upload a file in a project conversation or add a connector source to build project knowledge." />
+        <EmptyState icon={<IC.Folder size={22} />} title="No sources" sub="Upload files or a code folder, add a website, or connect a live account to build permission-scoped project knowledge." />
       ) : (
         <div className="flex flex-col gap-2">
           {sources.map(src => {
@@ -6795,7 +8314,7 @@ function ProjectSourcesTab({
                     <span style={{ color: SOURCE_STATUS_COLOR[status] ?? "var(--text-faint)" }}>{status}</span>
                   </div>
                 </div>
-                {src.source_type === "connector" && status !== "revoked" && (
+                {canEdit && src.source_type === "connector" && status !== "revoked" && (
                   <span
                     role="button"
                     tabIndex={0}
@@ -6833,8 +8352,9 @@ type ScheduleRun = { id: string; task_id?: string | null; status?: string | null
 type Phase12Workflow = { id: string; name: string; description?: string; status?: string; definition?: { steps?: Array<Record<string, unknown>> } };
 type Phase12Run = { id: string; workflow_id: string; status: string; trigger_source?: string; trigger_event_type?: string | null; updated_at?: string; created_at?: string };
 type Phase12Trigger = { id: string; workflow_id: string; trigger_type: string; source?: string; event_type?: string; status?: string; config?: Record<string, unknown> };
-type Phase12Monitor = { id: string; name: string; monitor_type: string; target: string; status: string; condition?: Record<string, unknown>; last_checked_at?: string | null; last_evidence?: Record<string, unknown> };
-type Phase12Alert = { id: string; monitor_id: string; severity: string; summary: string; status: string; evidence?: Record<string, unknown>; created_at?: string };
+type Phase12Monitor = { id: string; name: string; monitor_type: string; target: string; status: string; schedule_id?: string | null; workflow_id?: string | null; condition?: Record<string, unknown>; interval_seconds?: number; next_run_at?: string | null; last_run_at?: string | null; last_success_at?: string | null; last_failure_at?: string | null; last_run_status?: string | null; last_error_code?: string | null; consecutive_failures?: number; alert_count?: number; backoff_until?: string | null; last_checked_at?: string | null; last_evidence?: Record<string, unknown> };
+type Phase12MonitorRun = { id: string; monitor_id: string; status: string; trigger_source?: string; attempt?: number; started_at?: string | null; completed_at?: string | null; next_attempt_at?: string | null; error_code?: string | null; error_summary?: string | null; observation?: Record<string, unknown>; alert_id?: string | null };
+type Phase12Alert = { id: string; monitor_id: string; run_id?: string | null; severity: string; summary: string; status: string; evidence?: Record<string, unknown>; created_at?: string };
 
 function WorkflowsScreen() {
   const [schedules, setSchedules] = useState<Phase12Schedule[]>([]);
@@ -6845,17 +8365,31 @@ function WorkflowsScreen() {
   const [alerts, setAlerts] = useState<Phase12Alert[]>([]);
   const [loading, setLoading] = useState(true);
   const [toast, setToast] = useState<{ kind: "ok" | "danger"; text: string } | null>(null);
-  const [scheduleName, setScheduleName] = useState("Daily brief");
-  const [scheduleGoal, setScheduleGoal] = useState("Prepare a daily operations digest of what changed since yesterday.");
+  const [scheduleName, setScheduleName] = useState("");
+  const [scheduleGoal, setScheduleGoal] = useState("");
   const [scheduleKind, setScheduleKind] = useState("daily");
   const [scheduleTime, setScheduleTime] = useState("09:00");
-  const [scheduleCron, setScheduleCron] = useState("0 9 * * 1-5");
+  const [scheduleCron, setScheduleCron] = useState("");
+  const [scheduleDayOfWeek, setScheduleDayOfWeek] = useState("monday");
+  const [scheduleDayOfMonth, setScheduleDayOfMonth] = useState("1");
+  const [scheduleRunAt, setScheduleRunAt] = useState("");
   const [creatingRoutine, setCreatingRoutine] = useState(false);
   const [expandedRoutine, setExpandedRoutine] = useState<string | null>(null);
   const [routineRuns, setRoutineRuns] = useState<Record<string, ScheduleRun[]>>({});
-  const [workflowName, setWorkflowName] = useState("Source monitor workflow");
-  const [monitorName, setMonitorName] = useState("Pricing page monitor");
-  const [monitorTarget, setMonitorTarget] = useState("https://example.com/pricing");
+  const [workflowName, setWorkflowName] = useState("");
+  const [workflowDescription, setWorkflowDescription] = useState("");
+  const [workflowToolName, setWorkflowToolName] = useState("");
+  const [workflowArguments, setWorkflowArguments] = useState("{}");
+  const [creatingWorkflow, setCreatingWorkflow] = useState(false);
+  const [monitorName, setMonitorName] = useState("");
+  const [monitorTarget, setMonitorTarget] = useState("");
+  const [monitorType, setMonitorType] = useState("website");
+  const [monitorInterval, setMonitorInterval] = useState("900");
+  const [monitorTool, setMonitorTool] = useState("");
+  const [creatingMonitor, setCreatingMonitor] = useState(false);
+  const [runningMonitorId, setRunningMonitorId] = useState<string | null>(null);
+  const [expandedMonitor, setExpandedMonitor] = useState<string | null>(null);
+  const [monitorRuns, setMonitorRuns] = useState<Record<string, Phase12MonitorRun[]>>({});
   const [selectedWorkflowId, setSelectedWorkflowId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
@@ -6903,10 +8437,22 @@ function WorkflowsScreen() {
       if (scheduleKind === "hourly") { body.schedule_kind = "interval"; body.interval_seconds = 3600; }
       else if (scheduleKind === "daily") { body.schedule_kind = "daily"; body.time_of_day = scheduleTime; }
       else if (scheduleKind === "weekdays") { body.schedule_kind = "cron"; body.cron = `${cronMin} ${cronHour} * * 1-5`; }
-      else if (scheduleKind === "weekly") { body.schedule_kind = "weekly"; body.day_of_week = "monday"; body.time_of_day = scheduleTime; }
-      else if (scheduleKind === "monthly") { body.schedule_kind = "monthly"; body.day_of_month = 1; body.time_of_day = scheduleTime; }
-      else if (scheduleKind === "custom") { body.schedule_kind = "cron"; body.cron = scheduleCron.trim(); }
-      else if (scheduleKind === "one_time") { body.schedule_kind = "one_time"; body.run_at = new Date(Date.now() + 3600_000).toISOString(); }
+      else if (scheduleKind === "weekly") { body.schedule_kind = "weekly"; body.day_of_week = scheduleDayOfWeek; body.time_of_day = scheduleTime; }
+      else if (scheduleKind === "monthly") {
+        const day = Number(scheduleDayOfMonth);
+        if (!Number.isInteger(day) || day < 1 || day > 31) throw new Error("Day of month must be between 1 and 31.");
+        body.schedule_kind = "monthly"; body.day_of_month = day; body.time_of_day = scheduleTime;
+      }
+      else if (scheduleKind === "custom") {
+        if (!scheduleCron.trim()) throw new Error("Enter a cron expression.");
+        body.schedule_kind = "cron"; body.cron = scheduleCron.trim();
+      }
+      else if (scheduleKind === "one_time") {
+        if (!scheduleRunAt) throw new Error("Choose when this one-time routine should run.");
+        const runAt = new Date(scheduleRunAt);
+        if (Number.isNaN(runAt.getTime()) || runAt.getTime() <= Date.now()) throw new Error("One-time routines must be scheduled in the future.");
+        body.schedule_kind = "one_time"; body.run_at = runAt.toISOString();
+      }
       else { body.schedule_kind = "daily"; body.time_of_day = scheduleTime; }
       await apiFetch("/schedules/", { method: "POST", body: JSON.stringify(body) });
       setToast({ kind: "ok", text: "Routine created" });
@@ -6929,6 +8475,7 @@ function WorkflowsScreen() {
   }
 
   async function deleteRoutine(id: string) {
+    if (!window.confirm("Delete this routine and stop all future scheduled runs? Existing run history will remain available.")) return;
     try {
       await apiFetch(`/schedules/${id}`, { method: "DELETE" });
       setToast({ kind: "ok", text: "Routine deleted" });
@@ -6967,20 +8514,38 @@ function WorkflowsScreen() {
   }
 
   async function createWorkflow() {
+    if (!workflowName.trim()) { setToast({ kind: "danger", text: "Add a workflow name." }); return; }
+    if (!workflowToolName.includes("__")) { setToast({ kind: "danger", text: "Tool name must use connector_id__action_name format." }); return; }
+    let args: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(workflowArguments) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error();
+      args = parsed as Record<string, unknown>;
+    } catch {
+      setToast({ kind: "danger", text: "Step arguments must be a valid JSON object." });
+      return;
+    }
+    setCreatingWorkflow(true);
     try {
       await apiFetch("/workflows/", {
         method: "POST",
         body: JSON.stringify({
-          name: workflowName,
-          description: "Reusable Phase 12 workflow with dependency-ready steps and event trigger metadata.",
-          steps: [{ id: "capture", tool_name: "internal_echo__echo", arguments: { message: "capture event" }, max_attempts: 2 }],
-          triggers: [{ trigger_type: "webhook", source: "webhooks", event_type: "event.received", config: { path: "/workflows/events" } }],
+          name: workflowName.trim(),
+          description: workflowDescription.trim(),
+          steps: [{ id: "step_1", tool_name: workflowToolName.trim(), arguments: args, max_attempts: 2 }],
+          triggers: [],
         }),
       });
       setToast({ kind: "ok", text: "Workflow created" });
+      setWorkflowName("");
+      setWorkflowDescription("");
+      setWorkflowToolName("");
+      setWorkflowArguments("{}");
       await load();
     } catch (exc) {
       setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to create workflow" });
+    } finally {
+      setCreatingWorkflow(false);
     }
   }
 
@@ -7005,33 +8570,74 @@ function WorkflowsScreen() {
   }
 
   async function createMonitor() {
+    if (!monitorName.trim() || !monitorTarget.trim()) { setToast({ kind: "danger", text: "Add a monitor name and target." }); return; }
+    if (monitorType === "website") {
+      try {
+        const target = new URL(monitorTarget);
+        if (!["http:", "https:"].includes(target.protocol)) throw new Error();
+      } catch {
+        setToast({ kind: "danger", text: "Website targets must use a valid public HTTP or HTTPS URL." });
+        return;
+      }
+    }
+    if (["connector", "source", "inbox"].includes(monitorType) && !monitorTool.trim()) {
+      setToast({ kind: "danger", text: "Add a read-only connector tool such as gmail.search." });
+      return;
+    }
+    setCreatingMonitor(true);
     try {
+      const sourceConfig = ["connector", "source", "inbox"].includes(monitorType)
+        ? { tool: monitorTool.trim(), args: { query: monitorTarget.trim() } }
+        : {};
       await apiFetch("/monitors/", {
         method: "POST",
-        body: JSON.stringify({ name: monitorName, monitor_type: "website", target: monitorTarget, condition: { operator: "changed", severity: "info" }, status: "active" }),
+        body: JSON.stringify({ name: monitorName.trim(), monitor_type: monitorType, target: monitorTarget.trim(), source_config: sourceConfig, interval_seconds: Number(monitorInterval), condition: { operator: "changed", severity: "info" }, status: "active" }),
       });
-      setToast({ kind: "ok", text: "Monitor created" });
+      setMonitorName("");
+      setMonitorTarget("");
+      setMonitorTool("");
+      setToast({ kind: "ok", text: "Monitor is active and queued for its first real observation." });
       await load();
     } catch (exc) {
       setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to create monitor" });
-    }
-  }
-
-  async function evaluateMonitor(monitor: Phase12Monitor) {
-    try {
-      await apiFetch(`/monitors/${monitor.id}/evaluate`, {
-        method: "POST",
-        body: JSON.stringify({ observed: { hash: String(Date.now()), title: monitor.name, url: monitor.target, snippet: `${monitor.name} changed`, observed_at: new Date().toISOString() } }),
-      });
-      setToast({ kind: "ok", text: "Monitor evaluated" });
-      await load();
-    } catch (exc) {
-      setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to evaluate monitor" });
+    } finally {
+      setCreatingMonitor(false);
     }
   }
 
   function toggleMonitor(monitor: Phase12Monitor) {
     void apiFetch(`/monitors/${monitor.id}`, { method: "PATCH", body: JSON.stringify({ status: monitor.status === "paused" ? "active" : "paused" }) }).then(load).catch(exc => setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to update monitor" }));
+  }
+
+  async function runMonitorNow(id: string) {
+    setRunningMonitorId(id);
+    try {
+      const result = await apiFetch(`/monitors/${id}/run`, { method: "POST" }).then(response => response.json()) as Phase12MonitorRun;
+      setToast({ kind: result.status === "degraded" || result.status === "dead_letter" ? "danger" : "ok", text: `Monitor run finished: ${String(result.status).replaceAll("_", " ")}.` });
+      await load();
+      if (expandedMonitor === id) await loadMonitorRuns(id);
+    } catch (exc) {
+      setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to run monitor" });
+    } finally {
+      setRunningMonitorId(null);
+    }
+  }
+
+  async function loadMonitorRuns(id: string) {
+    try {
+      const rows = await apiFetch(`/monitors/${id}/runs`).then(response => response.json()) as Phase12MonitorRun[];
+      setMonitorRuns(previous => ({ ...previous, [id]: rows }));
+    } catch {
+      setMonitorRuns(previous => ({ ...previous, [id]: [] }));
+    }
+  }
+
+  function toggleMonitorHistory(id: string) {
+    setExpandedMonitor(current => {
+      const next = current === id ? null : id;
+      if (next) void loadMonitorRuns(id);
+      return next;
+    });
   }
 
   return (
@@ -7042,7 +8648,7 @@ function WorkflowsScreen() {
         right={<button className="btn btn-secondary btn-sm" onClick={() => void load()}><IC.Refresh size={14}/> Refresh</button>}
       />
       <div className="px-10 pb-10 space-y-7">
-        {toast && <div className="rounded-lg border px-3 py-2 text-[13px]" style={{ borderColor: toast.kind === "ok" ? "var(--ok)" : "var(--danger)", color: toast.kind === "ok" ? "var(--ok)" : "var(--danger)" }}>{toast.text}</div>}
+        {toast && <div role={toast.kind === "danger" ? "alert" : "status"} aria-live={toast.kind === "danger" ? "assertive" : "polite"} className="rounded-lg border px-3 py-2 text-[13px]" style={{ borderColor: toast.kind === "ok" ? "var(--ok)" : "var(--danger)", color: toast.kind === "ok" ? "var(--ok)" : "var(--danger)" }}>{toast.text}</div>}
         {loading && <div className="text-[13px]" style={{ color: "var(--text-dim)" }}>Loading workflow state...</div>}
 
         <section data-testid="phase12-schedules">
@@ -7063,8 +8669,34 @@ function WorkflowsScreen() {
                 {(scheduleKind === "daily" || scheduleKind === "weekdays" || scheduleKind === "weekly" || scheduleKind === "monthly") && (
                   <input aria-label="Time of day" type="time" className="px-2.5 py-1.5 rounded-lg border text-[13px]" style={{ borderColor: "var(--border)", background: "var(--surface)" }} value={scheduleTime} onChange={e => setScheduleTime(e.target.value)} />
                 )}
+                {scheduleKind !== "one_time" && <Tag>UTC schedule</Tag>}
+                {scheduleKind === "weekly" && (
+                  <SelectInput ariaLabel="Day of week" value={scheduleDayOfWeek} onChange={setScheduleDayOfWeek} options={["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]}/>
+                )}
+                {scheduleKind === "monthly" && (
+                  <input
+                    aria-label="Day of month"
+                    type="number"
+                    min={1}
+                    max={31}
+                    className="w-24 px-2.5 py-1.5 rounded-lg border text-[13px]"
+                    style={{ borderColor: "var(--border)", background: "var(--surface)" }}
+                    value={scheduleDayOfMonth}
+                    onChange={e => setScheduleDayOfMonth(e.target.value)}
+                  />
+                )}
                 {scheduleKind === "custom" && (
                   <TextInput ariaLabel="Cron expression" value={scheduleCron} onChange={setScheduleCron}/>
+                )}
+                {scheduleKind === "one_time" && (
+                  <input
+                    aria-label="Run once at"
+                    type="datetime-local"
+                    className="px-2.5 py-1.5 rounded-lg border text-[13px]"
+                    style={{ borderColor: "var(--border)", background: "var(--surface)" }}
+                    value={scheduleRunAt}
+                    onChange={e => setScheduleRunAt(e.target.value)}
+                  />
                 )}
                 <button className="btn btn-accent btn-sm" disabled={creatingRoutine} onClick={() => void createSchedule()}><IC.Plus size={14}/> {creatingRoutine ? "Creating…" : "Create routine"}</button>
               </div>
@@ -7079,13 +8711,13 @@ function WorkflowsScreen() {
               const runs = routineRuns[schedule.id] || [];
               return (
               <div key={schedule.id} className="border-b hairline last:border-b-0">
-                <div className="px-5 py-4 flex items-center justify-between gap-4">
+                <div className="flex flex-col items-stretch justify-between gap-3 px-4 py-4 sm:flex-row sm:items-center sm:px-5 sm:gap-4">
                   <div className="min-w-0">
                     <div className="font-medium text-[14px]">{schedule.name || schedule.goal}</div>
                     {schedule.name && <div className="text-[12.5px] mt-0.5 truncate" style={{ color: "var(--text-muted)" }}>{schedule.goal}</div>}
                     <div className="text-[12px] mt-1" style={{ color: "var(--text-dim)" }}>{schedule.schedule_kind} · next {fmtDate(schedule.next_run_at)} · last {fmtDate(schedule.last_run_at)}</div>
                   </div>
-                  <div className="flex items-center gap-2 flex-shrink-0">
+                  <div className="flex flex-wrap items-center gap-2 flex-shrink-0">
                     <Tag variant={paused ? "warn" : "ok"}>{paused ? "paused" : "active"}</Tag>
                     <button className="btn btn-sm" onClick={() => void runRoutineNow(schedule.id)}>Run now</button>
                     <button className="btn btn-sm" onClick={() => void toggleRoutine(schedule)}>{paused ? "Resume" : "Pause"}</button>
@@ -7099,7 +8731,7 @@ function WorkflowsScreen() {
                       {runs.length === 0 ? (
                         <div className="px-4 py-3 text-[12.5px]" style={{ color: "var(--text-dim)" }}>No runs yet. Use “Run now” to trigger one.</div>
                       ) : runs.map(run => (
-                        <div key={run.id} className="px-4 py-2.5 border-b hairline last:border-b-0 flex items-center justify-between gap-3">
+                        <div key={run.id} className="flex flex-col items-stretch justify-between gap-3 border-b hairline px-4 py-2.5 last:border-b-0 sm:flex-row sm:items-center">
                           <div className="min-w-0">
                             <div className="text-[12.5px]">{run.trigger_source || "scheduled"} · {fmtDate(run.created_at)}</div>
                           </div>
@@ -7118,7 +8750,30 @@ function WorkflowsScreen() {
         </section>
 
         <section>
-          <div className="flex items-center justify-between mb-3"><h2 className="text-[16px] font-semibold">Reusable workflows</h2><div className="flex gap-2"><TextInput ariaLabel="Workflow name" value={workflowName} onChange={setWorkflowName}/><button className="btn btn-accent btn-sm" onClick={() => void createWorkflow()}><IC.Plus size={14}/> Create</button></div></div>
+          <h2 className="text-[16px] font-semibold mb-3">Reusable workflows</h2>
+          <div className="surface border border-soft rounded-xl p-4 mb-4">
+            <div className="grid gap-3 md:grid-cols-2">
+              <label className="grid gap-1 text-[12px]" style={{ color: "var(--text-dim)" }}>
+                Workflow name
+                <input aria-label="Workflow name" className="input" value={workflowName} onChange={e => setWorkflowName(e.target.value)}/>
+              </label>
+              <label className="grid gap-1 text-[12px]" style={{ color: "var(--text-dim)" }}>
+                Description
+                <input aria-label="Workflow description" className="input" value={workflowDescription} onChange={e => setWorkflowDescription(e.target.value)}/>
+              </label>
+              <label className="grid gap-1 text-[12px]" style={{ color: "var(--text-dim)" }}>
+                First step tool
+                <input aria-label="Workflow tool name" className="input font-mono" placeholder="connector_id__action_name" value={workflowToolName} onChange={e => setWorkflowToolName(e.target.value)}/>
+              </label>
+              <label className="grid gap-1 text-[12px]" style={{ color: "var(--text-dim)" }}>
+                Step arguments (JSON)
+                <textarea aria-label="Workflow step arguments" className="input min-h-20 resize-y font-mono" value={workflowArguments} onChange={e => setWorkflowArguments(e.target.value)}/>
+              </label>
+            </div>
+            <div className="mt-3 flex justify-end">
+              <button className="btn btn-accent btn-sm" disabled={creatingWorkflow} onClick={() => void createWorkflow()}><IC.Plus size={14}/> {creatingWorkflow ? "Creating…" : "Create workflow"}</button>
+            </div>
+          </div>
           <div className="surface border border-soft rounded-xl overflow-hidden">
             {workflows.length === 0 ? <EmptyState title="No workflows" sub="Create a workflow for multi-step scheduled work or run one manually now."/> : workflows.map(workflow => (
               <div key={workflow.id} className="px-5 py-4 border-b hairline last:border-b-0">
@@ -7136,24 +8791,45 @@ function WorkflowsScreen() {
         </section>
 
         <section data-testid="phase12-workflow-runs">
-          <div className="flex items-center justify-between mb-3"><h2 className="text-[16px] font-semibold">Run history</h2><button className="btn btn-sm" onClick={() => void apiFetch("/workflows/dispatch", { method: "POST", body: JSON.stringify({ source: "webhooks", event_type: "event.received", payload: { type: "event.received" } }) }).then(load)}>Dispatch event</button></div>
+          <div className="flex items-center justify-between mb-3"><h2 className="text-[16px] font-semibold">Run history</h2></div>
           <div className="surface border border-soft rounded-xl overflow-hidden">
             {runs.length === 0 ? <EmptyState title="No workflow runs" sub="Manual, scheduled, webhook, and connector-triggered workflow runs appear here."/> : runs.map(run => (
-              <div key={run.id} className="px-5 py-4 border-b hairline last:border-b-0 flex items-center justify-between gap-4">
+              <div key={run.id} className="flex flex-col items-stretch justify-between gap-3 border-b hairline px-4 py-4 last:border-b-0 sm:flex-row sm:items-center sm:px-5 sm:gap-4">
                 <div><div className="font-medium text-[14px]">{workflowNameFor(workflows, run.workflow_id)}</div><div className="text-[12px] mt-1" style={{ color: "var(--text-dim)" }}>{run.trigger_source || "manual"} {run.trigger_event_type ? `· ${run.trigger_event_type}` : ""} · {fmtDate(run.updated_at || run.created_at)}</div></div>
-                <div className="flex items-center gap-2"><Tag variant={run.status === "failed" ? "danger" : run.status === "paused" ? "warn" : run.status === "completed" ? "ok" : "info"}>{run.status}</Tag><button className="btn btn-sm" onClick={() => void updateRun(run.id, "pause")}><IC.Pause size={14}/></button><button className="btn btn-sm" onClick={() => void updateRun(run.id, "resume")}><IC.Refresh size={14}/></button></div>
+                <div className="flex items-center gap-2"><Tag variant={run.status === "failed" ? "danger" : run.status === "paused" ? "warn" : run.status === "completed" ? "ok" : "info"}>{run.status}</Tag>{["pending", "running"].includes(run.status) && <button aria-label="Pause workflow run" className="btn btn-sm" onClick={() => void updateRun(run.id, "pause")}><IC.Pause size={14}/> Pause</button>}{run.status === "paused" && <button aria-label="Resume workflow run" className="btn btn-sm" onClick={() => void updateRun(run.id, "resume")}><IC.Refresh size={14}/> Resume</button>}{!["completed", "failed", "cancelled"].includes(run.status) && <button aria-label="Cancel workflow run" className="btn btn-danger-soft btn-sm" onClick={() => { if (window.confirm("Cancel this workflow run? Completed step evidence will remain available.")) void updateRun(run.id, "cancel"); }}><IC.X size={14}/> Cancel</button>}</div>
               </div>
             ))}
           </div>
         </section>
 
         <section data-testid="phase12-monitors">
-          <div className="flex items-center justify-between mb-3"><h2 className="text-[16px] font-semibold">Monitors</h2><div className="flex gap-2"><TextInput ariaLabel="Monitor name" value={monitorName} onChange={setMonitorName}/><TextInput ariaLabel="Monitor target" value={monitorTarget} onChange={setMonitorTarget}/><button className="btn btn-accent btn-sm" onClick={() => void createMonitor()}><IC.Plus size={14}/> Create</button></div></div>
+          <h2 className="text-[16px] font-semibold mb-3">Monitors</h2>
+          <div className="surface border border-soft rounded-xl p-4 mb-4">
+            <div className="grid gap-2.5 md:grid-cols-2 xl:grid-cols-3">
+              <label className="grid gap-1 text-[12px]" style={{ color: "var(--text-dim)" }}>Name<input aria-label="Monitor name" className="input" value={monitorName} onChange={event => setMonitorName(event.target.value)}/></label>
+              <label className="grid gap-1 text-[12px]" style={{ color: "var(--text-dim)" }}>Source<select aria-label="Monitor source type" className="input" value={monitorType} onChange={event => setMonitorType(event.target.value)}><option value="website">Website</option><option value="news">News and search</option><option value="inbox">Inbox</option><option value="connector">Connector</option><option value="source">Connected source</option></select></label>
+              <label className="grid gap-1 text-[12px]" style={{ color: "var(--text-dim)" }}>Check every<select aria-label="Monitor interval" className="input" value={monitorInterval} onChange={event => setMonitorInterval(event.target.value)}><option value="300">5 minutes</option><option value="900">15 minutes</option><option value="3600">Hourly</option><option value="21600">Every 6 hours</option><option value="86400">Daily</option></select></label>
+              <label className="grid gap-1 text-[12px] md:col-span-2" style={{ color: "var(--text-dim)" }}>{monitorType === "website" ? "Public URL" : "Search or filter"}<input aria-label="Monitor target" className="input" placeholder={monitorType === "website" ? "https://example.com/updates" : "New customer replies"} value={monitorTarget} onChange={event => setMonitorTarget(event.target.value)}/></label>
+              {["connector", "source", "inbox"].includes(monitorType) && <label className="grid gap-1 text-[12px]" style={{ color: "var(--text-dim)" }}>Read-only tool<input aria-label="Monitor connector tool" className="input font-mono" placeholder="gmail.search" value={monitorTool} onChange={event => setMonitorTool(event.target.value)}/></label>}
+            </div>
+            <div className="mt-3 flex items-center justify-between gap-3"><p className="text-[12px]" style={{ color: "var(--text-dim)" }}>The first run establishes a baseline. Later matching changes create deduplicated alerts.</p><button className="btn btn-accent btn-sm justify-center flex-shrink-0" disabled={creatingMonitor} onClick={() => void createMonitor()}><IC.Plus size={14}/> {creatingMonitor ? "Creating…" : "Create monitor"}</button></div>
+          </div>
           <div className="surface border border-soft rounded-xl overflow-hidden">
-            {monitors.length === 0 ? <EmptyState title="No monitors" sub="Watch websites, sources, connectors, inboxes, news, or recurring digests and create cited alerts."/> : monitors.map(monitor => (
-              <div key={monitor.id} className="px-5 py-4 border-b hairline last:border-b-0 flex items-center justify-between gap-4">
-                <div className="min-w-0"><div className="font-medium text-[14px]">{monitor.name}</div><div className="text-[12px] mt-1 truncate" style={{ color: "var(--text-dim)" }}>{monitor.monitor_type} · {monitor.target} · checked {fmtDate(monitor.last_checked_at)}</div></div>
-                <div className="flex items-center gap-2"><Tag variant={monitor.status === "paused" ? "warn" : "ok"}>{monitor.status}</Tag><button className="btn btn-sm" onClick={() => void evaluateMonitor(monitor)}><IC.Search size={14}/> Evaluate</button><button className="btn btn-sm" onClick={() => toggleMonitor(monitor)}>{monitor.status === "paused" ? "Resume" : "Pause"}</button></div>
+            {monitors.length === 0 ? <EmptyState title="No monitors" sub="Create a website, news, inbox, or connector monitor. Chronos will collect and record each real observation."/> : monitors.map(monitor => (
+              <div key={monitor.id} className="border-b hairline last:border-b-0">
+                <div className="flex flex-col items-stretch justify-between gap-3 px-4 py-4 sm:flex-row sm:items-start sm:px-5 sm:gap-4">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2"><div className="font-medium text-[14px]">{monitor.name}</div><Tag variant={monitor.last_run_status === "dead_letter" || monitor.last_run_status === "degraded" ? "danger" : monitor.last_run_status === "retry" ? "warn" : monitor.last_run_status ? "info" : "default"}>{monitor.last_run_status ? monitor.last_run_status.replaceAll("_", " ") : "awaiting baseline"}</Tag></div>
+                    <div className="text-[12px] mt-1 truncate" style={{ color: "var(--text-dim)" }}>{monitor.monitor_type} · {monitor.target}</div>
+                    <div className="text-[12px] mt-1" style={{ color: "var(--text-faint)" }}>Last {fmtDate(monitor.last_run_at)} · Next {monitor.status === "paused" ? "paused" : fmtDate(monitor.backoff_until || monitor.next_run_at)} · {monitor.alert_count || 0} alerts</div>
+                    {!!monitor.consecutive_failures && <div role="status" className="text-[12px] mt-1" style={{ color: "var(--danger)" }}>{monitor.consecutive_failures} consecutive failure{monitor.consecutive_failures === 1 ? "" : "s"} · {monitor.last_error_code || "poll failed"}</div>}
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2"><Tag variant={monitor.status === "paused" ? "warn" : "ok"}>{monitor.status}</Tag><button className="btn btn-sm" disabled={runningMonitorId === monitor.id} onClick={() => void runMonitorNow(monitor.id)}><IC.Search size={14}/> {runningMonitorId === monitor.id ? "Checking…" : "Run now"}</button><button aria-expanded={expandedMonitor === monitor.id} className="btn btn-sm" onClick={() => toggleMonitorHistory(monitor.id)}>History</button><button className="btn btn-sm" onClick={() => toggleMonitor(monitor)}>{monitor.status === "paused" ? "Resume" : "Pause"}</button></div>
+                </div>
+                {expandedMonitor === monitor.id && <div className="border-t hairline px-4 py-3 sm:px-5" style={{ background: "var(--bg)" }}>
+                  <div className="text-[12px] font-semibold mb-2">Poll history</div>
+                  {(monitorRuns[monitor.id] || []).length === 0 ? <div className="text-[12px]" style={{ color: "var(--text-dim)" }}>No completed polls yet.</div> : (monitorRuns[monitor.id] || []).map(run => <div key={run.id} className="flex flex-col justify-between gap-1 py-2 border-t hairline first:border-t-0 sm:flex-row"><div className="text-[12px]"><span className="font-medium">{run.status.replaceAll("_", " ")}</span> · {run.trigger_source || "scheduler"} · attempt {run.attempt || 1}{run.error_summary ? <div style={{ color: "var(--danger)" }}>{run.error_summary}</div> : null}</div><div className="text-[12px]" style={{ color: "var(--text-dim)" }}>{fmtDate(run.completed_at || run.started_at)}</div></div>)}
+                </div>}
               </div>
             ))}
           </div>
@@ -7224,165 +8900,20 @@ function workflowNameFor(workflows: Phase12Workflow[], id: string) {
   return workflows.find(workflow => workflow.id === id)?.name || id;
 }
 
-function TasksScreen() {
-  const [tasks, setTasks] = useState<Task[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [statusFilter, setStatusFilter] = useState("all");
-  const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
-  const [activeTask, setActiveTask] = useState<Task | null>(null);
-  const [events, setEvents] = useState<ActivityAction[]>([]);
-  const [actionBusy, setActionBusy] = useState<string | null>(null);
-  const [actionError, setActionError] = useState<string | null>(null);
-
-  const loadTasks = useCallback(async () => {
-    setLoading(true);
-    const params = new URLSearchParams({ limit: "100" });
-    if (statusFilter === "dead_letter") params.set("dead_letter", "true");
-    else if (statusFilter !== "all") params.set("status", statusFilter);
-    await apiFetch(`/tasks/?${params.toString()}`)
-      .then(r => r.json())
-      .then((data: Task[]) => setTasks(data))
-      .catch(() => setTasks([]))
-      .finally(() => setLoading(false));
-  }, [statusFilter]);
-
-  useEffect(() => { void loadTasks(); }, [loadTasks]);
-
-  useEffect(() => {
-    if (!activeTaskId) { setActiveTask(null); setEvents([]); return; }
-    apiFetch(`/tasks/${activeTaskId}`)
-      .then(r => r.json())
-      .then((data: Task) => setActiveTask(data))
-      .catch(() => setActiveTask(null));
-    apiFetch(`/tasks/${activeTaskId}/events`)
-      .then(r => r.json())
-      .then((data: ActivityAction[]) => setEvents(data))
-      .catch(() => setEvents([]));
-  }, [activeTaskId]);
-
-  const runTaskAction = useCallback(async (taskId: string, action: "cancel" | "retry") => {
-    setActionBusy(taskId);
-    setActionError(null);
-    try {
-      await apiFetch(`/tasks/${taskId}/${action}`, { method: "POST" });
-      await loadTasks();
-      if (activeTaskId === taskId) setActiveTaskId(null);
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : `Couldn't ${action} task`);
-    } finally {
-      setActionBusy(null);
-    }
-  }, [activeTaskId, loadTasks]);
-
-  const filters = [
-    { id: "all", label: "All" },
-    { id: "running", label: "Working" },
-    { id: "queued", label: "Queued" },
-    { id: "awaiting_approval", label: "Waiting on you" },
-    { id: "complete", label: "Done" },
-    { id: "failed", label: "Stopped" },
-    { id: "cancelled", label: "Cancelled" },
-    { id: "dead_letter", label: "Dead letter" },
-  ];
-  const statusLabel: Record<string, string> = {
-    queued: "Queued", running: "Working", awaiting_approval: "Waiting on you", complete: "Done", failed: "Stopped", pending: "Queued", cancelled: "Cancelled",
-  };
-  const cancellable = (t: Task) => !["complete", "failed", "cancelled"].includes(t.status);
-  const retryable = (t: Task) => ["failed", "cancelled"].includes(t.status);
-
-  return (
-    <div className="flex-1 flex flex-col min-w-0 overflow-y-auto">
-      <PageHeader
-        title="Tasks"
-        subtitle="Manage Chronos's background work — cancel running tasks or retry stopped ones."
-        right={<button onClick={() => void loadTasks()} className="btn btn-ghost btn-sm"><IC.Refresh size={13}/> Refresh</button>}
-      />
-      <div className="px-10 pb-4 flex items-center gap-1 flex-wrap">
-        {filters.map(f => (
-          <button key={f.id} onClick={() => setStatusFilter(f.id)}
-                  className="px-3 py-1.5 rounded-md text-[13px] font-medium smooth whitespace-nowrap"
-                  style={{ background: statusFilter === f.id ? "var(--surface-2)" : "transparent", color: statusFilter === f.id ? "var(--text)" : "var(--text-muted)" }}>
-            {f.label}
-          </button>
-        ))}
-      </div>
-      {actionError && (
-        <div className="mx-10 mb-3 text-[12.5px] rounded-md px-3 py-2" style={{ color: "var(--danger)", background: "var(--danger-soft)" }}>{actionError}</div>
-      )}
-      <div className="px-10 pb-10 space-y-2.5">
-        {loading && <p className="text-[13.5px]" style={{ color: "var(--text-dim)" }}>Loading…</p>}
-        {!loading && tasks.length === 0 && (
-          <EmptyState icon={<IC.Clock size={20}/>} title="No tasks here" sub="Tasks appear when you ask Chronos to do something, or pick another filter."/>
-        )}
-        {tasks.map(t => {
-          const sl = statusLabel[t.status] ?? t.status;
-          const statusColor = { running: "var(--accent-text)", awaiting_approval: "var(--warn)", failed: "var(--danger)", complete: "var(--ok)" }[t.status] ?? "var(--text-muted)";
-          return (
-            <div key={t.id} className="surface border border-soft rounded-lg overflow-hidden">
-              <div className="w-full p-4 flex items-center gap-4">
-                <button onClick={() => setActiveTaskId(activeTaskId === t.id ? null : t.id)} className="flex-1 min-w-0 flex items-center gap-4 text-left smooth cursor-pointer">
-                  <div className="flex-shrink-0">
-                    {t.status === "running"             && <Dot color="var(--accent)" size={10} pulse ring/>}
-                    {t.status === "awaiting_approval"   && <Dot color="var(--warn)" size={10}/>}
-                    {t.status === "complete"            && <IC.Check size={16} stroke={2.2} style={{ color: "var(--ok)" }}/>}
-                    {(t.status === "failed" || t.status === "cancelled") && <IC.Info size={16} style={{ color: "var(--danger)" }}/>}
-                    {(t.status === "queued" || t.status === "pending") && <Dot color="var(--text-faint)" size={8}/>}
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="text-[14.5px] font-medium mb-1 truncate">{t.goal}</div>
-                    <div className="flex items-center gap-2 text-[12.5px]" style={{ color: "var(--text-dim)" }}>
-                      <span style={{ color: statusColor }}>{sl}</span>
-                      <span>·</span>
-                      <span>{t.iteration_count ?? 0} iterations</span>
-                      {t.created_at && <><span>·</span><span>{new Date(t.created_at).toLocaleString()}</span></>}
-                    </div>
-                  </div>
-                </button>
-                <div className="flex items-center gap-1.5 flex-shrink-0">
-                  {cancellable(t) && (
-                    <button onClick={() => void runTaskAction(t.id, "cancel")} disabled={actionBusy === t.id} className="btn btn-ghost btn-sm">
-                      <IC.Stop size={13}/> Cancel
-                    </button>
-                  )}
-                  {retryable(t) && (
-                    <button onClick={() => void runTaskAction(t.id, "retry")} disabled={actionBusy === t.id} className="btn btn-ghost btn-sm">
-                      <IC.Refresh size={13}/> Retry
-                    </button>
-                  )}
-                  <button onClick={() => setActiveTaskId(activeTaskId === t.id ? null : t.id)} className="btn btn-ghost btn-icon">
-                    <IC.Chevron size={16} style={{ color: "var(--text-faint)", transform: activeTaskId === t.id ? "rotate(90deg)" : "none" }}/>
-                  </button>
-                </div>
-              </div>
-              {activeTaskId === t.id && (
-                <div className="border-t hairline px-5 py-4 space-y-3">
-                  {activeTask?.error && <div className="text-[12.5px]" style={{ color: "var(--danger)" }}>{activeTask.error}</div>}
-                  <TaskTimeline task={activeTask || t} events={events}/>
-                  <TaskResult task={activeTask || t}/>
-                </div>
-              )}
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
-function AuditScreen() {
+function AuditScreen({ canExport }: { canExport: boolean }) {
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-y-auto">
       <PageHeader title="Audit" subtitle="Every governed action Chronos has recorded — searchable and exportable."/>
       <div className="px-10 pb-10">
-        <AuditSettings/>
+        <AuditSettings canExport={canExport}/>
       </div>
     </div>
   );
 }
 
-function SettingsScreen({ tab, setTab, theme, setTheme, accent, setAccent, signOut }: {
+function SettingsScreen({ tab, setTab, setTheme, accent, setAccent, signOut }: {
   tab: SettingsTab; setTab: (t: SettingsTab) => void;
-  theme: "light" | "dark"; setTheme: (t: "light" | "dark") => void;
+  setTheme: (t: "light" | "dark") => void;
   accent: string; setAccent: (a: string) => void;
   signOut: () => void;
 }) {
@@ -7402,34 +8933,40 @@ function SettingsScreen({ tab, setTab, theme, setTheme, accent, setAccent, signO
       setDrafts(data.sections);
       const savedTheme = String(data.sections.general?.theme ?? "system");
       if (savedTheme === "light" || savedTheme === "dark") setTheme(savedTheme);
+      const savedAccent = String(data.sections.general?.accent ?? "");
+      if (savedAccent && ACCENT_PALETTES[savedAccent]) setAccent(savedAccent);
       setToast(null);
     } catch (exc) {
       setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to load settings" });
     } finally {
       setLoading(false);
     }
-  }, [setTheme]);
+  }, [setAccent, setTheme]);
 
   useEffect(() => { void load(); }, [load]);
 
+  const memberRole = overview?.member.role || "viewer";
+  const canAdmin = Boolean(overview?.member.can_admin);
   const visibleTabs = SETTING_TABS.filter(item => {
     const query = search.trim().toLowerCase();
+    if (!canViewSettingsTab(item.id, memberRole)) return false;
     return !query || item.label.toLowerCase().includes(query) || item.keywords.includes(query);
   });
   const activeMeta = SETTING_TABS.find(item => item.id === tab) ?? SETTING_TABS[0];
+  const canViewActiveTab = canViewSettingsTab(tab, memberRole);
   const activeSection = apiSectionForTab(tab);
   const sectionDraft = drafts[activeSection] || {};
   const sectionSaved = overview?.sections?.[activeSection] || {};
   const dirty = JSON.stringify(sectionDraft) !== JSON.stringify(sectionSaved);
-  const canAdmin = Boolean(overview?.member.can_admin);
-  const readOnly = !canEditTab(tab, canAdmin);
+  const readOnly = !canEditTab(tab, memberRole, canAdmin);
+  const saveable = SAVEABLE_SETTINGS_TABS.has(tab);
 
   function patch(section: string, values: Record<string, unknown>) {
     setDrafts(prev => ({ ...prev, [section]: { ...(prev[section] || {}), ...values } }));
   }
 
   async function save(section = activeSection) {
-    if (!overview) return;
+    if (!overview || readOnly || !canViewActiveTab) return;
     setSaving(true);
     try {
       const data = (await (await apiFetch(`/settings/${section}`, {
@@ -7437,9 +8974,12 @@ function SettingsScreen({ tab, setTab, theme, setTheme, accent, setAccent, signO
         body: JSON.stringify({ values: drafts[section] || {} }),
       })).json()) as { values: Record<string, unknown> };
       setOverview(prev => prev ? { ...prev, sections: { ...prev.sections, [section]: data.values } } : prev);
+      setDrafts(prev => ({ ...prev, [section]: data.values }));
       if (section === "general") {
         const savedTheme = String(data.values.theme ?? "system");
         if (savedTheme === "light" || savedTheme === "dark") setTheme(savedTheme);
+        const savedAccent = String(data.values.accent ?? "");
+        if (savedAccent && ACCENT_PALETTES[savedAccent]) setAccent(savedAccent);
       }
       setToast({ kind: "ok", text: "Settings saved" });
     } catch (exc) {
@@ -7471,8 +9011,8 @@ function SettingsScreen({ tab, setTab, theme, setTheme, accent, setAccent, signO
   if (!overview) return <EmptyState icon={<IC.Settings size={20}/>} title="Settings unavailable" sub="The settings API did not return data."/>;
 
   return (
-    <div className="flex-1 flex min-w-0 overflow-hidden">
-      <div className="flex-shrink-0 border-r hairline py-5" style={{ width: 260, background: "var(--bg-deep)" }}>
+    <div className="flex-1 flex min-w-0 flex-col overflow-hidden md:flex-row">
+      <div className="w-full max-h-[34vh] flex flex-col flex-shrink-0 border-b hairline py-3 overflow-hidden md:max-h-none md:w-[260px] md:border-b-0 md:border-r md:py-5" style={{ background: "var(--bg-deep)" }}>
         <div className="px-4 mb-3">
           <div className="text-[11px] font-semibold uppercase tracking-wider mb-3" style={{ color: "var(--text-dim)" }}>Settings</div>
           <div className="surface border border-soft rounded-lg flex items-center gap-2 px-2.5 py-2">
@@ -7480,7 +9020,7 @@ function SettingsScreen({ tab, setTab, theme, setTheme, accent, setAccent, signO
             <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search settings" className="bg-transparent outline-none text-[13px] w-full" aria-label="Search settings"/>
           </div>
         </div>
-        <div className="px-3 space-y-0.5 overflow-y-auto" style={{ maxHeight: "calc(100vh - 116px)" }}>
+        <nav aria-label="Settings sections" className="px-3 space-y-0.5 flex-1 min-h-0 overflow-y-auto md:max-h-[calc(100vh-116px)]">
           {(["You", "Workspace", "Advanced"] as SettingsGroup[]).map(group => {
             const items = visibleTabs.filter(item => item.group === group);
             if (!items.length) return null;
@@ -7488,7 +9028,7 @@ function SettingsScreen({ tab, setTab, theme, setTheme, accent, setAccent, signO
               <div key={group} className="mb-2">
                 <div className="px-2.5 pt-2 pb-1 text-[11px] font-semibold uppercase tracking-wider" style={{ color: "var(--text-dim)" }}>{group}</div>
                 {items.map(item => (
-                  <button key={item.id} onClick={() => selectTab(item.id)} className={`nav-item w-full ${tab === item.id ? "active" : ""}`}>
+                  <button key={item.id} onClick={() => selectTab(item.id)} aria-current={tab === item.id ? "page" : undefined} className={`nav-item w-full ${tab === item.id ? "active" : ""}`}>
                     <span className="nav-icon">{item.icon}</span>
                     <span className="flex-1 text-left">{item.label}</span>
                   </button>
@@ -7496,11 +9036,11 @@ function SettingsScreen({ tab, setTab, theme, setTheme, accent, setAccent, signO
               </div>
             );
           })}
-        </div>
+        </nav>
       </div>
 
       <div className="flex-1 min-w-0 overflow-y-auto" style={{ background: "var(--bg)" }}>
-        <div className="sticky top-0 z-20 border-b hairline px-10 py-4 flex items-center justify-between" style={{ background: "var(--bg)" }}>
+        <div className="sticky top-0 z-20 border-b hairline px-4 py-4 flex items-center justify-between gap-4 md:px-10" style={{ background: "var(--bg)" }}>
           <div>
             <div className="text-[12px]" style={{ color: "var(--text-dim)" }}>Settings / {activeMeta.label}</div>
             <h1 className="h-section mt-1">{activeMeta.label}</h1>
@@ -7508,7 +9048,7 @@ function SettingsScreen({ tab, setTab, theme, setTheme, accent, setAccent, signO
           <div className="flex items-center gap-2">
             {dirty && <span className="text-[12px]" style={{ color: "var(--text-dim)" }}>Unsaved changes</span>}
             {dirty && <button onClick={() => cancel()} className="btn btn-sm">Cancel</button>}
-            {!["members", "data", "audit", "security", "billing", "context", "danger"].includes(tab) && (
+            {saveable && canViewActiveTab && (
               <button onClick={() => void save()} disabled={!dirty || readOnly || saving} className="btn btn-accent btn-sm disabled:opacity-50">
                 {saving ? "Saving..." : readOnly ? "Read only" : "Save"}
               </button>
@@ -7516,31 +9056,40 @@ function SettingsScreen({ tab, setTab, theme, setTheme, accent, setAccent, signO
           </div>
         </div>
 
-        <div className="px-10 py-8 max-w-[1040px]">
+        <div className="px-4 py-6 max-w-[1040px] md:px-10 md:py-8">
           {toast && (
-            <div className="mb-5 rounded-lg border px-3 py-2 text-[13px]" style={{ borderColor: toast.kind === "ok" ? "var(--ok)" : "var(--danger)", color: toast.kind === "ok" ? "var(--ok)" : "var(--danger)" }}>
+            <div role={toast.kind === "danger" ? "alert" : "status"} aria-live={toast.kind === "danger" ? "assertive" : "polite"} className="mb-5 rounded-lg border px-3 py-2 text-[13px]" style={{ borderColor: toast.kind === "ok" ? "var(--ok)" : "var(--danger)", color: toast.kind === "ok" ? "var(--ok)" : "var(--danger)" }}>
               {toast.text}
             </div>
           )}
-          {readOnly && <Unavailable reason="Your role can view this section but cannot edit it."/>}
-          {tab === "general" && <GeneralSettings data={sectionDraft} patch={v => patch("general", v)} theme={theme} setTheme={setTheme} accent={accent} setAccent={setAccent}/>}
-          {tab === "profile" && <ProfileSettings data={sectionDraft} patch={v => patch("profile", v)} overview={overview}/>}
-          {tab === "organization" && <OrganizationSettings data={sectionDraft} patch={v => patch("organization", v)} overview={overview}/>}
+          {!canViewActiveTab ? (
+            <Unavailable reason={settingsAccessReason(tab)}/>
+          ) : (<>
+          {readOnly && saveable && <Unavailable reason={tab === "memory-settings" ? "You can manage memories below, but organization retention policy and legal holds are read-only for your role." : "Your role can view this section but cannot edit it."}/>}
+          {tab === "general" && (
+            <GeneralSettings data={sectionDraft} patch={v => patch("general", v)} setTheme={setTheme} accent={accent} setAccent={setAccent} canAdmin={canAdmin}/>
+          )}
+          {tab === "profile" && (
+            <ProfileSettings data={sectionDraft} patch={v => patch("profile", v)} overview={overview}/>
+          )}
+          {tab === "devices" && <DesktopDevicesSettings/>}
+          {tab === "organization" && <><fieldset disabled={!canAdmin} className="min-w-0 border-0 p-0"><OrganizationSettings data={sectionDraft} patch={v => patch("organization", v)} overview={overview}/></fieldset>{canAdmin && <AdminDirectorySettings members={overview.members} setToast={setToast} setConfirm={setConfirm}/>}</>}
           {tab === "members" && <MembersSettings overview={overview} reload={load} setToast={setToast} setConfirm={setConfirm}/>}
           {tab === "permissions" && <PermissionsSettings data={sectionDraft} patch={v => patch("permissions", v)}/>}
           {tab === "employees" && <EmployeeSettings data={sectionDraft} patch={v => patch("ai_employee", v)}/>}
-          {tab === "runtime" && <RuntimeSettings data={sectionDraft} patch={v => patch("runtime", v)} health={overview.runtime_health}/>}
-          {tab === "memory-settings" && <MemoryScreen embedded />}
+          {tab === "runtime" && <RuntimeSettings data={sectionDraft} patch={v => patch("runtime", v)} health={overview.runtime_health} canAdmin={canAdmin}/>}
+          {tab === "memory-settings" && <><RetentionSettings data={sectionDraft} patch={v => patch("memory", v)} stats={overview.memory_stats} organizationId={String(overview.organization.id || "")} canAdmin={canAdmin} dirty={dirty} setToast={setToast} setConfirm={setConfirm}/><MemoryScreen embedded canManageOrganization={canAdmin} /></>}
           {tab === "data" && <AccountDataSettings setToast={setToast}/>}
           {tab === "tools-settings" && <ToolsSettings data={sectionDraft} patch={v => patch("tool_settings", v)} connectors={overview.connectors} capabilities={overview.capabilities} health={overview.runtime_health.connectors || {}}/>}
           {tab === "approval-settings" && <ApprovalSettings data={sectionDraft} patch={v => patch("approval", v)} canAdmin={canAdmin} setToast={setToast}/>}
           {tab === "notifications" && <NotificationSettings data={sectionDraft} patch={v => patch("notifications", v)} capabilities={overview.capabilities}/>}
-          {tab === "security" && <SecuritySettings capabilities={overview.capabilities} signOut={signOut}/>}
+          {tab === "security" && <SecuritySettings capabilities={overview.capabilities} signOut={signOut} canAdmin={canAdmin} setToast={setToast} setConfirm={setConfirm}/>}
           {tab === "billing" && <BillingSettings overview={overview}/>}
-          {tab === "audit" && <AuditSettings />}
+          {tab === "audit" && <AuditSettings canExport={canAdmin} />}
           {tab === "context" && <ContextSuggestionsScreen />}
           {tab === "developer" && <DeveloperSettings data={sectionDraft} patch={v => patch("developer", v)} capabilities={overview.capabilities}/>}
-          {tab === "danger" && <DangerSettings capabilities={overview.capabilities} setToast={setToast}/>}
+          {tab === "danger" && <DangerSettings overview={overview} signOut={signOut} setToast={setToast} setConfirm={setConfirm}/>}
+          </>)}
         </div>
       </div>
       {confirm && <ConfirmModal confirm={confirm} onClose={() => setConfirm(null)}/>}
@@ -7552,9 +9101,10 @@ function apiSectionForTab(tab: SettingsTab) {
   return ({ "memory-settings": "memory", "tools-settings": "tool_settings", "approval-settings": "approval", employees: "ai_employee" } as Record<string, string>)[tab] || tab;
 }
 
-function canEditTab(tab: SettingsTab, canAdmin: boolean) {
-  if (["organization", "members", "permissions", "employees", "runtime", "memory-settings", "tools-settings", "approval-settings", "developer", "danger"].includes(tab)) return canAdmin;
-  return !["data", "audit", "security", "billing"].includes(tab);
+function canEditTab(tab: SettingsTab, role: string, canAdmin: boolean) {
+  if (tab === "memory-settings") return canAdmin;
+  if (["organization", "members", "permissions", "employees", "runtime", "tools-settings", "approval-settings", "developer", "danger"].includes(tab)) return canAdmin;
+  return !["data", "audit", "security", "billing", "context"].includes(tab);
 }
 
 function val(data: Record<string, unknown>, key: string, fallback = "") {
@@ -7566,49 +9116,234 @@ function SettingsSection({ title, children, note }: { title: string; children: R
 }
 
 function SettingsField({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
-  return <div className="flex items-start justify-between gap-6 px-5 py-4 border-b hairline last:border-b-0"><div className="min-w-0"><div className="text-[14px] font-medium">{label}</div>{hint && <div className="text-[13px] mt-0.5" style={{ color: "var(--text-dim)" }}>{hint}</div>}</div><div className="flex-shrink-0 max-w-[440px]">{children}</div></div>;
+  return <div className="flex flex-col items-stretch justify-between gap-3 px-4 py-4 border-b hairline last:border-b-0 sm:flex-row sm:items-start sm:gap-6 sm:px-5"><div className="min-w-0"><div className="text-[14px] font-medium">{label}</div>{hint && <div className="text-[13px] mt-0.5" style={{ color: "var(--text-dim)" }}>{hint}</div>}</div><div className="min-w-0 max-w-full sm:flex-shrink-0 sm:max-w-[440px]">{children}</div></div>;
 }
 
-function TextInput({ value, onChange, disabled = false, wide = false, ariaLabel }: { value: string; onChange: (value: string) => void; disabled?: boolean; wide?: boolean; ariaLabel: string }) {
-  return <input aria-label={ariaLabel} disabled={disabled} value={value} onChange={e => onChange(e.target.value)} className={`surface border border-soft rounded-lg px-3 py-2 text-[14px] outline-none disabled:opacity-60 ${wide ? "w-96" : "w-64"}`} style={{ color: "var(--text)" }}/>;
+function TextInput({ value, onChange, disabled = false, wide = false, ariaLabel, placeholder }: { value: string; onChange: (value: string) => void; disabled?: boolean; wide?: boolean; ariaLabel: string; placeholder?: string }) {
+  return <input aria-label={ariaLabel} placeholder={placeholder} disabled={disabled} value={value} onChange={e => onChange(e.target.value)} className={`surface border border-soft rounded-lg px-3 py-2 text-[14px] outline-none disabled:opacity-60 w-full ${wide ? "sm:w-96" : "sm:w-64"}`} style={{ color: "var(--text)" }}/>;
 }
 
 function SelectInput({ value, onChange, options, ariaLabel, disabled = false }: { value: string; onChange: (value: string) => void; options: string[]; ariaLabel: string; disabled?: boolean }) {
-  return <select aria-label={ariaLabel} disabled={disabled} value={value} onChange={e => onChange(e.target.value)} className="surface border border-soft rounded-lg px-3 py-2 text-[14px] outline-none w-64 disabled:opacity-60">{options.map(option => <option key={option} value={option}>{option}</option>)}</select>;
+  return <select aria-label={ariaLabel} disabled={disabled} value={value} onChange={e => onChange(e.target.value)} className="surface border border-soft rounded-lg px-3 py-2 text-[14px] outline-none w-full disabled:opacity-60 sm:w-64">{options.map(option => <option key={option} value={option}>{option}</option>)}</select>;
 }
 
 function Toggle({ checked, onChange, disabled = false, label }: { checked: boolean; onChange: (value: boolean) => void; disabled?: boolean; label: string }) {
-  return <button aria-label={label} disabled={disabled} onClick={() => onChange(!checked)} className="rounded-full smooth disabled:opacity-50" style={{ width: 42, height: 24, background: checked ? "var(--accent)" : "var(--border)", position: "relative" }}><span className="absolute top-1 rounded-full bg-white smooth" style={{ width: 16, height: 16, left: checked ? 22 : 3, boxShadow: "0 1px 2px rgba(0,0,0,0.2)" }}/></button>;
+  return <button type="button" role="switch" aria-checked={checked} aria-label={label} disabled={disabled} onClick={() => onChange(!checked)} className="rounded-full smooth disabled:opacity-50" style={{ width: 42, height: 24, background: checked ? "var(--accent)" : "var(--border)", position: "relative" }}><span className="absolute top-1 rounded-full bg-white smooth" style={{ width: 16, height: 16, left: checked ? 22 : 3, boxShadow: "0 1px 2px rgba(0,0,0,0.2)" }}/></button>;
 }
 
-function Unavailable({ reason }: { reason: string }) {
+function Unavailable({ reason }: { reason?: string }) {
+  if (!reason) return null;
   return <div className="mb-5 surface border border-soft rounded-xl px-4 py-3 flex gap-3"><IC.Info size={16} style={{ color: "var(--text-dim)" }}/><p className="text-[13px]" style={{ color: "var(--text-dim)" }}>{reason}</p></div>;
 }
 
-function GeneralSettings({ data, patch, theme, setTheme, accent, setAccent }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void; theme: "light" | "dark"; setTheme: (t: "light" | "dark") => void; accent: string; setAccent: (a: string) => void }) {
-  const notifications = (data.notifications || {}) as Record<string, unknown>;
+function GeneralSettings({ data, patch, setTheme, accent, setAccent, canAdmin }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void; setTheme: (t: "light" | "dark") => void; accent: string; setAccent: (a: string) => void; canAdmin: boolean }) {
+  void canAdmin;
   return <>
-    <SettingsSection title="Workspace basics"><SettingsField label="Workspace name"><TextInput ariaLabel="Workspace name" value={val(data, "workspace_name")} onChange={workspace_name => patch({ workspace_name })}/></SettingsField><SettingsField label="Description"><TextInput ariaLabel="Workspace description" wide value={val(data, "workspace_description")} onChange={workspace_description => patch({ workspace_description })}/></SettingsField><SettingsField label="Icon/avatar"><TextInput ariaLabel="Workspace icon" value={val(data, "workspace_icon")} onChange={workspace_icon => patch({ workspace_icon })}/></SettingsField><SettingsField label="Default landing page"><SelectInput ariaLabel="Default landing page" value={val(data, "default_landing_page", "chat")} onChange={default_landing_page => patch({ default_landing_page })} options={["chat", "activity", "approvals", "memory", "connectors", "assistants"]}/></SettingsField></SettingsSection>
-    <SettingsSection title="Locale and appearance"><SettingsField label="Time zone"><TextInput ariaLabel="Time zone" value={val(data, "time_zone")} onChange={time_zone => patch({ time_zone })}/></SettingsField><SettingsField label="Date/time format"><TextInput ariaLabel="Date time format" value={val(data, "date_time_format")} onChange={date_time_format => patch({ date_time_format })}/></SettingsField><SettingsField label="Language"><SelectInput ariaLabel="Language" value={val(data, "language", "en-US")} onChange={language => patch({ language })} options={["en-US"]}/></SettingsField><SettingsField label="Theme"><SelectInput ariaLabel="Theme" value={val(data, "theme", "system")} onChange={themeValue => { patch({ theme: themeValue }); if (themeValue === "light" || themeValue === "dark") setTheme(themeValue); }} options={["system", "light", "dark"]}/></SettingsField><SettingsField label="Accent color"><div className="flex gap-2">{Object.entries(ACCENT_PALETTES).map(([key, p]) => <button key={key} onClick={() => setAccent(key)} title={key} aria-label={`Accent ${key}`} className="w-7 h-7 rounded-full smooth" style={{ background: p.accent, boxShadow: accent === key ? `0 0 0 2px var(--bg), 0 0 0 4px ${p.accent}` : "none" }}/>)}</div></SettingsField></SettingsSection>
-    <SettingsSection title="Notification defaults"><SettingsField label="In-app notifications"><Toggle label="In-app notifications" checked={Boolean(notifications.in_app)} onChange={in_app => patch({ notifications: { ...notifications, in_app } })}/></SettingsField><SettingsField label="Email notifications"><Toggle label="Email notifications" checked={Boolean(notifications.email)} onChange={email => patch({ notifications: { ...notifications, email } })}/></SettingsField></SettingsSection>
+    <SettingsSection title="Appearance" note="Theme and accent are applied immediately and persist to your Chronos session."><SettingsField label="Theme"><SelectInput ariaLabel="Theme" value={val(data, "theme", "system")} onChange={themeValue => { patch({ theme: themeValue }); if (themeValue === "light" || themeValue === "dark") setTheme(themeValue); }} options={["system", "light", "dark"]}/></SettingsField><SettingsField label="Accent color"><div className="flex gap-3 flex-wrap">{Object.entries(ACCENT_PALETTES).map(([key, p]) => <button key={key} onClick={() => { setAccent(key); patch({ accent: key }); }} title={key} aria-label={`Accent ${key}`} aria-pressed={accent === key} className="w-8 h-8 rounded-full smooth" style={{ background: p.accent, boxShadow: accent === key ? `0 0 0 2px var(--bg), 0 0 0 4px ${p.accent}` : "none" }}/>)}</div></SettingsField></SettingsSection>
   </>;
 }
 
 function ProfileSettings({ data, patch, overview }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void; overview: SettingsOverview }) {
-  return <><SettingsSection title="Editable profile"><SettingsField label="Display name"><TextInput ariaLabel="Display name" value={val(data, "display_name")} onChange={display_name => patch({ display_name })}/></SettingsField><SettingsField label="Avatar"><TextInput ariaLabel="Profile avatar" value={val(data, "profile_avatar")} onChange={profile_avatar => patch({ profile_avatar })}/></SettingsField><SettingsField label="Personal preferences"><TextInput ariaLabel="Personal preferences" wide value={val(data, "personal_preferences")} onChange={personal_preferences => patch({ personal_preferences })}/></SettingsField></SettingsSection><SettingsSection title="Identity"><SettingsField label="Email" hint={overview.capabilities.email_edit.reason}><TextInput ariaLabel="Email" disabled value={overview.member.email} onChange={() => {}}/></SettingsField><SettingsField label="Role"><Tag>{overview.member.role}</Tag></SettingsField></SettingsSection><SettingsSection title="AI defaults"><SettingsField label="Interaction style"><SelectInput ariaLabel="AI interaction style" value={val(data, "ai_interaction_style", "balanced")} onChange={ai_interaction_style => patch({ ai_interaction_style })} options={["concise", "balanced", "detailed"]}/></SettingsField><SettingsField label="Response length"><SelectInput ariaLabel="Preferred response length" value={val(data, "preferred_response_length", "medium")} onChange={preferred_response_length => patch({ preferred_response_length })} options={["short", "medium", "long"]}/></SettingsField><SettingsField label="Citation/detail level"><SelectInput ariaLabel="Citation detail level" value={val(data, "citation_detail_level", "standard")} onChange={citation_detail_level => patch({ citation_detail_level })} options={["minimal", "standard", "detailed"]}/></SettingsField></SettingsSection></>;
+  void data;
+  void patch;
+  return <SettingsSection title="Identity" note="Profile identity is managed by your organization identity provider."><SettingsField label="Email" hint={overview.capabilities.email_edit.reason}><TextInput ariaLabel="Email" disabled value={overview.member.email} onChange={() => {}}/></SettingsField><SettingsField label="Role"><Tag>{overview.member.role}</Tag></SettingsField></SettingsSection>;
 }
 
 function OrganizationSettings({ data, patch, overview }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void; overview: SettingsOverview }) {
   return <SettingsSection title="Organization profile" note={overview.member.can_admin ? "Organization changes are persisted and audited." : "Only admins can edit organization settings."}><SettingsField label="Name"><TextInput ariaLabel="Organization name" value={val(data, "name", val(data, "organization_name"))} onChange={organization_name => patch({ organization_name, name: organization_name })}/></SettingsField><SettingsField label="Logo"><TextInput ariaLabel="Organization logo" value={val(data, "logo")} onChange={logo => patch({ logo })}/></SettingsField><SettingsField label="Domain"><TextInput ariaLabel="Organization domain" value={val(data, "domain")} onChange={domain => patch({ domain })}/></SettingsField><SettingsField label="Owner/admin"><Tag>{String(overview.organization.owner ?? "Owner/Admin")}</Tag></SettingsField><SettingsField label="Plan"><Tag variant="accent">{String(overview.organization.plan ?? "trial")}</Tag></SettingsField><SettingsField label="Seats/users"><Tag>{String(overview.organization.seats ?? 0)}</Tag></SettingsField><SettingsField label="Default workspace creation"><SelectInput ariaLabel="Workspace creation permissions" value={val(data, "default_workspace_creation", "admins")} onChange={default_workspace_creation => patch({ default_workspace_creation })} options={["owners", "admins", "managers"]}/></SettingsField></SettingsSection>;
 }
 
+type MemberInvitation = {
+  id: string;
+  email: string;
+  role: string;
+  status: string;
+  delivery_status?: string;
+  delivery_channel?: string;
+  delivery_error?: string | null;
+  created_at?: string | null;
+  expires_at?: string | null;
+  invite_url?: string;
+};
+
 function MembersSettings({ overview, reload, setToast, setConfirm }: { overview: SettingsOverview; reload: () => Promise<void>; setToast: (t: { kind: "ok" | "danger"; text: string }) => void; setConfirm: (c: { title: string; text: string; required?: string; action: (typed: string) => Promise<void> } | null) => void }) {
-  const [query, setQuery] = useState(""); const [role, setRole] = useState("all");
+  const [query, setQuery] = useState("");
+  const [role, setRole] = useState("all");
+  const [inviteOpen, setInviteOpen] = useState(false);
+  const [inviteEmail, setInviteEmail] = useState("");
+  const [inviteRole, setInviteRole] = useState("viewer");
+  const [inviteBusy, setInviteBusy] = useState(false);
+  const [inviteLoading, setInviteLoading] = useState(false);
+  const [inviteError, setInviteError] = useState("");
+  const [invitations, setInvitations] = useState<MemberInvitation[]>([]);
+  const [createdInvitation, setCreatedInvitation] = useState<MemberInvitation | null>(null);
+  const [copied, setCopied] = useState(false);
   const canAdmin = overview.member.can_admin;
+  const invitationCapability = overview.capabilities.invitations;
+  const canInvite = canAdmin && Boolean(invitationCapability?.supported);
   const rows = overview.members.filter(m => (role === "all" || m.role === role) && `${m.name} ${m.email}`.toLowerCase().includes(query.toLowerCase()));
-  async function changeRole(id: string, nextRole: string) { try { await apiFetch(`/settings/members/${id}/role`, { method: "PATCH", body: JSON.stringify({ role: nextRole }) }); setToast({ kind: "ok", text: "Role updated" }); await reload(); } catch (exc) { setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to update role" }); } }
-  async function remove(id: string) { try { await apiFetch(`/settings/members/${id}`, { method: "DELETE" }); setToast({ kind: "ok", text: "Member removed" }); await reload(); } catch (exc) { setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to remove member" }); } }
-  return <><Unavailable reason={overview.capabilities.invitations.reason}/><div className="flex gap-2 mb-4"><TextInput ariaLabel="Search members" value={query} onChange={setQuery}/><SelectInput ariaLabel="Filter by role" value={role} onChange={setRole} options={["all", "owner", "admin", "manager", "operator", "viewer"]}/><button className="btn btn-sm" disabled title={overview.capabilities.invitations.reason}>Invite member</button></div><div className="surface border border-soft rounded-xl overflow-hidden">{rows.map(member => <div key={member.id} className="grid grid-cols-[1fr_150px_120px] gap-3 items-center px-4 py-3 border-b hairline last:border-b-0"><div><div className="font-medium text-[14px]">{member.name}</div><div className="text-[12px]" style={{ color: "var(--text-dim)" }}>{member.email} · {member.status}</div></div><SelectInput ariaLabel={`Role for ${member.email}`} disabled={!canAdmin} value={member.role} onChange={next => void changeRole(member.id, next)} options={["owner", "admin", "manager", "operator", "viewer"]}/><button disabled={!canAdmin || member.is_self} className="btn btn-danger-soft btn-sm disabled:opacity-50" onClick={() => setConfirm({ title: "Remove member", text: `Remove ${member.email} from this organization?`, action: async () => remove(member.id) })}>Remove</button></div>)}</div></>;
+
+  const loadInvitations = useCallback(async () => {
+    if (!canInvite) return;
+    setInviteLoading(true);
+    setInviteError("");
+    try {
+      const data = await apiFetch("/settings/invitations").then(response => response.json()) as { invitations?: MemberInvitation[] };
+      setInvitations(data.invitations || []);
+    } catch (error) {
+      setInviteError(error instanceof Error ? error.message : "Invitations could not be loaded.");
+    } finally {
+      setInviteLoading(false);
+    }
+  }, [canInvite]);
+
+  useEffect(() => { void loadInvitations(); }, [loadInvitations]);
+
+  async function changeRole(id: string, nextRole: string) {
+    try {
+      await apiFetch(`/settings/members/${id}/role`, { method: "PATCH", body: JSON.stringify({ role: nextRole }) });
+      setToast({ kind: "ok", text: "Role updated" });
+      await reload();
+    } catch (exc) {
+      setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to update role" });
+    }
+  }
+
+  async function remove(id: string) {
+    try {
+      await apiFetch(`/settings/members/${id}`, { method: "DELETE" });
+      setToast({ kind: "ok", text: "Member removed" });
+      await reload();
+    } catch (exc) {
+      setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to remove member" });
+      throw exc;
+    }
+  }
+
+  async function createInvitation() {
+    if (!inviteEmail.trim()) return;
+    setInviteBusy(true);
+    setInviteError("");
+    setCreatedInvitation(null);
+    setCopied(false);
+    try {
+      const created = await apiFetch("/settings/invitations", {
+        method: "POST",
+        body: JSON.stringify({ email: inviteEmail.trim(), role: inviteRole }),
+      }).then(response => response.json()) as MemberInvitation;
+      setCreatedInvitation(created);
+      setInviteEmail("");
+      await loadInvitations();
+      setToast({
+        kind: "ok",
+        text: created.delivery_status === "sent" ? "Invitation email sent." : "Invitation created. Copy the one-time link below.",
+      });
+    } catch (error) {
+      setInviteError(error instanceof Error ? error.message : "Invitation could not be created.");
+    } finally {
+      setInviteBusy(false);
+    }
+  }
+
+  async function copyInvitationLink() {
+    if (!createdInvitation?.invite_url) return;
+    try {
+      await navigator.clipboard.writeText(createdInvitation.invite_url);
+      setCopied(true);
+    } catch {
+      setInviteError("The link could not be copied. Select it below and copy it manually.");
+    }
+  }
+
+  async function revokeInvitation(id: string) {
+    try {
+      await apiFetch(`/settings/invitations/${id}/revoke`, { method: "POST" });
+      await loadInvitations();
+      setToast({ kind: "ok", text: "Invitation revoked." });
+    } catch (error) {
+      setToast({ kind: "danger", text: error instanceof Error ? error.message : "Invitation could not be revoked." });
+      throw error;
+    }
+  }
+
+  return (
+    <>
+      {!canInvite && <Unavailable reason={invitationCapability?.reason || "Only administrators can invite members."}/>}
+      <div className="flex flex-col gap-2 mb-4 sm:flex-row sm:flex-wrap">
+        <TextInput ariaLabel="Search members" value={query} onChange={setQuery}/>
+        <SelectInput ariaLabel="Filter by role" value={role} onChange={setRole} options={["all", "owner", "admin", "manager", "operator", "viewer"]}/>
+        {canInvite && <button className="btn btn-accent btn-sm" onClick={() => setInviteOpen(value => !value)}>{inviteOpen ? "Close invitation form" : "Invite member"}</button>}
+      </div>
+
+      {inviteOpen && canInvite && (
+        <section className="surface mb-5 rounded-xl border border-soft p-4" aria-labelledby="invite-member-heading">
+          <h2 id="invite-member-heading" className="text-[15px] font-semibold">Invite a member</h2>
+          <p className="mt-1 text-[12.5px]" style={{ color: "var(--text-dim)" }}>
+            {invitationCapability.delivery === "email"
+              ? "Chronos will email a secure link that expires after seven days."
+              : "Email delivery is not configured. Chronos will create a secure link that is shown once for you to send manually."}
+          </p>
+          <form className="mt-3 flex flex-col gap-2 sm:flex-row" onSubmit={event => { event.preventDefault(); void createInvitation(); }}>
+            <input aria-label="Invitation email" type="email" required value={inviteEmail} onChange={event => setInviteEmail(event.target.value)} placeholder="teammate@company.com" className="surface min-w-0 flex-1 rounded-lg border border-soft px-3 py-2 text-[14px] outline-none"/>
+            <SelectInput ariaLabel="Invitation role" value={inviteRole} onChange={setInviteRole} options={["viewer", "operator", "manager", "admin"]}/>
+            <button type="submit" className="btn btn-accent btn-sm" disabled={inviteBusy || !inviteEmail.trim()}>{inviteBusy ? "Creating…" : "Create invitation"}</button>
+          </form>
+          {inviteError && <div className="mt-3 text-[12.5px]" style={{ color: "var(--danger)" }} role="alert">{inviteError}</div>}
+          {createdInvitation && (
+            <div className="mt-4 rounded-lg border border-soft p-3" role="status">
+              {createdInvitation.delivery_status === "sent" ? (
+                <p className="text-[13px]">Invitation email sent to <strong>{createdInvitation.email}</strong>.</p>
+              ) : (
+                <>
+                  <p className="text-[13px]"><strong>Copy this link now.</strong> For security, it will not be shown again after you leave this result.</p>
+                  {createdInvitation.invite_url && <div className="mt-2 flex flex-col gap-2 sm:flex-row">
+                    <input aria-label="One-time invitation link" className="surface min-w-0 flex-1 rounded-lg border border-soft px-3 py-2 text-[12px]" readOnly value={createdInvitation.invite_url}/>
+                    <button type="button" className="btn btn-secondary btn-sm" onClick={() => void copyInvitationLink()}>{copied ? "Copied" : "Copy link"}</button>
+                  </div>}
+                </>
+              )}
+            </div>
+          )}
+        </section>
+      )}
+
+      <div className="surface border border-soft rounded-xl overflow-hidden">
+        {rows.length === 0 && <div className="px-4 py-6 text-[13px]" style={{ color: "var(--text-dim)" }}>No members match this filter.</div>}
+        {rows.map(member => (
+          <div key={member.id} className="flex flex-col gap-3 px-4 py-3 border-b hairline last:border-b-0 sm:grid sm:grid-cols-[minmax(0,1fr)_150px_120px] sm:items-center">
+            <div className="min-w-0"><div className="font-medium text-[14px] truncate">{member.name}</div><div className="text-[12px] truncate" style={{ color: "var(--text-dim)" }}>{member.email} · {member.status}{member.is_self ? " · you" : ""}</div></div>
+            <SelectInput ariaLabel={`Role for ${member.email}`} disabled={!canAdmin || member.is_self} value={member.role === "user" ? "operator" : member.role} onChange={next => void changeRole(member.id, next)} options={["owner", "admin", "manager", "operator", "viewer"]}/>
+            <button disabled={!canAdmin || member.is_self} className="btn btn-danger-soft btn-sm disabled:opacity-50" onClick={() => setConfirm({ title: "Remove member", text: `Remove ${member.email} from this organization?`, action: async () => remove(member.id) })}>Remove</button>
+          </div>
+        ))}
+      </div>
+
+      {canInvite && (
+        <section className="mt-6" aria-labelledby="pending-invitations-heading">
+          <div className="mb-2 flex items-center justify-between gap-3">
+            <h2 id="pending-invitations-heading" className="text-[15px] font-semibold">Invitations</h2>
+            <button className="btn btn-ghost btn-sm" disabled={inviteLoading} onClick={() => void loadInvitations()}>{inviteLoading ? "Refreshing…" : "Refresh"}</button>
+          </div>
+          {inviteError && !inviteOpen && <div className="mb-2 text-[12.5px]" style={{ color: "var(--danger)" }} role="alert">{inviteError}</div>}
+          <div className="surface rounded-xl border border-soft overflow-hidden">
+            {!inviteLoading && invitations.length === 0 && <div className="px-4 py-6 text-[13px]" style={{ color: "var(--text-dim)" }}>No invitations have been created.</div>}
+            {invitations.map(invitation => (
+              <div key={invitation.id} className="flex flex-col gap-2 border-b hairline px-4 py-3 last:border-b-0 sm:flex-row sm:items-center sm:justify-between">
+                <div className="min-w-0">
+                  <div className="truncate text-[13.5px] font-medium">{invitation.email}</div>
+                  <div className="text-[12px]" style={{ color: "var(--text-dim)" }}>
+                    {roleLabel(invitation.role)} · {invitation.status} · {invitation.delivery_status === "sent" ? "email sent" : invitation.delivery_status === "manual_required" ? "manual link required" : invitation.delivery_status || "delivery pending"}
+                    {invitation.expires_at ? ` · expires ${fmtDate(invitation.expires_at)}` : ""}
+                  </div>
+                </div>
+                {invitation.status === "pending" && <button className="btn btn-danger-soft btn-sm" onClick={() => setConfirm({ title: "Revoke invitation", text: `Revoke the invitation for ${invitation.email}?`, action: async () => revokeInvitation(invitation.id) })}>Revoke</button>}
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+    </>
+  );
 }
 
 function PermissionsSettings({ data, patch }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void }) {
@@ -7617,30 +9352,175 @@ function PermissionsSettings({ data, patch }: { data: Record<string, unknown>; p
 }
 
 function EmployeeSettings({ data, patch }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void }) {
-  return <><SettingsSection title="Creation and memory policy"><SettingsField label="Creation policy"><SelectInput ariaLabel="Employee creation policy" value={val(data, "creation_policy")} onChange={creation_policy => patch({ creation_policy })} options={["admins_only", "admins_and_managers", "operators_with_approval"]}/></SettingsField><SettingsField label="Default memory scope"><SelectInput ariaLabel="Employee memory scope" value={val(data, "memory_scope")} onChange={memory_scope => patch({ memory_scope })} options={["user", "workspace", "org"]}/></SettingsField><SettingsField label="Tool access mode"><SelectInput ariaLabel="Employee tool access mode" value={val(data, "tool_access_mode")} onChange={tool_access_mode => patch({ tool_access_mode })} options={["disabled", "approval_required", "enabled"]}/></SettingsField></SettingsSection><SettingsSection title="Runtime limits"><SettingsField label="Runtime auto-start"><Toggle label="Runtime auto-start" checked={Boolean(data.runtime_auto_start)} onChange={runtime_auto_start => patch({ runtime_auto_start })}/></SettingsField><SettingsField label="Idle timeout minutes"><TextInput ariaLabel="Runtime idle timeout" value={val(data, "runtime_idle_timeout_minutes")} onChange={runtime_idle_timeout_minutes => patch({ runtime_idle_timeout_minutes: Number(runtime_idle_timeout_minutes) || 0 })}/></SettingsField><SettingsField label="Max concurrent runtimes"><TextInput ariaLabel="Max concurrent runtimes" value={val(data, "max_concurrent_runtimes")} onChange={max_concurrent_runtimes => patch({ max_concurrent_runtimes: Number(max_concurrent_runtimes) || 0 })}/></SettingsField><SettingsField label="Max sub-agent depth"><TextInput ariaLabel="Max sub-agent depth" value={val(data, "max_sub_agent_depth")} onChange={max_sub_agent_depth => patch({ max_sub_agent_depth: Number(max_sub_agent_depth) || 0 })}/></SettingsField><SettingsField label="Sub-agent spawning"><Toggle label="Sub-agent spawning" checked={Boolean(data.sub_agent_spawning)} onChange={sub_agent_spawning => patch({ sub_agent_spawning })}/></SettingsField></SettingsSection></>;
+  return <>
+    <SettingsSection title="Enforced runtime limit" note="This organization-level cap is checked before a task starts.">
+      <SettingsField label="Max concurrent runtimes" hint="Blocks additional task starts after the organization reaches this active-runtime cap."><TextInput ariaLabel="Max concurrent runtimes" value={val(data, "max_concurrent_runtimes")} onChange={max_concurrent_runtimes => patch({ max_concurrent_runtimes: Number(max_concurrent_runtimes) || 0 })}/></SettingsField>
+    </SettingsSection>
+    <SettingsSection title="Policy-owned agent behavior" note="These behaviors are read-only here because their real enforcement lives in RBAC, each agent profile, or a runtime-wide safety boundary.">
+      <SettingsField label="Who can create agents" hint="Agent creation is authorized by member role and permissions at request time."><Tag>RBAC-enforced</Tag></SettingsField>
+      <SettingsField label="Memory scope" hint="Configured explicitly on each agent profile and validated against the requesting member's access."><Tag>Per agent profile</Tag></SettingsField>
+      <SettingsField label="Tool access" hint="Configured per agent and enforced by connector policy, approvals, and the tool broker."><Tag>Per agent + broker</Tag></SettingsField>
+      <SettingsField label="Runtime auto-start and idle timeout" hint="Chronos starts governed tasks on demand; no tenant-editable idle runtime pool exists."><Tag>Not tenant-configurable</Tag></SettingsField>
+      <SettingsField label="Sub-agent spawning" hint="The runtime tool registry and approval policy control availability; sub-agents cannot recursively spawn beyond the hard safety boundary."><Tag>Runtime-governed</Tag></SettingsField>
+      <SettingsField label="Maximum sub-agent depth" hint="Fixed safety ceiling enforced in the runtime, not an editable organization preference."><Tag>3 levels</Tag></SettingsField>
+    </SettingsSection>
+  </>;
 }
 
-function RuntimeSettings({ data, patch, health }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void; health: Record<string, unknown> }) {
-  return <><Unavailable reason={`Current runtime health: ${String(health.status)}. High-risk changes require confirmation before production rollout.`}/><SettingsSection title="Runtime operation"><SettingsField label="Runtime mode"><SelectInput ariaLabel="Runtime mode" value={val(data, "runtime_mode")} onChange={runtime_mode => patch({ runtime_mode })} options={["local", "demo", "managed"]}/></SettingsField><SettingsField label="Isolation"><SelectInput ariaLabel="Isolation" value={val(data, "isolation")} onChange={isolation => patch({ isolation })} options={["process", "container_unavailable"]}/></SettingsField><SettingsField label="Heartbeat seconds"><TextInput ariaLabel="Heartbeat interval" value={val(data, "heartbeat_interval_seconds")} onChange={heartbeat_interval_seconds => patch({ heartbeat_interval_seconds: Number(heartbeat_interval_seconds) || 0 })}/></SettingsField><SettingsField label="Restart policy"><SelectInput ariaLabel="Restart policy" value={val(data, "restart_policy")} onChange={restart_policy => patch({ restart_policy })} options={["never", "on_failure", "always"]}/></SettingsField><SettingsField label="Log retention days"><TextInput ariaLabel="Log retention" value={val(data, "log_retention_days")} onChange={log_retention_days => patch({ log_retention_days: Number(log_retention_days) || 0 })}/></SettingsField><SettingsField label="Max task queue size"><TextInput ariaLabel="Max task queue size" value={val(data, "max_task_queue_size")} onChange={max_task_queue_size => patch({ max_task_queue_size: Number(max_task_queue_size) || 0 })}/></SettingsField><SettingsField label="Failure recovery"><SelectInput ariaLabel="Failure recovery" value={val(data, "failure_recovery")} onChange={failure_recovery => patch({ failure_recovery })} options={["resume", "stop", "restart"]}/></SettingsField><SettingsField label="Token budget daily"><TextInput ariaLabel="Token budget" value={val(data, "token_budget_daily")} onChange={token_budget_daily => patch({ token_budget_daily: Number(token_budget_daily) || 0 })}/></SettingsField><SettingsField label="Cost budget daily"><TextInput ariaLabel="Daily model cost budget" value={val(data, "cost_budget_daily_usd")} onChange={cost_budget_daily_usd => patch({ cost_budget_daily_usd: Number(cost_budget_daily_usd) || 0 })}/></SettingsField><SettingsField label="Request rate/min"><TextInput ariaLabel="Request rate per minute" value={val(data, "request_rate_per_minute")} onChange={request_rate_per_minute => patch({ request_rate_per_minute: Number(request_rate_per_minute) || 0 })}/></SettingsField><SettingsField label="Connector rate/min"><TextInput ariaLabel="Connector rate per minute" value={val(data, "connector_rate_per_minute")} onChange={connector_rate_per_minute => patch({ connector_rate_per_minute: Number(connector_rate_per_minute) || 0 })}/></SettingsField></SettingsSection></>;
+function RuntimeSettings({ data, patch, health, canAdmin }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void; health: Record<string, unknown>; canAdmin: boolean }) {
+  return <>
+    <RuntimeHealthPanel canAdmin={canAdmin}/>
+    <SettingsSection title="Enforced organization guardrails" note="A value of 0 disables that budget or rate limit. Plan entitlements still apply when a model budget has never been overridden.">
+      <SettingsField label="Max queued tasks" hint="Blocks new top-level tasks when this organization reaches the queue cap."><TextInput ariaLabel="Max task queue size" value={val(data, "max_task_queue_size")} onChange={max_task_queue_size => patch({ max_task_queue_size: Number(max_task_queue_size) || 0 })}/></SettingsField>
+      <SettingsField label="Daily token budget" hint="Hard-stops model work for this organization at the configured token total."><TextInput ariaLabel="Token budget" value={val(data, "token_budget_daily")} onChange={token_budget_daily => patch({ token_budget_daily: Number(token_budget_daily) || 0 })}/></SettingsField>
+      <SettingsField label="Daily model cost budget (USD)" hint="Hard-stops projected model spend after the configured daily amount."><TextInput ariaLabel="Daily model cost budget" value={val(data, "cost_budget_daily_usd")} onChange={cost_budget_daily_usd => patch({ cost_budget_daily_usd: Number(cost_budget_daily_usd) || 0 })}/></SettingsField>
+      <SettingsField label="API requests per minute" hint="Enforced through the organization request-rate gate."><TextInput ariaLabel="Request rate per minute" value={val(data, "request_rate_per_minute")} onChange={request_rate_per_minute => patch({ request_rate_per_minute: Number(request_rate_per_minute) || 0 })}/></SettingsField>
+      <SettingsField label="Connector calls per minute" hint="Enforced before connector execution for this organization."><TextInput ariaLabel="Connector rate per minute" value={val(data, "connector_rate_per_minute")} onChange={connector_rate_per_minute => patch({ connector_rate_per_minute: Number(connector_rate_per_minute) || 0 })}/></SettingsField>
+    </SettingsSection>
+    <SettingsSection title="Deployment-owned runtime configuration" note="These values are read-only here. Operators change them through the reviewed deployment configuration and roll out a new task revision.">
+      <SettingsField label="Environment" hint="Set by ENVIRONMENT at service startup."><Tag>{String(health.environment || "unknown")}</Tag></SettingsField>
+      <SettingsField label="Execution mode" hint="API replicas, workers, and schedulers are managed by the deployed platform."><Tag>{String(health.execution_mode || "platform_managed")}</Tag></SettingsField>
+      <SettingsField label="Isolation" hint="Container/process isolation is selected by the deployment topology, not an organization setting."><Tag>{String(health.isolation || "unknown")}</Tag></SettingsField>
+      <SettingsField label="Task lease heartbeat" hint="Worker-wide lease timing; changing it requires a reviewed service rollout."><Tag>{String(health.task_lease_heartbeat_seconds || "unknown")} seconds</Tag></SettingsField>
+      <SettingsField label="Task lease expiry" hint="Orphaned work becomes recoverable after this worker-wide lease interval."><Tag>{String(health.task_lease_ttl_seconds || "unknown")} seconds</Tag></SettingsField>
+      <SettingsField label="Failure recovery" hint="Leader-only startup recovery resumes incomplete tasks and workflows."><Tag>{String(health.recovery_policy || "automatic_resume")}</Tag></SettingsField>
+      <SettingsField label="Service log retention" hint="Cloud log retention is managed and audited through infrastructure configuration."><Tag>{String(health.log_retention || "deployment_managed")}</Tag></SettingsField>
+    </SettingsSection>
+  </>;
 }
 
-function MemorySettings({ data, patch, stats, setToast, setConfirm, reload }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void; stats: { active: number; deleted: number }; setToast: (t: { kind: "ok" | "danger"; text: string }) => void; setConfirm: (c: { title: string; text: string; required?: string; action: (typed: string) => Promise<void> } | null) => void; reload: () => Promise<void> }) {
-  async function purge() { try { await apiFetch("/settings/memory/purge", { method: "POST", body: JSON.stringify({ confirmation: "PURGE MEMORY" }) }); setToast({ kind: "ok", text: "Memory purged" }); await reload(); } catch (exc) { setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to purge memory" }); } }
-  async function exportMemoryJson() {
+type RetentionHold = {
+  id: string;
+  resource_type: "organization" | "memory" | "artifact";
+  resource_id: string;
+  reason: string;
+  created_by: string;
+  created_at?: string | null;
+};
+
+type RetentionRunResult = {
+  dry_run: boolean;
+  retention_enabled: boolean;
+  configuration_valid: boolean;
+  organization_hold: boolean;
+  memory_soft_delete_candidates: number;
+  memory_soft_deleted: number;
+  memory_hard_delete_candidates: number;
+  memory_hard_deleted: number;
+  artifact_purge_candidates: number;
+  artifact_metadata_deleted: number;
+  artifact_object_delete_candidates: number;
+  artifact_objects_deleted: number;
+  artifact_purge_failures: number;
+  failed_artifact_ids: string[];
+  held_resources_excluded: number;
+  pinned_memories_excluded: number;
+};
+
+function RetentionSettings({ data, patch, stats, organizationId, canAdmin, dirty, setToast, setConfirm }: {
+  data: Record<string, unknown>;
+  patch: (v: Record<string, unknown>) => void;
+  stats: { active: number; deleted: number };
+  organizationId: string;
+  canAdmin: boolean;
+  dirty: boolean;
+  setToast: (t: { kind: "ok" | "danger"; text: string }) => void;
+  setConfirm: (c: { title: string; text: string; required?: string; action: (typed: string) => Promise<void> } | null) => void;
+}) {
+  const [holds, setHolds] = useState<RetentionHold[]>([]);
+  const [holdType, setHoldType] = useState<RetentionHold["resource_type"]>("organization");
+  const [holdResourceId, setHoldResourceId] = useState(organizationId);
+  const [holdReason, setHoldReason] = useState("");
+  const [busy, setBusy] = useState("");
+  const [lastRun, setLastRun] = useState<RetentionRunResult | null>(null);
+
+  const loadHolds = useCallback(async () => {
+    if (!canAdmin) return;
     try {
-      const blob = await (await apiFetch("/settings/memory/export.json")).blob();
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement("a");
-      anchor.href = url;
-      anchor.download = "chronos-memory-org-export.json";
-      anchor.click();
-      URL.revokeObjectURL(url);
-      setToast({ kind: "ok", text: "Organization memory JSON exported." });
+      const response = await apiFetch("/settings/retention/holds");
+      const payload = await response.json() as { holds?: RetentionHold[] };
+      setHolds(payload.holds || []);
     } catch (exc) {
-      setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Unable to export memory" });
+      setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Retention holds could not be loaded." });
+    }
+  }, [canAdmin, setToast]);
+
+  useEffect(() => { void loadHolds(); }, [loadHolds]);
+  useEffect(() => {
+    if (holdType === "organization") setHoldResourceId(organizationId);
+  }, [holdType, organizationId]);
+
+  async function runRetention(dryRun: boolean) {
+    if (dirty) throw new Error("Save the retention policy before running it.");
+    setBusy(dryRun ? "dry-run" : "execute");
+    try {
+      const response = await apiFetch("/settings/retention/run", {
+        method: "POST",
+        body: JSON.stringify({ dry_run: dryRun, confirmation: dryRun ? null : "RUN RETENTION" }),
+      });
+      const result = await response.json() as RetentionRunResult;
+      setLastRun(result);
+      setToast({ kind: result.artifact_purge_failures ? "danger" : "ok", text: dryRun ? "Retention dry run completed and was audited." : result.artifact_purge_failures ? "Retention completed with object deletion failures; metadata was preserved for retry." : "Retention completed and was audited." });
+    } finally {
+      setBusy("");
     }
   }
-  return <><SettingsSection title="Memory policy" note={`${stats.active} active memories, ${stats.deleted} deleted.`}><SettingsField label="Workspace memory"><Toggle label="Workspace memory" checked={Boolean(data.workspace_memory)} onChange={workspace_memory => patch({ workspace_memory })}/></SettingsField><SettingsField label="Employee memory"><Toggle label="Employee memory" checked={Boolean(data.employee_memory)} onChange={employee_memory => patch({ employee_memory })}/></SettingsField><SettingsField label="User memory"><Toggle label="User memory" checked={Boolean(data.user_memory)} onChange={user_memory => patch({ user_memory })}/></SettingsField><SettingsField label="Retention days"><TextInput ariaLabel="Memory retention" value={val(data, "retention_days")} onChange={retention_days => patch({ retention_days: Number(retention_days) || 0 })}/></SettingsField><SettingsField label="Review required"><Toggle label="Memory review required" checked={Boolean(data.review_required)} onChange={review_required => patch({ review_required })}/></SettingsField><SettingsField label="Auto-save memory"><Toggle label="Auto-save memory" checked={Boolean(data.auto_save)} onChange={auto_save => patch({ auto_save })}/></SettingsField><SettingsField label="Sensitive detection"><Toggle label="Sensitive memory detection" checked={Boolean(data.sensitive_detection)} onChange={sensitive_detection => patch({ sensitive_detection })}/></SettingsField></SettingsSection><SettingsSection title="Memory danger zone"><SettingsField label="Export organization memory" hint="Downloads JSON for non-deleted organization memory, including archived entries and excluding superseded entries."><button className="btn btn-sm" onClick={() => void exportMemoryJson()}>Export JSON</button></SettingsField><SettingsField label="Purge all memory" hint="Requires typed confirmation and writes an audit entry."><button className="btn btn-danger-soft btn-sm" onClick={() => setConfirm({ title: "Purge memory", text: "This soft-deletes all active memory entries in this workspace.", required: "PURGE MEMORY", action: async () => purge() })}>Purge memory</button></SettingsField></SettingsSection></>;
+
+  async function addHold() {
+    const resourceId = holdType === "organization" ? organizationId : holdResourceId.trim();
+    if (!resourceId || holdReason.trim().length < 5) return;
+    setBusy("add-hold");
+    try {
+      await apiFetch("/settings/retention/holds", {
+        method: "POST",
+        body: JSON.stringify({ resource_type: holdType, resource_id: resourceId, reason: holdReason.trim() }),
+      });
+      setHoldReason("");
+      if (holdType !== "organization") setHoldResourceId("");
+      await loadHolds();
+      setToast({ kind: "ok", text: "Retention hold added and audited." });
+    } catch (exc) {
+      setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Retention hold could not be added." });
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function releaseHold(hold: RetentionHold) {
+    setBusy(`release:${hold.id}`);
+    try {
+      await apiFetch(`/settings/retention/holds/${hold.id}`, { method: "DELETE" });
+      await loadHolds();
+      setToast({ kind: "ok", text: "Retention hold released and audited." });
+    } finally {
+      setBusy("");
+    }
+  }
+
+  return <>
+    <SettingsSection title="Retention policy" note={`${stats.active} active memories and ${stats.deleted} soft-deleted memories. The daily job runs once under scheduler leader election; pinned memories and active legal holds are excluded.`}>
+      <SettingsField label="Automated retention" hint="When disabled, scheduled and manual runs record an audited no-op."><Toggle label="Automated retention" disabled={!canAdmin} checked={Boolean(data.retention_enabled)} onChange={retention_enabled => patch({ retention_enabled })}/></SettingsField>
+      <SettingsField label="Active memory retention" hint="Memories not updated within this period are soft-deleted. Pinned memories are never selected."><TextInput ariaLabel="Active memory retention days" disabled={!canAdmin} value={val(data, "retention_days")} onChange={retention_days => patch({ retention_days: Number(retention_days) || 0 })}/></SettingsField>
+      <SettingsField label="Deleted memory grace period" hint="Soft-deleted memory and its usage rows are irreversibly erased after this period."><TextInput ariaLabel="Deleted memory retention days" disabled={!canAdmin} value={val(data, "deleted_retention_days")} onChange={deleted_retention_days => patch({ deleted_retention_days: Number(deleted_retention_days) || 0 })}/></SettingsField>
+      <SettingsField label="Deleted artifact grace period" hint="Soft-deleted artifact versions are removed from object storage before their metadata is erased. Failed object deletions keep metadata for retry."><TextInput ariaLabel="Deleted artifact retention days" disabled={!canAdmin} value={val(data, "deleted_artifact_retention_days")} onChange={deleted_artifact_retention_days => patch({ deleted_artifact_retention_days: Number(deleted_artifact_retention_days) || 0 })}/></SettingsField>
+      <SettingsField label="Run policy now" hint={dirty ? "Save the policy before evaluating it." : "Dry runs and executions both append evidence to the audit log."}><div className="flex flex-wrap justify-end gap-2"><button className="btn btn-sm" disabled={!canAdmin || dirty || busy !== ""} onClick={() => { void runRetention(true).catch(exc => setToast({ kind: "danger", text: exc instanceof Error ? exc.message : "Retention dry run failed." })); }}>{busy === "dry-run" ? "Evaluating…" : "Dry run"}</button><button className="btn btn-danger-soft btn-sm" disabled={!canAdmin || dirty || busy !== ""} onClick={() => setConfirm({ title: "Run retention now", text: "This permanently deletes eligible memory rows and artifact objects after legal-hold checks. Type RUN RETENTION to continue.", required: "RUN RETENTION", action: async () => runRetention(false) })}>{busy === "execute" ? "Running…" : "Run retention"}</button></div></SettingsField>
+    </SettingsSection>
+
+    {lastRun && <SettingsSection title="Latest retention result" note={lastRun.dry_run ? "Dry-run candidate counts; no customer data was changed." : "Execution counts from the latest manual run in this session."}>
+      <SettingsField label="Policy state"><div className="flex flex-wrap justify-end gap-2"><Tag variant={lastRun.configuration_valid && lastRun.retention_enabled ? "ok" : "warn"}>{!lastRun.configuration_valid ? "invalid configuration — no-op" : lastRun.retention_enabled ? "enabled" : "disabled"}</Tag>{lastRun.organization_hold && <Tag variant="warn">organization held</Tag>}</div></SettingsField>
+      <SettingsField label="Memory"><Tag>{lastRun.memory_soft_delete_candidates} soft-delete candidates · {lastRun.memory_hard_delete_candidates} hard-delete candidates · {lastRun.memory_soft_deleted + lastRun.memory_hard_deleted} rows changed</Tag></SettingsField>
+      <SettingsField label="Artifacts"><Tag variant={lastRun.artifact_purge_failures ? "danger" : "ok"}>{lastRun.artifact_purge_candidates} candidates · {lastRun.artifact_objects_deleted}/{lastRun.artifact_object_delete_candidates} objects deleted · {lastRun.artifact_purge_failures} failures</Tag></SettingsField>
+      <SettingsField label="Exclusions"><Tag>{lastRun.pinned_memories_excluded} pinned · {lastRun.held_resources_excluded} held</Tag></SettingsField>
+    </SettingsSection>}
+
+    <SettingsSection title="Legal holds" note="An organization hold freezes every retention target. Resource holds protect one memory or artifact. Holds are released, never deleted, so their history remains auditable.">
+      {canAdmin ? <>
+        <SettingsField label="Add hold"><div className="grid w-full gap-2 sm:w-[440px] sm:grid-cols-2"><SelectInput ariaLabel="Retention hold resource type" value={holdType} onChange={value => setHoldType(value as RetentionHold["resource_type"])} options={["organization", "memory", "artifact"]}/><TextInput ariaLabel="Retention hold resource ID" disabled={holdType === "organization"} value={holdType === "organization" ? organizationId : holdResourceId} onChange={setHoldResourceId}/><div className="sm:col-span-2"><TextInput ariaLabel="Retention hold reason" wide value={holdReason} onChange={setHoldReason}/></div><button className="btn btn-accent btn-sm sm:col-span-2" disabled={busy !== "" || holdReason.trim().length < 5 || !(holdType === "organization" ? organizationId : holdResourceId.trim())} onClick={() => void addHold()}>{busy === "add-hold" ? "Adding…" : "Add legal hold"}</button></div></SettingsField>
+        {holds.length === 0 && <div className="px-5 py-5 text-[13px]" style={{ color: "var(--text-dim)" }}>No active legal holds.</div>}
+        {holds.map(hold => <SettingsField key={hold.id} label={`${hold.resource_type}: ${hold.resource_id}`} hint={`${hold.reason} · added ${fmtDate(hold.created_at)} by ${hold.created_by}`}><button className="btn btn-danger-soft btn-sm" disabled={busy !== ""} onClick={() => setConfirm({ title: "Release legal hold", text: `Release the hold on ${hold.resource_type} ${hold.resource_id}? Future retention runs may permanently delete eligible data.`, action: async () => releaseHold(hold) })}>{busy === `release:${hold.id}` ? "Releasing…" : "Release"}</button></SettingsField>)}
+      </> : <div className="px-5 py-5 text-[13px]" style={{ color: "var(--text-dim)" }}>Only organization administrators can view or change legal holds.</div>}
+    </SettingsSection>
+  </>;
 }
 
 type AccountArtifact = {
@@ -7714,14 +9594,14 @@ function AccountDataSettings({ setToast }: { setToast: (t: { kind: "ok" | "dange
   function addToChat(item: AccountArtifact) {
     const title = item.title || "uploaded document";
     window.localStorage.setItem("chronos.chat.pendingDraft", `Use the uploaded document "${title}" (artifact ${item.id}) in this chat.`);
-    window.location.href = "/chat";
+    window.location.assign("/chat");
   }
 
   return (
     <>
       <Unavailable reason="Upload documents in chat with the attachment button. This page manages account-level uploaded documents only."/>
-      <div className="mb-4 flex items-center justify-between gap-3">
-        <div className="surface border border-soft rounded-lg flex items-center gap-2 px-2.5 py-2 min-w-[280px]">
+      <div className="mb-4 flex flex-col items-stretch justify-between gap-3 sm:flex-row sm:items-center">
+        <div className="surface flex min-w-0 items-center gap-2 rounded-lg border border-soft px-2.5 py-2 sm:min-w-[280px]">
           <IC.Search size={14} style={{ color: "var(--text-dim)" }}/>
           <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search documents" className="bg-transparent outline-none text-[13px] w-full" aria-label="Search documents"/>
         </div>
@@ -7729,8 +9609,8 @@ function AccountDataSettings({ setToast }: { setToast: (t: { kind: "ok" | "dange
           <IC.Refresh size={13}/> Refresh
         </button>
       </div>
-      <div className="surface border border-soft rounded-xl overflow-hidden">
-        <div className="grid px-4 py-2.5 border-b hairline text-[11px] font-semibold uppercase tracking-wider" style={{ gridTemplateColumns: "minmax(0,1.6fr) 130px 100px 150px 260px", color: "var(--text-dim)" }}>
+      <div className="surface overflow-x-auto rounded-xl border border-soft">
+        <div className="grid min-w-[800px] border-b hairline px-4 py-2.5 text-[11px] font-semibold uppercase tracking-wider" style={{ gridTemplateColumns: "minmax(0,1.6fr) 130px 100px 150px 260px", color: "var(--text-dim)" }}>
           <div>Document</div>
           <div>Type</div>
           <div>Size</div>
@@ -7744,7 +9624,7 @@ function AccountDataSettings({ setToast }: { setToast: (t: { kind: "ok" | "dange
           </div>
         )}
         {filtered.map(item => (
-          <div key={item.id} className="grid items-center gap-3 px-4 py-3 border-b hairline last:border-b-0" style={{ gridTemplateColumns: "minmax(0,1.6fr) 130px 100px 150px 260px" }}>
+          <div key={item.id} className="grid min-w-[800px] items-center gap-3 border-b hairline px-4 py-3 last:border-b-0" style={{ gridTemplateColumns: "minmax(0,1.6fr) 130px 100px 150px 260px" }}>
             <div className="min-w-0">
               <div className="text-[13.5px] font-medium truncate">{item.title || "Untitled document"}</div>
               <div className="text-[11.5px] truncate" style={{ color: "var(--text-dim)" }}>{item.id}</div>
@@ -7767,7 +9647,43 @@ function AccountDataSettings({ setToast }: { setToast: (t: { kind: "ok" | "dange
 function ToolsSettings({ data, patch, connectors, capabilities, health }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void; connectors: SettingsOverview["connectors"]; capabilities: SettingsOverview["capabilities"]; health: NonNullable<SettingsOverview["runtime_health"]["connectors"]> }) {
   function update(provider: string, values: Record<string, unknown>) { patch({ [provider]: { ...((data[provider] || {}) as Record<string, unknown>), ...values } }); }
   const providers = Object.entries(health);
-  return <><SettingsSection title="Connector readiness" note="Chronos can run tools in fixture, demo, or live mode per connector.">{providers.length === 0 ? <div className="p-5"><EmptyState title="No connector checks available" sub="Startup health has not reported tool readiness yet."/></div> : providers.map(([provider, item]) => <div key={provider} className="px-5 py-4 border-b hairline last:border-b-0"><div className="flex items-start justify-between gap-4"><div><div className="font-medium capitalize">{provider}</div><div className="text-[12px] mt-1" style={{ color: "var(--text-dim)" }}>{item.reason || "Ready"}</div>{item.setup && <div className="text-[12px] mt-1 font-mono" style={{ color: "var(--text-muted)" }}>{item.setup}</div>}</div><Tag variant={item.tier === "live" ? "accent" : item.tier === "demo" ? "info" : "warn"}>{item.tier || item.status || "unknown"}</Tag></div></div>)}</SettingsSection><SettingsSection title="Connected tools" note="Enable/disable and approval-required states are enforced by the tool broker.">{connectors.length === 0 ? <div className="p-5"><EmptyState title="No tools connected" sub="Connectors appear here after OAuth or local enablement."/></div> : connectors.map(c => { const policy = ((data[c.provider] || c.policy || {}) as Record<string, unknown>); return <div key={c.id} className="px-5 py-4 border-b hairline last:border-b-0"><div className="flex justify-between gap-4"><div><div className="font-medium capitalize">{c.provider}</div><div className="text-[12px]" style={{ color: "var(--text-dim)" }}>{c.account_handle || "Org-level connector"} · {c.status} · last used {c.last_used_at || "never"}</div><div className="mt-2 flex flex-wrap gap-1">{(c.scopes || []).map(scope => <Tag key={scope}>{scope}</Tag>)}<Tag variant={String(policy.risk) === "high" ? "danger" : "info"}>{String(policy.risk || "unknown")} risk</Tag></div></div><div className="flex items-center gap-4"><Toggle label={`${c.provider} enabled`} checked={policy.enabled !== false} onChange={enabled => update(c.provider, { enabled })}/><Toggle label={`${c.provider} approval required`} checked={Boolean(policy.approval_required)} onChange={approval_required => update(c.provider, { approval_required })}/><button className="btn btn-danger-soft btn-sm" disabled title="Disconnect is managed from Connectors until scoped confirmation is added.">Disconnect</button></div></div></div>; })}</SettingsSection><Unavailable reason={capabilities.notification_email_dispatch.reason}/></>;
+  function statusVariant(item: (typeof providers)[number][1]): "ok" | "warn" | "danger" | "info" {
+    if (item.status === "verified" && !item.stale) return "ok";
+    if (item.status === "configured") return "info";
+    if (item.status === "error" || item.status === "unavailable") return "danger";
+    return "warn";
+  }
+  function statusLabel(item: (typeof providers)[number][1]): string {
+    if (item.status === "verified" && !item.stale) return "verified";
+    if (item.stale && item.verified_at) return "stale";
+    return item.status || "unknown";
+  }
+  return <>
+    <SettingsSection title="Connector readiness" note="Configured means credentials exist. Verified means a recent, non-mutating provider check succeeded.">
+      {providers.length === 0 ? <div className="p-5"><EmptyState title="No connector checks available" sub="Startup health has not reported tool readiness yet."/></div> : providers.map(([provider, item]) => (
+        <div key={provider} className="px-5 py-4 border-b hairline last:border-b-0">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <div className="font-medium capitalize">{provider}</div>
+              <div className="text-[12px] mt-1" style={{ color: "var(--text-dim)" }}>{item.reason || "No verification details reported."}</div>
+              {item.setup && <div className="text-[12px] mt-1 font-mono" style={{ color: "var(--text-muted)" }}>{item.setup}</div>}
+              {(item.checked_at || item.verified_at) && (
+                <div className="text-[11px] mt-1 font-mono" style={{ color: "var(--text-faint)" }}>
+                  {item.verified_at ? `Last verified ${new Date(item.verified_at).toLocaleString()}` : `Checked ${new Date(String(item.checked_at)).toLocaleString()}`}
+                  {item.latency_ms != null ? ` · ${item.latency_ms} ms` : ""}
+                </div>
+              )}
+            </div>
+            <Tag variant={statusVariant(item)}>{statusLabel(item)}</Tag>
+          </div>
+        </div>
+      ))}
+    </SettingsSection>
+    <SettingsSection title="Connected tools" note="Enable/disable and approval-required states are enforced by the tool broker.">
+      {connectors.length === 0 ? <div className="p-5"><EmptyState title="No tools connected" sub="Connectors appear here after OAuth or local enablement."/></div> : connectors.map(c => { const policy = ((data[c.provider] || c.policy || {}) as Record<string, unknown>); return <div key={c.id} className="px-5 py-4 border-b hairline last:border-b-0"><div className="flex justify-between gap-4"><div><div className="font-medium capitalize">{c.provider}</div><div className="text-[12px]" style={{ color: "var(--text-dim)" }}>{c.account_handle || "Org-level connector"} · {c.status} · last used {c.last_used_at || "never"}</div><div className="mt-2 flex flex-wrap gap-1">{(c.scopes || []).map(scope => <Tag key={scope}>{scope}</Tag>)}<Tag variant={String(policy.risk) === "high" ? "danger" : "info"}>{String(policy.risk || "unknown")} risk</Tag></div></div><div className="flex items-center gap-4"><Toggle label={`${c.provider} enabled`} checked={policy.enabled !== false} onChange={enabled => update(c.provider, { enabled })}/><Toggle label={`${c.provider} approval required`} checked={Boolean(policy.approval_required)} onChange={approval_required => update(c.provider, { approval_required })}/><button className="btn btn-danger-soft btn-sm" disabled title="Disconnect is managed from Connectors until scoped confirmation is added.">Disconnect</button></div></div></div>; })}
+    </SettingsSection>
+    <Unavailable reason={capabilities.notification_email_dispatch.reason}/>
+  </>;
 }
 
 const AUTONOMY_LABELS: Record<string, string> = { supervised: "Supervised", full_auto: "Full auto" };
@@ -7990,16 +9906,18 @@ function AutonomyTrustSettings({ canAdmin, setToast }: { canAdmin: boolean; setT
 }
 
 function ApprovalSettings({ data, patch, canAdmin, setToast }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void; canAdmin: boolean; setToast: (t: { kind: "ok" | "danger"; text: string }) => void }) {
-  const thresholds = (data.thresholds || {}) as Record<string, string>;
-  return <><WorkspaceAutonomySection/><AutonomyTrustSettings canAdmin={canAdmin} setToast={setToast}/><SettingsSection title="Approval policy"><SettingsField label="Mode"><SelectInput ariaLabel="Approval mode" value={val(data, "mode")} onChange={mode => patch({ mode })} options={["off", "low-risk auto", "manual", "strict"]}/></SettingsField>{["low", "medium", "high"].map(level => <SettingsField key={level} label={`${level} risk threshold`}><SelectInput ariaLabel={`${level} risk threshold`} value={thresholds[level] || "manual"} onChange={value => patch({ thresholds: { ...thresholds, [level]: value } })} options={["auto", "manual", "strict", "blocked"]}/></SettingsField>)}<SettingsField label="Rule builder"><pre className="text-[12px] overflow-auto max-w-md" style={{ color: "var(--text-muted)" }}>{JSON.stringify(data.rules || [], null, 2)}</pre></SettingsField></SettingsSection></>;
+  void data;
+  void patch;
+  return <><WorkspaceAutonomySection/><AutonomyTrustSettings canAdmin={canAdmin} setToast={setToast}/><SettingsSection title="Enforced approval baseline" note="These floors are enforced on the broker execution path and cannot be disabled by a display setting."><SettingsField label="Low risk"><Tag>Policy or earned trust</Tag></SettingsField><SettingsField label="Medium risk"><Tag variant="warn">Manual unless human-ratified</Tag></SettingsField><SettingsField label="High risk"><Tag variant="danger">Always requires approval</Tag></SettingsField><SettingsField label="External sends"><Tag variant="danger">Approval-bound execution</Tag></SettingsField></SettingsSection></>;
 }
 
 function NotificationSettings({ data, patch, capabilities }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void; capabilities: SettingsOverview["capabilities"] }) {
-  return <><Unavailable reason={capabilities.notification_email_dispatch.reason}/><SettingsSection title="Notification categories">{["email", "in_app", "runtime_failure_alerts", "approval_request_alerts", "task_completion_alerts", "weekly_digest", "security_alerts"].map(key => <SettingsField key={key} label={key.replaceAll("_", " ")}><Toggle label={key} checked={Boolean(data[key])} onChange={value => patch({ [key]: value })} disabled={key === "email"}/></SettingsField>)}</SettingsSection></>;
+  const emailSupported = Boolean(capabilities.notification_email_dispatch?.supported);
+  return <><Unavailable reason={capabilities.notification_email_dispatch?.reason}/><div className="mb-5 flex justify-end"><a href="/notifications" className="btn btn-secondary btn-sm">Open notification inbox</a></div><SettingsSection title="Notification categories">{["email", "in_app", "runtime_failure_alerts", "approval_request_alerts", "task_completion_alerts", "weekly_digest", "security_alerts"].map(key => <SettingsField key={key} label={key.replaceAll("_", " ")}><Toggle label={key} checked={Boolean(data[key])} onChange={value => patch({ [key]: value })} disabled={key === "email" && !emailSupported}/></SettingsField>)}</SettingsSection></>;
 }
 
-function SecuritySettings({ capabilities, signOut }: { capabilities: SettingsOverview["capabilities"]; signOut: () => void }) {
-  return <><SettingsSection title="Authentication">{["sessions", "password", "two_factor", "api_keys"].map(key => <SettingsField key={key} label={key.replaceAll("_", " ")}><button className="btn btn-sm" disabled>{capabilities[key]?.reason || "Unavailable"}</button></SettingsField>)}<SettingsField label="Current session"><button onClick={signOut} className="btn btn-danger-soft btn-sm">Sign out</button></SettingsField></SettingsSection><SSOConnectionsSettings /></>;
+function SecuritySettings({ capabilities, signOut, canAdmin, setToast, setConfirm }: { capabilities: SettingsOverview["capabilities"]; signOut: () => void; canAdmin: boolean; setToast: (t: { kind: "ok" | "danger"; text: string }) => void; setConfirm: (c: { title: string; text: string; required?: string; action: (typed: string) => Promise<void> } | null) => void }) {
+  return <><SettingsSection title="Authentication">{["sessions", "password", "two_factor"].map(key => <SettingsField key={key} label={key.replaceAll("_", " ")} hint={capabilities[key]?.reason || "This credential control is not available in the current authentication mode."}><Tag>{capabilities[key]?.supported ? "Available" : "Unavailable"}</Tag></SettingsField>)}<SettingsField label="Current session"><button onClick={signOut} className="btn btn-danger-soft btn-sm">Sign out</button></SettingsField></SettingsSection>{canAdmin && <OrganizationApiKeysSettings setToast={setToast} setConfirm={setConfirm}/>} {canAdmin ? <SSOConnectionsSettings /> : <Unavailable reason="Enterprise SSO configuration is restricted to administrators and owners."/>}</>;
 }
 
 function BillingSettings({ overview }: { overview: SettingsOverview }) {
@@ -8012,11 +9930,13 @@ function BillingSettings({ overview }: { overview: SettingsOverview }) {
     ? `$${Number(costUsage.cost_today_usd || 0).toFixed(4)} today`
     : "Metered when model usage is available";
   const stopLabel = overview.usage?.suspended || costUsage?.budget_hard_stop ? "Suspended" : "Active";
-  return <><Unavailable reason={overview.capabilities.billing.reason}/><SettingsSection title="Read-only usage summary"><SettingsField label="Current plan"><Tag variant="accent">{String(overview.organization.plan || "trial")}</Tag></SettingsField><SettingsField label="Seats"><Tag>{String(overview.organization.seats || 0)}</Tag></SettingsField><SettingsField label="Governance state"><Tag variant={stopLabel === "Suspended" ? "danger" : "ok"}>{stopLabel}</Tag></SettingsField><SettingsField label="Runtime usage"><Tag>Metered through task activity</Tag></SettingsField><SettingsField label="Token/model usage"><Tag>{tokenLabel}</Tag></SettingsField><SettingsField label="Model cost"><Tag>{costLabel}</Tag></SettingsField><SettingsField label="Storage usage"><Tag>{overview.memory_stats.active} memory entries</Tag></SettingsField></SettingsSection></>;
+  return <><Unavailable reason={overview.capabilities.billing?.reason}/>{overview.capabilities.billing?.supported && <div className="mb-5 flex justify-end"><a href="/settings/billing" className="btn btn-accent btn-sm">Manage plan and billing</a></div>}<SettingsSection title="Usage summary"><SettingsField label="Current plan"><Tag variant="accent">{String(overview.organization.plan || "trial")}</Tag></SettingsField><SettingsField label="Seats"><Tag>{String(overview.organization.seats || 0)}</Tag></SettingsField><SettingsField label="Governance state"><Tag variant={stopLabel === "Suspended" ? "danger" : "ok"}>{stopLabel}</Tag></SettingsField><SettingsField label="Runtime usage"><Tag>Metered through task activity</Tag></SettingsField><SettingsField label="Token/model usage"><Tag>{tokenLabel}</Tag></SettingsField><SettingsField label="Model cost"><Tag>{costLabel}</Tag></SettingsField><SettingsField label="Storage usage"><Tag>{overview.memory_stats.active} memory entries</Tag></SettingsField></SettingsSection></>;
 }
 
-function AuditSettings() {
+function AuditSettings({ canExport }: { canExport: boolean }) {
   const [rows, setRows] = useState<Array<Record<string, unknown>>>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
   const [query, setQuery] = useState("");
   const [since, setSince] = useState("");
   const [until, setUntil] = useState("");
@@ -8029,15 +9949,32 @@ function AuditSettings() {
     const qs = params.toString();
     return qs ? `?${qs}` : "";
   }
-  useEffect(() => { apiFetch(`/settings/audit${auditParams()}`).then(r => r.json()).then(setRows).catch(() => setRows([])); }, [query, since, until]);
+  useEffect(() => {
+    setLoading(true);
+    setError("");
+    apiFetch(`/settings/audit${auditParams()}`)
+      .then(r => r.json())
+      .then(setRows)
+      .catch(exc => {
+        setRows([]);
+        setError(exc instanceof Error ? exc.message : "Audit logs could not be loaded.");
+      })
+      .finally(() => setLoading(false));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [query, since, until]);
   async function exportAudit(format: "csv" | "json") {
-    const blob = await (await apiFetch(`/settings/audit/export${auditParams({ format })}`)).blob();
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = `chronos-audit.${format}`;
-    anchor.click();
-    URL.revokeObjectURL(url);
+    setError("");
+    try {
+      const blob = await (await apiFetch(`/settings/audit/export${auditParams({ format })}`)).blob();
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `chronos-audit.${format}`;
+      anchor.click();
+      URL.revokeObjectURL(url);
+    } catch (exc) {
+      setError(exc instanceof Error ? exc.message : "Audit export could not be created.");
+    }
   }
   // Business-readable summary fields first; the raw entry stays behind a toggle.
   const detailRows = selected
@@ -8049,21 +9986,45 @@ function AuditSettings() {
         ["Decision", String(selected.decision || "—")],
       ] as Array<[string, string]>)
     : [];
-  return <><div className="flex flex-wrap gap-2 mb-4 items-center"><TextInput ariaLabel="Search audit logs" value={query} onChange={setQuery}/><input aria-label="Audit from date" type="date" value={since} onChange={e => setSince(e.target.value)} className="surface border border-soft rounded-lg px-3 py-2 text-[14px] outline-none" style={{ color: "var(--text)" }}/><input aria-label="Audit to date" type="date" value={until} onChange={e => setUntil(e.target.value)} className="surface border border-soft rounded-lg px-3 py-2 text-[14px] outline-none" style={{ color: "var(--text)" }}/><button className="btn btn-sm" onClick={() => void exportAudit("csv")}>Export CSV</button><button className="btn btn-sm" onClick={() => void exportAudit("json")}>Export JSON</button></div><div className="surface border border-soft rounded-xl overflow-hidden">{rows.map(row => <button key={String(row.id)} onClick={() => setSelected(row)} className="w-full text-left px-4 py-3 border-b hairline last:border-b-0 hover:bg-[var(--surface-2)]"><div className="font-medium text-[13px]">{String(row.action)}</div><div className="text-[12px]" style={{ color: "var(--text-dim)" }}>{String(row.actor_id || "system")} · {row.created_at ? new Date(String(row.created_at)).toLocaleString() : "—"}</div></button>)}</div>{selected && <div className="mt-4 surface border border-soft rounded-xl p-4"><div className="font-medium mb-2">Audit detail</div><div className="space-y-1.5 text-[13px]" style={{ color: "var(--text-muted)" }}>{detailRows.map(([label, value]) => <div key={label} className="flex gap-2"><span className="w-32 flex-shrink-0 font-medium" style={{ color: "var(--text-dim)" }}>{label}</span><span className="min-w-0 break-words">{value}</span></div>)}</div><details className="mt-3"><summary className="cursor-pointer text-[12px]" style={{ color: "var(--text-dim)" }}>Technical details</summary><pre className="mt-2 text-[12px] overflow-auto" style={{ color: "var(--text-muted)" }}>{JSON.stringify(selected, null, 2)}</pre></details></div>}</>;
+  return <><div className="flex flex-wrap gap-2 mb-4 items-start"><TextInput ariaLabel="Search audit logs" placeholder="Search audit logs" value={query} onChange={setQuery}/><input aria-label="Audit from date" type="date" value={since} onChange={e => setSince(e.target.value)} className="surface border border-soft rounded-lg px-3 py-2 text-[14px] outline-none" style={{ color: "var(--text)" }}/><input aria-label="Audit to date" type="date" value={until} onChange={e => setUntil(e.target.value)} className="surface border border-soft rounded-lg px-3 py-2 text-[14px] outline-none" style={{ color: "var(--text)" }}/><button className="btn btn-sm" onClick={() => void exportAudit("csv")}>Export CSV</button><button className="btn btn-sm" onClick={() => void exportAudit("json")}>Export JSON</button><ComplianceExportControl since={since} until={until} canExport={canExport}/></div>{error && <div className="mb-3 rounded-lg border px-3 py-2 text-[13px]" role="alert" style={{ borderColor: "var(--danger)", color: "var(--danger)" }}>{error}</div>}<div className="surface border border-soft rounded-xl overflow-hidden">{loading && <div className="px-4 py-6 text-[13px]" style={{ color: "var(--text-dim)" }}>Loading audit logs…</div>}{!loading && !error && rows.length === 0 && <div className="px-4 py-6 text-[13px]" style={{ color: "var(--text-dim)" }}>No audit events match these filters.</div>}{rows.map(row => <button key={String(row.id)} onClick={() => setSelected(row)} className="w-full text-left px-4 py-3 border-b hairline last:border-b-0 hover:bg-[var(--surface-2)]"><div className="font-medium text-[13px]">{String(row.action)}</div><div className="text-[12px]" style={{ color: "var(--text-dim)" }}>{String(row.actor_id || "system")} · {row.created_at ? new Date(String(row.created_at)).toLocaleString() : "—"}</div></button>)}</div>{selected && <div className="mt-4 surface border border-soft rounded-xl p-4"><div className="font-medium mb-2">Audit detail</div><div className="space-y-1.5 text-[13px]" style={{ color: "var(--text-muted)" }}>{detailRows.map(([label, value]) => <div key={label} className="flex gap-2"><span className="w-32 flex-shrink-0 font-medium" style={{ color: "var(--text-dim)" }}>{label}</span><span className="min-w-0 break-words">{value}</span></div>)}</div><details className="mt-3"><summary className="cursor-pointer text-[12px]" style={{ color: "var(--text-dim)" }}>Technical details</summary><pre className="mt-2 text-[12px] overflow-auto" style={{ color: "var(--text-muted)" }}>{JSON.stringify(selected, null, 2)}</pre></details></div>}</>;
 }
 
 function DeveloperSettings({ data, patch, capabilities }: { data: Record<string, unknown>; patch: (v: Record<string, unknown>) => void; capabilities: SettingsOverview["capabilities"] }) {
-  return <><Unavailable reason="Secrets and provider API keys are never exposed in the frontend."/><SettingsSection title="Advanced"><SettingsField label="Environment"><Tag>dev</Tag></SettingsField><SettingsField label="API mode"><SelectInput ariaLabel="API mode" value={val(data, "api_mode")} onChange={api_mode => patch({ api_mode })} options={["local", "staging", "production"]}/></SettingsField><SettingsField label="Debug logging"><Toggle label="Debug logging" checked={Boolean(data.debug_logging)} onChange={debug_logging => patch({ debug_logging })}/></SettingsField><SettingsField label="Experimental features"><Toggle label="Experimental features" checked={Boolean(data.experimental_features)} onChange={experimental_features => patch({ experimental_features })}/></SettingsField><SettingsField label="Webhooks"><button className="btn btn-sm" disabled>{capabilities.webhooks.reason}</button></SettingsField></SettingsSection></>;
+  void data;
+  void patch;
+  const webBuild = process.env.NODE_ENV === "production" ? "Production build" : "Development build";
+  return <><Unavailable reason="Secrets, provider keys, runtime mode, and feature rollout flags are deployment configuration and are never editable in the browser."/><SettingsSection title="Runtime information"><SettingsField label="Web build"><Tag>{webBuild}</Tag></SettingsField><SettingsField label="Webhooks" hint={capabilities.webhooks?.reason || "Webhook delivery is unavailable."}><Tag>{capabilities.webhooks?.supported ? "Available" : "Unavailable"}</Tag></SettingsField></SettingsSection></>;
 }
 
-function DangerSettings({ capabilities, setToast }: { capabilities: SettingsOverview["capabilities"]; setToast: (t: { kind: "ok" | "danger"; text: string }) => void }) {
-  return <SettingsSection title="Danger zone" note="Unsupported destructive actions are disabled until backend archival workflows exist."><SettingsField label="Reset workspace settings"><button className="btn btn-danger-soft btn-sm" onClick={() => setToast({ kind: "danger", text: "Reset is not implemented because there is no versioned rollback workflow." })}>Reset unavailable</button></SettingsField><SettingsField label="Delete workspace"><button className="btn btn-danger-soft btn-sm" disabled>{capabilities.delete_workspace.reason}</button></SettingsField><SettingsField label="Leave organization"><button className="btn btn-danger-soft btn-sm" disabled>Leaving the only local workspace is not supported.</button></SettingsField><SettingsField label="Transfer ownership"><button className="btn btn-danger-soft btn-sm" disabled>{capabilities.transfer_ownership.reason}</button></SettingsField></SettingsSection>;
+function DangerSettings({ overview, signOut, setToast, setConfirm }: { overview: SettingsOverview; signOut: () => void; setToast: (t: { kind: "ok" | "danger"; text: string }) => void; setConfirm: (c: { title: string; text: string; required?: string; action: (typed: string) => Promise<void> } | null) => void }) {
+  return <OrganizationDangerSettings organizationName={String(overview.organization.name || overview.organization.organization_name || overview.organization.id || "organization")} memberId={overview.member.id} role={overview.member.role} members={overview.members} signOut={signOut} setToast={setToast} setConfirm={setConfirm}/>;
 }
 
 function ConfirmModal({ confirm, onClose }: { confirm: { title: string; text: string; required?: string; action: (typed: string) => Promise<void> }; onClose: () => void }) {
   const [typed, setTyped] = useState("");
-  const canRun = !confirm.required || typed === confirm.required;
-  return <div className="fixed inset-0 z-[100] flex items-center justify-center glass overlay-in" style={{ background: "color-mix(in oklch, var(--text) 18%, transparent)" }} role="dialog" aria-modal="true"><div className="surface border border-soft rounded-2xl p-5 w-[420px] pop-in" style={{ boxShadow: "var(--shadow-xl)" }}><h2 className="text-[16px] font-semibold">{confirm.title}</h2><p className="text-[13px] mt-2" style={{ color: "var(--text-dim)" }}>{confirm.text}</p>{confirm.required && <TextInput ariaLabel="Confirmation text" wide value={typed} onChange={setTyped}/>}<div className="flex justify-end gap-2 mt-5"><button className="btn btn-sm" onClick={onClose}>Cancel</button><button className="btn btn-danger-soft btn-sm" disabled={!canRun} onClick={() => { void confirm.action(typed).then(onClose); }}>Confirm</button></div></div></div>;
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const cancelRef = useRef<HTMLButtonElement>(null);
+  const canRun = !busy && (!confirm.required || typed === confirm.required);
+  useDialogFocus({
+    active: true,
+    containerRef: dialogRef,
+    initialFocusRef: cancelRef,
+    onClose: () => { if (!busy) onClose(); },
+  });
+  async function run() {
+    setBusy(true);
+    setError("");
+    try {
+      await confirm.action(typed);
+      onClose();
+    } catch (exc) {
+      setError(exc instanceof Error ? exc.message : "The action could not be completed.");
+      setBusy(false);
+    }
+  }
+  return <div className="fixed inset-0 z-[100] flex items-center justify-center px-4 glass overlay-in" onMouseDown={event => { if (event.target === event.currentTarget && !busy) onClose(); }} style={{ background: "color-mix(in oklch, var(--text) 18%, transparent)" }}><div ref={dialogRef} tabIndex={-1} className="surface border border-soft rounded-2xl p-5 w-full max-w-[420px] pop-in" style={{ boxShadow: "var(--shadow-xl)" }} role="alertdialog" aria-modal="true" aria-labelledby="confirmation-title" aria-describedby="confirmation-description"><h2 id="confirmation-title" className="text-[16px] font-semibold">{confirm.title}</h2><p id="confirmation-description" className="text-[13px] mt-2" style={{ color: "var(--text-dim)" }}>{confirm.text}</p>{confirm.required && <div className="mt-3"><TextInput ariaLabel="Confirmation text" wide value={typed} onChange={setTyped}/></div>}{error && <p className="mt-3 text-[12.5px]" role="alert" style={{ color: "var(--danger)" }}>{error}</p>}<div className="flex justify-end gap-2 mt-5"><button ref={cancelRef} className="btn btn-sm" disabled={busy} onClick={onClose}>Cancel</button><button className="btn btn-danger-soft btn-sm" disabled={!canRun} onClick={() => void run()}>{busy ? "Working…" : "Confirm"}</button></div></div></div>;
 }
 
 export default function ChronosApp() {

@@ -13,7 +13,17 @@ test("project detail research tab renders project-scoped activity", async () => 
   expect(source).toContain("sources={sources}");
 
   const researchBranch = source.indexOf('tab === "research"');
-  const comingSoonFallback = source.indexOf('EmptyState title="Nothing here yet" sub="This feature is coming soon."');
+  const unavailableFallback = source.indexOf('EmptyState title="Section unavailable" sub="Return to the project overview and try again."');
   expect(researchBranch).toBeGreaterThan(-1);
-  expect(comingSoonFallback).toBeGreaterThan(researchBranch);
+  expect(unavailableFallback).toBeGreaterThan(researchBranch);
+});
+
+test("project artifacts can create and download a bounded durable ZIP", async () => {
+  const source = fs.readFileSync(path.join(process.cwd(), "app/chat/page.tsx"), "utf8");
+
+  expect(source).toContain('apiFetch(`/projects/${projectId}/export`');
+  expect(source).toContain('apiFetch(`/artifacts/${result.artifact.id}/content`)');
+  expect(source).toContain("Export project ZIP");
+  expect(source).toContain("only artifacts explicitly shared to this project");
+  expect(source).toContain("Operator role required to export project artifacts");
 });

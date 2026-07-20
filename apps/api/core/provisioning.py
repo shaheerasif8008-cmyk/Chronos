@@ -38,6 +38,8 @@ async def provision_org(
 
     organizations = await reflect_table("organizations")
     members = await reflect_table("members")
+    workspaces = await reflect_table("workspaces")
+    workspace_members = await reflect_table("workspace_members")
     async with engine.begin() as conn:
         await conn.execute(insert(organizations).values(
             id=org_id, organization_id=org_id, region=region,
@@ -49,14 +51,46 @@ async def provision_org(
             email=owner_email, role="owner",
             name=owner_name or owner_email.split("@", 1)[0],
         ))
+        workspace_id = (
+            await conn.execute(
+                insert(workspaces)
+                .values(
+                    organization_id=org_id,
+                    region=region,
+                    name="Default workspace",
+                    slug="default",
+                    legacy_key="default",
+                    status="active",
+                    created_by=member_id,
+                )
+                .returning(workspaces.c.id)
+            )
+        ).scalar_one()
+        await conn.execute(
+            insert(workspace_members).values(
+                organization_id=org_id,
+                region=region,
+                workspace_id=str(workspace_id),
+                member_id=member_id,
+                role="owner",
+                added_by=member_id,
+            )
+        )
 
     # Best-effort: the org+owner are already durably committed. A grant failure
     # (OpenFGA configured but unreachable) must not lose the signup; the tuple is
     # idempotently re-grantable. Surface it for observability instead of 500ing.
     try:
         await permissions.grant_org_membership(member_id, org_id, admin=True)
+        await permissions.grant_workspace_role(
+            member_id, "owner", str(workspace_id), org_id
+        )
     except Exception:
-        logger.warning("OpenFGA owner grant failed for org %s; re-grant needed", org_id, exc_info=True)
+        logger.warning(
+            "OpenFGA owner/workspace grant failed for org %s; re-grant needed",
+            org_id,
+            exc_info=True,
+        )
 
     ctx = ROOT / "context" / org_id
     ctx.mkdir(parents=True, exist_ok=True)

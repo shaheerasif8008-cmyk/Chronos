@@ -14,27 +14,49 @@ from core.models import Member
 ADMIN_ROLES = {"owner", "admin"}
 ROLE_ORDER = ["owner", "admin", "manager", "operator", "viewer"]
 
+# Settings documents are intentionally schema-light JSON, but these two
+# sections feed enforcement code and must not accumulate controls that merely
+# *look* operational.  The allowlists are used on both read and write paths so
+# stale values from earlier builds do not reappear in the admin UI.
+RUNTIME_SETTING_KEYS = {
+    "token_budget_daily",
+    "cost_budget_daily_usd",
+    "request_rate_per_minute",
+    "connector_rate_per_minute",
+    "max_task_queue_size",
+}
+MEMORY_SETTING_KEYS = {
+    "retention_enabled",
+    "retention_days",
+    "deleted_retention_days",
+    "deleted_artifact_retention_days",
+}
+AI_EMPLOYEE_SETTING_KEYS = {"max_concurrent_runtimes"}
+APPROVAL_SETTING_KEYS: set[str] = set()
+GENERAL_SETTING_KEYS = {"theme", "accent"}
+PROFILE_SETTING_KEYS = {"ui_preferences"}
+DEVELOPER_SETTING_KEYS: set[str] = set()
+SECTION_SETTING_KEYS: dict[str, set[str]] = {
+    "general": GENERAL_SETTING_KEYS,
+    "profile": PROFILE_SETTING_KEYS,
+    "runtime": RUNTIME_SETTING_KEYS,
+    "memory": MEMORY_SETTING_KEYS,
+    "ai_employee": AI_EMPLOYEE_SETTING_KEYS,
+    # Approval enforcement is owned by the broker risk floor, connector
+    # policies, and the ratified autonomy APIs. Legacy JSON controls were never
+    # read on the execution path, so hide and discard them instead of presenting
+    # a dangerous settings illusion.
+    "approval": APPROVAL_SETTING_KEYS,
+    "developer": DEVELOPER_SETTING_KEYS,
+}
+
 
 DEFAULTS: dict[str, dict[str, Any]] = {
     "general": {
-        "workspace_name": "Chronos workspace",
-        "workspace_description": "Local Chronos operations workspace.",
-        "workspace_icon": "C",
-        "default_landing_page": "chat",
-        "time_zone": "America/New_York",
-        "date_time_format": "MMM d, yyyy h:mm a",
-        "language": "en-US",
         "theme": "system",
-        "notifications": {"in_app": True, "email": False, "approvals": True, "runtime_failures": True},
+        "accent": "coral",
     },
-    "profile": {
-        "display_name": "",
-        "profile_avatar": "",
-        "personal_preferences": "",
-        "ai_interaction_style": "balanced",
-        "preferred_response_length": "medium",
-        "citation_detail_level": "standard",
-    },
+    "profile": {"ui_preferences": {}},
     "organization": {
         "organization_name": "",
         "logo": "",
@@ -52,24 +74,10 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         }
     },
     "ai_employee": {
-        "creation_policy": "admins_and_managers",
-        "memory_scope": "workspace",
-        "tool_access_mode": "approval_required",
-        "runtime_auto_start": True,
-        "runtime_idle_timeout_minutes": 30,
         "max_concurrent_runtimes": 3,
-        "max_sub_agent_depth": 3,
-        "sub_agent_spawning": True,
-        "approval_threshold_depth": 2,
     },
     "runtime": {
-        "runtime_mode": "local",
-        "isolation": "process",
-        "heartbeat_interval_seconds": 30,
-        "restart_policy": "on_failure",
-        "log_retention_days": 14,
         "max_task_queue_size": 100,
-        "failure_recovery": "resume",
         # token_budget_daily and cost_budget_daily_usd are intentionally absent from DEFAULTS
         # so that save_settings_doc never writes them into settings_documents unless an admin
         # explicitly overrides them. governance_config falls back to plan entitlements when
@@ -78,42 +86,34 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "connector_rate_per_minute": 60,
     },
     "memory": {
-        "workspace_memory": True,
-        "employee_memory": True,
-        "user_memory": True,
+        "retention_enabled": True,
         "retention_days": 365,
-        "review_required": False,
-        "auto_save": True,
-        "sensitive_detection": False,
+        # Active memories are soft-deleted at ``retention_days``.  A separate
+        # grace period preserves recovery time before irreversible erasure.
+        "deleted_retention_days": 30,
+        # User-deleted artifacts are retained briefly before their object bytes
+        # and metadata are irreversibly removed.
+        "deleted_artifact_retention_days": 30,
     },
     "tool_settings": {
         "browser": {"enabled": True, "approval_required": False, "risk": "low"},
         "gmail": {"enabled": True, "approval_required": True, "risk": "high"},
         "chat_history": {"enabled": True, "approval_required": False, "risk": "low"},
     },
-    "approval": {
-        "mode": "manual",
-        "thresholds": {"low": "auto", "medium": "manual", "high": "strict"},
-        "rules": [
-            {"id": "gmail-draft", "target": "gmail.draft", "decision": "approval_required"},
-            {"id": "external-send", "target": "gmail.send", "decision": "blocked"},
-        ],
-    },
+    "approval": {},
     "notifications": {
         "email": False,
+        "slack": False,
+        "teams": False,
         "in_app": True,
+        "desktop": True,
         "runtime_failure_alerts": True,
         "approval_request_alerts": True,
         "task_completion_alerts": True,
         "weekly_digest": False,
         "security_alerts": True,
     },
-    "developer": {
-        "feature_flags": {},
-        "api_mode": "local",
-        "debug_logging": False,
-        "experimental_features": False,
-    },
+    "developer": {},
     "response_format": {
         "verbosity": "detailed",
     },
@@ -152,7 +152,11 @@ async def get_settings_doc(member: Member, section: str, *, scope: str | None = 
                 )
             )
         ).first()
-    return deep_merge(DEFAULTS.get(section, {}), dict(row[0] or {}) if row else {})
+    merged = deep_merge(DEFAULTS.get(section, {}), dict(row[0] or {}) if row else {})
+    allowed = SECTION_SETTING_KEYS.get(section)
+    if allowed is not None:
+        return {key: merged[key] for key in allowed if key in merged}
+    return merged
 
 
 async def save_settings_doc(
@@ -163,6 +167,9 @@ async def save_settings_doc(
     scope: str | None = None,
     scope_id: str | None = None,
 ) -> dict[str, Any]:
+    allowed = SECTION_SETTING_KEYS.get(section)
+    if allowed is not None:
+        values = {key: value for key, value in values.items() if key in allowed}
     target_scope = scope or ("user" if section == "profile" else "org")
     target_scope_id = scope_id or (member.id if target_scope == "user" else member.organization_id)
     current = await get_settings_doc(member, section, scope=target_scope, scope_id=target_scope_id)

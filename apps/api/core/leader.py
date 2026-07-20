@@ -24,6 +24,8 @@ from typing import Awaitable, Callable
 
 log = logging.getLogger(__name__)
 
+_STOP_WAIT_SECONDS = 5.0
+
 # Extend the TTL only if we still own the lock.
 _RENEW_SCRIPT = """
 if redis.call('get', KEYS[1]) == ARGV[1] then
@@ -133,6 +135,21 @@ class LeaderElection:
     async def stop(self) -> None:
         """Stop the loop, release the lock if held, and run on_release once."""
         self._stopped.set()
-        if self._task is not None:
-            await self._task
-            self._task = None
+        task = self._task
+        self._task = None
+        if task is None:
+            return
+
+        # Redis or an acquisition callback must not be able to consume the
+        # container's entire stop window. The normal path wakes immediately via
+        # ``_stopped``; the timeout is only a last-resort bound around external
+        # I/O. Cancelling the loop still executes its ``finally`` cleanup.
+        done, pending = await asyncio.wait({task}, timeout=_STOP_WAIT_SECONDS)
+        if pending:
+            log.warning("leader: stop timed out for %s; cancelling election task", self._key)
+            task.cancel()
+            done, pending = await asyncio.wait({task}, timeout=_STOP_WAIT_SECONDS)
+        if task in done and not task.cancelled():
+            task.exception()  # retrieve/loggable exception; do not leak it
+        if pending:
+            log.error("leader: election task did not stop after cancellation for %s", self._key)

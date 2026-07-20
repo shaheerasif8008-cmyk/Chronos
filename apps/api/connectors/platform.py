@@ -43,11 +43,12 @@ async def _discover_mcp(server_id: str, org_id: str) -> dict[str, Any]:
     return await MCPDiscoveryService(_get_repo()).discover(server_id, tenant_id=org_id)
 
 
-async def _connected_providers(org_id: str) -> list[dict[str, Any]]:
-    """Return active rows from the connectors table for this org (REST/OAuth apps)."""
+async def _connected_providers(org_id: str, member_id: str | None = None) -> list[dict[str, Any]]:
+    """Return caller-owned and explicitly org-shared active REST/OAuth rows."""
     from sqlalchemy import select
 
     from core.db import engine, reflect_table
+    from core.connector_tools import member_connector_clause
 
     connectors = await reflect_table("connectors")
     async with engine.begin() as conn:
@@ -60,6 +61,7 @@ async def _connected_providers(org_id: str) -> list[dict[str, Any]]:
                 ).where(
                     connectors.c.organization_id == org_id,
                     connectors.c.status == "active",
+                    member_connector_clause(connectors, org_id, member_id),
                 )
             )
         ).mappings().all()
@@ -118,24 +120,34 @@ def _mcp_server_id(platform_id: str) -> str:
 
 class PlatformConnector:
     async def execute(self, tool: str, args: dict[str, Any], agent: AgentContext) -> ToolResult:
+        approved_by_gate = bool(args.pop("__approved_by_gate", False))
+        approval_id = str(args.pop("__approval_id", "") or "")
+        idempotency_key = args.pop("__idempotency_key", None)
+        governance = {}
+        if approved_by_gate:
+            governance["__approved_by_gate"] = True
+        if approval_id:
+            governance["__approval_id"] = approval_id
+        if idempotency_key:
+            governance["__idempotency_key"] = idempotency_key
         args.pop("__connector_tier", None)
         args.pop("__org_id", None)
         args.pop("__task_id", None)
         org_id = agent.org_id
 
         if tool == "platform.list":
-            return await self._list(org_id)
+            return await self._list(org_id, agent.member_id)
         if tool == "platform.actions":
             return await self._actions(args, org_id)
         if tool == "platform.invoke":
-            return await self._invoke(args, agent)
+            return await self._invoke(args, agent, governance)
         if tool == "platform.connect":
             return await self._connect(args, org_id)
         raise ValueError(f"Unknown platform tool: {tool}")
 
     # ── platform.list ─────────────────────────────────────────────────────────
 
-    async def _list(self, org_id: str) -> ToolResult:
+    async def _list(self, org_id: str, member_id: str | None = None) -> ToolResult:
         platforms: list[dict[str, Any]] = []
 
         # MCP servers (Google Drive, Canva, custom servers, …).
@@ -155,7 +167,11 @@ class PlatformConnector:
         # Connected OAuth2/REST apps.
         catalog = _app_catalog()
         try:
-            connected = await _connected_providers(org_id)
+            connected = (
+                await _connected_providers(org_id, member_id)
+                if member_id
+                else await _connected_providers(org_id)
+            )
         except Exception:
             connected = []
         for row in connected:
@@ -222,6 +238,7 @@ class PlatformConnector:
                     "name": t.get("name"),
                     "description": t.get("description") or "",
                     "parameters": t.get("inputSchema") or {"type": "object"},
+                    "annotations": t.get("annotations") or {},
                 })
             return ToolResult(
                 data={"platform_id": platform_id, "kind": "mcp", "actions": actions,
@@ -249,12 +266,18 @@ class PlatformConnector:
 
     # ── platform.invoke ───────────────────────────────────────────────────────
 
-    async def _invoke(self, args: dict[str, Any], agent: AgentContext) -> ToolResult:
+    async def _invoke(
+        self,
+        args: dict[str, Any],
+        agent: AgentContext,
+        governance: dict[str, Any] | None = None,
+    ) -> ToolResult:
         platform_id = str(args.get("platform_id") or "")
         action = str(args.get("action") or "")
         action_args = args.get("action_args")
         if not isinstance(action_args, dict):
             action_args = {}
+        action_args = {**action_args, **(governance or {})}
         if not platform_id:
             return ToolResult(
                 data={"status": "error", "reason": "platform_id is required"},

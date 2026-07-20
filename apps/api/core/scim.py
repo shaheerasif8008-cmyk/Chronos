@@ -184,10 +184,21 @@ async def create_user(org_id: str, region: str, payload: dict, *, default_role: 
     member = await provision_member(
         org_id, email, name=_extract_name(payload), role=default_role,
         external_id=payload.get("externalId"), region=region,
+        reactivate=payload.get("active") is not False,
     )
     if payload.get("active") is False:
         await _set_status(org_id, member.id, "deactivated")
-    return await get_user(org_id, member.id)  # type: ignore[return-value]
+    created = await get_user(org_id, member.id)
+    if created:
+        from core.permissions import sync_org_membership
+
+        await sync_org_membership(
+            str(member.id),
+            org_id,
+            role=str(created.get("role") or default_role),
+            active=str(created.get("status") or "active") == "active",
+        )
+    return created  # type: ignore[return-value]
 
 
 async def replace_user(org_id: str, member_id: str, payload: dict) -> dict | None:
@@ -209,7 +220,17 @@ async def replace_user(org_id: str, member_id: str, payload: dict) -> dict | Non
     if values:
         async with engine.begin() as conn:
             await conn.execute(update(members).where(members.c.id == member_id, members.c.organization_id == org_id).values(**values))
-    return await get_user(org_id, member_id)
+    updated = await get_user(org_id, member_id)
+    if updated:
+        from core.permissions import sync_org_membership
+
+        await sync_org_membership(
+            member_id,
+            org_id,
+            role=str(updated.get("role") or "user"),
+            active=str(updated.get("status") or "active") == "active",
+        )
+    return updated
 
 
 async def patch_user(org_id: str, member_id: str, patch: dict) -> dict | None:
@@ -243,7 +264,17 @@ async def patch_user(org_id: str, member_id: str, patch: dict) -> dict | None:
     if values:
         async with engine.begin() as conn:
             await conn.execute(update(members).where(members.c.id == member_id, members.c.organization_id == org_id).values(**values))
-    return await get_user(org_id, member_id)
+    updated = await get_user(org_id, member_id)
+    if updated:
+        from core.permissions import sync_org_membership
+
+        await sync_org_membership(
+            member_id,
+            org_id,
+            role=str(updated.get("role") or "user"),
+            active=str(updated.get("status") or "active") == "active",
+        )
+    return updated
 
 
 async def deactivate_user(org_id: str, member_id: str) -> bool:
@@ -252,6 +283,14 @@ async def deactivate_user(org_id: str, member_id: str) -> bool:
     if not existing:
         return False
     await _set_status(org_id, member_id, "deactivated")
+    from core.permissions import sync_org_membership
+
+    await sync_org_membership(
+        member_id,
+        org_id,
+        role=str(existing.get("role") or "user"),
+        active=False,
+    )
     return True
 
 

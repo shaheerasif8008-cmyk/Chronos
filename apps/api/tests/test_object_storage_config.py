@@ -1,10 +1,18 @@
 import pytest
 
 from core.config import Settings
+from core.object_storage import check_bucket_sync
 
 
 def test_object_storage_defaults_to_s3_when_bucket_is_configured() -> None:
-    settings = Settings(_env_file=None, aws_s3_bucket="chronos-prod")
+    settings = Settings(
+        _env_file=None,
+        aws_s3_bucket="chronos-prod",
+        aws_s3_endpoint="",
+        aws_access_key_id="",
+        aws_secret_access_key="",
+        aws_session_token="",
+    )
 
     assert settings.object_storage_is_s3 is True
     assert settings.object_storage_health_name == "s3"
@@ -24,6 +32,7 @@ def test_object_storage_s3_uses_aws_settings() -> None:
         object_storage_backend="s3",
         aws_s3_bucket="chronos-prod",
         aws_s3_region="us-west-2",
+        aws_s3_endpoint="",
         aws_access_key_id="AKIA_TEST",
         aws_secret_access_key="secret",
         aws_session_token="session",
@@ -47,6 +56,7 @@ def test_object_storage_s3_us_east_1_omits_create_bucket_location() -> None:
         object_storage_backend="s3",
         aws_s3_bucket="chronos-prod",
         aws_s3_region="us-east-1",
+        aws_s3_endpoint="",
     )
 
     assert settings.object_storage_endpoint == "s3.us-east-1.amazonaws.com"
@@ -75,3 +85,19 @@ def test_object_storage_s3_requires_bucket(monkeypatch) -> None:
 def test_object_storage_rejects_unknown_backend() -> None:
     with pytest.raises(ValueError, match="OBJECT_STORAGE_BACKEND"):
         Settings(_env_file=None, object_storage_backend="filesystem")
+
+
+def test_object_storage_health_check_never_creates_a_missing_bucket() -> None:
+    class Client:
+        create_calls = 0
+
+        def head_bucket(self, **_kwargs):
+            raise RuntimeError("not found")
+
+        def create_bucket(self, **_kwargs):
+            self.create_calls += 1
+
+    client = Client()
+    with pytest.raises(RuntimeError, match="not found"):
+        check_bucket_sync(client)
+    assert client.create_calls == 0

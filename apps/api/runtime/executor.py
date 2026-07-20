@@ -79,16 +79,21 @@ class TaskExecutor:
         task = await get_task(task_id)
         if not task:
             raise RuntimeError(f"Task not found: {task_id}")
-        if task["status"] in {"complete", "failed", "cancelled"}:
+        if task["status"] in {"complete", "failed", "cancelled", "paused"}:
             return
         try:
             await save_task(task_id, status="running", started_at=now_utc())
             await run_loop(task)
         except asyncio.CancelledError:
-            await save_task(
-                task_id, status="cancelled",
-                error="Task execution was cancelled.", completed_at=now_utc(),
-            )
+            current = await get_task(task_id)
+            # A pause request cancels only the local coroutine. The durable
+            # checkpoint/status were already written by the intervention path
+            # and must not be converted into a terminal cancellation.
+            if not current or current.get("status") not in {"paused", "queued", "cancelled"}:
+                await save_task(
+                    task_id, status="cancelled",
+                    error="Task execution was cancelled.", completed_at=now_utc(),
+                )
             raise
         except Exception as exc:
             error = f"executor_error: {type(exc).__name__}: {exc}"
@@ -104,8 +109,10 @@ class TaskExecutor:
             return
         if task["status"] in {"complete", "failed", "cancelled"}:
             return
-        if task["status"] in {"awaiting_approval", "paused"}:
+        if task["status"] == "awaiting_approval":
             await resume_after_approval(task_id)
+            return
+        if task["status"] == "paused":
             return
         state = task.get("agent_state") or {}
         if isinstance(state, dict) and state.get("agent_history"):

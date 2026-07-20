@@ -9,16 +9,9 @@ type ComputerSession = {
   purpose?: string | null;
   task_id?: string | null;
   workspace_path?: string | null;
+  capabilities?: string[];
   updated_at?: string;
   created_at?: string;
-};
-
-type DesktopSession = {
-  id: string;
-  status: string;
-  purpose?: string | null;
-  task_id?: string | null;
-  updated_at?: string;
 };
 
 type ComputerEvent = {
@@ -91,7 +84,6 @@ export default function ComputerLiveView() {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [session, setSession] = useState<ComputerSession | null>(null);
   const [events, setEvents] = useState<ComputerEvent[]>([]);
-  const [desktop, setDesktop] = useState<DesktopSession | null>(null);
   const [shot, setShot] = useState<string | null>(null);
   const [shotStatus, setShotStatus] = useState<string>("");
   const [view, setView] = useState<"screen" | "console">("screen");
@@ -122,12 +114,8 @@ export default function ComputerLiveView() {
       setEvents([]);
     }
 
-    // GUI desktop operator (true pixel stream).
-    const desks = await apiFetch("/desktop-sessions/").then(r => r.json()).catch(() => []) as DesktopSession[];
-    const liveDesk = desks.find(d => d.status === "active") || desks.find(d => d.status === "degraded") || desks[0] || null;
-    setDesktop(liveDesk);
-    if (liveDesk && liveDesk.status !== "revoked" && liveDesk.status !== "closed") {
-      const frame = await apiFetch(`/desktop-sessions/${liveDesk.id}/screenshot`).then(r => r.json()).catch(() => null) as { screenshot_data_url?: string | null; status?: string } | null;
+    if (active?.status === "active" && active.capabilities?.includes("desktop")) {
+      const frame = await apiFetch(`/computer-sessions/${active.id}/screenshot`).then(r => r.json()).catch(() => null) as { screenshot_data_url?: string | null; status?: string } | null;
       setShot(frame?.screenshot_data_url ?? null);
       setShotStatus(frame?.status ?? "");
     } else {
@@ -143,11 +131,11 @@ export default function ComputerLiveView() {
     return () => clearInterval(timer);
   }, [open, refresh]);
 
-  // Default to the live screen when a desktop session exists, else the console.
+  // Default to the live screen only for an authorized E2B desktop session.
   useEffect(() => {
-    if (desktop && desktop.status !== "revoked" && desktop.status !== "closed") setView("screen");
-    else if (!desktop) setView("console");
-  }, [desktop]);
+    if (session?.status === "active" && session.capabilities?.includes("desktop")) setView("screen");
+    else setView("console");
+  }, [session]);
 
   useEffect(() => {
     if (view === "console" && feedRef.current) feedRef.current.scrollTop = feedRef.current.scrollHeight;
@@ -155,46 +143,46 @@ export default function ComputerLiveView() {
 
   if (!open) return null;
 
-  const hasDesktop = !!desktop && desktop.status !== "revoked" && desktop.status !== "closed";
+  const hasDesktop = !!session && session.status === "active" && !!session.capabilities?.includes("desktop");
 
   return (
     <div className="fixed inset-0 z-[60] flex flex-col" style={{ background: "var(--bg)" }}>
-      <header className="flex items-center gap-3 px-5 h-[52px] border-b hairline">
+      <header className="flex min-h-[52px] flex-wrap items-center gap-2 border-b hairline px-3 py-2 sm:gap-3 sm:px-5">
         <div className="flex items-center gap-2 text-[14px] font-semibold">
-          <span style={{ color: statusColor(session?.status || desktop?.status) }}>●</span>
-          Virtual computer
+          <span style={{ color: statusColor(session?.status) }}>●</span>
+          Cloud computer
         </div>
-        <div className="text-[12.5px] truncate" style={{ color: "var(--text-dim)" }}>
-          {desktop?.purpose || session?.purpose || "Governed sandbox workspace"}
+        <div className="hidden min-w-0 flex-1 truncate text-[12.5px] sm:block" style={{ color: "var(--text-dim)" }}>
+          {session?.purpose || "Governed E2B desktop"}
         </div>
-        <div className="ml-auto flex items-center gap-2">
+        <div className="ml-auto flex items-center gap-1 sm:gap-2">
           <div className="flex rounded-lg border overflow-hidden" style={{ borderColor: "var(--border)" }}>
             <button className="px-3 py-1 text-[12.5px]" onClick={() => setView("screen")}
                     style={{ background: view === "screen" ? "var(--accent-soft)" : "transparent", color: view === "screen" ? "var(--accent)" : "var(--text-dim)" }}>Screen</button>
             <button className="px-3 py-1 text-[12.5px]" onClick={() => setView("console")}
                     style={{ background: view === "console" ? "var(--accent-soft)" : "transparent", color: view === "console" ? "var(--accent)" : "var(--text-dim)" }}>Console</button>
           </div>
-          <span className="text-[12px] rounded-full px-2.5 py-0.5 border" style={{ borderColor: "var(--border)", color: statusColor(session?.status || desktop?.status) }}>
-            {session?.status || desktop?.status || "no session"}
+          <span className="hidden rounded-full border px-2.5 py-0.5 text-[12px] sm:inline" style={{ borderColor: "var(--border)", color: statusColor(session?.status) }}>
+            {session?.status || "no session"}
           </span>
-          <button className="btn btn-ghost btn-sm" onClick={() => void refresh()}>Refresh</button>
-          <button className="btn btn-ghost btn-sm" onClick={() => setOpen(false)}>Close</button>
+          <button className="btn btn-ghost btn-sm" aria-label="Refresh computer view" onClick={() => void refresh()}>Refresh</button>
+          <button className="btn btn-ghost btn-sm" aria-label="Close computer view" onClick={() => setOpen(false)}>Close</button>
         </div>
       </header>
 
-      <div className="flex-1 min-h-0 flex">
+      <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
         <main className="flex-1 min-w-0 flex flex-col">
           {view === "screen" ? (
             <div className="flex-1 min-h-0 flex items-center justify-center p-4" style={{ background: "#000" }}>
               {shot ? (
-                // eslint-disable-next-line @next/next/no-img-element
+
                 <img src={shot} alt="Live desktop" className="max-w-full max-h-full object-contain rounded-md" style={{ boxShadow: "0 0 0 1px rgba(255,255,255,0.08)" }} />
               ) : (
                 <div className="text-center text-[13px] max-w-md" style={{ color: "rgba(255,255,255,.72)" }}>
                   {!hasDesktop
-                    ? "No desktop session is running. Chronos opens one when a task needs to operate a graphical app, and the live screen streams here."
+                    ? "This cloud session does not have an active desktop capability. Use Console for terminal and file activity."
                     : shotStatus === "degraded" || shotStatus === "unavailable"
-                      ? "This runtime has no virtual display, so there are no pixels to stream. Switch to Console to follow the sandbox commands and file activity."
+                      ? "The E2B desktop frame is unavailable. Switch to Console and retry from the Computer workspace."
                       : "Waiting for the next desktop frame…"}
                 </div>
               )}
@@ -217,11 +205,11 @@ export default function ComputerLiveView() {
           )}
         </main>
 
-        <aside className="w-[320px] flex-shrink-0 border-l hairline p-5 space-y-4 overflow-auto">
+        <aside className="w-full flex-shrink-0 space-y-4 overflow-auto border-t hairline p-4 lg:w-[320px] lg:border-l lg:border-t-0 lg:p-5">
           <div>
             <div className="text-[11px] uppercase tracking-wide mb-1" style={{ color: "var(--text-dim)" }}>Screen</div>
             <div className="text-[12.5px]" style={{ color: "var(--text-dim)" }}>
-              {hasDesktop ? `Desktop ${String(desktop?.status)}${shot ? " · streaming" : ""}` : "No desktop session"}
+              {hasDesktop ? `E2B desktop active${shot ? " · streaming" : ""}` : "No active desktop capability"}
             </div>
           </div>
           <div>
@@ -237,7 +225,7 @@ export default function ComputerLiveView() {
             <div className="rounded-md border px-2 py-1.5" style={{ borderColor: "var(--border)" }}>Artifacts exported</div>
           </div>
           <div className="text-[12px]" style={{ color: "var(--text-dim)" }}>
-            {session?.task_id ? `Task ${session.task_id.slice(0, 8)}` : desktop?.task_id ? `Task ${desktop.task_id.slice(0, 8)}` : "Standalone session"}
+            {session?.task_id ? `Task ${session.task_id.slice(0, 8)}` : "Standalone session"}
             {session?.updated_at ? ` · updated ${timeLabel(session.updated_at)}` : ""}
           </div>
         </aside>

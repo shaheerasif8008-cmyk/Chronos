@@ -32,13 +32,18 @@ test("chat: send a message, stream a reply, and persist it", async ({ page }) =>
         const msgs = await (
           await fetch(`${apiBase}/chat/conversations/${c.id}/messages`, { credentials: "include" })
         ).json();
-        const hasUser = msgs.some(
-          (m: any) => m.role === "user" && (m.content ?? "").includes(sentPrompt),
-        );
+        if (!Array.isArray(msgs)) continue;
+        const hasUser = msgs.some((message: unknown) => {
+          if (!message || typeof message !== "object") return false;
+          const candidate = message as { role?: unknown; content?: unknown };
+          return candidate.role === "user" && typeof candidate.content === "string" && candidate.content.includes(sentPrompt);
+        });
         if (!hasUser) continue;
-        const hasAssistant = msgs.some(
-          (m: any) => m.role === "assistant" && (m.content ?? "").trim().length > 0,
-        );
+        const hasAssistant = msgs.some((message: unknown) => {
+          if (!message || typeof message !== "object") return false;
+          const candidate = message as { role?: unknown; content?: unknown };
+          return candidate.role === "assistant" && typeof candidate.content === "string" && candidate.content.trim().length > 0;
+        });
         return hasAssistant;
       }
       return false;

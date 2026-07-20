@@ -5,6 +5,50 @@ resource "aws_vpc" "main" {
   tags                 = { Name = "${local.prefix}-vpc" }
 }
 
+resource "aws_cloudwatch_log_group" "vpc_flow" {
+  name              = "/aws/vpc/${local.prefix}/flow"
+  retention_in_days = var.application_log_retention_days
+}
+
+resource "aws_iam_role" "vpc_flow_logs" {
+  name = "${local.prefix}-vpc-flow-logs"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "vpc-flow-logs.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "vpc_flow_logs" {
+  name = "${local.prefix}-vpc-flow-logs"
+  role = aws_iam_role.vpc_flow_logs.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+        "logs:DescribeLogGroups",
+        "logs:DescribeLogStreams",
+      ]
+      Resource = "${aws_cloudwatch_log_group.vpc_flow.arn}:*"
+    }]
+  })
+}
+
+resource "aws_flow_log" "main" {
+  vpc_id                   = aws_vpc.main.id
+  traffic_type             = "ALL"
+  log_destination_type     = "cloud-watch-logs"
+  log_destination          = aws_cloudwatch_log_group.vpc_flow.arn
+  iam_role_arn             = aws_iam_role.vpc_flow_logs.arn
+  max_aggregation_interval = 60
+}
+
 # ── Public subnets (ALB only) ─────────────────────────────────────────────────
 resource "aws_subnet" "public" {
   count                   = length(var.availability_zones)
@@ -80,20 +124,52 @@ resource "aws_route_table_association" "private" {
 resource "aws_security_group" "alb" {
   name        = "${local.prefix}-alb-sg"
   vpc_id      = aws_vpc.main.id
-  description = "ALB: allow HTTP/HTTPS from the internet"
+  description = var.restore_rehearsal_mode ? "Internal restore rehearsal ALBs: restricted operator access only" : "ALB: allow HTTP/HTTPS from the internet"
 
-  ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+  dynamic "ingress" {
+    for_each = var.restore_rehearsal_mode ? [] : [80]
+    content {
+      description = "Public HTTP"
+      from_port   = 80
+      to_port     = 80
+      protocol    = "tcp"
+      cidr_blocks = ["0.0.0.0/0"]
+    }
   }
-  ingress {
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+
+  dynamic "ingress" {
+    for_each = var.restore_rehearsal_mode ? [] : [443]
+    content {
+      description = "Public HTTPS"
+      from_port   = 443
+      to_port     = 443
+      protocol    = "tcp"
+      cidr_blocks = ["0.0.0.0/0"]
+    }
   }
+
+  dynamic "ingress" {
+    for_each = var.restore_rehearsal_mode ? toset(var.restore_rehearsal_ingress_cidrs) : toset([])
+    content {
+      description = "Approved restore operator HTTP from ${ingress.value}"
+      from_port   = 80
+      to_port     = 80
+      protocol    = "tcp"
+      cidr_blocks = [ingress.value]
+    }
+  }
+
+  dynamic "ingress" {
+    for_each = var.restore_rehearsal_mode ? toset(var.restore_rehearsal_ingress_cidrs) : toset([])
+    content {
+      description = "Approved restore operator HTTPS from ${ingress.value}"
+      from_port   = 443
+      to_port     = 443
+      protocol    = "tcp"
+      cidr_blocks = [ingress.value]
+    }
+  }
+
   egress {
     from_port   = 0
     to_port     = 0
@@ -140,6 +216,19 @@ resource "aws_security_group" "web" {
   }
 }
 
+resource "aws_security_group" "worker" {
+  name        = "${local.prefix}-worker-sg"
+  vpc_id      = aws_vpc.main.id
+  description = "Connector workers: no inbound traffic, controlled outbound access"
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
 resource "aws_security_group" "rds" {
   name        = "${local.prefix}-rds-sg"
   vpc_id      = aws_vpc.main.id
@@ -151,9 +240,42 @@ resource "aws_security_group" "rds" {
     protocol  = "tcp"
     security_groups = [
       aws_security_group.api.id,
-      aws_security_group.openfga.id,
+      aws_security_group.worker.id,
     ]
   }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_security_group" "openfga_rds" {
+  name        = "${local.prefix}-openfga-rds-sg"
+  vpc_id      = aws_vpc.main.id
+  description = "Dedicated OpenFGA RDS: PostgreSQL only from OpenFGA tasks and its one-off migration"
+
+  ingress {
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [aws_security_group.openfga.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_security_group" "restore_test" {
+  name        = "${local.prefix}-restore-test-sg"
+  vpc_id      = aws_vpc.main.id
+  description = "Isolated AWS Backup restore-test databases; no inbound application access"
+
   egress {
     from_port   = 0
     to_port     = 0
@@ -171,7 +293,7 @@ resource "aws_security_group" "redis" {
     from_port       = 6379
     to_port         = 6379
     protocol        = "tcp"
-    security_groups = [aws_security_group.api.id]
+    security_groups = [aws_security_group.api.id, aws_security_group.worker.id]
   }
   egress {
     from_port   = 0
@@ -190,7 +312,7 @@ resource "aws_security_group" "openfga" {
     from_port       = 8080
     to_port         = 8080
     protocol        = "tcp"
-    security_groups = [aws_security_group.api.id]
+    security_groups = [aws_security_group.api.id, aws_security_group.worker.id]
   }
   egress {
     from_port   = 0

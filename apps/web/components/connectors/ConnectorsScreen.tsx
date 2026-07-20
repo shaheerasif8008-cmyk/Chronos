@@ -13,9 +13,10 @@
 // - Governance (execution logs, approvals, policies, traces) stays available
 //   as a secondary tab for admins.
 
-import { useCallback, useEffect, useState } from "react";
+import { type KeyboardEvent as ReactKeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
 import { apiFetch } from "../../lib/api";
 import ConnectorGovernanceScreen from "./ConnectorGovernanceScreen";
+import CustomIntegrationsPanel from "./CustomIntegrationsPanel";
 
 type ToolSpec = {
   name: string;
@@ -42,6 +43,14 @@ type CatalogApp = {
   connected: boolean;
   account_handle: string;
   health_status?: string;
+  health_reason?: string;
+  health_checked_at?: string | null;
+  health_verified_at?: string | null;
+  health_stale?: boolean;
+  health_error_code?: string | null;
+  provider_health_status?: string;
+  connection_health_status?: string | null;
+  health_latency_ms?: number | null;
   last_used_at?: string;
   tools: ToolSpec[];
 };
@@ -85,6 +94,7 @@ function AppIcon({ svg, name, size = 36 }: { svg: string; name: string; size?: n
       style={{ background: "var(--surface-2)", width: size, height: size, padding: size * 0.2 }}
       dangerouslySetInnerHTML={{ __html: svg }}
       title={name}
+      aria-hidden="true"
     />
   );
 }
@@ -92,6 +102,8 @@ function AppIcon({ svg, name, size = 36 }: { svg: string; name: string; size?: n
 function Banner({ kind, children, onDismiss }: { kind: "ok" | "error"; children: React.ReactNode; onDismiss: () => void }) {
   return (
     <div
+      role={kind === "error" ? "alert" : "status"}
+      aria-live={kind === "error" ? "assertive" : "polite"}
       className="mb-5 rounded-xl border border-soft px-4 py-3 text-[13px] flex items-start gap-3"
       style={{ color: kind === "ok" ? "var(--ok)" : "var(--danger)", background: "var(--surface-2)" }}
     >
@@ -106,6 +118,63 @@ function toolActionLabel(name: string) {
   return action.replaceAll("_", " ");
 }
 
+type HealthTone = "ok" | "warn" | "danger" | "info" | "neutral";
+
+function healthPresentation(app: CatalogApp): { label: string; tone: HealthTone; dot: string } {
+  const status = app.health_status || (app.connected ? "connected_unverified" : "not_connected");
+  if ((status === "verified" || status === "healthy") && !app.health_stale) {
+    return { label: "Verified", tone: "ok", dot: "var(--ok)" };
+  }
+  if (status === "stale" || (app.health_stale && app.connected)) {
+    return { label: "Verification stale", tone: "warn", dot: "var(--warn)" };
+  }
+  if (status === "connected_unverified") {
+    return { label: "Connected · not verified", tone: "warn", dot: "var(--warn)" };
+  }
+  if (status === "configured") {
+    return { label: "Setup configured", tone: "info", dot: "var(--info)" };
+  }
+  if (status === "degraded" || status === "rate_limited") {
+    return {
+      label: status === "rate_limited" ? "Rate limited" : "Degraded",
+      tone: "warn",
+      dot: "var(--warn)",
+    };
+  }
+  if (status === "error" || status === "unavailable") {
+    return {
+      label: status === "error" ? "Verification failed" : "Unavailable",
+      tone: "danger",
+      dot: "var(--danger)",
+    };
+  }
+  if (status === "demo" || status === "fixture") {
+    return {
+      label: status === "demo" ? "Demo only" : "Fixture only",
+      tone: "warn",
+      dot: "var(--warn)",
+    };
+  }
+  return { label: app.connected ? "Connected" : "Not connected", tone: "neutral", dot: "var(--text-faint)" };
+}
+
+function healthTagClass(tone: HealthTone): string {
+  return {
+    ok: "tag-ok",
+    warn: "tag-warn",
+    danger: "tag-danger",
+    info: "tag-info",
+    neutral: "",
+  }[tone];
+}
+
+function readableHealthTime(value?: string | null): string | null {
+  if (!value) return null;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed.toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+}
+
 function ToolPermissions({ app, onPermissionChange }: {
   app: CatalogApp;
   onPermissionChange: (tool: ToolSpec, permission: ToolSpec["permission"]) => Promise<void>;
@@ -115,6 +184,13 @@ function ToolPermissions({ app, onPermissionChange }: {
   const writeTools = app.tools.filter(t => t.access === "write");
 
   async function change(tool: ToolSpec, permission: ToolSpec["permission"]) {
+    if (
+      permission === "always_allow"
+      && tool.permission !== "always_allow"
+      && !window.confirm(
+        `Always allow ${toolActionLabel(tool.name)}? Chronos will run this tool without asking each time. Hard policy floors and audit logging still apply.`,
+      )
+    ) return;
     setSaving(tool.name);
     try {
       await onPermissionChange(tool, permission);
@@ -130,7 +206,7 @@ function ToolPermissions({ app, onPermissionChange }: {
         <div className="text-[11.5px] font-semibold uppercase tracking-wide mb-1.5" style={{ color: "var(--text-faint)" }}>{label}</div>
         <div className="divide-y" style={{ borderColor: "var(--border-soft)" }}>
           {tools.map(tool => (
-            <div key={tool.name} className="py-2 flex items-center gap-3">
+            <div key={tool.name} className="flex flex-col items-stretch gap-2 py-2 sm:flex-row sm:items-center sm:gap-3">
               <div className="min-w-0 flex-1">
                 <div className="text-[13px] font-medium capitalize">{toolActionLabel(tool.name)}</div>
                 <div className="text-[11.5px] truncate" style={{ color: "var(--text-dim)" }}>{tool.description}</div>
@@ -139,6 +215,7 @@ function ToolPermissions({ app, onPermissionChange }: {
                 <span className="tag tag-warn shrink-0" title="This action always requires human approval — it cannot be loosened.">Always requires approval</span>
               ) : (
                 <select
+                  aria-label={`${app.name} ${toolActionLabel(tool.name)} permission`}
                   className="surface border border-soft rounded-md px-2 py-1 text-[12px] outline-none shrink-0"
                   value={tool.permission}
                   disabled={saving === tool.name}
@@ -176,23 +253,35 @@ function ToolPermissions({ app, onPermissionChange }: {
   );
 }
 
-function ConnectorRow({ app, busy, onConnect, onDisconnect, onPermissionChange }: {
+function ConnectorRow({ app, busy, canManage, onConnect, onDisconnect, onPermissionChange }: {
   app: CatalogApp;
   busy: string | null;
+  canManage: boolean;
   onConnect: (app: CatalogApp) => void;
   onDisconnect: (app: CatalogApp) => void;
   onPermissionChange: (tool: ToolSpec, permission: ToolSpec["permission"]) => Promise<void>;
 }) {
   const [expanded, setExpanded] = useState(false);
+  const health = healthPresentation(app);
+  const checkedAt = readableHealthTime(app.health_checked_at);
+  const verifiedAt = readableHealthTime(app.health_verified_at);
 
   return (
     <div className="surface border border-soft rounded-xl px-4 py-3">
-      <div className="flex items-center gap-3.5 min-w-0">
+      <div className="flex flex-wrap sm:flex-nowrap items-center gap-3.5 min-w-0">
         <AppIcon svg={app.icon_svg} name={app.name} />
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2 min-w-0">
+        <div className="min-w-0 flex-1 basis-[220px]">
+          <div className="flex flex-wrap items-center gap-2 min-w-0">
             <span className="font-semibold text-[14px] truncate">{app.name}</span>
-            {app.connected && <span className="inline-block w-1.5 h-1.5 rounded-full shrink-0" style={{ background: "var(--ok, var(--accent))" }} />}
+            <span
+              className="inline-block w-1.5 h-1.5 rounded-full shrink-0"
+              style={{ background: health.dot }}
+              aria-hidden="true"
+              title={app.health_reason || health.label}
+            />
+            <span className={`tag ${healthTagClass(health.tone)} shrink-0`} title={app.health_reason || health.label} aria-live="polite">
+              {health.label}
+            </span>
             {app.auth_mode === "composio" && !app.connected && (
               <span className="tag tag-info shrink-0" title="Managed auth is configured — connecting is one click.">Managed auth</span>
             )}
@@ -200,11 +289,22 @@ function ConnectorRow({ app, busy, onConnect, onDisconnect, onPermissionChange }
           <div className="text-[12.5px] truncate" style={{ color: "var(--text-dim)" }}>
             {app.connected && app.account_handle ? app.account_handle : app.description}
           </div>
+          {app.health_reason && (
+            <div className="text-[11.5px] mt-1" style={{ color: "var(--text-muted)" }}>
+              {app.health_reason}
+            </div>
+          )}
+          {(checkedAt || verifiedAt) && (
+            <div className="text-[11px] mt-1 font-mono" style={{ color: "var(--text-faint)" }}>
+              {verifiedAt ? `Verified ${verifiedAt}` : `Checked ${checkedAt}`}
+              {app.health_latency_ms != null ? ` · ${app.health_latency_ms} ms` : ""}
+            </div>
+          )}
         </div>
-        <div className="flex items-center gap-2 shrink-0">
-          {app.connected ? (
+        <div className="flex items-center gap-2 shrink-0 ml-auto">
+          {app.connected && canManage ? (
             <>
-              <button className="btn btn-ghost btn-sm" onClick={() => setExpanded(v => !v)}>
+              <button className="btn btn-ghost btn-sm" aria-expanded={expanded} aria-controls={`connector-tools-${app.id}`} onClick={() => setExpanded(v => !v)}>
                 {expanded ? "Close" : "Configure"}
               </button>
               <button
@@ -215,7 +315,7 @@ function ConnectorRow({ app, busy, onConnect, onDisconnect, onPermissionChange }
                 {busy === app.id ? "Disconnecting…" : "Disconnect"}
               </button>
             </>
-          ) : (
+          ) : !app.connected && canManage ? (
             <>
               {!app.configured && (
                 <span
@@ -227,17 +327,18 @@ function ConnectorRow({ app, busy, onConnect, onDisconnect, onPermissionChange }
               )}
               <button
                 className="btn btn-accent btn-sm disabled:opacity-50"
-                disabled={busy === app.id}
+                disabled={busy === app.id || !app.configured}
+                title={!app.configured ? "Configure provider credentials before connecting an account." : undefined}
                 onClick={() => onConnect(app)}
               >
                 {busy === app.id ? "Redirecting…" : "Connect"}
               </button>
             </>
-          )}
+          ) : null}
         </div>
       </div>
       {expanded && app.connected && (
-        <ToolPermissions app={app} onPermissionChange={onPermissionChange} />
+        <div id={`connector-tools-${app.id}`}><ToolPermissions app={app} onPermissionChange={onPermissionChange} /></div>
       )}
     </div>
   );
@@ -248,6 +349,39 @@ function AddCustomConnectorModal({ onClose, onAdded }: { onClose: () => void; on
   const [url, setUrl] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(
+    typeof document !== "undefined" && document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null,
+  );
+
+  useEffect(() => {
+    const previousFocus = previousFocusRef.current;
+    return () => previousFocus?.focus();
+  }, []);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !busy) onClose();
+      if (event.key === "Tab" && dialogRef.current) {
+        const focusable = [...dialogRef.current.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])')]
+          .filter(element => element.offsetParent !== null);
+        if (!focusable.length) return;
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first.focus();
+        }
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [busy, onClose]);
 
   async function submit() {
     if (!name.trim() || !url.trim()) return;
@@ -273,25 +407,25 @@ function AddCustomConnectorModal({ onClose, onAdded }: { onClose: () => void; on
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-6" style={{ background: "rgba(0,0,0,0.45)" }} onClick={onClose}>
-      <div className="surface border border-soft rounded-2xl w-full max-w-md p-6" onClick={e => e.stopPropagation()}>
-        <div className="text-[16px] font-semibold">Add custom connector</div>
-        <p className="mt-1 text-[12.5px]" style={{ color: "var(--text-dim)" }}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6" style={{ background: "rgba(0,0,0,0.45)" }} onClick={() => { if (!busy) onClose(); }}>
+      <div ref={dialogRef} tabIndex={-1} className="surface border border-soft max-h-[calc(100dvh-24px)] w-full max-w-md overflow-y-auto rounded-2xl p-4 sm:p-6" onClick={e => e.stopPropagation()} role="dialog" aria-modal="true" aria-labelledby="add-connector-title" aria-describedby="add-connector-description">
+        <div id="add-connector-title" className="text-[16px] font-semibold">Add custom connector</div>
+        <p id="add-connector-description" className="mt-1 text-[12.5px]" style={{ color: "var(--text-dim)" }}>
           Connect a remote MCP server. Chronos discovers its tools and makes them available in chats and tasks;
           risky tool calls stay approval-gated by policy.
         </p>
         <div className="mt-4 space-y-3">
           <div>
-            <label className="text-[12px] font-medium block mb-1">Name</label>
-            <input value={name} onChange={e => setName(e.target.value)} placeholder="e.g. Internal knowledge base"
+            <label htmlFor="custom-connector-name" className="text-[12px] font-medium block mb-1">Name</label>
+            <input id="custom-connector-name" autoFocus value={name} onChange={e => setName(e.target.value)} placeholder="e.g. Internal knowledge base"
                    className="w-full surface border border-soft rounded-md px-3 py-2 text-[13px] outline-none" />
           </div>
           <div>
-            <label className="text-[12px] font-medium block mb-1">Remote MCP server URL</label>
-            <input value={url} onChange={e => setUrl(e.target.value)} placeholder="https://mcp.example.com/sse"
+            <label htmlFor="custom-connector-url" className="text-[12px] font-medium block mb-1">Remote MCP server URL</label>
+            <input id="custom-connector-url" type="url" inputMode="url" autoCapitalize="none" autoCorrect="off" value={url} onChange={e => setUrl(e.target.value)} placeholder="https://mcp.example.com/sse"
                    className="w-full surface border border-soft rounded-md px-3 py-2 text-[13px] outline-none" />
           </div>
-          {error && <div className="text-[12.5px]" style={{ color: "var(--danger)" }}>{error}</div>}
+          {error && <div role="alert" className="text-[12.5px]" style={{ color: "var(--danger)" }}>{error}</div>}
         </div>
         <div className="mt-5 flex justify-end gap-2">
           <button className="btn btn-ghost btn-sm" onClick={onClose}>Cancel</button>
@@ -304,21 +438,30 @@ function AddCustomConnectorModal({ onClose, onAdded }: { onClose: () => void; on
   );
 }
 
-export default function ConnectorsScreen() {
+export default function ConnectorsScreen({ memberRole }: { memberRole: string }) {
+  const canManage = memberRole === "admin" || memberRole === "owner";
   const [view, setView] = useState<"connectors" | "governance">("connectors");
   const [apps, setApps] = useState<CatalogApp[]>([]);
   const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [showAddModal, setShowAddModal] = useState(false);
+  const addConnectorTriggerRef = useRef<HTMLButtonElement>(null);
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  const closeAddConnectorModal = useCallback(() => {
+    setShowAddModal(false);
+    window.requestAnimationFrame(() => addConnectorTriggerRef.current?.focus());
+  }, []);
+
+  const load = useCallback(async (refreshHealth = false) => {
+    if (refreshHealth) setRefreshing(true);
+    else setLoading(true);
     try {
       const [catalog, mcp] = await Promise.all([
-        apiFetch("/connectors/catalog").then(r => r.json()) as Promise<CatalogApp[]>,
+        apiFetch(`/connectors/catalog${refreshHealth ? "?refresh_health=true" : ""}`).then(r => r.json()) as Promise<CatalogApp[]>,
         apiFetch("/connectors/mcp").then(r => r.json()).catch(() => ({ servers: [] })) as Promise<{ servers: McpServer[] }>,
       ]);
       setApps(catalog);
@@ -327,6 +470,7 @@ export default function ConnectorsScreen() {
       setError(errorMessage(err, "Could not load connectors"));
     } finally {
       setLoading(false);
+      setRefreshing(false);
     }
   }, []);
 
@@ -403,25 +547,47 @@ export default function ConnectorsScreen() {
 
   const connected = apps.filter(a => a.connected);
   const directory = apps.filter(a => !a.connected && a.auth_type === "oauth2");
-  const advanced = apps.filter(a => !a.connected && a.auth_type !== "oauth2" && !["remote_mcp"].includes(a.id));
+  const advanced = apps.filter(a => !a.connected && a.auth_type !== "oauth2" && !["remote_mcp", "webhooks", "custom_http"].includes(a.id));
+
+  function handleViewTabKeyDown(event: ReactKeyboardEvent<HTMLDivElement>) {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    const tabs = [...event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]')];
+    if (tabs.length === 0) return;
+    event.preventDefault();
+    const current = tabs.indexOf(document.activeElement as HTMLButtonElement);
+    const next = event.key === "Home"
+      ? tabs[0]
+      : event.key === "End"
+        ? tabs[tabs.length - 1]
+        : event.key === "ArrowRight"
+          ? tabs[(current + 1 + tabs.length) % tabs.length]
+          : tabs[(current - 1 + tabs.length) % tabs.length];
+    next.focus();
+    next.click();
+  }
 
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-y-auto">
-      <header className="glass sticky top-0 z-20 px-10 pt-9 pb-6 flex items-start justify-between gap-6 flex-shrink-0 border-b hairline">
+      <header className="glass sticky top-0 z-20 px-4 sm:px-6 lg:px-10 pt-7 lg:pt-9 pb-5 lg:pb-6 flex flex-wrap items-start justify-between gap-4 lg:gap-6 flex-shrink-0 border-b hairline">
         <div className="min-w-0">
           <h1 className="h-page tracking-tight">Connectors</h1>
           <p className="mt-1.5 text-[14px]" style={{ color: "var(--text-dim)" }}>
             Connect Chronos to your tools and data sources. Connected apps become tools the model can use — governed, audited, and approval-gated.
           </p>
         </div>
-        <div className="flex items-center gap-2 flex-shrink-0">
-          <button className="btn btn-accent btn-sm" onClick={() => setShowAddModal(true)}>Add custom connector</button>
+        <div className="flex flex-wrap items-center gap-2 flex-shrink-0">
+          <button className="btn btn-ghost btn-sm" disabled={loading || refreshing} aria-busy={refreshing} onClick={() => void load(true)}>
+            {refreshing ? "Verifying…" : "Refresh status"}
+          </button>
+          {canManage && (
+            <button ref={addConnectorTriggerRef} className="btn btn-accent btn-sm" onClick={() => setShowAddModal(true)}>Add custom connector</button>
+          )}
         </div>
       </header>
 
-      <div className="px-10 pt-4 pb-2 flex items-center gap-1">
-        {([["connectors", "Connectors"], ["governance", "Governance"]] as const).map(([id, label]) => (
-          <button key={id} onClick={() => setView(id)}
+      <div role="tablist" aria-label="Connector views" onKeyDown={handleViewTabKeyDown} className="px-4 sm:px-6 lg:px-10 pt-4 pb-2 flex items-center gap-1">
+        {([["connectors", "Connectors"], ...(canManage ? [["governance", "Governance"]] as const : [])] as const).map(([id, label]) => (
+          <button key={id} id={`connectors-tab-${id}`} role="tab" aria-selected={view === id} aria-controls={`connectors-panel-${id}`} tabIndex={view === id ? 0 : -1} onClick={() => setView(id)}
                   className="px-3 py-1.5 rounded-md text-[13px] font-medium smooth"
                   style={{ background: view === id ? "var(--surface-2)" : "transparent", color: view === id ? "var(--text)" : "var(--text-muted)" }}>
             {label}
@@ -429,17 +595,17 @@ export default function ConnectorsScreen() {
         ))}
       </div>
 
-      {view === "governance" && (
-        <div className="px-10 pb-10 pt-2"><ConnectorGovernanceScreen /></div>
+      {view === "governance" && canManage && (
+        <div id="connectors-panel-governance" role="tabpanel" aria-labelledby="connectors-tab-governance" tabIndex={0} className="px-4 sm:px-6 lg:px-10 pb-10 pt-2"><ConnectorGovernanceScreen /></div>
       )}
 
       {view === "connectors" && (
-        <div className="px-10 pb-12 pt-2 max-w-[860px]">
+        <div id="connectors-panel-connectors" role="tabpanel" aria-labelledby="connectors-tab-connectors" tabIndex={0} className="px-4 sm:px-6 lg:px-10 pb-12 pt-2 max-w-[860px]">
           {notice && <Banner kind="ok" onDismiss={() => setNotice("")}>{notice}</Banner>}
           {error && <Banner kind="error" onDismiss={() => setError("")}>{error}</Banner>}
 
           {loading && (
-            <div className="space-y-3">
+            <div role="status" aria-label="Loading connectors" className="space-y-3">
               {[1, 2, 3, 4].map(i => <div key={i} className="surface border border-soft rounded-xl h-16 animate-pulse" />)}
             </div>
           )}
@@ -451,7 +617,7 @@ export default function ConnectorsScreen() {
                   <h2 className="text-[13px] font-semibold uppercase tracking-wide mb-3" style={{ color: "var(--text-faint)" }}>Connected</h2>
                   <div className="space-y-2.5">
                     {connected.map(app => (
-                      <ConnectorRow key={app.id} app={app} busy={busy}
+                      <ConnectorRow key={app.id} app={app} busy={busy} canManage={canManage}
                                     onConnect={connect} onDisconnect={disconnect}
                                     onPermissionChange={setPermission} />
                     ))}
@@ -464,23 +630,25 @@ export default function ConnectorsScreen() {
                   <h2 className="text-[13px] font-semibold uppercase tracking-wide mb-3" style={{ color: "var(--text-faint)" }}>Custom connectors</h2>
                   <div className="space-y-2.5">
                     {mcpServers.map(server => (
-                      <div key={server.id} className="surface border border-soft rounded-xl px-4 py-3 flex items-center gap-3.5">
-                        <div className="rounded-xl flex items-center justify-center shrink-0 border border-soft" style={{ background: "var(--surface-2)", width: 36, height: 36 }}>
-                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M5 8h14M5 16h14M8 5v14M16 5v14"/></svg>
-                        </div>
+                      <div key={server.id} className="surface border border-soft rounded-xl px-4 py-3 flex flex-wrap items-center gap-3.5 sm:flex-nowrap">
+                        <span className="tag shrink-0" aria-hidden="true">MCP</span>
                         <div className="min-w-0 flex-1">
                           <div className="font-semibold text-[14px] truncate">{server.name}</div>
                           <div className="text-[12.5px] truncate" style={{ color: "var(--text-dim)" }}>{server.server_url || server.command}</div>
                         </div>
                         <span className="tag shrink-0">{server.transport}</span>
-                        <button className="btn btn-ghost btn-sm shrink-0" disabled={busy === server.id} onClick={() => void rediscover(server)}>
-                          {busy === server.id ? "Refreshing…" : "Refresh tools"}
-                        </button>
+                        {canManage && (
+                          <button className="btn btn-ghost btn-sm shrink-0" disabled={busy === server.id} onClick={() => void rediscover(server)}>
+                            {busy === server.id ? "Refreshing…" : "Refresh tools"}
+                          </button>
+                        )}
                       </div>
                     ))}
                   </div>
                 </section>
               )}
+
+              {canManage && <CustomIntegrationsPanel />}
 
               <section className="mb-8">
                 <h2 className="text-[13px] font-semibold uppercase tracking-wide mb-3" style={{ color: "var(--text-faint)" }}>Browse connectors</h2>
@@ -489,7 +657,7 @@ export default function ConnectorsScreen() {
                 ) : (
                   <div className="space-y-2.5">
                     {directory.map(app => (
-                      <ConnectorRow key={app.id} app={app} busy={busy}
+                      <ConnectorRow key={app.id} app={app} busy={busy} canManage={canManage}
                                     onConnect={connect} onDisconnect={disconnect}
                                     onPermissionChange={setPermission} />
                     ))}
@@ -502,16 +670,13 @@ export default function ConnectorsScreen() {
                   <h2 className="text-[13px] font-semibold uppercase tracking-wide mb-3" style={{ color: "var(--text-faint)" }}>Advanced integrations</h2>
                   <div className="space-y-2.5">
                     {advanced.map(app => (
-                      <div key={app.id} className="surface border border-soft rounded-xl px-4 py-3 flex items-center gap-3.5">
+                      <div key={app.id} className="surface border border-soft rounded-xl px-4 py-3 flex flex-wrap items-center gap-3.5 sm:flex-nowrap">
                         <AppIcon svg={app.icon_svg} name={app.name} />
                         <div className="min-w-0 flex-1">
                           <div className="font-semibold text-[14px] truncate">{app.name}</div>
                           <div className="text-[12.5px] truncate" style={{ color: "var(--text-dim)" }}>{app.description}</div>
                         </div>
                         <span className="tag shrink-0" title={app.policy}>{app.auth_type}</span>
-                        {app.id === "webhooks" || app.id === "custom_http" ? (
-                          <span className="text-[12px] shrink-0" style={{ color: "var(--text-dim)" }}>Configured via environment</span>
-                        ) : null}
                       </div>
                     ))}
                   </div>
@@ -528,7 +693,7 @@ export default function ConnectorsScreen() {
         </div>
       )}
 
-      {showAddModal && <AddCustomConnectorModal onClose={() => setShowAddModal(false)} onAdded={load} />}
+      {showAddModal && canManage && <AddCustomConnectorModal onClose={closeAddConnectorModal} onAdded={load} />}
     </div>
   );
 }

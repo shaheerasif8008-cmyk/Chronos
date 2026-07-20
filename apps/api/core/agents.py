@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import secrets
 from typing import Any
 
 from fastapi import HTTPException
@@ -248,26 +247,11 @@ def _row_dict(row: Any) -> dict[str, Any]:
 async def _require_project_access(member: Member, project_ids: list[str]) -> None:
     if not project_ids:
         return
-    projects = await reflect_table("projects")
-    project_members = await reflect_table("project_members")
-    async with engine.begin() as conn:
-        rows = (
-            await conn.execute(
-                select(project_members.c.project_id)
-                .join(projects, projects.c.id == project_members.c.project_id)
-                .where(
-                    project_members.c.member_id == member.id,
-                    project_members.c.organization_id == member.organization_id,
-                    projects.c.organization_id == member.organization_id,
-                    project_members.c.project_id.in_(project_ids),
-                )
-            )
-        ).all()
-    allowed = {str(row[0]) for row in rows}
-    missing = set(project_ids) - allowed
-    if missing:
-        raise HTTPException(status_code=404, detail="Project not found")
+    from core.project_access import member_can_edit_project
+
     for project_id in project_ids:
+        if not await member_can_edit_project(member, project_id):
+            raise HTTPException(status_code=404, detail="Project not found")
         await permissions.check(member, "view_project", project_id)
 
 
@@ -391,6 +375,7 @@ async def get_profile(member: Member, agent_id: str) -> dict[str, Any]:
 
 
 async def patch_profile(member: Member, agent_id: str, data: dict[str, Any]) -> dict[str, Any]:
+    await permissions.check(member, "update_agent", agent_id)
     await get_profile(member, agent_id)
     patch = {key: value for key, value in data.items() if value is not None}
     if "profile_kind" in patch:
@@ -425,6 +410,7 @@ async def patch_profile(member: Member, agent_id: str, data: dict[str, Any]) -> 
 
 
 async def delete_profile(member: Member, agent_id: str) -> dict[str, Any]:
+    await permissions.check(member, "delete_agent", agent_id)
     await get_profile(member, agent_id)
     profiles = await reflect_table("agent_profiles")
     async with engine.begin() as conn:
@@ -440,61 +426,21 @@ async def delete_profile(member: Member, agent_id: str) -> dict[str, Any]:
 
 async def publish_agent(member: Member, agent_id: str, data: dict[str, Any]) -> dict[str, Any]:
     agent = await get_profile(member, agent_id)
-    await permissions.check(member, "publish_agent", agent_id)
-    target = str(data.get("target") or "").lower()
-    if target not in PUBLISH_TARGETS:
-        raise HTTPException(status_code=422, detail="Unsupported publish target")
-    publications = await reflect_table("agent_publications")
-    token = secrets.token_urlsafe(32)
-    values = {
-        "organization_id": member.organization_id,
-        "region": settings.region,
-        "agent_profile_id": agent_id,
-        "target": target,
-        "display_name": data.get("display_name") or agent["name"],
-        "external_channel_id": data.get("external_channel_id"),
-        "config": _json_dict(data.get("config")),
-        "approval_policy": agent.get("approval_policy") or {},
-        "inbound_token": token,
-        "status": "active",
-        "created_by": member.id,
-    }
-    async with engine.begin() as conn:
-        row = (
-            await conn.execute(insert(publications).values(**values).returning(publications))
-        ).mappings().first()
-    publication = _row_dict(row)
+    from core import agent_publications
+
+    publication = await agent_publications.create_publication(member, agent, data)
     await _event(
         agent_id=agent_id,
         organization_id=member.organization_id,
         publication_id=publication["id"],
         event_type="agent_published",
-        payload={"target": target, "external_channel_id": values["external_channel_id"]},
+        payload={"target": publication["target"], "external_channel_id": publication.get("external_channel_id")},
     )
-    await audit.log("agent_published", member.id, "agents.publish", organization_id=member.organization_id, resource_type="agent_publication", resource_id=publication["id"], payload={"agent_id": agent_id, "target": target})
     return publication
 
 
 async def get_publication(publication_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    publications = await reflect_table("agent_publications")
-    profiles = await reflect_table("agent_profiles")
-    async with engine.begin() as conn:
-        publication = (
-            await conn.execute(
-                select(publications).where(publications.c.id == publication_id, publications.c.status == "active")
-            )
-        ).mappings().first()
-        if publication is None:
-            raise HTTPException(status_code=404, detail="Publication not found")
-        agent = (
-            await conn.execute(
-                select(profiles).where(
-                    profiles.c.id == publication["agent_profile_id"],
-                    profiles.c.organization_id == publication["organization_id"],
-                    profiles.c.status == "active",
-                )
-            )
-        ).mappings().first()
-    if agent is None:
-        raise HTTPException(status_code=404, detail="Agent not found")
+    from core import agent_publications
+
+    publication, agent = await agent_publications.require_active(publication_id)
     return _row_dict(publication), _row_dict(agent)

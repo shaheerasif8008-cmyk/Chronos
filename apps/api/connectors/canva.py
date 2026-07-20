@@ -35,12 +35,17 @@ class CanvaConnector:
     async def execute(self, tool: str, args: dict[str, Any]) -> ToolResult:
         tier = args.pop("__connector_tier", "live")
         org_id = str(args.pop("__org_id", settings.org_id) or settings.org_id)
+        member_id = str(args.pop("__member_id", "") or "") or None
         args.pop("__task_id", None)
         args.pop("__idempotency_key", None)
         action = tool.split(".", 1)[1] if "." in tool else tool
 
         # demo_mode forces local demo behaviour regardless of connection state.
-        vault_ref = None if tier == "demo" else await self._connection_vault_ref(org_id)
+        vault_ref = (
+            None
+            if tier == "demo"
+            else await self._connection_vault_ref(org_id, member_id)
+        )
         if not vault_ref:
             return ToolResult(
                 data={"connected": False, "tool": tool},
@@ -176,8 +181,12 @@ class CanvaConnector:
 
         return await call(vault_ref, method, endpoint, params=params, body=body)
 
-    async def _connection_vault_ref(self, org_id: str) -> str | None:
+    async def _connection_vault_ref(
+        self, org_id: str, member_id: str | None
+    ) -> str | None:
         try:
+            from core.connector_tools import member_connector_clause
+
             connectors = await reflect_table("connectors")
             async with engine.begin() as conn:
                 row = (
@@ -186,6 +195,7 @@ class CanvaConnector:
                             connectors.c.organization_id == org_id,
                             connectors.c.provider == "canva",
                             connectors.c.status == "active",
+                            member_connector_clause(connectors, org_id, member_id),
                         ).limit(1)
                     )
                 ).first()

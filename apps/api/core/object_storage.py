@@ -52,6 +52,19 @@ def ensure_bucket_sync(client=None) -> None:
         client.create_bucket(**_create_bucket_kwargs())
 
 
+def check_bucket_sync(client=None) -> None:
+    """Verify bucket access without mutating infrastructure.
+
+    Operator health checks must not turn a missing bucket, denied task role, or
+    transient provider error into an attempted CreateBucket request. Production
+    buckets are Terraform-owned; creation remains confined to explicit setup and
+    write paths through :func:`ensure_bucket_sync`.
+    """
+
+    client = client or s3_client()
+    client.head_bucket(Bucket=settings.object_storage_bucket)
+
+
 def put_object_sync(key: str, body: bytes, content_type: str, client=None) -> None:
     client = client or s3_client()
     ensure_bucket_sync(client)
@@ -69,8 +82,23 @@ def get_object_sync(key: str, client=None) -> bytes:
     return response["Body"].read()
 
 
+def delete_object_sync(key: str, client=None) -> None:
+    """Delete one object idempotently.
+
+    S3's DeleteObject operation succeeds when a key is already absent, which is
+    important for retrying a retention run after a partial failure.
+    """
+
+    client = client or s3_client()
+    client.delete_object(Bucket=settings.object_storage_bucket, Key=key)
+
+
 async def ensure_bucket() -> None:
     await asyncio.to_thread(ensure_bucket_sync)
+
+
+async def check_bucket() -> None:
+    await asyncio.to_thread(check_bucket_sync)
 
 
 async def put_object(key: str, body: bytes, content_type: str) -> None:
@@ -79,3 +107,7 @@ async def put_object(key: str, body: bytes, content_type: str) -> None:
 
 async def get_object(key: str) -> bytes:
     return await asyncio.to_thread(get_object_sync, key)
+
+
+async def delete_object(key: str) -> None:
+    await asyncio.to_thread(delete_object_sync, key)

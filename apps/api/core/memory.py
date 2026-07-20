@@ -1,5 +1,6 @@
 from __future__ import annotations
 from datetime import datetime, timezone
+import hashlib
 import json
 import re
 from typing import Any
@@ -11,8 +12,16 @@ from core.config import settings
 from core.db import engine, reflect_table
 from core.embeddings import embed
 from core.llm import complete_json
+from core.memory_access import can_access_scope
 from core.memory_writes import EXPECTED_EMBEDDING_DIMENSIONS
-from core.models import MemoryEntry, RequesterContext
+from core.models import Member, MemoryEntry, RequesterContext
+
+
+def _query_audit_payload(query: str) -> dict[str, Any]:
+    return {
+        "query_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest(),
+        "query_length": len(query),
+    }
 
 
 async def _retrieve_recent_memories(
@@ -20,7 +29,10 @@ async def _retrieve_recent_memories(
     *,
     decision: str,
 ) -> list[MemoryEntry]:
-    scope_filter, scope_params = _authorized_scope_sql(requester_context)
+    authorized_pairs = await _validated_scope_pairs(requester_context)
+    scope_filter, scope_params = _authorized_scope_sql(
+        requester_context, authorized_pairs=authorized_pairs
+    )
     async with engine.begin() as conn:
         rows = (
             await conn.execute(
@@ -32,7 +44,9 @@ async def _retrieve_recent_memories(
                     WHERE organization_id = :org_id
                       AND is_deleted = FALSE
                       AND is_archived = FALSE
+                      AND is_sensitive = FALSE
                       AND superseded_by IS NULL
+                      AND source <> 'synthesized'
                       AND ({scope_filter})
                     ORDER BY created_at DESC
                     LIMIT 10
@@ -54,17 +68,79 @@ async def _retrieve_recent_memories(
 
 
 def _authorized_scope_pairs(requester_context: RequesterContext) -> list[tuple[str, str]]:
+    """Return requested scope pairs before durable-resource validation.
+
+    Callers must use ``_validated_scope_pairs`` before these pairs reach a
+    database query. This synchronous helper remains useful for displaying and
+    testing the canonical organization/workspace/private mapping.
+    """
     pairs = [("org", requester_context.org_id)]
-    if requester_context.workspace_id:
-        pairs.append(("workspace", requester_context.workspace_id))
+    # The current durable workspace is the organization workspace. Never trust
+    # an arbitrary client-supplied workspace id as a read capability.
+    pairs.append(("workspace", requester_context.org_id))
+    if requester_context.project_id:
+        pairs.append(("project", requester_context.project_id))
     if requester_context.persona_id:
         pairs.append(("persona", requester_context.persona_id))
+    if requester_context.task_id:
+        pairs.append(("task", requester_context.task_id))
+    if requester_context.conversation_id:
+        pairs.append(("conversation", requester_context.conversation_id))
     if requester_context.member_id:
         pairs.append(("personal", requester_context.member_id))
         pairs.append(("restricted", requester_context.member_id))
     if requester_context.role in {"owner", "admin"}:
         pairs.append(("restricted", requester_context.org_id))
     return pairs
+
+
+async def _validated_scope_pairs(
+    requester_context: RequesterContext,
+) -> list[tuple[str, str]]:
+    """Prove every DB-backed scope in a requester context, failing closed.
+
+    RequesterContext values ultimately originate in API/task payloads. An ID is
+    not an authorization capability: project membership, task ownership, and
+    persona existence are checked before a corresponding memory scope is added.
+    """
+    member = Member(
+        id=requester_context.member_id,
+        organization_id=requester_context.org_id,
+        email="memory-requester@chronos.invalid",
+        role=requester_context.role,
+    )
+    validated: list[tuple[str, str]] = [
+        ("org", requester_context.org_id),
+        ("workspace", requester_context.org_id),
+    ]
+    if requester_context.member_id:
+        validated.extend(
+            [
+                ("personal", requester_context.member_id),
+                ("restricted", requester_context.member_id),
+            ]
+        )
+    if requester_context.role in {"owner", "admin"}:
+        validated.append(("restricted", requester_context.org_id))
+
+    candidates = (
+        ("project", requester_context.project_id),
+        ("persona", requester_context.persona_id),
+        ("task", requester_context.task_id),
+        ("conversation", requester_context.conversation_id),
+    )
+    for scope, scope_id in candidates:
+        if not scope_id:
+            continue
+        try:
+            allowed = await can_access_scope(member, scope, str(scope_id))
+        except Exception:
+            # Missing/partially migrated tables must narrow access, never turn a
+            # payload-provided id into an authorization capability.
+            allowed = False
+        if allowed:
+            validated.append((scope, str(scope_id)))
+    return validated
 
 
 async def expand_query(query: str, requester_context: RequesterContext) -> list[str]:
@@ -113,10 +189,17 @@ def _fallback_query_variants(query: str) -> list[str]:
     return variants
 
 
-def _authorized_scope_sql(requester_context: RequesterContext) -> tuple[str, dict[str, str]]:
+def _authorized_scope_sql(
+    requester_context: RequesterContext,
+    *,
+    authorized_pairs: list[tuple[str, str]] | None = None,
+) -> tuple[str, dict[str, str]]:
     clauses = []
     params: dict[str, str] = {}
-    for index, (scope, scope_id) in enumerate(_authorized_scope_pairs(requester_context)):
+    if authorized_pairs is None:
+        raise ValueError("validated memory scope pairs are required")
+    pairs = authorized_pairs
+    for index, (scope, scope_id) in enumerate(pairs):
         scope_key = f"scope_{index}"
         scope_id_key = f"scope_id_{index}"
         clauses.append(f"(scope = :{scope_key} AND scope_id = :{scope_id_key})")
@@ -200,8 +283,13 @@ def _memory_entry_payload(row: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in row.items() if key in MemoryEntry.model_fields}
 
 
-async def _retrieve_task_scratchpad(requester_context: RequesterContext) -> list[MemoryEntry]:
+async def _retrieve_task_scratchpad(
+    requester_context: RequesterContext,
+) -> list[MemoryEntry]:
     if not requester_context.task_id:
+        return []
+    authorized_pairs = await _validated_scope_pairs(requester_context)
+    if ("task", str(requester_context.task_id)) not in authorized_pairs:
         return []
     try:
         tasks = await reflect_table("tasks")
@@ -209,7 +297,12 @@ async def _retrieve_task_scratchpad(requester_context: RequesterContext) -> list
         return []
     async with engine.begin() as conn:
         row = (
-            await conn.execute(select(tasks.c.agent_state).where(tasks.c.id == requester_context.task_id))
+            await conn.execute(
+                select(tasks.c.agent_state).where(
+                    tasks.c.id == requester_context.task_id,
+                    tasks.c.organization_id == requester_context.org_id,
+                )
+            )
         ).mappings().first()
     if not row:
         return []
@@ -250,10 +343,29 @@ async def add_task_scratchpad_memory(
     Scratchpad memory is intentionally ephemeral to the task and is retrieved
     before long-term memory when RequesterContext.task_id is set.
     """
+    if requester_context.task_id != task_id:
+        return
+    member = Member(
+        id=requester_context.member_id,
+        organization_id=requester_context.org_id,
+        email="memory-requester@chronos.invalid",
+        role=requester_context.role,
+    )
+    if not await can_access_scope(member, "task", task_id):
+        return
     tasks = await reflect_table("tasks")
     now = datetime.now(timezone.utc).isoformat()
     async with engine.begin() as conn:
-        row = (await conn.execute(select(tasks.c.agent_state).where(tasks.c.id == task_id))).mappings().first()
+        row = (
+            await conn.execute(
+                select(tasks.c.agent_state).where(
+                    tasks.c.id == task_id,
+                    tasks.c.organization_id == requester_context.org_id,
+                )
+            )
+        ).mappings().first()
+        if row is None:
+            return
         state = dict(row.get("agent_state") or {}) if row else {}
         scratchpad = list(state.get("memory_scratchpad") or [])
         scratchpad.append(
@@ -266,7 +378,14 @@ async def add_task_scratchpad_memory(
             }
         )
         state["memory_scratchpad"] = scratchpad[-50:]
-        await conn.execute(update(tasks).where(tasks.c.id == task_id).values(agent_state=state))
+        await conn.execute(
+            update(tasks)
+            .where(
+                tasks.c.id == task_id,
+                tasks.c.organization_id == requester_context.org_id,
+            )
+            .values(agent_state=state)
+        )
     await audit.log(
         "memory_scratchpad_write",
         requester_context.member_id,
@@ -282,10 +401,18 @@ async def retrieve(query: str, requester_context: RequesterContext) -> list[Memo
     # Privacy gate: if memory is disabled for this org/project/member, retrieve nothing.
     from core.memory_control import is_memory_enabled
 
+    authorized_pairs = await _validated_scope_pairs(requester_context)
+    authorized_project_id = (
+        str(requester_context.project_id)
+        if requester_context.project_id
+        and ("project", str(requester_context.project_id)) in authorized_pairs
+        else None
+    )
     if not await is_memory_enabled(
         org_id=requester_context.org_id,
-        project_id=requester_context.project_id,
+        project_id=authorized_project_id,
         member_id=requester_context.member_id,
+        conversation_id=requester_context.conversation_id,
     ):
         await audit.log(
             "memory_retrieve",
@@ -293,7 +420,10 @@ async def retrieve(query: str, requester_context: RequesterContext) -> list[Memo
             "memory.retrieve",
             organization_id=requester_context.org_id,
             resource_type="memory_entries",
-            payload={"project_id": requester_context.project_id},
+            payload={
+                "project_id": authorized_project_id,
+                "conversation_id": requester_context.conversation_id,
+            },
             decision="memory_disabled",
         )
         return []
@@ -310,7 +440,7 @@ async def retrieve(query: str, requester_context: RequesterContext) -> list[Memo
             "memory.retrieve",
             organization_id=requester_context.org_id,
             resource_type="memory_entries",
-            payload={"query_preview": query[:120], "error": str(exc)[:240]},
+            payload={**_query_audit_payload(query), "error": str(exc)[:240]},
             decision="embedding_failed",
         )
         recent = await _retrieve_recent_memories(requester_context, decision="embedding_failed")
@@ -324,7 +454,7 @@ async def retrieve(query: str, requester_context: RequesterContext) -> list[Memo
             organization_id=requester_context.org_id,
             resource_type="memory_entries",
             payload={
-                "query_preview": query[:120],
+                **_query_audit_payload(query),
                 "expected_dimensions": EXPECTED_EMBEDDING_DIMENSIONS,
                 "actual_dimensions": len(bad_embedding),
             },
@@ -332,7 +462,9 @@ async def retrieve(query: str, requester_context: RequesterContext) -> list[Memo
         )
         recent = await _retrieve_recent_memories(requester_context, decision="dimension_mismatch")
         return (scratchpad + recent)[:10]
-    scope_filter, scope_params = _authorized_scope_sql(requester_context)
+    scope_filter, scope_params = _authorized_scope_sql(
+        requester_context, authorized_pairs=authorized_pairs
+    )
     rows_by_id: dict[str, dict[str, Any]] = {}
     async with engine.begin() as conn:
         for expanded_query, query_embedding in embeddings:
@@ -348,7 +480,9 @@ async def retrieve(query: str, requester_context: RequesterContext) -> list[Memo
                         WHERE organization_id = :org_id
                           AND is_deleted = FALSE
                           AND is_archived = FALSE
+                          AND is_sensitive = FALSE
                           AND superseded_by IS NULL
+                          AND source <> 'synthesized'
                           AND embedding IS NOT NULL
                           AND ({scope_filter})
                         ORDER BY embedding <=> (:embedding)::vector
@@ -372,10 +506,10 @@ async def retrieve(query: str, requester_context: RequesterContext) -> list[Memo
         organization_id=requester_context.org_id,
         resource_type="memory_entries",
         payload={
-            "query_preview": query[:120],
+            **_query_audit_payload(query),
             "expanded_query_count": len(expanded_queries),
             "scratchpad_count": len(scratchpad),
-            "authorized_scopes": _authorized_scope_pairs(requester_context),
+            "authorized_scopes": authorized_pairs,
         },
         decision="expanded_scoped_memory_search",
     )

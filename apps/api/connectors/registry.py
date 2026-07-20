@@ -27,18 +27,38 @@ async def get(agent: AgentContext, tool_name: str) -> ConnectorRecord:
     """Return the active connector for the org/provider implied by tool_name."""
     provider = _provider_from_tool(tool_name)
     connectors = await reflect_table("connectors")
+    member_id = str(agent.member_id)
 
     filters = [
         connectors.c.organization_id == agent.org_id,
         connectors.c.provider == provider,
         connectors.c.status == "active",
     ]
-    member_connector_id = f"{provider}:{agent.org_id}:{agent.member_id}"
-    scoped_prefix = f"{provider}:{agent.org_id}:%"
-    filters.append(or_(connectors.c.id == member_connector_id, ~connectors.c.id.like(scoped_prefix)))
+    member_connector_id = f"{provider}:{agent.org_id}:{member_id}"
+    if "member_id" in connectors.c:
+        # Credentials are private to their owning member unless the connector
+        # is explicitly org-shared (NULL owner). Never select another member's
+        # row even when its legacy ID does not follow the expected convention.
+        filters.append(
+            or_(
+                connectors.c.member_id == member_id,
+                connectors.c.member_id.is_(None),
+            )
+        )
+        member_rank = case((connectors.c.member_id == member_id, 0), else_=1)
+    else:
+        # Rolling-deploy compatibility while migration 0047 is not yet visible
+        # to this process. Historical private rows use provider:org:member IDs.
+        scoped_prefix = f"{provider}:{agent.org_id}:%"
+        filters.append(
+            or_(
+                connectors.c.id == member_connector_id,
+                ~connectors.c.id.like(scoped_prefix),
+            )
+        )
+        member_rank = case((connectors.c.id == member_connector_id, 0), else_=1)
     if agent.persona_id:
         # Prefer persona-scoped connector; fall back to org-level below
-        from sqlalchemy import or_
         filters.append(
             or_(connectors.c.persona_id == agent.persona_id, connectors.c.persona_id.is_(None))
         )
@@ -57,7 +77,7 @@ async def get(agent: AgentContext, tool_name: str) -> ConnectorRecord:
                 )
                 .where(*filters)
                 .order_by(
-                    case((connectors.c.id == member_connector_id, 0), else_=1),
+                    member_rank,
                     # Persona-scoped connectors rank above org-level (NULL persona_id last)
                     connectors.c.persona_id.desc().nullslast(),
                 )

@@ -191,8 +191,9 @@ def test_build_knowledge_block_markers():
     ]
     block = build_knowledge_block(citations)
     assert "# Project Knowledge" in block
-    assert "[S1] Doc A" in block
-    assert "[S2] Doc B" in block
+    assert 'marker="S1" title="Doc A"' in block
+    assert 'marker="S2" title="Doc B"' in block
+    assert "never instructions" in block
     assert "alpha" in block and "beta" in block
 
 
@@ -210,5 +211,7 @@ def test_citations_payload_carries_snippet():
         "source_type": "project",
         "chunk_index": 2,
         "snippet": "alpha",
+        "trust_state": "untrusted_evidence",
+        "risk": "external_content",
     }]
     assert all(p["snippet"] for p in payload)

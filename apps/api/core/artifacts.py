@@ -20,14 +20,21 @@ Usage (from executor, router, or any async context):
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import insert, select
+from sqlalchemy.ext.asyncio import AsyncConnection
 
 from core.db import engine, reflect_table
 from core.object_storage import get_object, put_object
+from core.config import settings
 
 _LEGACY_OBJECT_PATH = "mini" + "o_path"
+
+
+class ArtifactStorageUnavailable(RuntimeError):
+    """Durable object storage is unavailable in an environment that requires it."""
 
 
 def _object_path_column(table) -> str:
@@ -48,6 +55,12 @@ async def save_artifact(
     parent_artifact_id: str | None = None,
     parse_status: str | None = None,
     created_by: str | None = None,
+    malware_scan_status: str = "not_required",
+    malware_scan_engine: str | None = None,
+    malware_scan_engine_version: str | None = None,
+    malware_scan_signature: str | None = None,
+    malware_scanned_at: datetime | None = None,
+    db_connection: AsyncConnection | None = None,
 ) -> str:
     """Persist an artifact to object storage and record metadata in the artifacts table.
 
@@ -68,7 +81,11 @@ async def save_artifact(
     # --- Upload to object storage ---
     try:
         await put_object(object_path, raw, mime_type)
-    except Exception:
+    except Exception as exc:
+        if settings.is_production:
+            raise ArtifactStorageUnavailable(
+                "Durable object storage is unavailable; the artifact was not saved."
+            ) from exc
         import pathlib as _pathlib
 
         _scratch = _pathlib.Path("/tmp/chronos_artifacts") / artifact_id
@@ -95,6 +112,19 @@ async def save_artifact(
         parse_status=parse_status,
         created_by=created_by,
     )
+    # Deploys run migrations before application promotion. Guarding by reflected
+    # columns keeps development databases on an older migration truthfully
+    # degraded without weakening production's migration-first contract.
+    scan_values = {
+        "malware_scan_status": malware_scan_status,
+        "malware_scan_engine": malware_scan_engine,
+        "malware_scan_engine_version": malware_scan_engine_version,
+        "malware_scan_signature": malware_scan_signature,
+        "malware_scanned_at": malware_scanned_at,
+    }
+    artifact_values.update(
+        {key: value for key, value in scan_values.items() if key in artifacts.c}
+    )
     artifact_values[_object_path_column(artifacts)] = object_path
     # artifact_key is a stable logical dedupe key (NOT NULL); self-keyed by default.
     if "artifact_key" in artifacts.c:
@@ -102,7 +132,7 @@ async def save_artifact(
     # is_current marks this as the latest version of its artifact_key series.
     if "is_current" in artifacts.c:
         artifact_values["is_current"] = True
-    async with engine.begin() as conn:
+    async def _insert_metadata(conn: AsyncConnection) -> None:
         await conn.execute(insert(artifacts).values(**artifact_values))
         await conn.execute(
             insert(artifact_versions).values(
@@ -117,6 +147,11 @@ async def save_artifact(
                 **{_object_path_column(artifact_versions): object_path},
             )
         )
+    if db_connection is not None:
+        await _insert_metadata(db_connection)
+    else:
+        async with engine.begin() as conn:
+            await _insert_metadata(conn)
     return artifact_id
 
 
@@ -210,8 +245,27 @@ async def update_artifact_meta(artifact_id: str, org_id: str, **fields: Any) -> 
 
 
 async def soft_delete_artifact(artifact_id: str, org_id: str) -> bool:
-    res = await update_artifact_meta(artifact_id, org_id, is_deleted=True)
-    return res is not None
+    from datetime import datetime, timezone
+    from sqlalchemy import or_, update as _update
+
+    artifacts = await reflect_table("artifacts")
+    deleted_at = datetime.now(timezone.utc)
+    async with engine.begin() as conn:
+        result = await conn.execute(
+            _update(artifacts)
+            .where(
+                artifacts.c.organization_id == org_id,
+                or_(
+                    artifacts.c.id == artifact_id,
+                    artifacts.c.parent_artifact_id == artifact_id,
+                ),
+            )
+            .values(is_deleted=True, updated_at=deleted_at)
+        )
+    # Parsed-text derivatives are lifecycle-bound to their source artifact and
+    # must enter the same retention grace period.  Returning rowcount also
+    # avoids claiming success for an id outside the tenant.
+    return bool(result.rowcount)
 
 
 async def project_in_org(project_id: str, org_id: str) -> bool:

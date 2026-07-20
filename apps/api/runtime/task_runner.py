@@ -10,9 +10,16 @@ from typing import Any
 from runtime import leases
 
 
+# Uvicorn gets a separate graceful connection-drain window. Once application
+# shutdown starts, task cleanup must leave time for the leader lock and the
+# remaining lifespan resources to close before the container stop deadline.
+_SHUTDOWN_TASK_WAIT_SECONDS = 10.0
+
+
 RunTask = Callable[[str], Awaitable[Any]]
 MarkCancelled = Callable[[str, str], Awaitable[Any]]
 MarkFailed = Callable[[str, str], Awaitable[Any]]
+MarkPaused = Callable[[str, str], Awaitable[Any]]
 
 
 async def _default_run_task(task_id: str) -> Any:
@@ -89,6 +96,7 @@ class TaskRunner:
         run_task: RunTask | None = None,
         mark_cancelled: MarkCancelled | None = None,
         mark_failed: MarkFailed | None = None,
+        mark_paused: MarkPaused | None = None,
         max_concurrency: int = 4,
         max_attempts: int = 1,
         task_timeout_seconds: float | None = None,
@@ -96,6 +104,7 @@ class TaskRunner:
         self._run_task = run_task or _default_run_task
         self._mark_cancelled = mark_cancelled or self._builtin_mark_cancelled
         self._mark_failed = mark_failed or self._builtin_mark_failed
+        self._mark_paused = mark_paused or self._builtin_mark_paused
         self._last_attempts: dict[str, int] = {}
         self._max_concurrency = max(1, int(max_concurrency))
         self._max_attempts = max(1, int(max_attempts))
@@ -104,6 +113,7 @@ class TaskRunner:
         self._sequence = itertools.count()
         self._queued: set[str] = set()
         self._cancelled: dict[str, str] = {}
+        self._paused: dict[str, str] = {}
         self._running: dict[str, asyncio.Task[Any]] = {}
         self._worker_task: asyncio.Task[Any] | None = None
         self._wake = asyncio.Event()
@@ -137,6 +147,32 @@ class TaskRunner:
              "dead_letter": True, "attempts": attempts},
         )
 
+    async def _builtin_mark_paused(self, task_id: str, reason: str) -> None:
+        """Persist a cooperative pause when the runner is used directly.
+
+        The HTTP intervention path persists and emits before cancelling a local
+        coroutine.  This fallback keeps direct/queued runner use equally safe
+        and is idempotent when that intervention already happened.
+        """
+        from runtime.agent_loop import emit_activity, get_task, save_task
+
+        task = await get_task(task_id)
+        if task and task.get("status") == "paused":
+            return
+        state = dict((task or {}).get("agent_state") or {})
+        state["pause"] = {
+            "reason": reason,
+            "requested_at": datetime.now(timezone.utc).isoformat(),
+        }
+        await save_task(
+            task_id,
+            status="paused",
+            agent_state=state,
+            error=None,
+            completed_at=None,
+        )
+        await emit_activity(task_id, {"type": "task_paused", "reason": reason})
+
     async def requeue(self, task_id: str, *, priority: int = 10) -> bool:
         """Revive a dead-lettered/failed task: clear terminal state and re-enqueue."""
         from runtime.agent_loop import save_task
@@ -166,10 +202,36 @@ class TaskRunner:
             return True
         return False
 
+    def pause(self, task_id: str, *, reason: str = "operator_pause") -> bool:
+        """Stop queued work or cancel a local coroutine at its checkpoint.
+
+        A running coroutine is cancelled only after the caller has persisted
+        ``status=paused``.  The executor therefore leaves the durable checkpoint
+        intact, and the lease is released by ``_run_with_policy``'s ``finally``.
+        Workers in another process observe the persisted status at the agent
+        loop's safe boundaries.
+        """
+        if task_id in self._running:
+            self._paused[task_id] = reason
+            self._running[task_id].cancel()
+            return True
+        if task_id in self._queued:
+            self._paused[task_id] = reason
+            self._wake.set()
+            return True
+        return False
+
+    def clear_pause(self, task_id: str) -> None:
+        self._paused.pop(task_id, None)
+
     async def drain_once(self) -> bool:
         while self._queue:
             _, _, task_id = heapq.heappop(self._queue)
             self._queued.discard(task_id)
+            pause_reason = self._paused.pop(task_id, None)
+            if pause_reason:
+                await self._mark_paused(task_id, pause_reason)
+                return True
             reason = self._cancelled.pop(task_id, None)
             if reason:
                 await self._mark_cancelled(task_id, reason)
@@ -187,20 +249,56 @@ class TaskRunner:
     async def stop(self) -> None:
         self._closed = True
         self._wake.set()
-        for task in list(self._running.values()):
+        # A worker shutdown is resumable, not a user cancellation. Persist the
+        # queued state before cancelling local coroutines so another replica or
+        # the next process can claim the checkpoint exactly once.
+        if self._running:
+            from runtime.agent_loop import save_task
+
+            for task_id in list(self._running):
+                await save_task(task_id, status="queued")
+        running_tasks = list(self._running.values())
+        for task in running_tasks:
             task.cancel()
-        if self._worker_task:
-            self._worker_task.cancel()
+        worker_task = self._worker_task
+        self._worker_task = None
+        if worker_task:
+            worker_task.cancel()
             try:
-                await self._worker_task
+                await worker_task
             except asyncio.CancelledError:
                 pass
+        if running_tasks:
+            # Cancellation runs each task's ``finally`` block, which stops its
+            # lease heartbeat and releases the Redis lease. Await that cleanup
+            # so a replacement replica can recover immediately instead of
+            # waiting for the lease TTL. Keep the wait bounded: third-party
+            # model/tool code can mishandle cancellation, and container shutdown
+            # must still complete before the orchestrator sends SIGKILL.
+            done, pending = await asyncio.wait(
+                running_tasks,
+                timeout=_SHUTDOWN_TASK_WAIT_SECONDS,
+            )
+            for task in done:
+                if not task.cancelled():
+                    task.exception()  # retrieve/loggable exception; do not leak it
+            if pending:
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "task runner shutdown timed out waiting for %d task(s)",
+                    len(pending),
+                )
 
     async def _run_forever(self) -> None:
         while not self._closed:
             while len(self._running) < self._max_concurrency and self._queue:
                 _, _, task_id = heapq.heappop(self._queue)
                 self._queued.discard(task_id)
+                pause_reason = self._paused.pop(task_id, None)
+                if pause_reason:
+                    await self._mark_paused(task_id, pause_reason)
+                    continue
                 reason = self._cancelled.pop(task_id, None)
                 if reason:
                     await self._mark_cancelled(task_id, reason)
@@ -216,8 +314,15 @@ class TaskRunner:
         try:
             await self._run_with_policy(task_id)
         except asyncio.CancelledError:
-            reason = self._cancelled.pop(task_id, "user_cancelled")
-            await self._mark_cancelled(task_id, reason)
+            pause_reason = self._paused.pop(task_id, None)
+            if pause_reason:
+                await self._mark_paused(task_id, pause_reason)
+            elif self._closed:
+                # ``stop`` already persisted ``queued`` for restart recovery.
+                pass
+            else:
+                reason = self._cancelled.pop(task_id, "user_cancelled")
+                await self._mark_cancelled(task_id, reason)
         finally:
             self._running.pop(task_id, None)
             self._wake.set()
@@ -324,6 +429,94 @@ async def reap_orphaned_tasks(task_ids: list[str] | None = None) -> list[str]:
 
 def cancel_task(task_id: str, reason: str = "user_cancelled") -> bool:
     return runner.cancel(task_id, reason=reason)
+
+
+async def pause_task(task_id: str, reason: str = "operator_pause") -> bool:
+    """Persist a pause request and stop local execution if this worker owns it."""
+    from sqlalchemy import select, update
+
+    from core.db import engine, reflect_table
+    from runtime.agent_loop import emit_activity
+
+    tasks = await reflect_table("tasks")
+    async with engine.begin() as conn:
+        task = (
+            await conn.execute(
+                select(tasks.c.status, tasks.c.agent_state)
+                .where(tasks.c.id == task_id)
+                .with_for_update()
+            )
+        ).mappings().first()
+        if not task or task.get("status") in {"complete", "failed", "cancelled", "paused"}:
+            return False
+        state = dict(task.get("agent_state") or {})
+        state["pause"] = {
+            "reason": reason,
+            "requested_at": datetime.now(timezone.utc).isoformat(),
+        }
+        updated = (
+            await conn.execute(
+                update(tasks)
+                .where(tasks.c.id == task_id, tasks.c.status == task["status"])
+                .values(
+                    status="paused",
+                    agent_state=state,
+                    error=None,
+                    completed_at=None,
+                )
+                .returning(tasks.c.id)
+            )
+        ).first()
+    if not updated:
+        return False
+    await emit_activity(task_id, {"type": "task_paused", "reason": reason})
+    runner.pause(task_id, reason=reason)
+    return True
+
+
+async def resume_task(task_id: str, priority: int = 5) -> bool:
+    """Atomically resume a paused task exactly once across API replicas."""
+    from sqlalchemy import select, update
+
+    from core.db import engine, reflect_table
+    from runtime.agent_loop import emit_activity
+
+    tasks = await reflect_table("tasks")
+    async with engine.begin() as conn:
+        row = (
+            await conn.execute(
+                select(tasks.c.agent_state).where(
+                    tasks.c.id == task_id,
+                    tasks.c.status == "paused",
+                )
+            )
+        ).mappings().first()
+        if not row:
+            return False
+        state = dict(row.get("agent_state") or {})
+        pause = dict(state.pop("pause", {}) or {})
+        updated = (
+            await conn.execute(
+                update(tasks)
+                .where(tasks.c.id == task_id, tasks.c.status == "paused")
+                .values(
+                    status="queued",
+                    agent_state=state,
+                    error=None,
+                    completed_at=None,
+                )
+                .returning(tasks.c.id)
+            )
+        ).first()
+    if not updated:
+        return False
+    runner.clear_pause(task_id)
+    await emit_activity(
+        task_id,
+        {"type": "task_resumed", "pause_reason": pause.get("reason")},
+    )
+    await runner.enqueue(task_id, priority=priority)
+    return True
 
 
 async def requeue_task(task_id: str, priority: int = 10) -> bool:

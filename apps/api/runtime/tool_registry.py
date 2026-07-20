@@ -130,8 +130,16 @@ GMAIL_DRAFT = _fn(
     "for review before sending. Never sends immediately — always creates a draft first.",
     {
         "to": {"type": "string", "description": "Recipient email address."},
-        "subject": {"type": "string", "description": "Email subject line."},
-        "body": {"type": "string", "description": "Plain text email body."},
+        "subject": {
+            "type": "string",
+            "description": "Email subject line (maximum 998 characters).",
+            "maxLength": 998,
+        },
+        "body": {
+            "type": "string",
+            "description": "Plain text email body (maximum 100,000 UTF-8 bytes).",
+            "maxLength": 100000,
+        },
     },
     ["to", "subject", "body"],
 )
@@ -174,8 +182,16 @@ GMAIL_SEND = _fn(
     "Send an email from the connected Gmail account. This always requires explicit human approval before execution.",
     {
         "to": {"type": "string", "description": "Recipient email address."},
-        "subject": {"type": "string", "description": "Email subject line."},
-        "body": {"type": "string", "description": "Plain text email body."},
+        "subject": {
+            "type": "string",
+            "description": "Email subject line (maximum 998 characters).",
+            "maxLength": 998,
+        },
+        "body": {
+            "type": "string",
+            "description": "Plain text email body (maximum 100,000 UTF-8 bytes).",
+            "maxLength": 100000,
+        },
         "cc": {"type": "string", "description": "Optional CC recipient.", "default": ""},
     },
     ["to", "subject", "body"],
@@ -407,8 +423,8 @@ FS_WRITE = _fn(
 
 CODE_PYTHON = _fn(
     "code__python",
-    "Execute Python code in a sandboxed environment. "
-    "Use for data processing, analysis, and computation over local task files. "
+    "Execute Python code. Production uses an ephemeral E2B sandbox and fails closed when "
+    "that runtime is not configured; development/test uses the task workspace subprocess. "
     "Not for network access — use browser tools for that.",
     {
         "code": {"type": "string", "description": "Python code to execute."},
@@ -425,22 +441,44 @@ CODE_PYTHON = _fn(
 
 COMPUTER_CREATE_SESSION = _fn(
     "computer__create_session",
-    "Start an isolated Linux sandbox for a task. The sandbox has its own filesystem and shell, starts empty, "
-    "and is ephemeral: export anything you need to keep.",
-    {"purpose": {"type": "string", "description": "Why this computer session is needed.", "default": "computer task"}},
-    [],
+    "Start a tenant-isolated, resumable E2B Linux desktop for a bounded task. This is a cost-bearing provider "
+    "operation and requires a human-approved consent envelope. The sandbox auto-pauses when idle and is "
+    "destroyed at consent expiry; export durable outputs before cancellation or expiry.",
+    {
+        "purpose": {"type": "string", "description": "Why this computer session is needed."},
+        "consent": {
+            "type": "object",
+            "description": "Human-approved purpose, capabilities, ISO expiry, and confirmed_by_user=true.",
+            "properties": {
+                "purpose": {"type": "string"},
+                "capabilities": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["terminal", "files", "packages", "desktop", "network"]},
+                },
+                "expires_at": {"type": "string"},
+                "confirmed_by_user": {"type": "boolean"},
+                "allowed_egress_domains": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Exact DNS domains approved for this session; required with network capability.",
+                    "maxItems": 20,
+                },
+            },
+            "required": ["purpose", "capabilities", "expires_at", "confirmed_by_user"],
+        },
+    },
+    ["purpose", "consent"],
 )
 
 COMPUTER_EXEC = _fn(
     "computer__exec",
-    "Run a shell command inside the isolated sandbox. Each new session is empty, so copy or fetch any files needed first. "
-    "Commands are audited and resource-limited.",
+    "Run an approved shell command inside an existing consented sandbox. Commands are audited and resource-limited.",
     {
-        "session_id": {"type": "string", "description": "Sandbox session id. Omit to create a new empty one.", "default": ""},
+        "session_id": {"type": "string", "description": "Existing consented sandbox session id."},
         "command": {"type": "string", "description": "Shell command to run inside the sandbox."},
         "timeout_seconds": {"type": "integer", "description": "Timeout in seconds, capped at 600.", "default": 60},
     },
-    ["command"],
+    ["session_id", "command"],
 )
 
 COMPUTER_LIST_FILES = _fn("computer__list_files", "List files in a cloud computer workspace.", {"session_id": {"type": "string"}, "path": {"type": "string", "default": "."}}, ["session_id"])
@@ -457,14 +495,43 @@ COMPUTER_INSTALL_PACKAGE = _fn(
     },
     ["session_id", "package"],
 )
-COMPUTER_SCREENSHOT = _fn("computer__screenshot", "Capture the cloud computer desktop screenshot, or return a truthful degraded state if no desktop runtime is attached.", {"session_id": {"type": "string"}}, ["session_id"])
+COMPUTER_SCREENSHOT = _fn("computer__screenshot", "Capture the current E2B Linux desktop as a PNG. The session must include the desktop capability.", {"session_id": {"type": "string"}}, ["session_id"])
+COMPUTER_INPUT = _fn(
+    "computer__input",
+    "Send one human-approved mouse or keyboard action to the E2B Linux desktop. Take a fresh screenshot before and after coordinate actions.",
+    {
+        "session_id": {"type": "string"},
+        "action": {"type": "string", "enum": ["move", "click", "double_click", "type", "key", "scroll", "drag"]},
+        "x": {"type": "integer"},
+        "y": {"type": "integer"},
+        "to_x": {"type": "integer"},
+        "to_y": {"type": "integer"},
+        "button": {"type": "string", "enum": ["left", "middle", "right"], "default": "left"},
+        "text": {"type": "string"},
+        "key": {"type": "string"},
+        "direction": {"type": "string", "enum": ["up", "down"], "default": "down"},
+        "amount": {"type": "integer", "default": 1},
+    },
+    ["session_id", "action"],
+)
+COMPUTER_PAUSE_SESSION = _fn("computer__pause_session", "Pause a cloud computer while preserving its provider state until consent expiry.", {"session_id": {"type": "string"}}, ["session_id"])
+COMPUTER_RESUME_SESSION = _fn("computer__resume_session", "Resume a paused cloud computer if its consent remains valid.", {"session_id": {"type": "string"}}, ["session_id"])
+COMPUTER_CANCEL_SESSION = _fn("computer__cancel_session", "Permanently destroy a cloud computer and its unexported state. Requires human approval.", {"session_id": {"type": "string"}}, ["session_id"])
 COMPUTER_EXPORT_ARTIFACT = _fn("computer__export_artifact", "Export a file or directory from a cloud computer workspace as a durable artifact.", {"session_id": {"type": "string"}, "path": {"type": "string"}, "title": {"type": "string", "default": ""}, "kind": {"type": "string", "default": "file"}, "mime_type": {"type": "string", "default": "application/octet-stream"}}, ["session_id", "path"])
 
-LOCAL_COMPUTER_GRANT = _fn("local_computer__grant", "Authorize a local folder for this task's desktop bridge actions.", {"folder_path": {"type": "string"}, "purpose": {"type": "string", "default": "local computer task"}}, ["folder_path"])
-LOCAL_COMPUTER_LIST_FILES = _fn("local_computer__list_files", "List files inside an authorized local folder grant.", {"grant_id": {"type": "string"}, "path": {"type": "string", "default": "."}}, ["grant_id"])
-LOCAL_COMPUTER_READ_FILE = _fn("local_computer__read_file", "Read a file inside an authorized local folder grant.", {"grant_id": {"type": "string"}, "path": {"type": "string"}}, ["grant_id", "path"])
-LOCAL_COMPUTER_EXEC = _fn("local_computer__exec", "Run an approved shell command inside an authorized local folder. Requires a human approval record.", {"grant_id": {"type": "string"}, "command": {"type": "string"}, "timeout_seconds": {"type": "integer", "default": 10}}, ["grant_id", "command"])
-LOCAL_COMPUTER_OPEN_APP = _fn("local_computer__open_app", "Request opening a local app through the desktop bridge. Requires a human approval record.", {"grant_id": {"type": "string"}, "app": {"type": "string"}}, ["grant_id", "app"])
+LOCAL_COMPUTER_GRANT = _fn(
+    "local_computer__grant",
+    "Request local-folder authorization. In production the user chooses the folder in their paired Chronos desktop app; the API never receives an absolute client path. Development/test may pass folder_path for the local bridge.",
+    {
+        "folder_path": {"type": "string", "default": ""},
+        "purpose": {"type": "string", "default": "local computer task"},
+    },
+    [],
+)
+LOCAL_COMPUTER_LIST_FILES = _fn("local_computer__list_files", "List files inside an authorized folder on the paired desktop device. Paths are relative to its local security-scoped grant.", {"grant_id": {"type": "string"}, "path": {"type": "string", "default": "."}}, ["grant_id"])
+LOCAL_COMPUTER_READ_FILE = _fn("local_computer__read_file", "Read a file inside an authorized folder on the paired desktop device. Paths are relative to its local security-scoped grant.", {"grant_id": {"type": "string"}, "path": {"type": "string"}}, ["grant_id", "path"])
+LOCAL_COMPUTER_EXEC = _fn("local_computer__exec", "Run an approved shell command inside an authorized folder on the paired desktop device. Requires a human approval record.", {"grant_id": {"type": "string"}, "command": {"type": "string"}, "timeout_seconds": {"type": "integer", "default": 10}}, ["grant_id", "command"])
+LOCAL_COMPUTER_OPEN_APP = _fn("local_computer__open_app", "Request opening a local app through the authenticated paired desktop device. Requires a human approval record.", {"grant_id": {"type": "string"}, "app": {"type": "string"}}, ["grant_id", "app"])
 LOCAL_COMPUTER_REVOKE = _fn("local_computer__revoke", "Revoke an authorized local folder grant.", {"grant_id": {"type": "string"}}, ["grant_id"])
 
 COMPUTER_TOOLS = [
@@ -475,6 +542,10 @@ COMPUTER_TOOLS = [
     COMPUTER_WRITE_FILE,
     COMPUTER_INSTALL_PACKAGE,
     COMPUTER_SCREENSHOT,
+    COMPUTER_INPUT,
+    COMPUTER_PAUSE_SESSION,
+    COMPUTER_RESUME_SESSION,
+    COMPUTER_CANCEL_SESSION,
     COMPUTER_EXPORT_ARTIFACT,
     LOCAL_COMPUTER_GRANT,
     LOCAL_COMPUTER_LIST_FILES,
@@ -485,15 +556,15 @@ COMPUTER_TOOLS = [
 ]
 
 # ── Desktop GUI operator ──────────────────────────────────────────────────────
-# Vision-driven desktop control over an isolated virtual display. The agent
+# Development/test vision-driven desktop control over a virtual display. The agent
 # perceives via desktop__screenshot (the image is fed back into the loop) and
 # acts via move/click/type/key/scroll. Launching an app is risk-tiered and
 # requires a human approval record.
 
 DESKTOP_CREATE_SESSION = _fn(
     "desktop__create_session",
-    "Create an isolated virtual-desktop session for GUI operation. State persists across actions. "
-    "Provide a clear purpose; the session runs apps on a private virtual display.",
+    "Create a development/test virtual-desktop session for GUI operation. The API-host desktop "
+    "is unavailable in production until a separate isolated desktop runtime is configured.",
     {
         "purpose": {"type": "string", "description": "Why this desktop session is needed.", "default": "desktop task"},
         "consent": {"type": "object", "description": "Optional purpose/scope metadata for the session.", "default": {}},
@@ -645,10 +716,14 @@ CANVA_TOOLS = [
 
 REPO_CLONE = _fn(
     "repo__clone",
-    "Import a repository into the current task workspace. Supports local workspace paths and public GitHub HTTPS clone URLs.",
+    "Import a GitHub repository into the current task's persistent isolated coding workspace. "
+    "Production uses E2B with durable encrypted object-storage snapshots; a connected direct "
+    "GitHub OAuth account can import private repositories without copying its token into the sandbox. "
+    "Local source_path import is development/test only.",
     {
-        "source_path": {"type": "string", "description": "Local path under the configured Chronos workspace root.", "default": ""},
-        "source_url": {"type": "string", "description": "Public https://github.com/<owner>/<repo> URL.", "default": ""},
+        "source_path": {"type": "string", "description": "Development-only local path under the configured Chronos workspace root.", "default": ""},
+        "source_url": {"type": "string", "description": "https://github.com/<owner>/<repo> URL.", "default": ""},
+        "ref": {"type": "string", "description": "Branch, tag, or commit for authenticated snapshot imports. Default: HEAD.", "default": "HEAD"},
         "repo_path": {"type": "string", "description": "Workspace-relative destination path. Default: repos/imported.", "default": "repos/imported"},
         "timeout_seconds": {"type": "integer", "description": "Clone timeout, capped at 60 seconds.", "default": 30},
     },
@@ -657,8 +732,7 @@ REPO_CLONE = _fn(
 
 REPO_OPEN_FIXTURE = _fn(
     "repo__open_fixture",
-    "Open a bundled fixture repository inside the current task workspace. "
-    "This is the supported repo-workspace MVP: no arbitrary clone or host access.",
+    "Open a bundled non-secret fixture repository in the current task's isolated coding workspace.",
     {
         "name": {"type": "string", "description": "Fixture repo name. Default: python_bug.", "default": "python_bug"},
         "repo_path": {"type": "string", "description": "Workspace-relative destination path. Default: repos/<name>.", "default": ""},
@@ -708,7 +782,8 @@ REPO_WRITE_FILE = _fn(
 
 REPO_RUN_TESTS = _fn(
     "repo__run_tests",
-    "Run the constrained repo test loop. Only pytest commands are accepted; shell operators and absolute paths are rejected.",
+    "Run the constrained repo test loop. Production executes only inside the persistent E2B "
+    "workspace. Only pytest argv is accepted; shell operators and absolute paths are rejected.",
     {
         "repo_path": {"type": "string", "description": "Workspace-relative repo path. Default: repos/python_bug.", "default": "repos/python_bug"},
         "command": {"type": "string", "description": "Optional pytest command, for example 'pytest -q tests/test_app.py'.", "default": "pytest -q"},
@@ -747,13 +822,15 @@ REPO_COMMIT = _fn(
 
 REPO_CREATE_PR = _fn(
     "repo__create_pr",
-    "Create an approved pull-request request artifact for the repo workspace. Without approval_id it returns approval_required.",
+    "Publish the committed isolated workspace changes to the approved GitHub head branch and create "
+    "a real pull request. This always requires verified human approval at the broker; approval and "
+    "idempotency evidence are never model-supplied. Fails safely instead of force-pushing when the "
+    "base/head moved or the member-scoped OAuth token lacks push scope.",
     {
         "title": {"type": "string", "description": "PR title."},
         "body": {"type": "string", "description": "PR body.", "default": ""},
         "base": {"type": "string", "description": "Base branch.", "default": "main"},
         "head": {"type": "string", "description": "Head branch. Defaults to current branch.", "default": ""},
-        "approval_id": {"type": "string", "description": "Approval record id authorizing PR creation.", "default": ""},
         "repo_path": {"type": "string", "description": "Workspace-relative repo path. Default: repos/python_bug.", "default": "repos/python_bug"},
     },
     ["title"],
@@ -1124,7 +1201,8 @@ DATA_RUN = _fn(
     "data__run",
     "Run Python data analysis code (pandas/matplotlib/numpy) against an uploaded dataset. "
     "The dataset is identified by dataset_id (obtained from POST /datasets). "
-    "The code runs in a sandbox where the dataset is available as 'data.csv' (or 'data.json'). "
+    "The runtime receives the dataset as 'data.csv' (or 'data.json'); production uses an "
+    "ephemeral E2B sandbox and fails closed when that runtime is not configured. "
     "Produce charts by saving matplotlib figures with plt.savefig('chart_N.png'). "
     "Printed output (tables, stats) is captured as a report artifact. "
     "Returns artifact ids for any generated charts and report.",
@@ -1301,6 +1379,7 @@ ALWAYS_APPROVAL_TOOL_NAMES: frozenset[str] = frozenset(
         "local_computer__exec",
         "local_computer__open_app",
         "desktop__open_app",
+        "repo__create_pr",
     }
 )
 

@@ -120,6 +120,47 @@ async def test_org_bound_token_rejected_on_no_tenant_host_in_production(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_org_bound_token_accepted_on_configured_central_api_host_in_production(monkeypatch):
+    """The SPA calls one central API host; the signed org claim plus the current
+    member row supplies tenant identity there without trusting a browser header."""
+    org_a, member_a = await _make_org_and_member(f"acme{uuid.uuid4().hex[:6]}")
+    token = create_access_token(member_a, org_id=org_a)
+    monkeypatch.setattr("core.auth._is_production", lambda: True)
+    monkeypatch.setattr(
+        "core.auth.settings.oauth_callback_base_url",
+        "https://api.cognisiatech.com",
+        raising=False,
+    )
+    async with _client() as client:
+        resp = await client.get(
+            "/auth/me",
+            headers={"Authorization": f"Bearer {token}", "Host": "api.cognisiatech.com"},
+        )
+    assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_central_api_rejects_token_claim_that_disagrees_with_member_org(monkeypatch):
+    org_a, member_a = await _make_org_and_member(f"acme{uuid.uuid4().hex[:6]}")
+    org_b, _ = await _make_org_and_member(f"globex{uuid.uuid4().hex[:6]}")
+    assert org_a != org_b
+    token = create_access_token(member_a, org_id=org_b)
+    monkeypatch.setattr("core.auth._is_production", lambda: True)
+    monkeypatch.setattr(
+        "core.auth.settings.oauth_callback_base_url",
+        "https://api.cognisiatech.com",
+        raising=False,
+    )
+    async with _client() as client:
+        resp = await client.get(
+            "/auth/me",
+            headers={"Authorization": f"Bearer {token}", "Host": "api.cognisiatech.com"},
+        )
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "Token not valid for this tenant"
+
+
+@pytest.mark.asyncio
 async def test_enforce_rejects_org_less_tokens_in_production(monkeypatch):
     """In production, enforcement is on by default: a legacy org-less token with
     no grace window is rejected (401)."""

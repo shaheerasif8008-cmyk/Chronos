@@ -7,6 +7,14 @@ import resource
 import sys
 from typing import Any
 
+from connectors.e2b_runtime import (
+    RuntimeUnavailable,
+    SANDBOX_ROOT,
+    SandboxRuntime,
+    default_runtime,
+)
+from core.config import settings
+from core.execution_boundary import api_host_execution_allowed, unavailable_host_execution_result
 from core.models import ToolResult
 from core.workspace import task_workspace_root_from_args
 
@@ -16,10 +24,10 @@ DEFAULT_TIMEOUT_SECONDS = 5
 # NOTE: this is a defence-in-depth denylist, NOT a security boundary. A lexical
 # blocklist cannot fully contain Python (e.g. ``().__class__.__bases__[0]
 # .__subclasses__()`` reaches arbitrary classes without any blocked token). The
-# real isolation is the RLIMITs below plus the per-task workspace cwd; the proper
-# fix is OS-level isolation (container/namespace, no network, read-only FS) —
-# tracked in docs/SECURITY_AUDIT.md. Patterns below close the cheap, common
-# bypasses (dynamic import/exec, builtins reflection, dunder traversal).
+# production isolation is the E2B sandbox; RLIMITs and the per-task cwd only
+# reduce risk in the explicitly development-only host implementation. Patterns
+# below close cheap, common bypasses in both paths, but are never treated as the
+# security boundary.
 FORBIDDEN_PATTERNS = [
     r"\bimport\s+(socket|requests|httpx|urllib|subprocess|multiprocessing|ctypes|resource)\b",
     r"\bfrom\s+(socket|requests|httpx|urllib|subprocess|multiprocessing|ctypes|resource)\b",
@@ -68,11 +76,106 @@ def _validate_code(code: str) -> None:
 
 
 class CodeConnector:
+    def __init__(self, runtime: SandboxRuntime | None = None) -> None:
+        self._runtime = runtime
+
     async def execute(self, tool: str, args: dict[str, Any]) -> ToolResult:
         args.pop("__connector_tier", None)
         if tool != "code.python":
             raise ValueError(f"Unknown code tool: {tool}")
+        if settings.is_production:
+            return await self._python_isolated(args)
+        if not api_host_execution_allowed():
+            return unavailable_host_execution_result(tool)
         return await self._python(args)
+
+    def _isolated_runtime(self) -> SandboxRuntime | None:
+        return self._runtime if self._runtime is not None else default_runtime()
+
+    async def _python_isolated(self, args: dict[str, Any]) -> ToolResult:
+        """Execute Python in an ephemeral E2B sandbox in production."""
+
+        org_id = str(args.pop("__org_id", "default") or "default")
+        task_id = str(args.pop("__task_id", "manual") or "manual")
+        code = str(args.get("code") or "")
+        timeout_seconds = min(int(args.get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS), 10)
+        _validate_code(code)
+
+        runtime = self._isolated_runtime()
+        if runtime is None:
+            return ToolResult(
+                data={
+                    "status": "unavailable",
+                    "reason": "code.python requires the isolated E2B runtime; set E2B_API_KEY.",
+                    "execution_boundary": "isolated_runtime_required",
+                    "host_execution": False,
+                },
+                summary="code.python unavailable: isolated runtime required",
+            )
+
+        sandbox_id: str | None = None
+        try:
+            sandbox_id = await runtime.create(
+                timeout_seconds=min(settings.e2b_sandbox_timeout_seconds, 120),
+                metadata={"org": org_id, "task": task_id, "tool": "code.python"},
+            )
+            remote_script = f"{SANDBOX_ROOT}/code.py"
+            await runtime.write(sandbox_id, remote_script, code.encode("utf-8"))
+            result = await runtime.run(
+                sandbox_id,
+                "python3 code.py",
+                cwd=SANDBOX_ROOT,
+                timeout_seconds=timeout_seconds,
+            )
+        except RuntimeUnavailable as exc:
+            return ToolResult(
+                data={
+                    "status": "unavailable",
+                    "reason": f"isolated code runtime unavailable: {exc}",
+                    "execution_boundary": "isolated_runtime_required",
+                    "host_execution": False,
+                },
+                summary="code.python unavailable: isolated runtime failed",
+            )
+        except Exception as exc:  # noqa: BLE001 - provider errors vary
+            return ToolResult(
+                data={
+                    "status": "failure",
+                    "reason": f"isolated code execution failed: {type(exc).__name__}",
+                    "execution_boundary": "isolated_runtime",
+                    "host_execution": False,
+                },
+                summary="code.python failed in isolated runtime",
+            )
+        finally:
+            if sandbox_id is not None:
+                try:
+                    await runtime.kill(sandbox_id)
+                except Exception:
+                    # E2B's TTL remains the cleanup backstop.
+                    pass
+
+        stdout = str(result.get("stdout") or "")
+        stderr = str(result.get("stderr") or "")
+        stdout_b = stdout.encode("utf-8")
+        stderr_b = stderr.encode("utf-8")
+        status = str(result.get("status") or "failure")
+        return ToolResult(
+            data={
+                "status": status,
+                "returncode": result.get("returncode"),
+                "stdout": stdout_b[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace"),
+                "stderr": stderr_b[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace"),
+                "stdout_truncated": bool(result.get("stdout_truncated"))
+                or len(stdout_b) > MAX_OUTPUT_BYTES,
+                "stderr_truncated": bool(result.get("stderr_truncated"))
+                or len(stderr_b) > MAX_OUTPUT_BYTES,
+                "workspace": SANDBOX_ROOT,
+                "execution_boundary": "isolated_runtime",
+                "host_execution": False,
+            },
+            summary=f"Python execution {status} in isolated runtime",
+        )
 
     async def _python(self, args: dict[str, Any]) -> ToolResult:
         root = task_workspace_root_from_args(args)

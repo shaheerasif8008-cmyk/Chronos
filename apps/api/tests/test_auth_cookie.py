@@ -1,5 +1,4 @@
-"""W1 Phase 2C — session cookie scoped to the parent domain in production so an
-apex-signup cookie is valid on the tenant subdomain."""
+"""Session cookies stay on the central API host in every environment."""
 from __future__ import annotations
 
 from starlette.responses import Response
@@ -7,16 +6,19 @@ from starlette.responses import Response
 from core import auth as auth_mod
 
 
-def test_cookie_scoped_to_parent_domain_in_production(monkeypatch):
-    monkeypatch.setattr("core.auth._is_production", lambda: True)
+def test_cookie_is_host_only_secure_and_lax_in_production(monkeypatch):
+    monkeypatch.setattr("core.auth.settings.environment", "production", raising=False)
     monkeypatch.setattr("core.auth.settings.base_domain", "cognisiatech.com", raising=False)
     resp = Response()
     auth_mod.set_session_cookie(resp, "tok")
-    assert "Domain=.cognisiatech.com" in resp.headers.get("set-cookie", "")
+    cookie = resp.headers.get("set-cookie", "")
+    assert "Domain=" not in cookie
+    assert "Secure" in cookie
+    assert "SameSite=lax" in cookie
 
 
 def test_cookie_host_only_in_non_production(monkeypatch):
-    monkeypatch.setattr("core.auth._is_production", lambda: False)
+    monkeypatch.setattr("core.auth.settings.environment", "development", raising=False)
     resp = Response()
     auth_mod.set_session_cookie(resp, "tok")
     assert "Domain=" not in resp.headers.get("set-cookie", "")

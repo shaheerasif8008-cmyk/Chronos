@@ -12,7 +12,7 @@ from typing import Any
 from fastapi import APIRouter, Depends
 from sqlalchemy import func, select
 
-from core import audit, authz, notification_delivery, permissions
+from core import audit, authz, notification_delivery, notifications, permissions
 from core.auth import get_current_member
 from core.config import settings
 from core.db import engine, reflect_table
@@ -74,11 +74,11 @@ async def admin_overview(member: Member = Depends(get_current_member)) -> dict[s
         "connectors": {"active": await _count("connectors", org_id, connectors.c.status == "active")},
         "approvals": {"pending": pending_approvals},
         "audit": {"total_events": await _count("audit_log", org_id)},
-        "notifications": {"unread_org_wide": await _count(
-            "notifications", org_id,
-            (await reflect_table("notifications")).c.member_id.is_(None),
-            (await reflect_table("notifications")).c.read_at.is_(None),
-        )},
+        "notifications": {
+            "unread_org_wide": await notifications.unread_org_wide_count(
+                org_id, str(member.id)
+            )
+        },
         "governance": {
             "openfga_enabled": authz.is_enabled(),
             "sso_configured": bool(settings.cognito_user_pool_id),

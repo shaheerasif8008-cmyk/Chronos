@@ -74,7 +74,12 @@ async def upsert_seed() -> None:
     context_dir.mkdir(parents=True, exist_ok=True)
     org_md = context_dir / "org.md"
     if not org_md.exists():
-        org_md.write_text("# Default Org\n\nChronos is running in Phase 1 local development mode.\n")
+        org_md.write_text(
+            "# Default Org\n\n"
+            "This is the default local development organization. Do not infer "
+            "production account configuration, client identity, or launch readiness "
+            "from this context.\n"
+        )
 
     print(f"Seed complete. Admin email: {settings.admin_email}")
 

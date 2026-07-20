@@ -1,6 +1,8 @@
 from __future__ import annotations
 import logging
+import secrets
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit
 
 import jwt
 from fastapi import Cookie, Depends, HTTPException, Request
@@ -13,6 +15,8 @@ from core.models import Member
 
 log = logging.getLogger(__name__)
 bearer = HTTPBearer(auto_error=False)
+_COGNITO_STATE_AUDIENCE = "chronos-cognito-oauth"
+_COGNITO_STATE_TTL_SECONDS = 10 * 60
 
 
 def _org_bound_grace_active() -> bool:
@@ -40,32 +44,92 @@ def _is_production() -> bool:
     return settings.is_production
 
 
+def _is_configured_central_api_host(request: Request) -> bool:
+    """Return whether the request targets the explicitly configured API origin.
+
+    Production uses one central API hostname while tenant identity lives in the
+    signed session claim and the member row. The central hostname is therefore
+    a valid authenticated entrypoint, but an arbitrary unknown/apex Host is not.
+    Comparing against the configured OAuth callback origin avoids trusting a
+    caller-controlled organization header or accepting every reserved hostname.
+    """
+
+    configured_host = urlsplit(settings.oauth_callback_base_url).hostname
+    request_host = request.url.hostname
+    if not configured_host or not request_host:
+        return False
+    return request_host.rstrip(".").lower() == configured_host.rstrip(".").lower()
+
+
+def create_cognito_oauth_state(*, org_id: str, subdomain: str) -> str:
+    """Create a signed, short-lived tenant binding for the Cognito round trip."""
+
+    now = datetime.now(timezone.utc)
+    return jwt.encode(
+        {
+            "aud": _COGNITO_STATE_AUDIENCE,
+            "purpose": "cognito_login",
+            "org": str(org_id),
+            "tenant": subdomain.strip().lower(),
+            "nonce": secrets.token_urlsafe(24),
+            "iat": int(now.timestamp()),
+            "exp": int((now + timedelta(seconds=_COGNITO_STATE_TTL_SECONDS)).timestamp()),
+        },
+        settings.jwt_secret,
+        algorithm="HS256",
+    )
+
+
+def decode_cognito_oauth_state(token: str) -> dict[str, str]:
+    """Verify a Cognito state token and return its tenant claims."""
+
+    try:
+        payload = jwt.decode(
+            token,
+            settings.jwt_secret,
+            algorithms=["HS256"],
+            audience=_COGNITO_STATE_AUDIENCE,
+            options={"require": ["exp", "iat", "aud", "purpose", "org", "tenant", "nonce"]},
+        )
+    except jwt.PyJWTError as exc:
+        raise ValueError("Invalid or expired Cognito login state") from exc
+    if payload.get("purpose") != "cognito_login":
+        raise ValueError("Invalid or expired Cognito login state")
+    return {
+        "org": str(payload["org"]),
+        "tenant": str(payload["tenant"]),
+        "nonce": str(payload["nonce"]),
+    }
+
+
 def set_session_cookie(response, token: str) -> None:
     """Set the session JWT as an httpOnly cookie.
 
     The web app and API are served from different hosts (``app.<domain>`` vs
-    ``api.<domain>``), so every authenticated request the SPA makes is a
-    cross-origin credentialed fetch, and the Cognito hosted-UI sign-in returns
-    through a cross-site redirect. A ``SameSite=Strict``/``Lax`` cookie is not
-    sent on (and, across registrable domains, not even stored from) those
-    cross-site requests, which silently breaks the session right after login.
-    In production we therefore use ``SameSite=None`` — which requires
-    ``Secure`` — so the cookie travels with the SPA's credentialed calls. In
-    development (plaintext HTTP, same-host) ``Lax`` is kept since ``None``
-    without ``Secure`` is rejected by browsers.
+    ``api.<domain>``), so requests are cross-origin but still same-site. A
+    host-only ``SameSite=Lax`` cookie is therefore sent to the API during the
+    SPA's credentialed fetches without exposing the session to every tenant
+    subdomain or enabling ordinary cross-site request forgery.
     """
-    # In production, scope the cookie to the parent domain (.<base_domain>) so a
-    # cookie set during apex signup is valid on the tenant subdomain after redirect
-    # (W1 Phase 2C). Host-only in dev.
-    domain = f".{settings.base_domain}" if _is_production() else None
     response.set_cookie(
         "chronos_session",
         token,
-        domain=domain,
         httponly=True,
-        samesite="none" if settings.is_production else "lax",
+        samesite="lax",
         secure=settings.is_production,
         max_age=settings.access_token_expire_minutes * 60,
+    )
+
+
+def clear_session_cookie(response) -> None:
+    """Expire the session cookie using the same scope used when it was set."""
+
+    response.delete_cookie(
+        "chronos_session",
+        path="/",
+        httponly=True,
+        samesite="lax",
+        secure=settings.is_production,
     )
 
 
@@ -89,6 +153,16 @@ async def get_current_member(
     token = credentials.credentials if credentials is not None else chronos_session
     if not token:
         raise HTTPException(status_code=401, detail="Missing session token")
+    if credentials is not None and token.startswith("chr_live_"):
+        from core.organization_api_keys import authenticate_api_key
+
+        member = await authenticate_api_key(token, request)
+        resolved = getattr(request.state, "resolved_org_id", None)
+        if resolved is not None and str(resolved) != str(member.organization_id):
+            raise HTTPException(status_code=403, detail="API key not valid for this tenant")
+        if resolved is None and _is_production() and not _is_configured_central_api_host(request):
+            raise HTTPException(status_code=403, detail="API key not valid for this tenant")
+        return member
     try:
         payload = jwt.decode(
             token,
@@ -139,13 +213,18 @@ async def get_current_member(
     # valid only on its own tenant.
     token_org = payload.get("org")
     if token_org is not None:
+        # A valid signature alone is not enough: bind the claim to the current
+        # database membership so a stale or incorrectly minted token cannot
+        # cross organizations even on the central API host.
+        if str(member.organization_id) != str(token_org):
+            raise HTTPException(status_code=403, detail="Token not valid for this tenant")
         resolved = getattr(request.state, "resolved_org_id", None)
         if resolved is None:
-            # No tenant resolved from the host. In production this is the apex /
-            # an unknown subdomain — reject (C1): the app only serves authed
-            # traffic on a tenant subdomain. In non-production there is no
-            # wildcard DNS (Host is "test"/localhost), so trust the token's org.
-            if _is_production():
+            # The production SPA talks to one configured central API host. On
+            # that host the signed org claim, cross-checked against the member
+            # row above, is the tenant context. Unknown/apex hosts still fail
+            # closed; non-production keeps localhost ergonomics.
+            if _is_production() and not _is_configured_central_api_host(request):
                 raise HTTPException(status_code=403, detail="Token not valid for this tenant")
         elif resolved != token_org:
             raise HTTPException(status_code=403, detail="Token not valid for this tenant")

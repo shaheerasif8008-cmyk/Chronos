@@ -7,10 +7,9 @@ from typing import Any
 
 import asyncio
 import litellm
+from core.config import settings
 
 litellm.drop_params = True
-
-from core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -90,10 +89,15 @@ async def _with_retry(coro_factory, *, max_retries: int = _MAX_RETRIES) -> Any:
             last_exc = exc
             if attempt == max_retries:
                 break
-            delay = _BASE_BACKOFF_SECONDS * (2 ** attempt) + random.uniform(0, 0.5)
-            logger.warning("LLM rate limit (attempt %d/%d), retrying in %.1fs", attempt + 1, max_retries, delay)
+            delay = _BASE_BACKOFF_SECONDS * (2**attempt) + random.uniform(0, 0.5)
+            logger.warning(
+                "LLM rate limit (attempt %d/%d), retrying in %.1fs",
+                attempt + 1,
+                max_retries,
+                delay,
+            )
             await asyncio.sleep(delay)
-        except Exception as exc:
+        except Exception:
             # Non-retryable error — raise immediately.
             raise
     raise last_exc  # type: ignore[misc]
@@ -108,10 +112,15 @@ def _model_status(*, configured: bool, preferred_live: bool = False) -> str:
 
 
 def available_chat_models() -> list[dict[str, Any]]:
+    fallback_models = [settings.backup_model] if independent_backup_available() else []
     return [
         {
             **model,
-            "status": _model_status(configured=bool(model["model"]), preferred_live=bool(settings.openrouter_api_key)),
+            "status": _model_status(
+                configured=bool(model["model"]),
+                preferred_live=bool(settings.openrouter_api_key),
+            ),
+            "fallback_for": fallback_models,
         }
         for model in CHAT_MODEL_OPTIONS
     ]
@@ -207,8 +216,18 @@ def normalize_reasoning_effort(reasoning_effort: str | None) -> str | None:
 # specific OpenRouter route happens not to honor it.
 _REASONING_CAPABLE_MARKERS: tuple[str, ...] = (
     "gpt-5",
-    "o1-", "o1_", "/o1", "o3-", "o3_", "/o3", "o4-", "o4_", "/o4",
-    "deepseek-v4-pro", "deepseek-r1", "deepseek-reasoner",
+    "o1-",
+    "o1_",
+    "/o1",
+    "o3-",
+    "o3_",
+    "/o3",
+    "o4-",
+    "o4_",
+    "/o4",
+    "deepseek-v4-pro",
+    "deepseek-r1",
+    "deepseek-reasoner",
 )
 
 
@@ -227,33 +246,50 @@ def model_accepts_reasoning_effort(model: str | None) -> bool:
     return any(marker in lowered for marker in _REASONING_CAPABLE_MARKERS)
 
 
-def apply_reasoning_effort(kwargs: dict[str, Any], reasoning_effort: str | None) -> dict[str, Any]:
+def apply_reasoning_effort(
+    kwargs: dict[str, Any], reasoning_effort: str | None
+) -> dict[str, Any]:
     normalized = normalize_reasoning_effort(reasoning_effort)
     if normalized and model_accepts_reasoning_effort(str(kwargs.get("model") or "")):
         kwargs["reasoning_effort"] = normalized
     return kwargs
 
 
+def _provider_family(model: str | None) -> str:
+    """Return the concrete provider family encoded in a LiteLLM model id."""
+    normalized = (model or "").strip().lower()
+    if not normalized:
+        return ""
+    return normalized.split("/", 1)[0]
+
+
+def independent_backup_available(primary_model: str | None = None) -> bool:
+    """True only for a configured fallback on a different provider family."""
+    backup_model = settings.backup_model.strip()
+    if not settings.backup_api_key.strip() or not backup_model:
+        return False
+    if primary_model is None:
+        primary_model = settings.openrouter_model
+    primary_provider = _provider_family(primary_model)
+    backup_provider = _provider_family(backup_model)
+    return bool(backup_provider and backup_provider != primary_provider)
+
+
 def backup_completion_kwargs(
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     *,
     stream: bool = False,
     reasoning_effort: str | None = None,
 ) -> dict[str, Any]:
-    if settings.openrouter_api_key:
-        return apply_reasoning_effort({
-            "model": settings.openrouter_model,
-            "api_key": settings.openrouter_api_key,
-            "api_base": settings.openrouter_api_base,
-            "messages": messages,
-            "stream": stream,
-        }, reasoning_effort)
-    return apply_reasoning_effort({
+    kwargs: dict[str, Any] = {
         "model": settings.backup_model,
         "api_key": settings.backup_api_key,
         "messages": messages,
         "stream": stream,
-    }, reasoning_effort)
+    }
+    if settings.backup_model.startswith("openrouter/"):
+        kwargs["api_base"] = settings.openrouter_api_base
+    return apply_reasoning_effort(kwargs, reasoning_effort)
 
 
 def agent_completion_kwargs(
@@ -262,7 +298,12 @@ def agent_completion_kwargs(
     stream: bool = False,
     reasoning_effort: str | None = None,
 ) -> dict[str, Any]:
-    return model_kwargs(settings.agent_model, messages=messages, stream=stream, reasoning_effort=reasoning_effort)
+    return model_kwargs(
+        settings.agent_model,
+        messages=messages,
+        stream=stream,
+        reasoning_effort=reasoning_effort,
+    )
 
 
 def model_kwargs(
@@ -273,10 +314,62 @@ def model_kwargs(
     reasoning_effort: str | None = None,
 ) -> dict[str, Any]:
     kwargs: dict[str, Any] = {"model": model, "messages": messages, "stream": stream}
-    if model.startswith("openrouter/") or settings.openrouter_api_key:
+    if model.startswith("openrouter/"):
         kwargs["api_key"] = settings.openrouter_api_key
         kwargs["api_base"] = settings.openrouter_api_base
+    elif model == settings.backup_model and settings.backup_api_key:
+        kwargs["api_key"] = settings.backup_api_key
     return apply_reasoning_effort(kwargs, reasoning_effort)
+
+
+def _fallback_kwargs(primary_kwargs: dict[str, Any]) -> dict[str, Any]:
+    fallback = backup_completion_kwargs(
+        list(primary_kwargs.get("messages") or []),
+        stream=bool(primary_kwargs.get("stream")),
+        reasoning_effort=primary_kwargs.get("reasoning_effort"),
+    )
+    # Preserve the request contract. These values contain schemas and routing
+    # choices, never provider credentials.
+    for key in ("tools", "tool_choice", "response_format"):
+        if key in primary_kwargs:
+            fallback[key] = primary_kwargs[key]
+    return fallback
+
+
+async def completion_with_provider_fallback(
+    primary_kwargs: dict[str, Any],
+    *,
+    max_retries: int = _MAX_RETRIES,
+) -> Any:
+    """Run a non-streaming request with one independent-provider failover.
+
+    Primary-provider retries remain bounded. The backup is attempted only when
+    it has a distinct provider family, which prevents an OpenRouter outage from
+    being mislabeled as resilient merely because a second OpenRouter model/key
+    was supplied.
+    """
+    try:
+        return await _with_retry(
+            lambda: litellm.acompletion(**primary_kwargs), max_retries=max_retries
+        )
+    except Exception:
+        primary_model = str(primary_kwargs.get("model") or "")
+        if not independent_backup_available(primary_model):
+            raise
+        fallback = _fallback_kwargs(primary_kwargs)
+        logger.warning(
+            "Primary LLM provider %s failed; attempting independent backup provider %s",
+            _provider_family(primary_model) or "unknown",
+            _provider_family(str(fallback.get("model") or "")) or "unknown",
+        )
+        try:
+            return await _with_retry(
+                lambda: litellm.acompletion(**fallback), max_retries=max_retries
+            )
+        except Exception as backup_exc:
+            raise RuntimeError(
+                "Primary and independent backup LLM providers failed"
+            ) from backup_exc
 
 
 def selected_completion_kwargs(
@@ -286,7 +379,12 @@ def selected_completion_kwargs(
     stream: bool = False,
     reasoning_effort: str | None = None,
 ) -> dict[str, Any]:
-    return model_kwargs(chat_model_string(model_id), messages=messages, stream=stream, reasoning_effort=reasoning_effort)
+    return model_kwargs(
+        chat_model_string(model_id),
+        messages=messages,
+        stream=stream,
+        reasoning_effort=reasoning_effort,
+    )
 
 
 def _choice_delta_content(chunk: Any) -> str:
@@ -334,7 +432,12 @@ def _delta_tool_calls(delta: Any) -> list[Any]:
 def _frag_fields(frag: Any) -> tuple[int, str | None, str | None, str]:
     if isinstance(frag, dict):
         fn = frag.get("function") or {}
-        return int(frag.get("index") or 0), frag.get("id"), fn.get("name"), fn.get("arguments") or ""
+        return (
+            int(frag.get("index") or 0),
+            frag.get("id"),
+            fn.get("name"),
+            fn.get("arguments") or "",
+        )
     fn = getattr(frag, "function", None)
     return (
         int(getattr(frag, "index", 0) or 0),
@@ -344,45 +447,6 @@ def _frag_fields(frag: Any) -> tuple[int, str | None, str | None, str]:
     )
 
 
-async def stream_step(
-    messages: list[dict[str, Any]],
-    tools: list[dict[str, Any]],
-    model: str,
-    *,
-    reasoning_effort: str | None = None,
-):
-    kwargs = model_kwargs(model, messages=messages, stream=True, reasoning_effort=reasoning_effort)
-    kwargs["tools"] = tools
-    kwargs["tool_choice"] = "auto"
-    stream = await _with_retry(lambda: litellm.acompletion(**kwargs))
-
-    text_parts: list[str] = []
-    acc: dict[int, dict[str, Any]] = {}
-    async for chunk in stream:
-        delta = _delta(chunk)
-        content = _delta_content(delta)
-        if content:
-            text_parts.append(content)
-            yield {"type": "token", "content": content}
-        for frag in _delta_tool_calls(delta):
-            idx, fid, name, args = _frag_fields(frag)
-            slot = acc.setdefault(idx, {"id": None, "name": None, "args": ""})
-            if fid:
-                slot["id"] = fid
-            if name:
-                slot["name"] = name
-            slot["args"] += args
-
-    if acc:
-        calls = [
-            {"id": s["id"] or f"call_{i}", "name": s["name"] or "", "args_str": s["args"] or "{}"}
-            for i, s in sorted(acc.items())
-        ]
-        yield {"type": "tool_calls", "calls": calls}
-    else:
-        yield {"type": "text_done", "text": "".join(text_parts)}
-
-
 async def stream_completion(
     messages: list[dict[str, str]],
     *,
@@ -390,18 +454,37 @@ async def stream_completion(
     reasoning_effort: str | None = None,
 ):
     selected = normalize_chat_model(model_id)
-    try:
-        stream = await litellm.acompletion(
-            **selected_completion_kwargs(selected, messages, stream=True, reasoning_effort=reasoning_effort)
-        )
-    except Exception:
-        yield "Chronos is connected, but the selected AI provider is unavailable right now. Choose another model in the selector."
-        return
+    primary = selected_completion_kwargs(
+        selected, messages, stream=True, reasoning_effort=reasoning_effort
+    )
+    candidates = [primary]
+    if independent_backup_available(str(primary.get("model") or "")):
+        candidates.append(_fallback_kwargs(primary))
 
-    async for chunk in stream:
-        token = _choice_delta_content(chunk)
-        if token:
-            yield token
+    for index, kwargs in enumerate(candidates):
+        emitted = False
+        try:
+            stream = await _with_retry(lambda: litellm.acompletion(**kwargs))
+            async for chunk in stream:
+                token = _choice_delta_content(chunk)
+                if token:
+                    emitted = True
+                    yield token
+            return
+        except Exception:
+            if emitted:
+                logger.exception(
+                    "LLM stream interrupted after response output; refusing unsafe replay"
+                )
+                yield "\n\nChronos lost the model connection after part of this response. The partial response was not replayed to avoid duplication."
+                return
+            if index + 1 < len(candidates):
+                logger.warning(
+                    "Selected LLM provider failed before output; trying independent backup"
+                )
+                continue
+            yield "Chronos is connected, but both the selected AI provider and its independent backup are unavailable right now."
+            return
 
 
 async def stream_step(
@@ -418,55 +501,74 @@ async def stream_step(
         {"type": "text_done", "text": str}     — full text when no tool calls
         {"type": "tool_calls", "calls": list}  — normalised tool call dicts
     """
-    kwargs = model_kwargs(model, messages=history, stream=True, reasoning_effort=reasoning_effort)
-    kwargs["tools"] = tools
-    kwargs["tool_choice"] = "auto"
+    primary = model_kwargs(
+        model, messages=history, stream=True, reasoning_effort=reasoning_effort
+    )
+    primary["tools"] = tools
+    primary["tool_choice"] = "auto"
+    candidates = [primary]
+    if independent_backup_available(model):
+        candidates.append(_fallback_kwargs(primary))
 
-    stream = await _with_retry(lambda: litellm.acompletion(**kwargs))
+    for index, kwargs in enumerate(candidates):
+        full_text = ""
+        raw_tool_calls: dict[int, dict[str, Any]] = {}
+        emitted = False
+        try:
+            stream = await _with_retry(lambda: litellm.acompletion(**kwargs))
+            async for chunk in stream:
+                choice = chunk.choices[0] if chunk.choices else None
+                if choice is None:
+                    continue
+                delta = choice.delta if hasattr(choice, "delta") else {}
 
-    full_text = ""
-    raw_tool_calls: dict[int, dict[str, Any]] = {}
+                token = (delta.content if hasattr(delta, "content") else None) or ""
+                if token:
+                    emitted = True
+                    full_text += token
+                    yield {"type": "token", "content": token}
 
-    async for chunk in stream:
-        choice = chunk.choices[0] if chunk.choices else None
-        if choice is None:
-            continue
-        delta = choice.delta if hasattr(choice, "delta") else {}
+                tc_deltas = (
+                    delta.tool_calls if hasattr(delta, "tool_calls") else None
+                ) or []
+                for tc in tc_deltas:
+                    idx = tc.index if hasattr(tc, "index") else 0
+                    if idx not in raw_tool_calls:
+                        raw_tool_calls[idx] = {"id": "", "name": "", "args_str": ""}
+                    entry = raw_tool_calls[idx]
+                    if hasattr(tc, "id") and tc.id:
+                        entry["id"] = tc.id
+                    fn = getattr(tc, "function", None)
+                    if fn:
+                        if getattr(fn, "name", None):
+                            entry["name"] += fn.name
+                        if getattr(fn, "arguments", None):
+                            entry["args_str"] += fn.arguments
 
-        # Accumulate text tokens
-        token = (delta.content if hasattr(delta, "content") else None) or ""
-        if token:
-            full_text += token
-            yield {"type": "token", "content": token}
-
-        # Accumulate streaming tool call fragments
-        tc_deltas = (delta.tool_calls if hasattr(delta, "tool_calls") else None) or []
-        for tc in tc_deltas:
-            idx = tc.index if hasattr(tc, "index") else 0
-            if idx not in raw_tool_calls:
-                raw_tool_calls[idx] = {"id": "", "name": "", "args_str": ""}
-            entry = raw_tool_calls[idx]
-            if hasattr(tc, "id") and tc.id:
-                entry["id"] = tc.id
-            fn = getattr(tc, "function", None)
-            if fn:
-                if getattr(fn, "name", None):
-                    entry["name"] += fn.name
-                if getattr(fn, "arguments", None):
-                    entry["args_str"] += fn.arguments
-
-    if raw_tool_calls:
-        calls = [
-            {
-                "id": v["id"] or f"call_{i}",
-                "name": v["name"],
-                "args_str": v["args_str"] or "{}",
-            }
-            for i, v in sorted(raw_tool_calls.items())
-        ]
-        yield {"type": "tool_calls", "calls": calls}
-    else:
-        yield {"type": "text_done", "text": full_text}
+            if raw_tool_calls:
+                calls = [
+                    {
+                        "id": value["id"] or f"call_{i}",
+                        "name": value["name"],
+                        "args_str": value["args_str"] or "{}",
+                    }
+                    for i, value in sorted(raw_tool_calls.items())
+                ]
+                yield {"type": "tool_calls", "calls": calls}
+            else:
+                yield {"type": "text_done", "text": full_text}
+            return
+        except Exception:
+            # Once a token is visible, replaying the request on another provider
+            # can duplicate actions or contradict already-streamed text.
+            if emitted:
+                raise
+            if index + 1 < len(candidates):
+                logger.warning(
+                    "Agent LLM provider failed before output; trying independent backup"
+                )
+                continue
+            raise
 
 
 async def complete_json(prompt: str, *, model: str | None = None) -> str:
@@ -480,7 +582,9 @@ async def complete_json(prompt: str, *, model: str | None = None) -> str:
     try:
         kwargs = model_kwargs(selected, messages=messages, stream=False)
         kwargs["response_format"] = {"type": "json_object"}
-        response = await _with_retry(lambda: litellm.acompletion(**kwargs), max_retries=0)
+        response = await _with_retry(
+            lambda: litellm.acompletion(**kwargs), max_retries=0
+        )
         return _message_content(response)
     except Exception:
         pass
@@ -495,7 +599,16 @@ async def complete_json(prompt: str, *, model: str | None = None) -> str:
         except Exception:
             pass
 
-    raise RuntimeError("All models failed for complete_json — check OPENROUTER_API_KEY and model config")
+    if independent_backup_available(selected):
+        try:
+            kwargs = backup_completion_kwargs(messages, stream=False)
+            kwargs["response_format"] = {"type": "json_object"}
+            response = await _with_retry(lambda: litellm.acompletion(**kwargs))
+            return _message_content(response)
+        except Exception:
+            pass
+
+    raise RuntimeError("Primary and independent backup models failed for complete_json")
 
 
 async def complete_text(prompt: str, *, model: str | None = None) -> str:
@@ -518,7 +631,15 @@ async def complete_text(prompt: str, *, model: str | None = None) -> str:
         except Exception:
             pass
 
-    raise RuntimeError("All models failed for complete_text — check OPENROUTER_API_KEY and model config")
+    if independent_backup_available(selected):
+        try:
+            kwargs = backup_completion_kwargs(messages, stream=False)
+            response = await _with_retry(lambda: litellm.acompletion(**kwargs))
+            return _message_content(response)
+        except Exception:
+            pass
+
+    raise RuntimeError("Primary and independent backup models failed for complete_text")
 
 
 async def vision_ocr(image_bytes: bytes, mime: str) -> str:
@@ -547,7 +668,7 @@ async def vision_ocr(image_bytes: bytes, mime: str) -> str:
     ]
     try:
         kwargs = model_kwargs(settings.vision_model, messages=messages, stream=False)
-        response = await _with_retry(lambda: litellm.acompletion(**kwargs), max_retries=0)
+        response = await completion_with_provider_fallback(kwargs, max_retries=0)
         return _message_content(response)
     except Exception:
         return ""
@@ -576,13 +697,18 @@ async def vision_json(image_bytes: bytes, mime: str, instruction: str) -> str:
     try:
         kwargs = model_kwargs(settings.vision_model, messages=messages, stream=False)
         kwargs["response_format"] = {"type": "json_object"}
-        response = await _with_retry(lambda: litellm.acompletion(**kwargs), max_retries=0)
+        response = await completion_with_provider_fallback(kwargs, max_retries=0)
         return _message_content(response)
     except Exception:
         return ""
 
 
-async def tool_call(messages: list[dict[str, Any]], tools: list[dict[str, Any]], *, model: str | None = None) -> dict[str, Any]:
+async def tool_call(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    *,
+    model: str | None = None,
+) -> dict[str, Any]:
     """Ask the agent model for the next tool call or final response.
 
     Uses retry/backoff on rate-limit errors before giving up.
@@ -591,7 +717,7 @@ async def tool_call(messages: list[dict[str, Any]], tools: list[dict[str, Any]],
     kwargs = model_kwargs(selected, messages=messages, stream=False)
     kwargs["tools"] = tools
     kwargs["tool_choice"] = "auto"
-    response = await _with_retry(lambda: litellm.acompletion(**kwargs))
+    response = await completion_with_provider_fallback(kwargs)
     message = _message(response)
     calls = _tool_calls(message)
     if calls:
@@ -608,7 +734,11 @@ async def tool_call(messages: list[dict[str, Any]], tools: list[dict[str, Any]],
             args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
         except json.JSONDecodeError:
             args = {}
-        return {"type": "tool_call", "tool": name, "args": args if isinstance(args, dict) else {}}
+        return {
+            "type": "tool_call",
+            "tool": name,
+            "args": args if isinstance(args, dict) else {},
+        }
 
     content = _message_content(response)
     try:

@@ -26,6 +26,10 @@ log = logging.getLogger(__name__)
 TOKEN_REFRESH_BUFFER = 300  # seconds
 
 
+class AmbiguousProviderMutation(RuntimeError):
+    """A request was dispatched but the remote mutation outcome is unknown."""
+
+
 async def _get_token(vault_ref: str, *, org_id: str) -> tuple[str, dict]:
     """Return (access_token, full_creds). Refreshes proactively if near expiry."""
     from connectors.vault import get as vault_get, update as vault_update
@@ -79,6 +83,7 @@ async def call(
     org_id: str,
     params: dict | None = None,
     body: dict | None = None,
+    provider_idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     """Make one authenticated HTTP call. Returns parsed JSON (or empty dict)."""
     from connectors.oauth_apps import get_app
@@ -107,23 +112,11 @@ async def call(
     # GitHub wants JSON accept header
     if provider == "github":
         headers["Accept"] = "application/vnd.github+json"
+    mutation = method.upper() not in {"GET", "HEAD", "OPTIONS"}
+    if mutation and provider == "stripe" and provider_idempotency_key:
+        headers["Idempotency-Key"] = provider_idempotency_key
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.request(
-            method.upper(),
-            url,
-            headers=headers,
-            params=params,
-            json=body,
-        )
-
-    if resp.status_code == 401:
-        # Force expire and retry once
-        creds["expires_at"] = "0"
-        from connectors.vault import update as vault_update
-        await vault_update(vault_ref, creds)
-        token, _ = await _get_token(vault_ref, org_id=org_id)
-        headers["Authorization"] = f"Bearer {token}"
+    try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.request(
                 method.upper(),
@@ -132,13 +125,55 @@ async def call(
                 params=params,
                 json=body,
             )
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
+        raise RuntimeError(f"{provider} connection failed before dispatch") from exc
+    except httpx.HTTPError as exc:
+        if mutation:
+            raise AmbiguousProviderMutation(
+                f"{provider} provider outcome is unknown after a transport failure"
+            ) from exc
+        raise RuntimeError(f"{provider} request failed") from exc
+
+    if resp.status_code == 401:
+        # Force expire and retry once
+        creds["expires_at"] = "0"
+        from connectors.vault import update as vault_update
+        await vault_update(vault_ref, creds)
+        token, _ = await _get_token(vault_ref, org_id=org_id)
+        headers["Authorization"] = f"Bearer {token}"
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.request(
+                    method.upper(),
+                    url,
+                    headers=headers,
+                    params=params,
+                    json=body,
+                )
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
+            raise RuntimeError(f"{provider} connection failed before dispatch") from exc
+        except httpx.HTTPError as exc:
+            if mutation:
+                raise AmbiguousProviderMutation(
+                    f"{provider} provider outcome is unknown after a transport failure"
+                ) from exc
+            raise RuntimeError(f"{provider} request failed") from exc
 
     if resp.status_code >= 400:
+        if mutation and resp.status_code >= 500:
+            raise AmbiguousProviderMutation(
+                f"{provider} returned HTTP {resp.status_code}; mutation outcome is unknown"
+            )
         raise RuntimeError(
-            f"{provider} API {method} {endpoint} → {resp.status_code}: {resp.text[:400]}"
+            f"{provider} API returned HTTP {resp.status_code}"
         )
 
-    return resp.json() if resp.content else {}
+    if not resp.content:
+        return {"status_code": resp.status_code}
+    try:
+        return resp.json()
+    except ValueError:
+        return {"status_code": resp.status_code, "response_body_unavailable": True}
 
 
 class GenericHTTPConnector:
@@ -146,11 +181,14 @@ class GenericHTTPConnector:
 
     async def execute(self, tool: str, args: dict[str, Any], vault_ref: str) -> ToolResult:
         provider = tool.split(".")[0]
-        action = tool.split(".", 1)[1] if "." in tool else "api"
 
         tier = args.pop("__connector_tier", "live")
         org_id = str(args.pop("__org_id", "") or "")
         args.pop("__task_id", None)
+        args.pop("__member_id", None)
+        provider_idempotency_key = str(
+            args.pop("__provider_idempotency_key", "") or ""
+        )
 
         if tier in {"demo", "fixture"}:
             return ToolResult(
@@ -164,7 +202,24 @@ class GenericHTTPConnector:
         body = args.get("body") or args.get("json")
 
         try:
-            data = await call(vault_ref, method, endpoint, org_id=org_id, params=params, body=body)
+            data = await call(
+                vault_ref,
+                method,
+                endpoint,
+                org_id=org_id,
+                params=params,
+                body=body,
+                provider_idempotency_key=provider_idempotency_key,
+            )
+        except AmbiguousProviderMutation as exc:
+            return ToolResult(
+                data={
+                    "status": "ambiguous",
+                    "manual_review_required": provider != "stripe",
+                    "error": str(exc),
+                },
+                summary=f"{tool} outcome is ambiguous; automatic unsafe retry is disabled",
+            )
         except RuntimeError as exc:
             return ToolResult(data={"error": str(exc)}, summary=f"{tool} failed: {exc}")
 

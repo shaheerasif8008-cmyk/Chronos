@@ -183,7 +183,11 @@ async def test_signup_endpoint_second_same_domain_auto_joins():
     async with _client() as client:
         await client.post("/auth/signup", json={"email": f"founder@{domain}", "code": "123456"})
         _seed_otp(f"teammate@{domain}")
-        resp = await client.post("/auth/signup", json={"email": f"teammate@{domain}", "code": "123456"})
+        resp = await client.post(
+            "/auth/signup",
+            json={"email": f"teammate@{domain}", "code": "123456"},
+            headers={"Origin": "http://localhost:3000"},
+        )
     assert resp.status_code == 200
     assert resp.json()["created"] is False
 

@@ -6,7 +6,7 @@ import pytest
 import httpx
 import main
 
-from core import domains
+from core import domains, sso
 from core.auth import create_access_token
 from core.db import engine, reflect_table
 
@@ -150,6 +150,10 @@ async def test_verify_start_rejects_non_admin():
 
 @pytest.mark.asyncio
 async def test_sso_connection_requires_hard_claimed_domain(monkeypatch):
+    # Exercise the production storage path from the initial create. Production
+    # cannot boot without this key; leaving it blank here would intentionally
+    # select the development-only plaintext compatibility path.
+    monkeypatch.setattr(sso.settings, "vault_encryption_key", "22" * 32)
     domain = f"ssov{uuid.uuid4().hex[:8]}.com"
     org_id = await _seed_claim(domain)  # soft claim only
     token = await _admin_in_org(org_id)
@@ -169,3 +173,54 @@ async def test_sso_connection_requires_hard_claimed_domain(monkeypatch):
         await domains.check_domain_verification(org_id, domain)
         r2 = await client.post("/auth/sso/connections", json=body, headers=headers)
         assert r2.status_code == 200  # now hard-claimed → allowed
+        connection_id = r2.json()["id"]
+        monkeypatch.setattr("core.sso.assert_safe_url", lambda url: url)
+        async def _discovery(_issuer: str) -> dict[str, str]:
+            return {
+                "authorize_url": "https://idp.example.com/authorize",
+                "token_url": "https://idp.example.com/token",
+                "jwks_url": "https://idp.example.com/jwks",
+                "userinfo_url": "",
+            }
+        monkeypatch.setattr("core.sso.discover", _discovery)
+        started = await client.get(
+            "/auth/sso/start", params={"email": f"member@{domain}"}
+        )
+        assert started.status_code == 200
+        assert "chronos_sso_state=" in started.headers.get("set-cookie", "")
+        patched = await client.patch(
+            f"/auth/sso/connections/{connection_id}",
+            json={"enabled": False, "client_secret": ""},
+            headers=headers,
+        )
+        assert patched.status_code == 200
+        assert patched.json()["has_client_secret"] is True
+
+        # Empty is preserve-only; a non-empty PATCH performs an encrypted
+        # rotation when the production vault key is configured.
+        table = await reflect_table("sso_connections")
+        async with engine.begin() as conn:
+            preserved = (
+                await conn.execute(table.select().where(table.c.id == connection_id))
+            ).mappings().one()["client_secret"]
+        assert preserved.startswith("enc:v1:")
+        assert sso.reveal_client_secret(
+            preserved, organization_id=org_id
+        ) == "s"
+        rotated = await client.patch(
+            f"/auth/sso/connections/{connection_id}",
+            json={"client_secret": "replacement-secret"},
+            headers=headers,
+        )
+        assert rotated.status_code == 200
+
+    # The replacement is encrypted at rest and decrypts only in the owning org.
+    async with engine.begin() as conn:
+        stored = (
+            await conn.execute(table.select().where(table.c.id == connection_id))
+        ).mappings().one()
+    assert stored["client_secret"].startswith("enc:v1:")
+    assert sso.reveal_client_secret(
+        stored["client_secret"], organization_id=org_id
+    ) == "replacement-secret"
+    assert stored["enabled"] is False

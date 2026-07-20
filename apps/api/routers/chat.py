@@ -4,15 +4,16 @@ import json
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Coroutine
+from typing import Any, Coroutine, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, insert, or_, select, update
 
-from core import audit, permissions
+from core import audit, notifications, permissions, workspace_access
 from core.auth import get_current_member
+from core import conversation_access as conversation_acl
 from core.config import settings
 from core.context import assemble_context
 from core.db import engine, reflect_table
@@ -29,9 +30,15 @@ from core.llm import (
     normalize_chat_model,
     normalize_reasoning_effort,
 )
-from core.modes import available_modes
-from core.memory_writes import create_memory_entry, extract_explicit_memory_content
-from core.models import Member, RequesterContext
+from core.modes import available_modes, normalize_mode
+from core.memory_access import normalize_entry_scope
+from core.project_access import member_can_edit_project
+from core.memory_writes import (
+    create_memory_entry,
+    extract_explicit_memory_content,
+    MemoryCaptureDisabled,
+)
+from core.models import AgentContext, Member, RequesterContext
 from core.governance import enforce_request_rate
 from core.redis import redis_client
 from core.artifacts import get_artifact as _get_artifact
@@ -91,13 +98,22 @@ class ChatRequest(BaseModel):
     disabled_tools: list[str] = Field(default_factory=list)
 
 
-async def _create_conversation(member: Member, title: str, project_id: str | None = None) -> str:
+async def _create_conversation(
+    member: Member,
+    title: str,
+    project_id: str | None = None,
+    workspace_id: str | None = None,
+) -> str:
+    workspace = await workspace_access.require_workspace_access(
+        member, workspace_id or "default", access="write"
+    )
     conversations = await reflect_table("conversations")
     values: dict = dict(
         organization_id=member.organization_id,
         region=settings.region,
         member_id=member.id,
         title=title[:80],
+        workspace_id=str(workspace["id"]),
     )
     if project_id is not None:
         values["project_id"] = project_id
@@ -107,7 +123,13 @@ async def _create_conversation(member: Member, title: str, project_id: str | Non
             .values(**values)
             .returning(conversations.c.id)
         )
-        return str(result.scalar_one())
+        conversation_id = str(result.scalar_one())
+    # The DB trigger writes the durable owner ACL atomically. Mirror it to FGA
+    # after commit when relationship enforcement is configured.
+    await permissions.grant_conversation_role(
+        str(member.id), "owner", conversation_id, member.organization_id
+    )
+    return conversation_id
 
 
 async def _save_message(
@@ -115,6 +137,9 @@ async def _save_message(
     structured_response: dict | None = None,
     _member_id: str | None = None,
     _org_id: str | None = None,
+    _member_role: str = "user",
+    _workspace_id: str | None = None,
+    _project_id: str | None = None,
     model: str | None = None,
     mode: str | None = None,
     citations: list | None = None,
@@ -138,19 +163,35 @@ async def _save_message(
     async with engine.begin() as conn:
         conv_row = None
         if _member_id is not None and _org_id is not None:
-            conv_row = (
-                await conn.execute(
-                    select(conversations).where(
-                        conversations.c.id == conversation_id,
-                        conversations.c.member_id == _member_id,
-                        conversations.c.organization_id == _org_id,
-                    )
+            actor = Member(
+                id=str(_member_id),
+                organization_id=str(_org_id),
+                email="conversation-writer@chronos.invalid",
+                role=_member_role,
+            )
+            conv_row = await _check_conversation_ownership(
+                conn,
+                conversations,
+                conversation_id,
+                actor,
+                minimum="editor",
+            )
+            stored_workspace_id = conv_row.get("workspace_id") if conv_row else None
+            if _workspace_id is not None and str(stored_workspace_id or "") != str(_workspace_id):
+                raise HTTPException(
+                    status_code=422,
+                    detail="workspace_id does not match conversation",
                 )
-            ).mappings().first()
-            if conv_row is None:
-                from fastapi import HTTPException
-
-                raise HTTPException(status_code=404, detail="Conversation not found")
+            stored_project_id = conv_row.get("project_id") if conv_row else None
+            if _project_id is not None and str(stored_project_id or "") != str(_project_id):
+                raise HTTPException(
+                    status_code=422,
+                    detail="project_id does not match conversation",
+                )
+            if stored_project_id and not await member_can_edit_project(
+                actor, str(stored_project_id)
+            ):
+                raise HTTPException(status_code=404, detail="Project not found")
 
         await conn.execute(
             insert(messages).values(
@@ -261,14 +302,25 @@ async def list_chat_modes(member: Member = Depends(get_current_member)) -> list[
 async def list_conversations(member: Member = Depends(get_current_member)) -> list[dict]:
     await permissions.check(member, "list_conversations", settings.org_id)
     conversations = await reflect_table("conversations")
+    conditions = [conversations.c.organization_id == member.organization_id]
+    if member.role not in conversation_acl.ADMIN_ROLES:
+        try:
+            conversation_members = await reflect_table("conversation_members")
+        except Exception:
+            conversation_members = None
+        if conversation_members is None:
+            conditions.append(conversations.c.member_id == member.id)
+        else:
+            conditions.append(
+                conversation_acl.visibility_clause(
+                    conversations, conversation_members, member
+                )
+            )
     async with engine.begin() as conn:
         rows = (
             await conn.execute(
                 select(conversations)
-                .where(
-                    conversations.c.member_id == member.id,
-                    conversations.c.organization_id == member.organization_id,
-                )
+                .where(*conditions)
                 .order_by(conversations.c.updated_at.desc())
             )
         ).mappings().all()
@@ -281,7 +333,9 @@ async def list_messages(conversation_id: str, member: Member = Depends(get_curre
     conversations = await reflect_table("conversations")
     messages = await reflect_table("messages")
     async with engine.begin() as conn:
-        await _check_conversation_ownership(conn, conversations, conversation_id, member)
+        await _check_conversation_ownership(
+            conn, conversations, conversation_id, member, minimum="viewer"
+        )
         rows = (
             await conn.execute(
                 select(messages)
@@ -298,8 +352,12 @@ async def list_messages(conversation_id: str, member: Member = Depends(get_curre
 @router.get("/conversations/{conversation_id}/latest-task")
 async def latest_conversation_task(conversation_id: str, member: Member = Depends(get_current_member)) -> dict | None:
     await permissions.check(member, "view_conversation", conversation_id)
+    conversations = await reflect_table("conversations")
     tasks = await reflect_table("tasks")
     async with engine.begin() as conn:
+        await _check_conversation_ownership(
+            conn, conversations, conversation_id, member, minimum="viewer"
+        )
         row = (
             await conn.execute(
                 select(tasks)
@@ -312,11 +370,19 @@ async def latest_conversation_task(conversation_id: str, member: Member = Depend
                 .limit(1)
             )
         ).mappings().first()
-    return dict(row) if row else None
+    if not row:
+        return None
+    from core.task_access import visible_task
+
+    return dict(row) if await visible_task(member, str(row["id"])) else None
 
 
 class RenameConversationRequest(BaseModel):
     title: str
+
+
+class ConversationMemberRequest(BaseModel):
+    role: Literal["editor", "viewer"]
 
 
 @router.patch("/conversations/{conversation_id}")
@@ -331,17 +397,9 @@ async def rename_conversation(
     await permissions.check(member, "rename_conversation", conversation_id)
     conversations = await reflect_table("conversations")
     async with engine.begin() as conn:
-        row = (
-            await conn.execute(
-                select(conversations.c.id).where(
-                    conversations.c.id == conversation_id,
-                    conversations.c.member_id == member.id,
-                    conversations.c.organization_id == member.organization_id,
-                )
-            )
-        ).first()
-        if row is None:
-            raise HTTPException(status_code=404, detail="Conversation not found")
+        await _check_conversation_ownership(
+            conn, conversations, conversation_id, member, minimum="editor"
+        )
         await conn.execute(
             update(conversations)
             .where(conversations.c.id == conversation_id)
@@ -358,22 +416,137 @@ async def rename_conversation(
     return {"id": conversation_id, "title": title}
 
 
+@router.get("/conversations/{conversation_id}/members")
+async def list_conversation_acl(
+    conversation_id: str,
+    member: Member = Depends(get_current_member),
+) -> list[dict]:
+    await permissions.check(member, "view_conversation", conversation_id)
+    try:
+        await conversation_acl.require_conversation(
+            member, conversation_id, minimum="viewer"
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Conversation not found") from exc
+    return await conversation_acl.list_conversation_members(
+        member.organization_id, conversation_id
+    )
+
+
+@router.put("/conversations/{conversation_id}/members/{target_member_id}")
+async def put_conversation_member(
+    conversation_id: str,
+    target_member_id: str,
+    req: ConversationMemberRequest,
+    member: Member = Depends(get_current_member),
+) -> dict:
+    await permissions.check(member, "share_conversation", conversation_id)
+    try:
+        await conversation_acl.require_conversation(
+            member, conversation_id, minimum="owner"
+        )
+        row = await conversation_acl.upsert_conversation_member(
+            organization_id=member.organization_id,
+            conversation_id=conversation_id,
+            member_id=target_member_id,
+            role=req.role,
+            granted_by_member_id=member.id,
+        )
+    except LookupError as exc:
+        # Do not reveal whether a foreign/inactive target member exists.
+        raise HTTPException(status_code=404, detail="Conversation or member not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    # Converge both possible historical roles before writing the desired tuple.
+    for prior_role in ("editor", "viewer"):
+        if prior_role != req.role:
+            await permissions.revoke_conversation_role(
+                target_member_id, prior_role, conversation_id
+            )
+    await permissions.grant_conversation_role(
+        target_member_id,
+        req.role,
+        conversation_id,
+        member.organization_id,
+    )
+    await audit.log(
+        "conversation_shared",
+        member.id,
+        "chat.share_conversation",
+        organization_id=member.organization_id,
+        resource_type="conversations",
+        resource_id=conversation_id,
+        payload={"member_id": target_member_id, "role": req.role},
+    )
+    try:
+        await notifications.emit(
+            organization_id=member.organization_id,
+            type="conversation_shared",
+            title=f"{member.name or member.email} shared a conversation with you",
+            body="You can now open this conversation in Chronos.",
+            severity="info",
+            member_id=target_member_id,
+            resource_type="conversation",
+            resource_id=conversation_id,
+            created_by=member.id,
+        )
+    except Exception:  # noqa: BLE001 - the durable ACL must not roll back on delivery
+        logger.warning(
+            "conversation share notification failed for member %s",
+            target_member_id,
+            exc_info=True,
+        )
+    return row
+
+
+@router.delete("/conversations/{conversation_id}/members/{target_member_id}")
+async def delete_conversation_member(
+    conversation_id: str,
+    target_member_id: str,
+    member: Member = Depends(get_current_member),
+) -> dict:
+    await permissions.check(member, "share_conversation", conversation_id)
+    try:
+        await conversation_acl.require_conversation(
+            member, conversation_id, minimum="owner"
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Conversation not found") from exc
+    removed = await conversation_acl.remove_conversation_member(
+        organization_id=member.organization_id,
+        conversation_id=conversation_id,
+        member_id=target_member_id,
+    )
+    if not removed:
+        raise HTTPException(status_code=404, detail="Conversation member not found")
+    for prior_role in ("editor", "viewer"):
+        await permissions.revoke_conversation_role(
+            target_member_id, prior_role, conversation_id
+        )
+    await audit.log(
+        "conversation_unshared",
+        member.id,
+        "chat.unshare_conversation",
+        organization_id=member.organization_id,
+        resource_type="conversations",
+        resource_id=conversation_id,
+        payload={"member_id": target_member_id},
+    )
+    return {"conversation_id": conversation_id, "member_id": target_member_id, "removed": True}
+
+
 @router.delete("/conversations/{conversation_id}")
 async def delete_conversation(conversation_id: str, member: Member = Depends(get_current_member)) -> dict:
     await permissions.check(member, "delete_conversation", conversation_id)
     conversations = await reflect_table("conversations")
     messages = await reflect_table("messages")
     async with engine.begin() as conn:
-        row = (
-            await conn.execute(
-                select(conversations.c.id).where(
-                    conversations.c.id == conversation_id,
-                    conversations.c.member_id == member.id,
-                    conversations.c.organization_id == member.organization_id,
-                )
+        try:
+            await _check_conversation_ownership(
+                conn, conversations, conversation_id, member, minimum="owner"
             )
-        ).first()
-        if row is None:
+        except HTTPException:
             return {"id": conversation_id, "deleted": False}
         await conn.execute(delete(messages).where(messages.c.conversation_id == conversation_id))
         await conn.execute(delete(conversations).where(conversations.c.id == conversation_id))
@@ -524,6 +697,7 @@ async def _agent_loop_stream(
         workspace_id=workspace_id,
         model=model,
         reasoning_effort=reasoning_effort,
+        project_id=requester_context.project_id if requester_context else None,
         attachments_context=attachments_context,
         original_message=original_message,
         router_decision=router_decision,
@@ -630,6 +804,10 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
     from fastapi import HTTPException
 
     await permissions.check(member, "chat", req.conversation_id or "new_conversation")
+    workspace = await workspace_access.require_workspace_access(
+        member, req.workspace_id or "default", access="write"
+    )
+    canonical_workspace_id = str(workspace["id"])
     await enforce_request_rate(member.organization_id, scope="request")
     try:
         selected_model = normalize_chat_model(req.model)
@@ -661,6 +839,9 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
             req.conversation_id, "user", req.message,
             artifact_refs=_user_artifact_refs or None,
             _member_id=member.id, _org_id=member.organization_id,
+            _member_role=member.role,
+            _workspace_id=canonical_workspace_id,
+            _project_id=req.project_id,
         )
         conversation_id = req.conversation_id
         # Validate / hydrate project_id from the stored conversation row.
@@ -674,7 +855,14 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
     else:
         # New conversation: create it (with project_id if supplied), then save
         # the user message WITHOUT a RETURNING fetch (_member_id omitted).
-        conversation_id = await _create_conversation(member, req.message, project_id=req.project_id)
+        if req.project_id is not None and not await member_can_edit_project(member, req.project_id):
+            raise HTTPException(status_code=404, detail="Project not found")
+        conversation_id = await _create_conversation(
+            member,
+            req.message,
+            project_id=req.project_id,
+            workspace_id=canonical_workspace_id,
+        )
         await _save_message(
             conversation_id, "user", req.message,
             artifact_refs=_user_artifact_refs or None,
@@ -682,29 +870,39 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
         )
         effective_project_id = req.project_id
 
+    if effective_project_id is not None and not await member_can_edit_project(
+        member, str(effective_project_id)
+    ):
+        raise HTTPException(status_code=404, detail="Project not found")
+
     requester_context = RequesterContext.from_member(member)
     requester_context.persona_id = req.persona_id
-    requester_context.workspace_id = req.workspace_id
+    requester_context.workspace_id = canonical_workspace_id
     requester_context.project_id = effective_project_id
+    requester_context.conversation_id = conversation_id
     explicit_memory = extract_explicit_memory_content(req.message)
 
     if explicit_memory and not _attachment_ids_raw:
-        async def explicit_stream():
+        try:
             entry_id = await create_memory_entry(
                 content=explicit_memory,
                 requester_context=requester_context,
                 source="explicit",
-                scope="org",
-                scope_id=member.organization_id,
+                scope="personal",
+                scope_id=member.id,
                 importance_score=0.9,
                 conversation_id=conversation_id,
                 created_by=member.id,
             )
+        except MemoryCaptureDisabled as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+        async def explicit_stream():
             assistant_response = f"Got it, I'll remember that: {explicit_memory}"
             await _save_message(conversation_id, "assistant", assistant_response, _org_id=member.organization_id)
             await audit.log("chat_response", member.id, "chat.message", organization_id=member.organization_id, resource_id=conversation_id)
             yield f"data: {json.dumps({'type': 'conversation', 'conversation_id': conversation_id})}\n\n"
-            yield f"data: {json.dumps({'type': 'memory_saved', 'entry_id': entry_id, 'content': explicit_memory, 'scope': 'org', 'source': 'explicit'})}\n\n"
+            yield f"data: {json.dumps({'type': 'memory_saved', 'entry_id': entry_id, 'content': explicit_memory, 'scope': 'personal', 'source': 'explicit'})}\n\n"
             yield f"data: {json.dumps({'type': 'token', 'content': assistant_response})}\n\n"
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
@@ -718,7 +916,18 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
     # task and chat branches need the assembled context — so run them concurrently
     # to overlap their LLM round-trips instead of paying for them in series.
     # Obviously conversational messages skip the classifier LLM call entirely.
-    if _is_trivial_chat(req.message):
+    request_mode = normalize_mode(req.mode)
+    if request_mode == "chat":
+        intent = {
+            "mode": "chat",
+            "goal": None,
+            "difficulty": "standard",
+            "reasoning_effort": selected_reasoning_effort,
+        }
+        context = await assemble_context(
+            conversation_id, req.message, requester_context
+        )
+    elif _is_trivial_chat(req.message):
         intent = {"mode": "chat", "goal": None, "difficulty": "trivial", "reasoning_effort": None}
         context = await assemble_context(conversation_id, req.message, requester_context)
     else:
@@ -765,8 +974,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
     # chat.  No LLM turn is needed — the message IS the generation prompt.
     # The honest degraded state (no provider configured) is returned by the
     # connector itself and streamed back as an assistant message, not an error.
-    from core.modes import normalize_mode as _normalize_mode
-    if _normalize_mode(req.mode) == "image":
+    if request_mode == "image":
         async def _image_mode_stream():
             from core.models import AgentContext
 
@@ -780,6 +988,7 @@ async def send_message(req: ChatRequest, member: Member = Depends(get_current_me
                 task_id=None,
                 member_id=member.id,
                 workspace_id=req.workspace_id,
+                project_id=str(effective_project_id) if effective_project_id else None,
             )
             from core.tool_broker import tool_broker as _tb
 
@@ -878,7 +1087,7 @@ class EditMessageRequest(BaseModel):
 
 
 class SaveToMemoryRequest(BaseModel):
-    scope: str = "org"
+    scope: str = "personal"
 
 
 class ConvertToTaskRequest(BaseModel):
@@ -937,21 +1146,32 @@ async def _check_conversation_ownership(
     conversations: Any,
     conversation_id: str,
     member: Member,
+    *,
+    minimum: str = "viewer",
 ) -> dict:
-    """Return conversation row or raise 404 if not owned by member/org."""
-    from fastapi import HTTPException
-    row = (
-        await conn.execute(
-            select(conversations).where(
-                conversations.c.id == conversation_id,
-                conversations.c.member_id == member.id,
-                conversations.c.organization_id == member.organization_id,
-            )
-        )
-    ).mappings().first()
+    """Legacy name for the canonical owner/share ACL check."""
+
+    try:
+        conversation_members = await reflect_table("conversation_members")
+        required = {"organization_id", "conversation_id", "member_id", "role"}
+        if not required.issubset(set(conversation_members.c.keys())):
+            conversation_members = None
+    except Exception:
+        # Rolling-deploy and narrow unit-test fallback: owner/admin only.
+        conversation_members = None
+    row, role = await conversation_acl.access_in_connection(
+        conn,
+        conversations,
+        conversation_members,
+        member=member,
+        conversation_id=conversation_id,
+        select_fn=select,
+    )
     if row is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    return dict(row)
+    if not conversation_acl.role_allows(role, minimum):
+        raise HTTPException(status_code=403, detail="Conversation is read-only")
+    return row
 
 
 @router.post("/conversations/{conversation_id}/messages/{message_id}/pin")
@@ -964,7 +1184,9 @@ async def pin_message(
     conversations = await reflect_table("conversations")
     messages = await reflect_table("messages")
     async with engine.begin() as conn:
-        await _check_conversation_ownership(conn, conversations, conversation_id, member)
+        await _check_conversation_ownership(
+            conn, conversations, conversation_id, member, minimum="editor"
+        )
         await conn.execute(
             update(messages)
             .where(messages.c.id == message_id, messages.c.conversation_id == conversation_id)
@@ -991,7 +1213,9 @@ async def unpin_message(
     conversations = await reflect_table("conversations")
     messages = await reflect_table("messages")
     async with engine.begin() as conn:
-        await _check_conversation_ownership(conn, conversations, conversation_id, member)
+        await _check_conversation_ownership(
+            conn, conversations, conversation_id, member, minimum="editor"
+        )
         await conn.execute(
             update(messages)
             .where(messages.c.id == message_id, messages.c.conversation_id == conversation_id)
@@ -1020,7 +1244,9 @@ async def edit_message(
     conversations = await reflect_table("conversations")
     messages = await reflect_table("messages")
     async with engine.begin() as conn:
-        await _check_conversation_ownership(conn, conversations, conversation_id, member)
+        await _check_conversation_ownership(
+            conn, conversations, conversation_id, member, minimum="editor"
+        )
         msg_row = (
             await conn.execute(
                 select(messages).where(
@@ -1061,7 +1287,9 @@ async def branch_conversation(
     conversations = await reflect_table("conversations")
     messages = await reflect_table("messages")
     async with engine.begin() as conn:
-        conv_row = await _check_conversation_ownership(conn, conversations, conversation_id, member)
+        conv_row = await _check_conversation_ownership(
+            conn, conversations, conversation_id, member, minimum="editor"
+        )
         # Fetch the branch point message
         src_msg = (
             await conn.execute(
@@ -1098,6 +1326,8 @@ async def branch_conversation(
                 region=settings.region,
                 member_id=member.id,
                 title=f"Branch: {conv_row.get('title', '')}",
+                workspace_id=conv_row["workspace_id"],
+                project_id=conv_row.get("project_id"),
             ).returning(conversations.c.id)
         )
         new_conv_id = str(new_conv_result.scalar_one())
@@ -1109,6 +1339,9 @@ async def branch_conversation(
                 msg_dict["conversation_id"] = new_conv_id
                 msg_dict["organization_id"] = member.organization_id
                 await conn.execute(insert(messages).values(**msg_dict))
+    await permissions.grant_conversation_role(
+        member.id, "owner", new_conv_id, member.organization_id
+    )
     await audit.log(
         "conversation_branched",
         member.id,
@@ -1132,7 +1365,9 @@ async def save_message_to_memory(
     conversations = await reflect_table("conversations")
     messages = await reflect_table("messages")
     async with engine.begin() as conn:
-        await _check_conversation_ownership(conn, conversations, conversation_id, member)
+        conversation_row = await _check_conversation_ownership(
+            conn, conversations, conversation_id, member, minimum="editor"
+        )
         msg_row = (
             await conn.execute(
                 select(messages).where(
@@ -1142,21 +1377,28 @@ async def save_message_to_memory(
             )
         ).mappings().first()
         if msg_row is None:
-            from fastapi import HTTPException
             raise HTTPException(status_code=404, detail="Message not found")
         msg_row = dict(msg_row)
-    scope_id = member.id if req.scope == "personal" else member.organization_id
+    try:
+        scope, scope_id = await normalize_entry_scope(member, req.scope, None)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     requester_context = RequesterContext.from_member(member)
-    entry_id = await create_memory_entry(
-        content=msg_row["content"],
-        requester_context=requester_context,
-        source="explicit",
-        scope=req.scope,
-        scope_id=scope_id,
-        importance_score=0.8,
-        conversation_id=conversation_id,
-        created_by=member.id,
-    )
+    requester_context.conversation_id = conversation_id
+    requester_context.project_id = conversation_row.get("project_id")
+    try:
+        entry_id = await create_memory_entry(
+            content=msg_row["content"],
+            requester_context=requester_context,
+            source="explicit",
+            scope=scope,
+            scope_id=scope_id,
+            importance_score=0.8,
+            conversation_id=conversation_id,
+            created_by=member.id,
+        )
+    except MemoryCaptureDisabled as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     await audit.log(
         "message_saved_to_memory",
         member.id,
@@ -1164,7 +1406,7 @@ async def save_message_to_memory(
         organization_id=member.organization_id,
         resource_type="messages",
         resource_id=message_id,
-        payload={"scope": req.scope, "memory_entry_id": str(entry_id)},
+        payload={"scope": scope, "memory_entry_id": str(entry_id)},
     )
     return {"memory_entry_id": entry_id}
 
@@ -1180,7 +1422,9 @@ async def convert_message_to_task(
     conversations = await reflect_table("conversations")
     messages = await reflect_table("messages")
     async with engine.begin() as conn:
-        await _check_conversation_ownership(conn, conversations, conversation_id, member)
+        conversation_row = await _check_conversation_ownership(
+            conn, conversations, conversation_id, member, minimum="editor"
+        )
         msg_row = (
             await conn.execute(
                 select(messages).where(
@@ -1199,6 +1443,7 @@ async def convert_message_to_task(
         triggered_by=conversation_id,
         model=req.model,
         mode=req.mode,
+        project_id=conversation_row.get("project_id"),
     )
     await audit.log(
         "message_converted_to_task",
@@ -1220,10 +1465,13 @@ async def convert_message_to_workflow(
     member: Member = Depends(get_current_member),
 ) -> dict:
     await permissions.check(member, "convert_to_workflow", conversation_id)
+    await workspace_access.require_workspace_access(member, req.workspace_id, access="write")
     conversations = await reflect_table("conversations")
     messages = await reflect_table("messages")
     async with engine.begin() as conn:
-        await _check_conversation_ownership(conn, conversations, conversation_id, member)
+        await _check_conversation_ownership(
+            conn, conversations, conversation_id, member, minimum="editor"
+        )
         msg_row = (
             await conn.execute(
                 select(messages).where(
@@ -1277,7 +1525,9 @@ async def _replay_message_turn(
     conversations = await reflect_table("conversations")
     messages = await reflect_table("messages")
     async with engine.begin() as conn:
-        await _check_conversation_ownership(conn, conversations, conversation_id, member)
+        await _check_conversation_ownership(
+            conn, conversations, conversation_id, member, minimum="editor"
+        )
         rows = (
             await conn.execute(
                 select(messages)
@@ -1368,10 +1618,8 @@ class VoiceSpeakRequest(BaseModel):
     conversation_id: str | None = None
 
 
-def _make_voice_agent(member: Member) -> "core.models.AgentContext":  # type: ignore[name-defined]
+def _make_voice_agent(member: Member) -> AgentContext:
     """Build a minimal AgentContext from a member for voice tool calls."""
-    from core.models import AgentContext
-
     return AgentContext(
         id=member.id,
         org_id=member.organization_id,

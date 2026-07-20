@@ -158,15 +158,27 @@ class DocAuthoringConnector:
         args.pop("__connector_tier", None)
         org_id = str(args.pop("__org_id", "default") or "default")
         task_id = args.pop("__task_id", None)
+        member_id = str(
+            args.pop("__member_id", "doc_authoring_connector")
+            or "doc_authoring_connector"
+        )
 
         if tool == "doc.create":
-            return await self._create(args, org_id=org_id, task_id=task_id)
+            return await self._create(
+                args, org_id=org_id, task_id=task_id, member_id=member_id
+            )
         if tool == "doc.create_slides":
-            return await self._create_slides(args, org_id=org_id, task_id=task_id)
+            return await self._create_slides(
+                args, org_id=org_id, task_id=task_id, member_id=member_id
+            )
         if tool == "doc.fill_pdf":
-            return await self._fill_pdf(args, org_id=org_id, task_id=task_id)
+            return await self._fill_pdf(
+                args, org_id=org_id, task_id=task_id, member_id=member_id
+            )
         if tool == "doc.render_chart":
-            return await self._render_chart(args, org_id=org_id, task_id=task_id)
+            return await self._render_chart(
+                args, org_id=org_id, task_id=task_id, member_id=member_id
+            )
         if tool == "doc.detect_fields":
             return await self._detect_fields(args, org_id=org_id)
         if tool == "doc.verify_fill":
@@ -176,7 +188,12 @@ class DocAuthoringConnector:
     # ── doc.create ────────────────────────────────────────────────────────────
 
     async def _create(
-        self, args: dict[str, Any], *, org_id: str, task_id: str | None
+        self,
+        args: dict[str, Any],
+        *,
+        org_id: str,
+        task_id: str | None,
+        member_id: str = "doc_authoring_connector",
     ) -> ToolResult:
         """Author a new PDF / DOCX / Markdown document from structured blocks.
 
@@ -218,7 +235,7 @@ class DocAuthoringConnector:
 
         artifact_id = await save_artifact(
             raw, kind=kind, title=title, task_id=task_id, org_id=org_id,
-            mime_type=mime, created_by="doc_authoring_connector",
+            mime_type=mime, created_by=member_id,
         )
         return ToolResult(
             data={"status": "success", "artifact_id": artifact_id, "format": fmt, "blocks": len(blocks)},
@@ -313,7 +330,12 @@ class DocAuthoringConnector:
     # ── doc.create_slides ─────────────────────────────────────────────────────
 
     async def _create_slides(
-        self, args: dict[str, Any], *, org_id: str, task_id: str | None
+        self,
+        args: dict[str, Any],
+        *,
+        org_id: str,
+        task_id: str | None,
+        member_id: str = "doc_authoring_connector",
     ) -> ToolResult:
         """Author a PPTX deck from a slides list.
 
@@ -336,7 +358,7 @@ class DocAuthoringConnector:
         artifact_id = await save_artifact(
             raw, kind="file", title=title, task_id=task_id, org_id=org_id,
             mime_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-            created_by="doc_authoring_connector",
+            created_by=member_id,
         )
         return ToolResult(
             data={"status": "success", "artifact_id": artifact_id, "slides": len(slides)},
@@ -384,7 +406,12 @@ class DocAuthoringConnector:
     # ── doc.fill_pdf ──────────────────────────────────────────────────────────
 
     async def _fill_pdf(
-        self, args: dict[str, Any], *, org_id: str, task_id: str | None
+        self,
+        args: dict[str, Any],
+        *,
+        org_id: str,
+        task_id: str | None,
+        member_id: str = "doc_authoring_connector",
     ) -> ToolResult:
         """Overlay text/images onto an existing PDF, preserving the original pages.
 
@@ -481,7 +508,7 @@ class DocAuthoringConnector:
             filled_bytes, kind="file",
             title=f"Filled: {args.get('title') or source_id}",
             task_id=task_id, org_id=org_id, mime_type="application/pdf",
-            parent_artifact_id=source_id, created_by="doc_authoring_connector",
+            parent_artifact_id=source_id, created_by=member_id,
         )
         return ToolResult(
             data={
@@ -556,7 +583,12 @@ class DocAuthoringConnector:
     # ── doc.render_chart ──────────────────────────────────────────────────────
 
     async def _render_chart(
-        self, args: dict[str, Any], *, org_id: str, task_id: str | None
+        self,
+        args: dict[str, Any],
+        *,
+        org_id: str,
+        task_id: str | None,
+        member_id: str = "doc_authoring_connector",
     ) -> ToolResult:
         """Render a precise, code-generated chart via matplotlib → image artifact.
 
@@ -574,7 +606,7 @@ class DocAuthoringConnector:
             )
         artifact_id = await save_artifact(
             raw, kind="image", title=f"Chart: {title}", task_id=task_id, org_id=org_id,
-            mime_type="image/png", created_by="doc_authoring_connector",
+            mime_type="image/png", created_by=member_id,
         )
         return ToolResult(
             data={"status": "success", "artifact_id": artifact_id, "chart_type": chart_type},

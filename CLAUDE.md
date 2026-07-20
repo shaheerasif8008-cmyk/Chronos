@@ -1,6 +1,19 @@
 # CLAUDE.md — Chronos by Cognisia
 
-This file is the primary context source for all AI coding assistants (Codex, Claude Code, Cursor) working on this project. Read it fully before writing any code.
+This file records enduring engineering principles and historical design examples
+for AI coding assistants. It is **not** the current implementation or production
+readiness source of truth. Read it for constraints, then verify every path,
+schema, signature, configuration value, and completion claim against the live
+checkout.
+
+> **Current authority — 2026-07-12:**
+> `CHRONOS_TOTAL_PARITY_GOAL.md` defines the north star;
+> `docs/chronos_total_parity_matrix.md` controls capability status and proof;
+> `docs/PRODUCTION_CONFIGURATION.md`, `docs/PRODUCTION_OPERATIONS.md`,
+> `docs/TERRAFORM_STATE_ADOPTION.md`, and `docs/DISASTER_RECOVERY.md` control the
+> AWS production path. Code, Alembic migrations, Terraform, and executable tests
+> override the illustrative snippets below. Repository implementation does not
+> prove external accounts, live deployment, Computer Use QA, capacity, or DR.
 
 ---
 
@@ -8,7 +21,7 @@ This file is the primary context source for all AI coding assistants (Codex, Cla
 
 **Chronos** is a polished enterprise AI platform targeting the combined capability set of ChatGPT, Claude.ai, and Manus.ai. The product goal is total practical parity with those systems: general assistant UX, deep research, projects and source knowledge, memory, artifacts, multimodal input/output, connectors/apps, coding assistance, agentic task execution, full browser operation, cloud/local computer operation, scheduled work, collaboration, and enterprise governance.
 
-Chronos differentiates by making those capabilities reliable and governable for organizations. Every capability must run through governed autonomous execution, persistent organizational memory, approvals, auditability, tenant boundaries, and complete product UX. One Chronos instance per organization learns the org through use, accumulates institutional memory, and becomes harder to replace over time.
+Chronos differentiates by making those capabilities reliable and governable for organizations. Every capability must run through governed autonomous execution, persistent organizational memory, approvals, auditability, tenant boundaries, and complete product UX. The production architecture is multi-tenant and multi-replica; organization identity is an explicit security boundary, not a process/deployment boundary.
 
 **Company:** Cognisia  
 **Product:** Chronos (working name)  
@@ -17,10 +30,11 @@ Chronos differentiates by making those capabilities reliable and governable for 
 
 **Reference documents (always attach to sessions):**
 - `CHRONOS_TOTAL_PARITY_GOAL.md` — canonical north-star product goal and completion bar
-- `chronos_capability_roadmap.md` — parity roadmap and implementation categories
-- `chronos_architecture_v2.md` — product decisions and system design
-- `chronos_build_plan.md` — historical sprint-by-sprint build order and useful implementation context
-- `chronos_technical_architecture.md` — code patterns, request flows, schemas
+- `docs/chronos_total_parity_matrix.md` — current capability status, gaps, and acceptance proof
+- `docs/PRODUCTION_CONFIGURATION.md` — external/runtime configuration inventory
+- `docs/PRODUCTION_OPERATIONS.md` — deploy, launch, incident, and client operations
+- `docs/TERRAFORM_STATE_ADOPTION.md` — state bootstrap/adoption safety
+- `docs/DISASTER_RECOVERY.md` — restore and regional-recovery contract
 
 ---
 
@@ -32,7 +46,9 @@ The active goal is the **Chronos Total Parity Program**:
 2. Then reach total parity with ChatGPT, Claude.ai, and Manus.ai across assistant, research, projects, artifacts, memory, multimodal, connectors, browser/computer operation, coding, schedules, agents, collaboration, admin, mobile/desktop, and compliance.
 3. Preserve Chronos's enterprise posture: all risky actions are governed; all durable outputs are auditable; all tenant boundaries are enforced.
 
-All future work is evaluated against this goal. Older phase/sprint language in `chronos_build_plan.md` and `chronos_technical_architecture.md` is historical context unless it supports the total parity goal.
+All future work is evaluated against this goal. Phase/sprint labels and code
+snippets in this file are historical context unless confirmed by the current
+matrix and implementation.
 
 **Completion rule:** no feature is complete until it works through the real UI/API, persists durable state, respects tenant boundaries, emits audit evidence, survives refresh/restart where applicable, and has automated proof.
 
@@ -106,8 +122,8 @@ async def execute(agent: AgentContext, tool: str, args: dict) -> ToolResult:
 RULE 1: Every tool call goes through tool_broker.execute(). Never call a connector directly.
 RULE 2: Every memory read goes through memory.retrieve(). Never query memory_entries directly.
 RULE 3: Every action check goes through permission.check(). Never inline permission logic.
-RULE 4: Every table has organization_id UUID NOT NULL DEFAULT 'default'. No exceptions.
-RULE 5: Every table has region TEXT NOT NULL DEFAULT 'us'. No exceptions.
+RULE 4: Every tenant-owned row carries an explicit, non-null organization_id and every query enforces it. Never rely on a client-supplied default tenant.
+RULE 5: Every tenant-owned table carries the deployment region where its current migration defines that column; verify the live schema before changing it.
 RULE 6: audit_log is INSERT-only. REVOKE UPDATE, DELETE ON audit_log FROM app_user.
 RULE 7: Credentials NEVER appear in logs. Only vault_ref is logged.
 RULE 8: gmail.send always creates a draft first. Sending requires an approval record.
@@ -120,23 +136,30 @@ RULE 10: Do not build sub-agent UI before the task engine runs real tasks end-to
 ## Tech Stack
 
 ```
-Backend:       Python 3.11+, FastAPI (async), Pydantic v2, SQLAlchemy Core, Alembic
-Model layer:   litellm (local LLM primary, BYOK API key fallback)
+Backend:       Python 3.12, FastAPI (async), Pydantic v2, SQLAlchemy Core, Alembic
+Model layer:   LiteLLM/provider adapters; OpenRouter is the production primary
 Database:      Postgres 15 + pgvector extension
 Cache/pubsub:  Redis
-File storage:  S3 (S3-compatible, local in dev)
-Frontend:      Next.js 14 (App Router), TypeScript, Tailwind
-Auth:          Email OTP + JWT currently; WorkOS/Clerk or equivalent enterprise auth later.
-Connectors:    MCP (primary interface). Composio for Gmail/HubSpot adapters.
-Browser:       Playwright (sandboxed subprocess)
+File storage:  AWS S3 in production; MinIO-compatible local development
+Frontend:      Next.js 16 App Router, React 18, TypeScript, Tailwind
+Auth:          Cognito in production; development OTP only outside production; tenant SSO/SCIM
+Connectors:    Broker-governed native adapters, Composio, remote MCP, custom HTTP seams
+Browser:       Browserbase Contexts/sessions in production; local Playwright only in development
+Execution:     Separate E2B profiles for code/data, Linux desktop, and repository workspaces
 Observability: Langfuse (LLM calls), Sentry (errors)
-Scheduling:    APScheduler (in-process, not Celery)
-Permissions:   Permission seam currently lightweight; OpenFGA or equivalent policy engine later.
+Scheduling:    APScheduler jobs coordinated by Redis leader election; durable state in Postgres
+Permissions:   Deterministic role floors plus enforced OpenFGA in production
+Deployment:    Terraform-managed AWS ECS/Fargate, RDS, Redis, S3, WAF, backups, and security services
 ```
 
 ---
 
 ## Repository Structure
+
+The tree below is an early conceptual map, not a literal inventory. Use
+`rg --files` for the current tree; in particular, the current web app uses a
+unified App Router shell, the API has many additional routers/core modules, and
+the native macOS app lives under `apps/desktop-macos/`.
 
 ```
 chronos/
@@ -228,6 +251,12 @@ chronos/
 ---
 
 ## Database Schema
+
+The SQL below is historical shorthand. Alembic migrations under
+`apps/api/migrations/versions/` are the only schema authority. Never create a
+migration by copying these definitions, and never infer that newer tenant,
+ACL, billing, browser/computer, notification, retention, or repository tables
+are absent because they are not shown here.
 
 All tables include `organization_id` and `region`. This is non-negotiable.
 
@@ -390,6 +419,10 @@ CREATE INDEX ON audit_log (organization_id, created_at DESC);
 ---
 
 ## Core Data Model
+
+The following snippets illustrate intended seams only. Import and inspect the
+current implementations before editing call sites; signatures and fields have
+evolved.
 
 ```python
 # apps/api/core/models.py
@@ -697,13 +730,18 @@ class SubAgentManager:
 
 ## Environment Variables (.env)
 
+The block below is a historical minimal example and is incomplete. Copy
+`.env.example` for local development. For AWS production, use
+`docs/PRODUCTION_CONFIGURATION.md` and verify each Terraform-to-ECS injection;
+never infer production support from a setting appearing in this block.
+
 ```bash
 # Local development defaults
 ORG_ID=default
 REGION=us
 
 # Database
-DATABASE_URL=postgresql+asyncpg://chronos:chronos@localhost:5432/chronos
+DATABASE_URL=postgresql+asyncpg://chronos:chronos@localhost:55432/chronos
 
 # Redis
 REDIS_URL=redis://localhost:6379
@@ -712,8 +750,9 @@ REDIS_URL=redis://localhost:6379
 OBJECT_STORAGE_BACKEND=s3
 AWS_S3_BUCKET=chronos-dev
 AWS_S3_REGION=us-east-1
-AWS_ACCESS_KEY_ID=
-AWS_SECRET_ACCESS_KEY=
+AWS_S3_ENDPOINT=http://127.0.0.1:9000
+AWS_ACCESS_KEY_ID=chronos
+AWS_SECRET_ACCESS_KEY=chronos123
 
 # Model layer
 LOCAL_LLM_BASE_URL=http://localhost:11434  # Ollama or similar
@@ -737,6 +776,10 @@ SENDGRID_API_KEY=optional-in-dev
 
 ## Local Dev Setup
 
+Prefer the current root README and scripts. A current baseline is Python 3.12,
+Node 24, Postgres on loopback port 55432, Redis on 6379, MinIO on 9000/9001,
+and OpenFGA on 8080/8081/3010.
+
 ```bash
 # Clone and configure
 git clone https://github.com/cognisia/chronos
@@ -746,17 +789,17 @@ cp .env.example .env
 # Start infrastructure
 docker-compose up -d  # Postgres+pgvector, Redis, OpenFGA
 
-# Backend
+# Backend (a root `.venv` is also supported by `scripts/dev.sh`)
 cd apps/api
+python3.12 -m venv .venv
+. .venv/bin/activate
 pip install -r requirements.txt
 alembic upgrade head
 python seed.py        # creates default org + admin member
-uvicorn main:app --reload --port 8000
 
-# Frontend (new terminal)
-cd apps/web
-npm install
-npm run dev           # runs on localhost:3000
+# Frontend and connector worker
+cd ../web && npm ci
+cd ../.. && npm run dev
 
 # Login: open localhost:3000, enter the test email from seed.py
 # OTP appears in the API console log in dev (no SendGrid needed)
@@ -784,16 +827,16 @@ services:
       POSTGRES_DB: chronos
       POSTGRES_USER: chronos
       POSTGRES_PASSWORD: chronos
-    ports: ["5432:5432"]
+    ports: ["127.0.0.1:55432:5432"]
 
   redis:
     image: redis:7-alpine
-    ports: ["6379:6379"]
+    ports: ["127.0.0.1:6379:6379"]
 
   openfga:
-    image: openfga/openfga:latest
+    image: openfga/openfga:v1.9.5
     command: run
-    ports: ["8080:8080", "8081:8081", "3010:3000"]
+    ports: ["127.0.0.1:8080:8080", "127.0.0.1:8081:8081", "127.0.0.1:3010:3000"]
 ```
 
 ---
@@ -926,6 +969,6 @@ These guidelines are working if: fewer unnecessary changes in diffs, fewer rewri
 
 ---
 
-*This file is the source of truth for all AI coding sessions.*
-*Reference: chronos_architecture_v2.md · chronos_build_plan.md · chronos_technical_architecture.md*
-*Version: 1.0*
+*This file preserves engineering principles and historical examples. The current
+matrix, code, migrations, Terraform, and executable tests are authoritative.*
+*Reconciled: 2026-07-12*

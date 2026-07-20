@@ -78,12 +78,19 @@ async def test_browser_health_prefers_tavily_without_playwright(monkeypatch):
     from core import connector_health
 
     monkeypatch.setattr(connector_health.settings, "tavily_api_key", "tvly-test")
-    monkeypatch.setattr(connector_health, "_module_available", lambda name: False)
+    monkeypatch.setattr(connector_health.settings, "browserbase_api_key", "")
+
+    async def no_playwright():
+        return False, "Playwright is not installed."
+
+    monkeypatch.setattr(connector_health, "_playwright_available", no_playwright)
+    monkeypatch.setattr(connector_health, "_CACHE", None)
 
     health = await connector_health.check_connectors(refresh=True)
 
-    assert health["browser"]["status"] == "live"
-    assert health["browser"]["tier"] == "live"
+    assert health["browser"]["status"] == "configured"
+    assert health["browser"]["tier"] == "configured"
+    assert health["browser"]["verified"] is False
     assert "Tavily" in health["browser"]["reason"]
 
 
@@ -93,10 +100,25 @@ async def test_browser_health_accepts_browserbase_without_playwright(monkeypatch
 
     monkeypatch.setattr(connector_health.settings, "tavily_api_key", "")
     monkeypatch.setattr(connector_health.settings, "browserbase_api_key", "bb-test")
-    monkeypatch.setattr(connector_health, "_module_available", lambda name: False)
+
+    async def no_playwright():
+        return False, "Playwright is not installed."
+
+    async def verified_browserbase():
+        return connector_health.ProbeResult(
+            ok=True,
+            checked_at=connector_health._utcnow(),
+            latency_ms=12,
+        )
+
+    monkeypatch.setattr(connector_health, "_playwright_available", no_playwright)
+    monkeypatch.setattr(connector_health, "_probe_browserbase", verified_browserbase)
+    monkeypatch.setattr(connector_health, "_CACHE", None)
 
     health = await connector_health.check_connectors(refresh=True)
 
-    assert health["browser"]["status"] == "live"
+    assert health["browser"]["status"] == "verified"
     assert health["browser"]["tier"] == "live"
+    assert health["browser"]["verified"] is True
+    assert health["browser"]["checked_at"]
     assert "Browserbase" in health["browser"]["reason"]

@@ -19,24 +19,41 @@ State stored in tasks.agent_state:
 The tasks table still exists for persistence and observability — it stores
 loop state (messages + tool results) rather than a pre-generated JSON plan.
 """
+
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import json
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-import litellm
 from sqlalchemy import insert, select, update
 
 from core import audit, tool_broker
 from core.config import settings
 from core.db import engine, reflect_table
 from core.exceptions import ApprovalRequired
-from core.governance import GovernanceLimitExceeded, enforce_model_budget, enforce_task_start, record_model_usage
-from core.llm import _message_content, _message, _tool_calls, _with_retry, complete_json, default_chat_model_id, model_kwargs, resolve_agent_model, stream_step, stronger_agent_model
+from core.governance import (
+    GovernanceLimitExceeded,
+    enforce_model_budget,
+    enforce_task_start,
+    record_model_usage,
+)
+from core.llm import (
+    _message_content,
+    _message,
+    _tool_calls,
+    complete_json,
+    completion_with_provider_fallback,
+    default_chat_model_id,
+    model_kwargs,
+    resolve_agent_model,
+    stream_step,
+    stronger_agent_model,
+)
 from core.models import AgentContext
 from runtime import cognition
 from core.redis import redis_client
@@ -73,6 +90,7 @@ DURABLE_TRACE_TYPES = {
     "sub_agent_spawned",
     "sub_agent_complete",
     "task_cancelled",
+    "task_cleanup_requested",
     "task_complete",
     "task_failed",
 }
@@ -101,10 +119,15 @@ def _spawn_background(coro: Any) -> None:
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
+
 async def get_task(task_id: str) -> dict[str, Any] | None:
     tasks = await reflect_table("tasks")
     async with engine.begin() as conn:
-        row = (await conn.execute(select(tasks).where(tasks.c.id == task_id))).mappings().first()
+        row = (
+            (await conn.execute(select(tasks).where(tasks.c.id == task_id)))
+            .mappings()
+            .first()
+        )
     return dict(row) if row else None
 
 
@@ -122,10 +145,20 @@ async def is_task_cancelled(task_id: str) -> bool:
     return bool(task and task.get("status") == "cancelled")
 
 
+async def is_task_paused(task_id: str) -> bool:
+    """Return the durable operator-pause signal observed by every worker."""
+    try:
+        task = await get_task(task_id)
+    except Exception:
+        return False
+    return bool(task and task.get("status") == "paused")
+
+
 # ── Conversation persistence (source of truth, independent of SSE) ────────────
 
 _UUID_RE = __import__("re").compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", __import__("re").IGNORECASE
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    __import__("re").IGNORECASE,
 )
 
 
@@ -281,7 +314,9 @@ async def _save_assistant_message(
     async with engine.begin() as conn:
         # Guard: conversation must exist (manual tasks may reference nothing).
         exists = (
-            await conn.execute(select(conversations.c.id).where(conversations.c.id == conversation_id))
+            await conn.execute(
+                select(conversations.c.id).where(conversations.c.id == conversation_id)
+            )
         ).first()
         if not exists:
             return None
@@ -319,6 +354,7 @@ async def _save_assistant_message(
 
 # ── Activity emission ─────────────────────────────────────────────────────────
 
+
 def activity_channel(task_id: str) -> str:
     return f"activity:{task_id}"
 
@@ -341,7 +377,11 @@ async def emit_activity(
     event: dict[str, Any],
     actor_id: str | None = "chronos",
 ) -> None:
-    payload = {"task_id": task_id, "ts": datetime.now(timezone.utc).isoformat(), **event}
+    payload = {
+        "task_id": task_id,
+        "ts": datetime.now(timezone.utc).isoformat(),
+        **event,
+    }
     await audit.log(
         "activity",
         actor_id,
@@ -351,7 +391,9 @@ async def emit_activity(
         resource_id=task_id,
         payload=payload,
     )
-    await redis_client.publish(activity_channel(task_id), json.dumps(payload, default=str))
+    await redis_client.publish(
+        activity_channel(task_id), json.dumps(payload, default=str)
+    )
 
 
 async def publish_activity(task_id: str, event: dict[str, Any]) -> None:
@@ -361,7 +403,11 @@ async def publish_activity(task_id: str, event: dict[str, Any]) -> None:
     activity is also written to audit_log so crash/restart investigations have
     model-step evidence without relying on the live SSE stream.
     """
-    payload = {"task_id": task_id, "ts": datetime.now(timezone.utc).isoformat(), **event}
+    payload = {
+        "task_id": task_id,
+        "ts": datetime.now(timezone.utc).isoformat(),
+        **event,
+    }
     if payload.get("type") in DURABLE_TRACE_TYPES:
         await audit.log(
             "activity",
@@ -372,12 +418,17 @@ async def publish_activity(task_id: str, event: dict[str, Any]) -> None:
             resource_id=task_id,
             payload=payload,
         )
-    await redis_client.publish(activity_channel(task_id), json.dumps(payload, default=str))
+    await redis_client.publish(
+        activity_channel(task_id), json.dumps(payload, default=str)
+    )
 
 
 # ── Message history ───────────────────────────────────────────────────────────
 
-async def _agent_system_message(tools: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+
+async def _agent_system_message(
+    tools: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     current_date = datetime.now(timezone.utc).date().isoformat()
     # Sub-agents get a bounded-loop prompt. Detected structurally (no
     # spawn__subagent / start_task in the list) so it also holds for
@@ -387,7 +438,9 @@ async def _agent_system_message(tools: list[dict[str, Any]] | None = None) -> di
         for tool in (tools or [])
         if isinstance(tool, dict)
     }
-    is_sub_agent = bool(tool_names) and not (tool_names & {"spawn__subagent", "start_task"})
+    is_sub_agent = bool(tool_names) and not (
+        tool_names & {"spawn__subagent", "start_task"}
+    )
     manifest = await generate_tool_manifest(sub_agent=is_sub_agent, tools=tools)
     orchestration_guidance = (
         "For large jobs with independent workstreams, spawn all useful sub-agents in the same "
@@ -444,7 +497,7 @@ async def _agent_system_message(tools: list[dict[str, Any]] | None = None) -> di
             "- If a search returns 0 results, say so. Do not fabricate statistics, sources, or data.\n"
             "- If a tool result contains `is_fallback: true` or a `warning` field, the live search failed. "
             "Report this honestly. Do not present placeholder/fixture data as real.\n"
-            "- If you cannot find real data, say \"I could not find that information\" rather than inventing it.\n\n"
+            '- If you cannot find real data, say "I could not find that information" rather than inventing it.\n\n'
             f"{manifest}"
         ),
     }
@@ -466,9 +519,15 @@ def _resolve_inherited_context(
         parent_ctx = parent_task.get("result") or {}
         inherited = {
             "parent_goal": parent_task.get("goal", ""),
-            "parent_context": {key: parent_ctx[key] for key in args["inherit_keys"] if key in parent_ctx},
+            "parent_context": {
+                key: parent_ctx[key]
+                for key in args["inherit_keys"]
+                if key in parent_ctx
+            },
         }
-    if isinstance(inherited, dict) and (inherited.get("parent_context") or inherited.get("parent_goal")):
+    if isinstance(inherited, dict) and (
+        inherited.get("parent_context") or inherited.get("parent_goal")
+    ):
         return inherited
     return None
 
@@ -488,14 +547,19 @@ def _format_inherited_context(inherited: dict[str, Any]) -> str:
 
 def _format_attachments_context(attachments: list[dict[str, Any]]) -> str:
     """Render parsed attachment previews as one immutable seed block."""
-    lines = ["# Attached files", "The user attached these files. Their parsed text follows."]
+    lines = [
+        "# Attached files",
+        "The user attached these files. Their parsed text follows.",
+    ]
     for a in attachments:
         name = str(a.get("filename") or "file")
         artifact_id = str(a.get("parsed_artifact_id") or a.get("attachment_id") or "")
         note = a.get("note")
         header = f"\n## {name}"
         if a.get("truncated"):
-            header += f"  (truncated — use doc__read with artifact_id={artifact_id} for more)"
+            header += (
+                f"  (truncated — use doc__read with artifact_id={artifact_id} for more)"
+            )
         if note:
             header += f"  [{note}]"
         lines.append(header)
@@ -503,49 +567,161 @@ def _format_attachments_context(attachments: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-async def _load_history(task: dict[str, Any], tools: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+async def _load_history(
+    task: dict[str, Any], tools: list[dict[str, Any]] | None = None
+) -> list[dict[str, Any]]:
     state = task.get("agent_state") or {}
+    history: list[dict[str, Any]] = []
     if isinstance(state, dict):
-        history = state.get("agent_history") or []
-        if isinstance(history, list) and history:
-            # Resume path: checkpointed history already contains any inherited block
-            # from the first load — return as-is, do NOT re-inject below.
-            return list(history)
+        stored_history = state.get("agent_history") or []
+        if isinstance(stored_history, list) and stored_history:
+            history = list(stored_history)
+    if history and not task.get("project_id"):
+        # Non-project checkpoints contain no shared project/source grounding to
+        # re-authorize, so they can resume exactly as persisted.
+        return history
     # Fresh start. Sub-agents spawned with inherit_keys carry an opt-in snapshot of
     # parent state, injected here as a single context message before the goal.
     system_msg = await _agent_system_message(tools)
+    project_grounded = False
+    if task.get("project_id"):
+        # Rebuild project grounding from durable task identity on every fresh
+        # execution.  Never trust a client-supplied project blob, and fail
+        # closed if membership was revoked after the task was queued.
+        from core.context import assemble_context
+        from core.memory_access import member_can_access_project
+        from core.models import Member, RequesterContext
+
+        members = await reflect_table("members")
+        async with engine.begin() as conn:
+            member_row = (
+                (
+                    await conn.execute(
+                        select(members).where(
+                            members.c.id
+                            == str(task.get("triggered_by_member_id") or ""),
+                            members.c.organization_id
+                            == str(task.get("organization_id") or "default"),
+                            members.c.status == "active",
+                        )
+                    )
+                )
+                .mappings()
+                .first()
+            )
+        if member_row is None:
+            raise PermissionError("Project task member is no longer active")
+        task_member = Member(**dict(member_row))
+        project_id = str(task["project_id"])
+        if not await member_can_access_project(task_member, project_id):
+            raise PermissionError("Project task access was revoked")
+        requester = RequesterContext.from_member(task_member)
+        requester.project_id = project_id
+        requester.workspace_id = task.get("workspace_id")
+        requester.persona_id = task.get("persona_id")
+        requester.task_id = str(task.get("id") or "")
+        # ``triggered_by`` is overloaded for manual, agent-profile and child
+        # tasks. Only a validated top-level conversation UUID is a conversation
+        # scope; arbitrary trigger strings must never reach UUID DB predicates.
+        requester.conversation_id = _conversation_id_for(task)
+        assembled = await assemble_context(
+            requester.conversation_id,
+            str(task.get("goal") or ""),
+            requester,
+        )
+        assembled_system = str((assembled[0] if assembled else {}).get("content") or "")
+        if assembled_system:
+            system_msg = {
+                **system_msg,
+                "content": (
+                    f"{system_msg['content']}\n\n"
+                    "# Authorized Project Context\n"
+                    f"{assembled_system}"
+                ),
+            }
+        state["surfaced_citations"] = list(requester.surfaced_citations)
+        state["surfaced_memory_refs"] = list(requester.surfaced_memory_refs)
+        state["project_context_bound"] = {
+            "project_id": project_id,
+            "member_id": task_member.id,
+        }
+        await save_task(str(task["id"]), agent_state=state)
+        project_grounded = True
+    if history:
+        # Rebuild project grounding on every resume. This both revalidates active
+        # membership above and drops memories/sources whose policy or ACL changed
+        # after the checkpoint was written.
+        system_index = next(
+            (
+                index
+                for index, message in enumerate(history)
+                if message.get("role") == "system"
+            ),
+            None,
+        )
+        if system_index is None:
+            history.insert(0, system_msg)
+        else:
+            history[system_index] = system_msg
+        return history
     # Connectors awareness: tell the model which apps are connected, which are
     # available to connect, and which custom MCP servers are registered.
     try:
         from core.connector_tools import connectors_prompt_block
 
-        connectors_block = await connectors_prompt_block(
-            str(task.get("organization_id") or "default")
+        connectors_block = (
+            ""
+            if project_grounded
+            else await connectors_prompt_block(
+                str(task.get("organization_id") or "default"),
+                str(task.get("triggered_by_member_id") or "") or None,
+            )
         )
         if connectors_block.strip():
-            system_msg = {**system_msg, "content": f"{system_msg['content']}\n\n{connectors_block}"}
+            system_msg = {
+                **system_msg,
+                "content": f"{system_msg['content']}\n\n{connectors_block}",
+            }
     except Exception:
-        logger.warning("Connectors context assembly failed for task %s", task.get("id"), exc_info=True)
+        logger.warning(
+            "Connectors context assembly failed for task %s",
+            task.get("id"),
+            exc_info=True,
+        )
     seed = [system_msg]
     # Skills (progressive disclosure): always advertise the catalog and inline the
     # SKILL.md most relevant to the goal, so durable tasks are no longer skill-blind.
     try:
         from skills.loader import build_agent_skills_block
 
-        skills_block = await build_agent_skills_block(
-            str(task.get("goal") or ""), str(task.get("organization_id") or "default")
+        skills_block = (
+            ""
+            if project_grounded
+            else await build_agent_skills_block(
+                str(task.get("goal") or ""),
+                str(task.get("organization_id") or "default"),
+                member_id=str(task.get("triggered_by_member_id") or "") or None,
+            )
         )
         if skills_block.strip():
             seed.append({"role": "system", "content": skills_block})
     except Exception:
-        logger.warning("Skill seed assembly failed for task %s", task.get("id"), exc_info=True)
+        logger.warning(
+            "Skill seed assembly failed for task %s", task.get("id"), exc_info=True
+        )
     inherited = state.get("inherited_context") if isinstance(state, dict) else None
-    if isinstance(inherited, dict) and (inherited.get("parent_context") or inherited.get("parent_goal")):
+    if isinstance(inherited, dict) and (
+        inherited.get("parent_context") or inherited.get("parent_goal")
+    ):
         seed.append({"role": "user", "content": _format_inherited_context(inherited)})
     attachments = state.get("attachments") if isinstance(state, dict) else None
     if isinstance(attachments, list) and attachments:
-        seed.append({"role": "user", "content": _format_attachments_context(attachments)})
-    project_knowledge = state.get("project_knowledge") if isinstance(state, dict) else None
+        seed.append(
+            {"role": "user", "content": _format_attachments_context(attachments)}
+        )
+    project_knowledge = (
+        state.get("project_knowledge") if isinstance(state, dict) else None
+    )
     if isinstance(project_knowledge, str) and project_knowledge.strip():
         seed.append({"role": "user", "content": project_knowledge})
     envelope_data = state.get("task_envelope") if isinstance(state, dict) else None
@@ -553,12 +729,22 @@ async def _load_history(task: dict[str, Any], tools: list[dict[str, Any]] | None
         try:
             from core.models import TaskEnvelope
 
-            seed.append({"role": "user", "content": envelope_to_agent_prompt(TaskEnvelope(**envelope_data))})
+            seed.append(
+                {
+                    "role": "user",
+                    "content": envelope_to_agent_prompt(TaskEnvelope(**envelope_data)),
+                }
+            )
             return seed
         except Exception:
-            logger.warning("Invalid task envelope for task %s; falling back to raw message", task.get("id"))
+            logger.warning(
+                "Invalid task envelope for task %s; falling back to raw message",
+                task.get("id"),
+            )
 
-    original_message = state.get("original_user_message") if isinstance(state, dict) else None
+    original_message = (
+        state.get("original_user_message") if isinstance(state, dict) else None
+    )
     if isinstance(original_message, str) and original_message.strip():
         goal = str(task["goal"])
         envelope = build_task_envelope(
@@ -585,13 +771,21 @@ async def _checkpoint(
     token_usage: dict[str, Any] | None = None,
     **extra: Any,
 ) -> None:
-    state: dict[str, Any] = {"agent_history": history, "iteration_count": iteration}
+    current = await get_task(task_id)
+    state: dict[str, Any] = dict(
+        (current or {}).get("agent_state")
+        if isinstance((current or {}).get("agent_state"), dict)
+        else {}
+    )
+    state.update({"agent_history": history, "iteration_count": iteration})
     if model:
         state["model"] = model  # preserve the UI-chosen model across resume
     if orchestration_state:
         state["orchestration_state"] = orchestration_state
     if cognition_state:
-        state["cognition"] = cognition_state  # reflections/replans used, survives resume
+        state["cognition"] = (
+            cognition_state  # reflections/replans used, survives resume
+        )
     if token_usage:
         state["token_usage"] = token_usage
     await save_task(task_id, agent_state=state, iteration_count=iteration, **extra)
@@ -617,10 +811,15 @@ def _append_step_token_usage(
             "recorded_at": datetime.now(timezone.utc).isoformat(),
         }
     )
-    return {"total_tokens": sum(int(step.get("tokens") or 0) for step in steps), "steps": steps}
+    return {
+        "total_tokens": sum(int(step.get("tokens") or 0) for step in steps),
+        "steps": steps,
+    }
 
 
-def _project_next_step_tokens(token_usage: dict[str, Any], estimated_prompt_tokens: int) -> int:
+def _project_next_step_tokens(
+    token_usage: dict[str, Any], estimated_prompt_tokens: int
+) -> int:
     """Estimate the full next model step, not just the prompt.
 
     Governance checks run before the model call, while real usage is recorded
@@ -651,6 +850,7 @@ def _latest_assistant_text(history: list[dict[str, Any]]) -> str | None:
 
 # ── LLM step ──────────────────────────────────────────────────────────────────
 
+
 async def _llm_step(
     history: list[dict[str, Any]],
     tools: list[dict[str, Any]],
@@ -665,10 +865,12 @@ async def _llm_step(
         tool_calls:   Normalised list of tool call dicts if the LLM wants to act.
         token_count:  Total tokens consumed by this step (0 if unavailable).
     """
-    kwargs = model_kwargs(model, messages=history, stream=False, reasoning_effort=reasoning_effort)
+    kwargs = model_kwargs(
+        model, messages=history, stream=False, reasoning_effort=reasoning_effort
+    )
     kwargs["tools"] = tools
     kwargs["tool_choice"] = "auto"
-    response = await _with_retry(lambda: litellm.acompletion(**kwargs))
+    response = await completion_with_provider_fallback(kwargs)
 
     msg = _message(response)
     raw_calls = _tool_calls(msg)
@@ -688,21 +890,27 @@ def _normalise_calls(raw_calls: list[Any]) -> list[dict[str, Any]]:
     for i, call in enumerate(raw_calls):
         if isinstance(call, dict):
             fn = call.get("function") or {}
-            result.append({
-                "id": call.get("id") or f"call_{i}",
-                "name": fn.get("name") or "",
-                "args_str": fn.get("arguments") or "{}",
-            })
+            result.append(
+                {
+                    "id": call.get("id") or f"call_{i}",
+                    "name": fn.get("name") or "",
+                    "args_str": fn.get("arguments") or "{}",
+                }
+            )
         else:
-            result.append({
-                "id": getattr(call, "id", f"call_{i}"),
-                "name": call.function.name,
-                "args_str": call.function.arguments or "{}",
-            })
+            result.append(
+                {
+                    "id": getattr(call, "id", f"call_{i}"),
+                    "name": call.function.name,
+                    "args_str": call.function.arguments or "{}",
+                }
+            )
     return result
 
 
-def _serialise_assistant(raw_calls: list[dict[str, Any]], text: str | None) -> dict[str, Any]:
+def _serialise_assistant(
+    raw_calls: list[dict[str, Any]], text: str | None
+) -> dict[str, Any]:
     """Build a JSON-serialisable assistant message with tool_calls."""
     msg: dict[str, Any] = {"role": "assistant", "content": text or ""}
     if raw_calls:
@@ -775,7 +983,17 @@ def _tool_message_has_prompt_injection(message: dict[str, Any]) -> bool:
 
 
 def _history_has_prompt_injection(history: list[dict[str, Any]]) -> bool:
-    return any(_tool_message_has_prompt_injection(message) for message in history)
+    if any(_tool_message_has_prompt_injection(message) for message in history):
+        return True
+    # Project-source excerpts are intentionally untrusted even when the
+    # deterministic scanner found no known injection phrase.  Conservatively
+    # keep external writes behind approval whenever such evidence influenced
+    # the model, so a novel source-borne instruction cannot inherit autonomy.
+    return any(
+        message.get("role") == "system"
+        and "<untrusted_source" in str(message.get("content") or "")
+        for message in history
+    )
 
 
 def _message_tool_call_ids(message: dict[str, Any]) -> set[str]:
@@ -807,10 +1025,24 @@ def _summarize_tool_payload(message: dict[str, Any]) -> str:
         parts.append(f"idempotency_key={payload['idempotency_key']}")
     data = payload.get("data")
     if isinstance(data, dict):
-        for key in ("artifact_id", "artifact_ids", "source_id", "source_ids", "citations", "untrusted_content"):
+        for key in (
+            "artifact_id",
+            "artifact_ids",
+            "source_id",
+            "source_ids",
+            "citations",
+            "untrusted_content",
+        ):
             if key in data:
                 parts.append(f"{key}={str(data[key])[:240]}")
-    for key in ("artifact_id", "artifact_ids", "source_id", "source_ids", "citations", "prompt_injection"):
+    for key in (
+        "artifact_id",
+        "artifact_ids",
+        "source_id",
+        "source_ids",
+        "citations",
+        "prompt_injection",
+    ):
         if key in payload:
             parts.append(f"{key}={str(payload[key])[:240]}")
     return "; ".join(parts)
@@ -825,26 +1057,82 @@ def compact_agent_history_for_model(
     """Return a model-facing compact copy of agent history.
 
     Persisted task history remains complete. This function only prepares the
-    next model call by summarizing older completed tool iterations.
+    next model call by summarizing older completed tool iterations. Assistant
+    tool-call messages and their result messages are one protocol unit: splitting
+    a parallel call group leaves orphaned ``tool_call_id`` values that providers
+    reject. Malformed legacy/interrupted units are summarized instead of replayed
+    as invalid provider messages.
     """
-    pending_ids = {str(call.get("id")) for call in (pending_approval_calls or []) if call.get("id")}
-    tool_indices = [i for i, msg in enumerate(history) if msg.get("role") == "tool"]
-    if len(tool_indices) <= recent_tool_iterations:
-        return history
-    keep_from = tool_indices[-recent_tool_iterations]
-    if keep_from > 0 and history[keep_from - 1].get("role") == "assistant" and history[keep_from - 1].get("tool_calls"):
-        keep_from -= 1
+    pending_ids = {
+        str(call.get("id")) for call in (pending_approval_calls or []) if call.get("id")
+    }
+
+    units: list[tuple[str, list[dict[str, Any]], bool]] = []
+    index = 0
+    while index < len(history):
+        message = history[index]
+        if message.get("role") == "assistant" and message.get("tool_calls"):
+            group = [message]
+            declared_ids = _message_tool_call_ids(message)
+            cursor = index + 1
+            while cursor < len(history) and history[cursor].get("role") == "tool":
+                group.append(history[cursor])
+                cursor += 1
+            result_ids = [
+                str(result.get("tool_call_id"))
+                for result in group[1:]
+                if result.get("tool_call_id")
+            ]
+            complete = bool(declared_ids) and (
+                len(result_ids) == len(declared_ids)
+                and len(set(result_ids)) == len(result_ids)
+                and set(result_ids) == declared_ids
+            )
+            units.append(("protocol", group, complete))
+            index = cursor
+            continue
+        if message.get("role") == "tool":
+            units.append(("orphan", [message], False))
+        else:
+            units.append(("message", [message], True))
+        index += 1
+
+    complete_protocol_indices = [
+        unit_index
+        for unit_index, (kind, _messages, complete) in enumerate(units)
+        if kind == "protocol" and complete
+    ]
+    recent_protocol_indices = set(
+        complete_protocol_indices[-max(0, recent_tool_iterations) :]
+        if recent_tool_iterations > 0
+        else []
+    )
     kept: list[dict[str, Any]] = []
     summarized: list[dict[str, Any]] = []
-    for index, message in enumerate(history):
-        ids = _message_tool_call_ids(message)
-        if index < keep_from and message.get("role") in {"assistant", "tool"} and (message.get("tool_calls") or message.get("role") == "tool") and not (ids & pending_ids):
-            summarized.append(message)
-        else:
-            kept.append(message)
+    interrupted_tools: list[str] = []
+    for unit_index, (kind, messages, complete) in enumerate(units):
+        ids = set().union(*(_message_tool_call_ids(message) for message in messages))
+        pending = bool(ids & pending_ids)
+        if kind == "message" or pending:
+            kept.extend(messages)
+            continue
+        if kind == "protocol" and complete and unit_index in recent_protocol_indices:
+            kept.extend(messages)
+            continue
+        summarized.extend(messages)
+        if kind == "protocol" and not complete:
+            for call in messages[0].get("tool_calls") or []:
+                if isinstance(call, dict):
+                    function = call.get("function") or {}
+                    interrupted_tools.append(str(function.get("name") or "tool"))
+        elif kind == "orphan":
+            interrupted_tools.append(str(messages[0].get("name") or "tool"))
     if not summarized:
         return history
-    summary_lines = ["# Prior Work Summary", "Older completed tool work was compacted to reduce repeated context."]
+    summary_lines = [
+        "# Prior Work Summary",
+        "Older completed tool work was compacted to reduce repeated context.",
+    ]
     assistant_tools = []
     for message in summarized:
         if message.get("tool_calls"):
@@ -855,18 +1143,38 @@ def compact_agent_history_for_model(
         elif message.get("role") == "tool":
             summary_lines.append(_summarize_tool_payload(message))
     if assistant_tools:
-        summary_lines.insert(2, "Tool calls already attempted: " + ", ".join(assistant_tools))
+        summary_lines.insert(
+            2, "Tool calls already attempted: " + ", ".join(assistant_tools)
+        )
+    if interrupted_tools:
+        summary_lines.insert(
+            2,
+            "Interrupted or legacy tool protocol was recovered without replaying "
+            "orphaned results: " + ", ".join(interrupted_tools),
+        )
     summary_message = {"role": "system", "content": "\n".join(summary_lines)}
-    insert_at = next((i for i, msg in enumerate(kept) if msg.get("role") not in {"system", "user"}), len(kept))
+    insert_at = next(
+        (i for i, msg in enumerate(kept) if msg.get("role") not in {"system", "user"}),
+        len(kept),
+    )
     return [*kept[:insert_at], summary_message, *kept[insert_at:]]
 
 
 def _call_is_external_write(call: dict[str, Any]) -> bool:
     name = str(call.get("name") or "")
     broker_name = to_broker_name(name)
-    return (
-        name in _UNTRUSTED_WRITE_NAMES
-        or any(marker in broker_name for marker in (".draft", ".send", ".post", ".publish", ".write", ".create", ".update", ".delete"))
+    return name in _UNTRUSTED_WRITE_NAMES or any(
+        marker in broker_name
+        for marker in (
+            ".draft",
+            ".send",
+            ".post",
+            ".publish",
+            ".write",
+            ".create",
+            ".update",
+            ".delete",
+        )
     )
 
 
@@ -947,6 +1255,7 @@ def _append_replan_instruction(
 
 # ── Tool execution ────────────────────────────────────────────────────────────
 
+
 async def _execute_tool(
     call: dict[str, Any],
     task: dict[str, Any],
@@ -961,26 +1270,34 @@ async def _execute_tool(
     task_id = task["id"]
     depth = int(task.get("depth") or 0)
 
-    await emit_activity(task_id, {
-        "type": "tool_call",
-        "tool": tool_name,
-        "args_preview": _args_preview(args),
-    })
+    await emit_activity(
+        task_id,
+        {
+            "type": "tool_call",
+            "tool": tool_name,
+            "args_preview": _args_preview(args),
+        },
+    )
 
     # spawn__subagent is handled here, not via the broker
     if tool_name == _SUBAGENT_TOOL_NAME:
         try:
             result_data = await _run_subagent(task, args, depth)
             content = json.dumps(result_data, default=str)
-            await emit_activity(task_id, {
-                "type": "tool_result",
-                "tool": tool_name,
-                "summary": f"Sub-agent finished: {str(args.get('goal', ''))[:60]}",
-            })
+            await emit_activity(
+                task_id,
+                {
+                    "type": "tool_result",
+                    "tool": tool_name,
+                    "summary": f"Sub-agent finished: {str(args.get('goal', ''))[:60]}",
+                },
+            )
         except Exception as exc:
             logger.warning("Sub-agent failed: %s", exc)
             content = json.dumps({"error": str(exc)})
-            await emit_activity(task_id, {"type": "tool_error", "tool": tool_name, "error": str(exc)})
+            await emit_activity(
+                task_id, {"type": "tool_error", "tool": tool_name, "error": str(exc)}
+            )
         return {
             "role": "tool",
             "tool_call_id": call["id"],
@@ -1012,11 +1329,14 @@ async def _execute_tool(
             data = {k: v for k, v in data.items() if k != "screenshot_data_url"}
         payload = {"summary": result.summary, "data": data}
         content = json.dumps(payload, default=str)
-        await emit_activity(task_id, {
-            "type": "tool_result",
-            "tool": tool_name,
-            "summary": result.summary,
-        })
+        await emit_activity(
+            task_id,
+            {
+                "type": "tool_result",
+                "tool": tool_name,
+                "summary": result.summary,
+            },
+        )
         # A file write of a renderable type becomes a user-facing artifact.
         if tool_name == "fs__write":
             artifact = await _maybe_create_artifact(task, args)
@@ -1037,7 +1357,10 @@ async def _execute_tool(
         # so filled PDFs, generated images, slides, and charts show up inline.
         if isinstance(result.data, dict):
             for artifact in await _surface_result_artifacts(task, result.data):
-                if any(existing.get("artifact_id") == artifact["artifact_id"] for existing in created_artifacts):
+                if any(
+                    existing.get("artifact_id") == artifact["artifact_id"]
+                    for existing in created_artifacts
+                ):
                     continue
                 created_artifacts.append(artifact)
                 await emit_activity(task_id, {"type": "artifact", **artifact})
@@ -1046,7 +1369,9 @@ async def _execute_tool(
     except Exception as exc:
         logger.warning("Tool %s error: %s", tool_name, exc)
         content = json.dumps({"error": str(exc)})
-        await emit_activity(task_id, {"type": "tool_error", "tool": tool_name, "error": str(exc)})
+        await emit_activity(
+            task_id, {"type": "tool_error", "tool": tool_name, "error": str(exc)}
+        )
 
     return {
         "role": "tool",
@@ -1080,9 +1405,18 @@ _RENDERABLE_EXT: dict[str, tuple[str, str]] = {
     ".py": ("code", "text/plain"),
     ".txt": ("text", "text/plain"),
     ".pdf": ("pdf", "application/pdf"),
-    ".pptx": ("presentation", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
-    ".docx": ("document", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
-    ".xlsx": ("spreadsheet", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+    ".pptx": (
+        "presentation",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ),
+    ".docx": (
+        "document",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ),
+    ".xlsx": (
+        "spreadsheet",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ),
 }
 
 # Extensions that are always binary. We refuse to honour `fs__write`'s text
@@ -1091,7 +1425,9 @@ _RENDERABLE_EXT: dict[str, tuple[str, str]] = {
 _BINARY_EXT = {".pdf", ".pptx", ".docx", ".xlsx"}
 
 
-async def _maybe_create_artifact(task: dict[str, Any], args: dict[str, Any]) -> dict[str, Any] | None:
+async def _maybe_create_artifact(
+    task: dict[str, Any], args: dict[str, Any]
+) -> dict[str, Any] | None:
     """Persist a renderable fs__write as a downloadable/openable artifact.
 
     Returns an event payload {artifact_id, title, kind, mime_type, size_bytes}
@@ -1100,8 +1436,6 @@ async def _maybe_create_artifact(task: dict[str, Any], args: dict[str, Any]) -> 
     must produce them via `code__python`, which is picked up by the
     workspace scan in `_scan_workspace_for_artifacts`.
     """
-    import os
-
     path = str(args.get("path") or "")
     file_content = args.get("content")
     if not path:
@@ -1115,7 +1449,9 @@ async def _maybe_create_artifact(task: dict[str, Any], args: dict[str, Any]) -> 
     kind, mime = mapping
     if not isinstance(file_content, str):
         try:
-            root = task_workspace_root(str(task.get("organization_id") or "default"), str(task["id"]))
+            root = task_workspace_root(
+                str(task.get("organization_id") or "default"), str(task["id"])
+            )
             candidate = jailed_path(root, path)
             if not candidate.is_file():
                 return None
@@ -1147,10 +1483,12 @@ async def _maybe_create_artifact(task: dict[str, Any], args: dict[str, Any]) -> 
         "kind": kind,
         "mime_type": mime,
         "size_bytes": len(file_content.encode("utf-8")),
-}
+    }
 
 
-async def _surface_result_artifacts(task: dict[str, Any], data: dict[str, Any]) -> list[dict[str, Any]]:
+async def _surface_result_artifacts(
+    task: dict[str, Any], data: dict[str, Any]
+) -> list[dict[str, Any]]:
     """Resolve tool-returned artifact ids into chat/activity artifact payloads."""
     from core.artifacts import get_artifact
 
@@ -1168,7 +1506,9 @@ async def _surface_result_artifacts(task: dict[str, Any], data: dict[str, Any]) 
         try:
             meta = await get_artifact(artifact_id)
         except Exception as exc:
-            logger.warning("Artifact surfacing lookup failed for %s: %r", artifact_id, exc)
+            logger.warning(
+                "Artifact surfacing lookup failed for %s: %r", artifact_id, exc
+            )
             continue
         if not meta or str(meta.get("organization_id") or "") != org_id:
             continue
@@ -1194,8 +1534,6 @@ async def _scan_workspace_for_artifacts(task: dict[str, Any]) -> list[dict[str, 
     artifacts. Dedup is by (task_id, relative path) so a re-scan does not
     re-archive the same file.
     """
-    import os
-
     org_id = str(task.get("organization_id") or "default")
     task_id = str(task["id"])
     region = str(task.get("region") or "us")
@@ -1210,14 +1548,15 @@ async def _scan_workspace_for_artifacts(task: dict[str, Any]) -> list[dict[str, 
     artifacts_tbl = await reflect_table("artifacts")
     try:
         async with engine.begin() as conn:
-            existing_rows = (await conn.execute(
-                select(artifacts_tbl.c.title)
-                .where(
-                    artifacts_tbl.c.task_id == task_id,
-                    artifacts_tbl.c.organization_id == org_id,
-                    artifacts_tbl.c.is_deleted == False,  # noqa: E712
+            existing_rows = (
+                await conn.execute(
+                    select(artifacts_tbl.c.title).where(
+                        artifacts_tbl.c.task_id == task_id,
+                        artifacts_tbl.c.organization_id == org_id,
+                        artifacts_tbl.c.is_deleted == False,  # noqa: E712
+                    )
                 )
-            )).all()
+            ).all()
     except Exception as exc:
         logger.warning("Workspace scan: existing artifact lookup failed: %r", exc)
         existing_rows = []
@@ -1263,15 +1602,19 @@ async def _scan_workspace_for_artifacts(task: dict[str, Any]) -> list[dict[str, 
                 created_by=f"task:{task_id}",
             )
         except Exception as exc:
-            logger.warning("Workspace scan: save_artifact failed for %s: %r", rel_path, exc)
+            logger.warning(
+                "Workspace scan: save_artifact failed for %s: %r", rel_path, exc
+            )
             continue
-        created.append({
-            "artifact_id": artifact_id,
-            "title": rel_path,
-            "kind": kind,
-            "mime_type": mime,
-            "size_bytes": len(content_bytes),
-        })
+        created.append(
+            {
+                "artifact_id": artifact_id,
+                "title": rel_path,
+                "kind": kind,
+                "mime_type": mime,
+                "size_bytes": len(content_bytes),
+            }
+        )
         existing_titles.add(rel_path)
     return created
 
@@ -1283,7 +1626,9 @@ async def _run_subagent(
 ) -> dict[str, Any]:
     """Create a child task and run a nested agent loop for it."""
     if parent_depth >= MAX_DEPTH:
-        raise ValueError(f"Sub-agent depth limit ({MAX_DEPTH}) reached — cannot spawn further.")
+        raise ValueError(
+            f"Sub-agent depth limit ({MAX_DEPTH}) reached — cannot spawn further."
+        )
 
     goal = str(args.get("goal") or "No goal specified")
     model_id = str(args.get("model") or default_chat_model_id())
@@ -1332,38 +1677,46 @@ async def _run_subagent(
     _child_org_id = str(parent_task["organization_id"])
     from core import permissions as _perm
     from core.permissions import _INTERNAL_ACTOR_IDS
+
     if _child_member_id and _child_member_id not in _INTERNAL_ACTOR_IDS:
         import asyncio as _asyncio
+
         _asyncio.create_task(
             _perm.grant_task_role(_child_member_id, "owner", child_id, _child_org_id)
         )
     else:
         import asyncio as _asyncio
-        _asyncio.create_task(
-            _perm._seed_task_org_link(child_id, _child_org_id)
-        )
+
+        _asyncio.create_task(_perm._seed_task_org_link(child_id, _child_org_id))
 
     child_task = await get_task(child_id)
     if not child_task:
         raise RuntimeError("Failed to create child task")
 
-    await emit_activity(parent_task["id"], {
-        "type": "sub_agent_spawned",
-        "sub_task_id": child_id,
-        "goal": goal,
-    })
+    await emit_activity(
+        parent_task["id"],
+        {
+            "type": "sub_agent_spawned",
+            "sub_task_id": child_id,
+            "goal": goal,
+        },
+    )
 
     final_result = await run_loop(child_task, tools=SUBAGENT_TOOLS, model=child_model)
 
-    await emit_activity(parent_task["id"], {
-        "type": "sub_agent_complete",
-        "sub_task_id": child_id,
-        "result": final_result,
-    })
+    await emit_activity(
+        parent_task["id"],
+        {
+            "type": "sub_agent_complete",
+            "sub_task_id": child_id,
+            "result": final_result,
+        },
+    )
     return final_result
 
 
 # ── Approval gating ───────────────────────────────────────────────────────────
+
 
 def _needs_approval(tool_name: str) -> bool:
     return tool_name in ALWAYS_APPROVAL_TOOL_NAMES
@@ -1387,6 +1740,13 @@ async def _open_approval_gate(
         for call in pending_calls:
             broker_name = to_broker_name(call["name"])
             args = _parse_args(call["args_str"])
+            # Persist the same logical-step key that normal execution would
+            # use. Approval resumes can happen in another worker/process, so
+            # the durable approval record must carry the idempotency evidence.
+            if _call_is_external_write(call) and "__idempotency_key" not in args:
+                args["__idempotency_key"] = hashlib.sha256(
+                    f"{task_id}:{call['id']}".encode()
+                ).hexdigest()[:24]
             payload = {
                 "tool": broker_name,
                 "args": args,
@@ -1420,12 +1780,20 @@ async def _open_approval_gate(
         token_usage = task["agent_state"].get("token_usage")
     if token_usage:
         state["token_usage"] = token_usage
-    await save_task(task_id, agent_state=state, iteration_count=iteration, status="awaiting_approval")
-    await emit_activity(task_id, {
-        "type": "awaiting_approval",
-        "approval_ids": approval_ids,
-        "step_id": "agent_loop",
-    })
+    await save_task(
+        task_id,
+        agent_state=state,
+        iteration_count=iteration,
+        status="awaiting_approval",
+    )
+    await emit_activity(
+        task_id,
+        {
+            "type": "awaiting_approval",
+            "approval_ids": approval_ids,
+            "step_id": "agent_loop",
+        },
+    )
     # Surface an in-app notification so an approver is alerted (best-effort,
     # gated by the org's notification settings).
     try:
@@ -1436,8 +1804,39 @@ async def _open_approval_gate(
             organization_id=task["organization_id"],
             type="approval_request",
             title="Approval needed" + (f": {tools}" if tools else ""),
-            body=f"A task is waiting for approval to run: {tools}." if tools else "A task is waiting for approval.",
+            body=f"A task is waiting for approval to run: {tools}."
+            if tools
+            else "A task is waiting for approval.",
             severity="warning",
+            resource_type="task",
+            resource_id=str(task_id),
+            created_by="chronos",
+        )
+    except Exception:
+        pass
+
+
+async def _notify_task_completion(task: dict[str, Any], task_id: str) -> None:
+    """Preference-gated completion alert for a top-level task.
+
+    ``notifications.emit`` owns durable in-app delivery and fans out the narrow
+    signed desktop ``notify`` command. Scheduled tasks retain their creator as
+    ``triggered_by_member_id``, so scheduled completions follow the same path.
+    """
+
+    if int(task.get("depth") or 0) > 0:
+        return
+    try:
+        from core import notifications
+
+        target = str(task.get("triggered_by_member_id") or "") or None
+        await notifications.emit(
+            organization_id=str(task.get("organization_id") or "default"),
+            type="task_completion",
+            title="Task completed",
+            body=str(task.get("goal") or "A Chronos task completed.")[:500],
+            severity="success",
+            member_id=target,
             resource_type="task",
             resource_id=str(task_id),
             created_by="chronos",
@@ -1448,12 +1847,13 @@ async def _open_approval_gate(
 
 # ── Resume after approval ─────────────────────────────────────────────────────
 
+
 async def resume_after_approval(task_id: str) -> None:
     """Resume a loop that paused for approval.  Called by the approvals router."""
     task = await get_task(task_id)
     if not task:
         return
-    if task["status"] not in {"awaiting_approval", "paused"}:
+    if task["status"] != "awaiting_approval":
         return
 
     state = task.get("agent_state") or {}
@@ -1465,13 +1865,17 @@ async def resume_after_approval(task_id: str) -> None:
     approvals = await reflect_table("approvals")
     async with engine.begin() as conn:
         rows = (
-            await conn.execute(
-                select(approvals).where(
-                    approvals.c.task_id == task_id,
-                    approvals.c.step_id == "agent_loop",
+            (
+                await conn.execute(
+                    select(approvals).where(
+                        approvals.c.task_id == task_id,
+                        approvals.c.step_id == "agent_loop",
+                    )
                 )
             )
-        ).mappings().all()
+            .mappings()
+            .all()
+        )
     rows = [dict(r) for r in rows]
 
     pending = [r for r in rows if r["status"] == "pending"]
@@ -1481,33 +1885,79 @@ async def resume_after_approval(task_id: str) -> None:
     # Process each approval decision
     for row in rows:
         payload = dict(row.get("action_payload") or {})
-        if payload.get("execution_result") or payload.get("execution_error") or payload.get("rejection_result"):
+        if (
+            payload.get("execution_result")
+            or payload.get("execution_error")
+            or payload.get("rejection_result")
+        ):
             continue  # already processed
 
         broker_name = payload.get("tool") or row["action_type"]
         call_id = payload.get("call_id") or row["id"]
-        args = payload.get("args") or {}
+        args = dict(payload.get("args") or {})
 
         if row["status"] == "rejected":
-            content = json.dumps({"status": "rejected", "reason": row.get("decision_note")})
-            history.append({"role": "tool", "tool_call_id": call_id, "name": broker_name, "content": content})
-            await _mark_approval(row["id"], {**payload, "rejection_result": True}, approvals)
-            await emit_activity(task_id, {"type": "approval_rejected", "approval_id": row["id"]})
+            content = json.dumps(
+                {"status": "rejected", "reason": row.get("decision_note")}
+            )
+            history.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "name": broker_name,
+                    "content": content,
+                }
+            )
+            await _mark_approval(
+                row["id"], {**payload, "rejection_result": True}, approvals
+            )
+            await emit_activity(
+                task_id, {"type": "approval_rejected", "approval_id": row["id"]}
+            )
             continue
 
         # approved → execute
         try:
-            result = await tool_broker.execute(agent, broker_name, {**args, "__approved_by_gate": True})
+            # Bind irreversible execution to this approved row. The broker
+            # strips these internal fields from args hashing/audit payloads and
+            # forwards them only to the Gmail delivery seam.
+            result = await tool_broker.execute(
+                agent,
+                broker_name,
+                {
+                    **args,
+                    "__approved_by_gate": True,
+                    "__approval_id": str(row["id"]),
+                    "__idempotency_key": args.get("__idempotency_key")
+                    or hashlib.sha256(f"{task_id}:{call_id}".encode()).hexdigest()[:24],
+                },
+            )
             result_data = {"summary": result.summary, "data": result.data}
             content = json.dumps(result_data, default=str)
-            await _mark_approval(row["id"], {**payload, "execution_result": result_data}, approvals)
-            await emit_activity(task_id, {"type": "tool_result", "tool": broker_name, "summary": result.summary})
+            await _mark_approval(
+                row["id"], {**payload, "execution_result": result_data}, approvals
+            )
+            await emit_activity(
+                task_id,
+                {"type": "tool_result", "tool": broker_name, "summary": result.summary},
+            )
         except Exception as exc:
             content = json.dumps({"error": str(exc)})
-            await _mark_approval(row["id"], {**payload, "execution_error": str(exc)}, approvals)
-            await emit_activity(task_id, {"type": "tool_error", "tool": broker_name, "error": str(exc)})
+            await _mark_approval(
+                row["id"], {**payload, "execution_error": str(exc)}, approvals
+            )
+            await emit_activity(
+                task_id, {"type": "tool_error", "tool": broker_name, "error": str(exc)}
+            )
 
-        history.append({"role": "tool", "tool_call_id": call_id, "name": broker_name, "content": content})
+        history.append(
+            {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "name": broker_name,
+                "content": content,
+            }
+        )
 
     # Clear pending state and continue (preserve the UI-chosen model).
     new_state: dict[str, Any] = {"agent_history": history, "iteration_count": iteration}
@@ -1522,14 +1972,31 @@ async def resume_after_approval(task_id: str) -> None:
         await run_loop(refreshed)
 
 
-async def _mark_approval(approval_id: str, payload: dict[str, Any], approvals_table: Any) -> None:
+async def _mark_approval(
+    approval_id: str, payload: dict[str, Any], approvals_table: Any
+) -> None:
     async with engine.begin() as conn:
+        current = (
+            await conn.execute(
+                select(approvals_table.c.action_payload)
+                .where(approvals_table.c.id == approval_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        # Connector execution may have persisted provider-side idempotency
+        # evidence into the approval while the external call was in flight.
+        # Merge under the row lock so the stale pre-call payload cannot erase
+        # draft/message IDs when adding execution_result/execution_error.
+        merged_payload = {**dict(current or {}), **payload}
         await conn.execute(
-            update(approvals_table).where(approvals_table.c.id == approval_id).values(action_payload=payload)
+            update(approvals_table)
+            .where(approvals_table.c.id == approval_id)
+            .values(action_payload=merged_payload)
         )
 
 
 # ── Inline chat turn ──────────────────────────────────────────────────────────
+
 
 async def persist_assistant_message(
     conversation_id: str,
@@ -1590,16 +2057,23 @@ def _normalize_chat_tool_traces(raw: list[dict[str, Any]]) -> list[dict[str, Any
                 row["summary"] = str(event.get("summary") or row.get("summary") or "")
                 row["status"] = "complete"
             else:
-                row["summary"] = str(event.get("error") or event.get("summary") or row.get("summary") or "")
+                row["summary"] = str(
+                    event.get("error")
+                    or event.get("summary")
+                    or row.get("summary")
+                    or ""
+                )
                 row["status"] = "error"
             out.append(row)
         elif event.get("tool"):
-            out.append({
-                "id": next_id("trace"),
-                "tool": str(event.get("tool")),
-                "summary": str(event.get("summary") or ""),
-                "status": str(event.get("status") or "complete"),
-            })
+            out.append(
+                {
+                    "id": next_id("trace"),
+                    "tool": str(event.get("tool")),
+                    "summary": str(event.get("summary") or ""),
+                    "status": str(event.get("status") or "complete"),
+                }
+            )
 
     out.extend(pending.values())
     return out
@@ -1630,6 +2104,7 @@ async def create_task_from_history(
                 workspace_id=requester_context.workspace_id,
                 triggered_by=conversation_id,
                 triggered_by_member_id=requester_context.member_id,
+                project_id=requester_context.project_id,
                 status=status,
                 goal=goal,
                 plan={},
@@ -1647,11 +2122,15 @@ async def create_task_from_history(
         lazy_task_id = str(result.scalar_one())
 
     # Seed FGA task ownership for this lazily-persisted task (no-op when FGA off).
-    _lazy_member_id = str(requester_context.member_id) if requester_context.member_id else ""
+    _lazy_member_id = (
+        str(requester_context.member_id) if requester_context.member_id else ""
+    )
     from core import permissions as _perm
     from core.permissions import _INTERNAL_ACTOR_IDS
+
     if _lazy_member_id and _lazy_member_id not in _INTERNAL_ACTOR_IDS:
         import asyncio as _asyncio
+
         _asyncio.create_task(
             _perm.grant_task_role(
                 _lazy_member_id, "owner", lazy_task_id, requester_context.org_id
@@ -1659,6 +2138,7 @@ async def create_task_from_history(
         )
     else:
         import asyncio as _asyncio
+
         _asyncio.create_task(
             _perm._seed_task_org_link(lazy_task_id, requester_context.org_id)
         )
@@ -1667,16 +2147,36 @@ async def create_task_from_history(
 
 def requires_mailbox_grounding(message: str) -> bool:
     text = message.lower()
-    if not any(marker in text for marker in ("email", "emails", "gmail", "inbox", "mailbox")):
+    if not any(
+        marker in text for marker in ("email", "emails", "gmail", "inbox", "mailbox")
+    ):
         return False
-    if any(marker in text for marker in ("draft an email", "write an email", "compose an email")):
+    if any(
+        marker in text
+        for marker in ("draft an email", "write an email", "compose an email")
+    ):
         return False
     return any(
         marker in text
         for marker in (
-            "summarize", "summarise", "summary", "search", "find", "look",
-            "what", "which", "who", "last", "recent", "today", "yesterday",
-            "days", "week", "inbox", "received", "came in",
+            "summarize",
+            "summarise",
+            "summary",
+            "search",
+            "find",
+            "look",
+            "what",
+            "which",
+            "who",
+            "last",
+            "recent",
+            "today",
+            "yesterday",
+            "days",
+            "week",
+            "inbox",
+            "received",
+            "came in",
         )
     )
 
@@ -1722,23 +2222,38 @@ async def stream_chat_turn(
     # user_content may be a list (multimodal vision blocks) or a plain string.
     # message (always str) is kept for ack/grounding/memory/goal — user_content
     # only controls what the model receives as the user turn's content field.
-    history.append({"role": "user", "content": user_content if user_content is not None else message})
+    history.append(
+        {
+            "role": "user",
+            "content": user_content if user_content is not None else message,
+        }
+    )
     # Connector-aware tool exposure: only connected SaaS connectors' tools reach
     # the model; blocked tools are removed; per-conversation toggles honored.
     from core.connector_tools import resolve_agent_tools
+    from core.project_access import project_tool_allowlist
 
     chat_tools = await resolve_agent_tools(
         INLINE_CHAT_TOOLS,
         org_id=str(requester_context.org_id),
+        member_id=str(requester_context.member_id),
         disabled_tools=disabled_tools,
+        enabled_tools=await project_tool_allowlist(
+            str(requester_context.org_id),
+            getattr(requester_context, "project_id", None),
+        ),
     )
     effective_model = resolve_agent_model(model)
     task_id: str | None = None
     task: dict[str, Any] | None = None
     iteration = 0
     raw_tool_trace_events: list[dict[str, Any]] = []
-    surfaced_citations = list(getattr(requester_context, "surfaced_citations", []) or [])
-    surfaced_memory_refs = list(getattr(requester_context, "surfaced_memory_refs", []) or [])
+    surfaced_citations = list(
+        getattr(requester_context, "surfaced_citations", []) or []
+    )
+    surfaced_memory_refs = list(
+        getattr(requester_context, "surfaced_memory_refs", []) or []
+    )
 
     async def save_inline_answer(content: str) -> None:
         await persist_assistant_message(
@@ -1765,7 +2280,9 @@ async def stream_chat_turn(
             stream_kwargs: dict[str, str] = {}
             if reasoning_effort:
                 stream_kwargs["reasoning_effort"] = reasoning_effort
-            async for ev in stream_step(history, chat_tools, effective_model, **stream_kwargs):
+            async for ev in stream_step(
+                history, chat_tools, effective_model, **stream_kwargs
+            ):
                 if ev["type"] == "token":
                     yield {"type": "token", "content": ev["content"]}
                 elif ev["type"] == "text_done":
@@ -1795,7 +2312,9 @@ async def stream_chat_turn(
                 prompt_tokens=estimated_prompt_tokens,
             )
             await save_inline_answer(answer)
-            _spawn_background(extract_and_save(conversation_id, message, answer, requester_context))
+            _spawn_background(
+                extract_and_save(conversation_id, message, answer, requester_context)
+            )
             yield {"type": "done"}
             return
 
@@ -1803,19 +2322,30 @@ async def stream_chat_turn(
         if promote:
             goal = _parse_args(promote["args_str"]).get("goal") or message
             bg_id = await create_task_from_history(
-                goal=goal, history=history, requester_context=requester_context,
-                conversation_id=conversation_id, model=model, status="queued",
+                goal=goal,
+                history=history,
+                requester_context=requester_context,
+                conversation_id=conversation_id,
+                model=model,
+                status="queued",
             )
             await task_runner.enqueue_task(bg_id)
             yield {"type": "task_created", "task_id": bg_id, "background": True}
             yield {"type": "done"}
             return
 
-        clarification = next((c for c in calls if c["name"] == _ASK_CLARIFICATION_TOOL_NAME), None)
+        clarification = next(
+            (c for c in calls if c["name"] == _ASK_CLARIFICATION_TOOL_NAME), None
+        )
         if clarification:
             args = _parse_args(clarification["args_str"])
-            question = str(args.get("question") or "").strip() or "Which direction should I take?"
-            raw_options = args.get("options") if isinstance(args.get("options"), list) else []
+            question = (
+                str(args.get("question") or "").strip()
+                or "Which direction should I take?"
+            )
+            raw_options = (
+                args.get("options") if isinstance(args.get("options"), list) else []
+            )
             options: list[dict[str, str]] = []
             for item in raw_options[:3]:
                 if not isinstance(item, dict):
@@ -1823,18 +2353,35 @@ async def stream_chat_turn(
                 label = str(item.get("label") or "").strip()
                 if not label:
                     continue
-                options.append({
-                    "label": label[:80],
-                    "description": str(item.get("description") or "").strip()[:220],
-                })
+                options.append(
+                    {
+                        "label": label[:80],
+                        "description": str(item.get("description") or "").strip()[:220],
+                    }
+                )
             if len(options) < 2:
                 options = [
-                    {"label": "Proceed", "description": "Continue with the most likely interpretation."},
-                    {"label": "Revise", "description": "Use a different direction that I provide."},
+                    {
+                        "label": "Proceed",
+                        "description": "Continue with the most likely interpretation.",
+                    },
+                    {
+                        "label": "Revise",
+                        "description": "Use a different direction that I provide.",
+                    },
                 ]
-            assistant_text = question + "\n\n" + "\n".join(
-                f"{idx + 1}. {option['label']}" + (f" - {option['description']}" if option.get("description") else "")
-                for idx, option in enumerate(options)
+            assistant_text = (
+                question
+                + "\n\n"
+                + "\n".join(
+                    f"{idx + 1}. {option['label']}"
+                    + (
+                        f" - {option['description']}"
+                        if option.get("description")
+                        else ""
+                    )
+                    for idx, option in enumerate(options)
+                )
             )
             await save_inline_answer(assistant_text)
             yield {"type": "clarification", "question": question, "options": options}
@@ -1845,13 +2392,19 @@ async def stream_chat_turn(
         await record_model_usage(
             requester_context.org_id,
             model=effective_model,
-            total_tokens=estimated_prompt_tokens + estimate_tokens(final_text or "") + estimate_tokens(str(calls)),
+            total_tokens=estimated_prompt_tokens
+            + estimate_tokens(final_text or "")
+            + estimate_tokens(str(calls)),
             prompt_tokens=estimated_prompt_tokens,
         )
         if task_id is None:
             task_id = await create_task_from_history(
-                goal=message, history=history, requester_context=requester_context,
-                conversation_id=conversation_id, model=model, status="running",
+                goal=message,
+                history=history,
+                requester_context=requester_context,
+                conversation_id=conversation_id,
+                model=model,
+                status="running",
             )
             task = await get_task(task_id)
             yield {"type": "task_created", "task_id": task_id, "background": False}
@@ -1863,10 +2416,14 @@ async def stream_chat_turn(
         # history, any external write must be gated even if it isn't always-approval.
         if _history_has_prompt_injection(history):
             approval_needed.extend(
-                c for c in calls if _call_is_external_write(c) and c not in approval_needed
+                c
+                for c in calls
+                if _call_is_external_write(c) and c not in approval_needed
             )
         if approval_needed:
-            await _open_approval_gate(task, approval_needed, history, iteration, model=effective_model)
+            await _open_approval_gate(
+                task, approval_needed, history, iteration, model=effective_model
+            )
             yield {"type": "awaiting_approval", "task_id": task_id}
             yield {"type": "done"}
             return
@@ -1882,7 +2439,9 @@ async def stream_chat_turn(
             try:
                 tool_msg = await _execute_tool(call, task, agent)
             except ApprovalRequired:
-                await _open_approval_gate(task, [call], history, iteration, model=effective_model)
+                await _open_approval_gate(
+                    task, [call], history, iteration, model=effective_model
+                )
                 yield {"type": "awaiting_approval", "task_id": task_id}
                 yield {"type": "done"}
                 return
@@ -1902,11 +2461,17 @@ async def stream_chat_turn(
                 summary = json.loads(tool_msg["content"]).get("summary", "")
             except Exception:
                 pass
-            tool_result_event = {"type": "tool_result", "tool": call["name"], "summary": summary}
+            tool_result_event = {
+                "type": "tool_result",
+                "tool": call["name"],
+                "summary": summary,
+            }
             raw_tool_trace_events.append(tool_result_event)
             yield {"type": "trace", "event": tool_result_event}
 
-        await _checkpoint(task_id, history, iteration, model=effective_model, current_step=iteration)
+        await _checkpoint(
+            task_id, history, iteration, model=effective_model, current_step=iteration
+        )
 
     msg = "This is taking many steps. Try narrowing the request, or ask me to run it as a background task."
     await save_inline_answer(msg)
@@ -1931,7 +2496,9 @@ def _cognition_enabled(is_sub_agent: bool) -> bool:
     return bool(settings.openrouter_api_key or settings.backup_api_key)
 
 
-async def _connector_availability_note(tools: list[dict[str, Any]] | None) -> str | None:
+async def _connector_availability_note(
+    tools: list[dict[str, Any]] | None,
+) -> str | None:
     """Per-family degradation notes for the planner, or None when all are live."""
     if not tools:
         return None
@@ -1978,7 +2545,9 @@ async def _build_plan(
         return None
 
 
-async def _reflect(goal: str, answer: str, tool_summaries: list[str]) -> cognition.Verdict | None:
+async def _reflect(
+    goal: str, answer: str, tool_summaries: list[str]
+) -> cognition.Verdict | None:
     """Critique the proposed answer, or None (accept) on any failure."""
     try:
         raw = await complete_json(
@@ -2004,12 +2573,16 @@ async def _verify_answer(
     """
     try:
         raw = await complete_json(
-            cognition.build_evidence_verification_prompt(goal, answer, ledger, tool_summaries),
+            cognition.build_evidence_verification_prompt(
+                goal, answer, ledger, tool_summaries
+            ),
             model=settings.fast_model,
         )
         return cognition.parse_verdict(raw)
     except Exception as exc:  # noqa: BLE001 — verifier is advisory
-        logger.info("Evidence verifier unavailable, falling back to reflection: %s", exc)
+        logger.info(
+            "Evidence verifier unavailable, falling back to reflection: %s", exc
+        )
         return None
 
 
@@ -2045,34 +2618,63 @@ async def run_loop(
     task_id = task["id"]
     effective_tools = tools if tools is not None else ALL_TOOLS
     # Capture sub-agent identity before connector filtering replaces the list object.
-    _is_sub_agent_loop = effective_tools is SUBAGENT_TOOLS or int(task.get("depth") or 0) > 0
+    _is_sub_agent_loop = (
+        effective_tools is SUBAGENT_TOOLS or int(task.get("depth") or 0) > 0
+    )
     # Connector-aware tool exposure (Anthropic model): the model only sees SaaS
     # connector tools that are actually connected for this org, and never sees
     # tools blocked in Settings → Connectors. Degrades to the static list on error.
     from core.connector_tools import resolve_agent_tools
+    from core.project_access import project_tool_allowlist
 
     effective_tools = await resolve_agent_tools(
-        effective_tools, org_id=str(task.get("organization_id") or "default")
+        effective_tools,
+        org_id=str(task.get("organization_id") or "default"),
+        member_id=str(task.get("triggered_by_member_id") or "") or None,
+        enabled_tools=await project_tool_allowlist(
+            str(task.get("organization_id") or "default"),
+            str(task.get("project_id")) if task.get("project_id") else None,
+        ),
     )
     # Precedence: explicit arg (sub-agents) > model chosen in the UI (stored in
     # agent_state) > default agent model.
-    stored_model = (task.get("agent_state") or {}).get("model") if isinstance(task.get("agent_state"), dict) else None
-    stored_reasoning_effort = (task.get("agent_state") or {}).get("reasoning_effort") if isinstance(task.get("agent_state"), dict) else None
+    stored_model = (
+        (task.get("agent_state") or {}).get("model")
+        if isinstance(task.get("agent_state"), dict)
+        else None
+    )
+    stored_reasoning_effort = (
+        (task.get("agent_state") or {}).get("reasoning_effort")
+        if isinstance(task.get("agent_state"), dict)
+        else None
+    )
     effective_model = model or stored_model or settings.agent_model
     agent = AgentContext.from_task(task)
 
     history = await _load_history(task, effective_tools)
     iteration = int(task.get("iteration_count") or 0)
-    state_from_task = task.get("agent_state") if isinstance(task.get("agent_state"), dict) else {}
-    token_usage: dict[str, Any] = dict((state_from_task or {}).get("token_usage") or {"total_tokens": 0, "steps": []})
+    state_from_task = (
+        task.get("agent_state") if isinstance(task.get("agent_state"), dict) else {}
+    )
+    token_usage: dict[str, Any] = dict(
+        (state_from_task or {}).get("token_usage") or {"total_tokens": 0, "steps": []}
+    )
 
-    await save_task(task_id, status="running",
-                    started_at=task.get("started_at") or datetime.now(timezone.utc))
+    await save_task(
+        task_id,
+        status="running",
+        started_at=task.get("started_at") or datetime.now(timezone.utc),
+    )
     try:
         await enforce_task_start(task.get("organization_id", "default"), task_id)
     except GovernanceLimitExceeded as exc:
         friendly = str(exc)
-        await save_task(task_id, status="failed", error=friendly, completed_at=datetime.now(timezone.utc))
+        await save_task(
+            task_id,
+            status="failed",
+            error=friendly,
+            completed_at=datetime.now(timezone.utc),
+        )
         failed_msg_id = await _persist_to_conversation(task, friendly)
         failed_event: dict[str, Any] = {"type": "task_failed", "error": friendly}
         if failed_msg_id:
@@ -2094,7 +2696,11 @@ async def run_loop(
         max_reflections=settings.agent_max_reflections,
         max_replans=settings.agent_max_replans,
     )
-    _cog_state = (task.get("agent_state") or {}).get("cognition") if isinstance(task.get("agent_state"), dict) else None
+    _cog_state = (
+        (task.get("agent_state") or {}).get("cognition")
+        if isinstance(task.get("agent_state"), dict)
+        else None
+    )
     if isinstance(_cog_state, dict):
         budget.reflections_used = int(_cog_state.get("reflections_used") or 0)
         budget.replans_used = int(_cog_state.get("replans_used") or 0)
@@ -2109,7 +2715,9 @@ async def run_loop(
     # Plan: build fresh on first entry, restore from the task row on resume.
     plan_steps: list[dict[str, Any]] = []
     _existing_plan = task.get("plan")
-    if isinstance(_existing_plan, dict) and isinstance(_existing_plan.get("steps"), list):
+    if isinstance(_existing_plan, dict) and isinstance(
+        _existing_plan.get("steps"), list
+    ):
         plan_steps = list(_existing_plan["steps"])
     elif isinstance(_existing_plan, list):
         plan_steps = list(_existing_plan)
@@ -2118,10 +2726,16 @@ async def run_loop(
         _built = await _build_plan(goal, effective_tools)
         if _built:
             plan_steps = _built
-            await save_task(task_id, plan=_persist_plan_shape(plan_steps), current_step=0)
-            await emit_activity(task_id, {"type": "step_start", "step": plan_steps[0], "step_index": 0})
+            await save_task(
+                task_id, plan=_persist_plan_shape(plan_steps), current_step=0
+            )
+            await emit_activity(
+                task_id, {"type": "step_start", "step": plan_steps[0], "step_index": 0}
+            )
 
     while iteration < MAX_ITERATIONS:
+        if await is_task_paused(task_id):
+            return {"status": "paused"}
         if await is_task_cancelled(task_id):
             await save_task(
                 task_id,
@@ -2129,7 +2743,9 @@ async def run_loop(
                 error="task_cancelled",
                 completed_at=datetime.now(timezone.utc),
             )
-            await emit_activity(task_id, {"type": "task_cancelled", "reason": "task_cancelled"})
+            await emit_activity(
+                task_id, {"type": "task_cancelled", "reason": "task_cancelled"}
+            )
             return {"error": "task_cancelled"}
 
         # ── Ask the LLM ────────────────────────────────────────────────────
@@ -2137,20 +2753,29 @@ async def run_loop(
         # (e.g. generating a whole file in tool args). Tell the UI we're working
         # so it shows "Thinking…" instead of a frozen caret. Publish-only — this
         # high-frequency signal must not bloat the append-only audit_log.
-        await publish_activity(task_id, {
-            "type": "model_step",
-            "iteration": iteration + 1,
-            "summary": "Assembling context and deciding the next action.",
-        })
+        await publish_activity(
+            task_id,
+            {
+                "type": "model_step",
+                "iteration": iteration + 1,
+                "summary": "Assembling context and deciding the next action.",
+            },
+        )
         await publish_activity(task_id, {"type": "thinking"})
         # Transient per-step guidance (budget + plan position). Built as a fresh
         # list so persistent history is never bloated with repeated directives.
         budget.used = iteration
-        pending_approval_calls = (task.get("agent_state") or {}).get("pending_approval_calls") if isinstance(task.get("agent_state"), dict) else None
+        pending_approval_calls = (
+            (task.get("agent_state") or {}).get("pending_approval_calls")
+            if isinstance(task.get("agent_state"), dict)
+            else None
+        )
         step_history = compact_agent_history_for_model(
             history,
             recent_tool_iterations=2,
-            pending_approval_calls=pending_approval_calls if isinstance(pending_approval_calls, list) else None,
+            pending_approval_calls=pending_approval_calls
+            if isinstance(pending_approval_calls, list)
+            else None,
         )
         if light_cognition:
             ledger = cognition.build_task_ledger(
@@ -2159,7 +2784,9 @@ async def run_loop(
                 plan_steps=plan_steps,
                 current_plan_step=current_plan_step,
                 token_usage=token_usage,
-                pending_approval_calls=pending_approval_calls if isinstance(pending_approval_calls, list) else None,
+                pending_approval_calls=pending_approval_calls
+                if isinstance(pending_approval_calls, list)
+                else None,
             )
             step_history = step_history + [
                 {"role": "system", "content": cognition.render_task_ledger(ledger)}
@@ -2168,7 +2795,11 @@ async def run_loop(
             _bd = budget.directive()
             if _bd:
                 _guidance.append(_bd)
-            _pd = cognition.plan_directive(plan_steps, current_plan_step) if plan_steps else None
+            _pd = (
+                cognition.plan_directive(plan_steps, current_plan_step)
+                if plan_steps
+                else None
+            )
             if _pd:
                 _guidance.append(_pd)
             _sd = cognition.subagent_orchestration_directive(
@@ -2180,10 +2811,14 @@ async def run_loop(
             if _td:
                 _guidance.append(_td)
             if _guidance:
-                step_history = step_history + [{"role": "system", "content": "\n\n".join(_guidance)}]
+                step_history = step_history + [
+                    {"role": "system", "content": "\n\n".join(_guidance)}
+                ]
         try:
             estimated_prompt_tokens = estimate_message_tokens(step_history)
-            projected_step_tokens = _project_next_step_tokens(token_usage, estimated_prompt_tokens)
+            projected_step_tokens = _project_next_step_tokens(
+                token_usage, estimated_prompt_tokens
+            )
             await enforce_model_budget(
                 task.get("organization_id", "default"),
                 model=effective_model,
@@ -2195,17 +2830,24 @@ async def run_loop(
                 effective_model,
                 reasoning_effort=stored_reasoning_effort,
             )
+            if await is_task_paused(task_id):
+                return {"status": "paused"}
         except GovernanceLimitExceeded as exc:
             friendly = str(exc)
-            logger.warning("Governance blocked agent loop for task %s: %s", task_id, friendly)
+            logger.warning(
+                "Governance blocked agent loop for task %s: %s", task_id, friendly
+            )
             last_answer = _latest_assistant_text(history)
             if last_answer:
                 result = {"answer": last_answer}
-                await publish_activity(task_id, {
-                    "type": "model_result",
-                    "iteration": iteration + 1,
-                    "summary": "Budget is nearly exhausted; finalizing from gathered evidence.",
-                })
+                await publish_activity(
+                    task_id,
+                    {
+                        "type": "model_result",
+                        "iteration": iteration + 1,
+                        "summary": "Budget is nearly exhausted; finalizing from gathered evidence.",
+                    },
+                )
                 await _checkpoint(
                     task_id,
                     history,
@@ -2227,6 +2869,16 @@ async def run_loop(
                 if message_id:
                     event["message_id"] = message_id
                 await emit_activity(task_id, event)
+                try:
+                    from core.notification_delivery import enqueue_agent_response
+
+                    await enqueue_agent_response(task_id, last_answer)
+                except Exception:
+                    logger.exception(
+                        "Could not enqueue published-agent response for task %s",
+                        task_id,
+                    )
+                await _notify_task_completion(task, task_id)
                 return result
             await save_task(task_id, status="failed", error=friendly)
             failed_msg_id = await _persist_to_conversation(task, friendly)
@@ -2287,35 +2939,56 @@ async def run_loop(
                 and any(m.get("role") == "tool" for m in history)
             ):
                 budget.reflections_used += 1
-                await publish_activity(task_id, {
-                    "type": "model_step",
-                    "iteration": iteration + 1,
-                    "summary": "Reviewing the answer against the goal.",
-                })
+                await publish_activity(
+                    task_id,
+                    {
+                        "type": "model_step",
+                        "iteration": iteration + 1,
+                        "summary": "Reviewing the answer against the goal.",
+                    },
+                )
                 tool_summaries = collect_tool_summaries(history)
-                verdict = await _verify_answer(goal, answer, final_ledger, tool_summaries)
+                verdict = await _verify_answer(
+                    goal, answer, final_ledger, tool_summaries
+                )
                 if verdict is None:
                     verdict = await _reflect(goal, answer, tool_summaries)
-                if verdict and not verdict.complete and budget.can_replan and not budget.exhausted:
+                if (
+                    verdict
+                    and not verdict.complete
+                    and budget.can_replan
+                    and not budget.exhausted
+                ):
                     budget.replans_used += 1
                     history.append({"role": "assistant", "content": answer})
-                    _missing = "; ".join(verdict.missing) if verdict.missing else "see directive"
-                    history.append({
-                        "role": "system",
-                        "content": (
-                            "Controller self-check: the answer is not yet complete. "
-                            f"{verdict.directive} Missing: {_missing}. "
-                            "Continue working to close the gap, then give an improved final answer."
-                        ),
-                    })
-                    await emit_activity(task_id, {
-                        "type": "step_retry",
-                        "summary": "Answer needs more work; continuing.",
-                        "attempt": budget.replans_used,
-                    })
+                    _missing = (
+                        "; ".join(verdict.missing)
+                        if verdict.missing
+                        else "see directive"
+                    )
+                    history.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "Controller self-check: the answer is not yet complete. "
+                                f"{verdict.directive} Missing: {_missing}. "
+                                "Continue working to close the gap, then give an improved final answer."
+                            ),
+                        }
+                    )
+                    await emit_activity(
+                        task_id,
+                        {
+                            "type": "step_retry",
+                            "summary": "Answer needs more work; continuing.",
+                            "attempt": budget.replans_used,
+                        },
+                    )
                     iteration += 1
                     await _checkpoint(
-                        task_id, history, iteration,
+                        task_id,
+                        history,
+                        iteration,
                         model=effective_model,
                         current_step=current_plan_step if plan_steps else iteration,
                         cognition_state={
@@ -2328,38 +3001,53 @@ async def run_loop(
                     )
                     continue
 
-            await publish_activity(task_id, {
-                "type": "model_result",
-                "iteration": iteration + 1,
-                "summary": "No tool call needed; preparing final answer.",
-            })
+            await publish_activity(
+                task_id,
+                {
+                    "type": "model_result",
+                    "iteration": iteration + 1,
+                    "summary": "No tool call needed; preparing final answer.",
+                },
+            )
             result = {"answer": answer}
             if plan_steps:
-                await emit_activity(task_id, {
-                    "type": "step_done",
-                    "step": plan_steps[min(current_plan_step, len(plan_steps) - 1)],
-                    "step_index": min(current_plan_step, len(plan_steps) - 1),
-                })
+                await emit_activity(
+                    task_id,
+                    {
+                        "type": "step_done",
+                        "step": plan_steps[min(current_plan_step, len(plan_steps) - 1)],
+                        "step_index": min(current_plan_step, len(plan_steps) - 1),
+                    },
+                )
             history.append({"role": "assistant", "content": answer})
-            await _checkpoint(task_id, history, iteration + 1, model=effective_model,
-                              status="complete", result=result,
-                              current_step=len(plan_steps) if plan_steps else iteration + 1,
-                              cognition_state={
-                                  "reflections_used": budget.reflections_used,
-                                  "replans_used": budget.replans_used,
-                                  "ledger": final_ledger,
-                                  "trace_metrics": cognition.score_task_trace(history, result),
-                                  "learning_notes": cognition.derive_trace_learning_notes(
-                                      cognition.score_task_trace(history, result),
-                                      final_ledger,
-                                  ),
-                              },
-                              token_usage=token_usage,
-                              completed_at=datetime.now(timezone.utc))
+            await _checkpoint(
+                task_id,
+                history,
+                iteration + 1,
+                model=effective_model,
+                status="complete",
+                result=result,
+                current_step=len(plan_steps) if plan_steps else iteration + 1,
+                cognition_state={
+                    "reflections_used": budget.reflections_used,
+                    "replans_used": budget.replans_used,
+                    "ledger": final_ledger,
+                    "trace_metrics": cognition.score_task_trace(history, result),
+                    "learning_notes": cognition.derive_trace_learning_notes(
+                        cognition.score_task_trace(history, result),
+                        final_ledger,
+                    ),
+                },
+                token_usage=token_usage,
+                completed_at=datetime.now(timezone.utc),
+            )
             # Build the structured response envelope from runtime facts + prose composer.
             # Failures are silently suppressed so the loop never breaks on this path.
             from core.structured_response import (
-                build_runtime_facts, compose, resolve_verbosity, derive_response_type,
+                build_runtime_facts,
+                compose,
+                resolve_verbosity,
+                derive_response_type,
             )
             from core.models import RequesterContext
 
@@ -2369,7 +3057,9 @@ async def run_loop(
                 async with engine.begin() as conn:
                     approval_exists = (
                         await conn.execute(
-                            select(approvals.c.id).where(approvals.c.task_id == task_id).limit(1)
+                            select(approvals.c.id)
+                            .where(approvals.c.task_id == task_id)
+                            .limit(1)
                         )
                     ).first() is not None
                 facts = build_runtime_facts(
@@ -2380,12 +3070,17 @@ async def run_loop(
                 )
                 triggered_member = task.get("triggered_by_member_id") or "system"
                 verbosity = await resolve_verbosity(
-                    RequesterContext(org_id=task.get("organization_id", "default"),
-                                     member_id=str(triggered_member), role="user")
+                    RequesterContext(
+                        org_id=task.get("organization_id", "default"),
+                        member_id=str(triggered_member),
+                        role="user",
+                    )
                 )
                 envelope = await compose(
-                    response_type=derive_response_type(facts), answer_text=answer_text,
-                    facts=facts, verbosity=verbosity,
+                    response_type=derive_response_type(facts),
+                    answer_text=answer_text,
+                    facts=facts,
+                    verbosity=verbosity,
                 )
                 envelope_dict = envelope.model_dump()
             except Exception:
@@ -2393,13 +3088,24 @@ async def run_loop(
 
             # Persist the answer to the conversation (source of truth, survives
             # SSE disconnects). Only top-level conversation-triggered tasks.
-            message_id = await _persist_to_conversation(task, answer_text, structured_response=envelope_dict)
+            message_id = await _persist_to_conversation(
+                task, answer_text, structured_response=envelope_dict
+            )
             event: dict[str, Any] = {"type": "task_complete", "result": result}
             if envelope_dict is not None:
                 event["structured_response"] = envelope_dict
             if message_id:
                 event["message_id"] = message_id
             await emit_activity(task_id, event)
+            try:
+                from core.notification_delivery import enqueue_agent_response
+
+                await enqueue_agent_response(task_id, answer_text)
+            except Exception:
+                logger.exception(
+                    "Could not enqueue published-agent response for task %s", task_id
+                )
+            await _notify_task_completion(task, task_id)
             return result
 
         iteration += 1
@@ -2410,14 +3116,22 @@ async def run_loop(
         # ── Check for always-approval tools ────────────────────────────────
         approval_needed = [c for c in calls if _needs_approval(c["name"])]
         if _history_has_prompt_injection(history):
-            approval_needed.extend(c for c in calls if _call_is_external_write(c) and c not in approval_needed)
+            approval_needed.extend(
+                c
+                for c in calls
+                if _call_is_external_write(c) and c not in approval_needed
+            )
         if approval_needed:
             if token_usage:
                 task.setdefault("agent_state", {})["token_usage"] = token_usage
-            await _open_approval_gate(task, approval_needed, history, iteration, model=effective_model)
+            await _open_approval_gate(
+                task, approval_needed, history, iteration, model=effective_model
+            )
             return {"status": "awaiting_approval"}
 
         # ── Execute tool calls (parallel if multiple) ───────────────────────
+        if await is_task_paused(task_id):
+            return {"status": "paused"}
         if await is_task_cancelled(task_id):
             await save_task(
                 task_id,
@@ -2425,7 +3139,9 @@ async def run_loop(
                 error="task_cancelled",
                 completed_at=datetime.now(timezone.utc),
             )
-            await emit_activity(task_id, {"type": "task_cancelled", "reason": "task_cancelled"})
+            await emit_activity(
+                task_id, {"type": "task_cancelled", "reason": "task_cancelled"}
+            )
             return {"error": "task_cancelled"}
 
         tool_messages: list[dict[str, Any]] = []
@@ -2435,7 +3151,9 @@ async def run_loop(
             except ApprovalRequired:
                 if token_usage:
                     task.setdefault("agent_state", {})["token_usage"] = token_usage
-                await _open_approval_gate(task, calls, history, iteration, model=effective_model)
+                await _open_approval_gate(
+                    task, calls, history, iteration, model=effective_model
+                )
                 return {"status": "awaiting_approval"}
             # Artifacts from this tool call were already emitted to Redis pub/sub
             # inside `_execute_tool`; strip the non-standard key before the
@@ -2458,14 +3176,16 @@ async def run_loop(
             if approval_hit:
                 if token_usage:
                     task.setdefault("agent_state", {})["token_usage"] = token_usage
-                await _open_approval_gate(task, calls, history, iteration, model=effective_model)
+                await _open_approval_gate(
+                    task, calls, history, iteration, model=effective_model
+                )
                 return {"status": "awaiting_approval"}
-            for r in raw_results:
+            for call, r in zip(calls, raw_results, strict=True):
                 if isinstance(r, Exception):
                     tool_msg = {
                         "role": "tool",
-                        "tool_call_id": "error",
-                        "name": "error",
+                        "tool_call_id": call["id"],
+                        "name": call["name"],
                         "content": json.dumps({"error": str(r)}),
                     }
                     tool_messages.append(tool_msg)
@@ -2482,7 +3202,9 @@ async def run_loop(
         _append_replan_instruction(history, state)
 
         # ── Progress / loop detection + visible plan advancement ───────────────
-        plan_report = cognition.PlanComplianceReport(cognition.PlanComplianceSignal.NO_PLAN)
+        plan_report = cognition.PlanComplianceReport(
+            cognition.PlanComplianceSignal.NO_PLAN
+        )
         if light_cognition:
             plan_report = cognition.assess_plan_compliance(
                 plan_steps,
@@ -2492,63 +3214,90 @@ async def run_loop(
             )
             if plan_report.directive:
                 history.append({"role": "system", "content": plan_report.directive})
-                await publish_activity(task_id, {
-                    "type": "model_step",
-                    "iteration": iteration,
-                    "summary": "Checking plan fit after tool results.",
-                })
+                await publish_activity(
+                    task_id,
+                    {
+                        "type": "model_step",
+                        "iteration": iteration,
+                        "summary": "Checking plan fit after tool results.",
+                    },
+                )
             signal = tracker.record(
-                calls, tool_messages,
+                calls,
+                tool_messages,
                 args_for=lambda c: _parse_args(c.get("args_str", "{}")),
             )
             if signal != cognition.ProgressSignal.OK:
                 _pdir = tracker.directive(signal)
                 if _pdir:
                     history.append({"role": "system", "content": _pdir})
-                    await publish_activity(task_id, {
-                        "type": "model_step",
-                        "iteration": iteration,
-                        "summary": "Adjusting strategy after limited progress.",
-                    })
+                    await publish_activity(
+                        task_id,
+                        {
+                            "type": "model_step",
+                            "iteration": iteration,
+                            "summary": "Adjusting strategy after limited progress.",
+                        },
+                    )
                 # Difficulty-aware routing: a recurring error, a repeated identical
                 # call, or a stall means the current model is stuck — step up to a
                 # stronger one (once).
-                if signal in (
-                    cognition.ProgressSignal.REPEAT_ERROR,
-                    cognition.ProgressSignal.REPEAT_CALL,
-                    cognition.ProgressSignal.STALLED,
-                ) and not escalated:
+                if (
+                    signal
+                    in (
+                        cognition.ProgressSignal.REPEAT_ERROR,
+                        cognition.ProgressSignal.REPEAT_CALL,
+                        cognition.ProgressSignal.STALLED,
+                    )
+                    and not escalated
+                ):
                     _stronger = stronger_agent_model(effective_model)
                     if _stronger and _stronger != effective_model:
                         effective_model = _stronger
                         escalated = True
-                        await publish_activity(task_id, {
-                            "type": "model_step",
-                            "iteration": iteration,
-                            "summary": "Switching to a stronger model to get unstuck.",
-                        })
+                        await publish_activity(
+                            task_id,
+                            {
+                                "type": "model_step",
+                                "iteration": iteration,
+                                "summary": "Switching to a stronger model to get unstuck.",
+                            },
+                        )
             if tracker.should_force_finish:
-                history.append({
-                    "role": "system",
-                    "content": (
-                        "Controller: stop using tools now and deliver your best final answer "
-                        "from the evidence gathered so far."
-                    ),
-                })
+                history.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "Controller: stop using tools now and deliver your best final answer "
+                            "from the evidence gathered so far."
+                        ),
+                    }
+                )
             # Advance the user-visible plan on a productive (error-free) step.
             _productive = bool(tool_messages) and not state.get("last_tool_errors")
-            if plan_steps and _productive and plan_report.should_advance and current_plan_step < len(plan_steps) - 1:
-                await emit_activity(task_id, {
-                    "type": "step_done",
-                    "step": plan_steps[current_plan_step],
-                    "step_index": current_plan_step,
-                })
+            if (
+                plan_steps
+                and _productive
+                and plan_report.should_advance
+                and current_plan_step < len(plan_steps) - 1
+            ):
+                await emit_activity(
+                    task_id,
+                    {
+                        "type": "step_done",
+                        "step": plan_steps[current_plan_step],
+                        "step_index": current_plan_step,
+                    },
+                )
                 current_plan_step += 1
-                await emit_activity(task_id, {
-                    "type": "step_start",
-                    "step": plan_steps[current_plan_step],
-                    "step_index": current_plan_step,
-                })
+                await emit_activity(
+                    task_id,
+                    {
+                        "type": "step_start",
+                        "step": plan_steps[current_plan_step],
+                        "step_index": current_plan_step,
+                    },
+                )
 
         controller_ledger = cognition.build_task_ledger(
             goal,
@@ -2558,12 +3307,15 @@ async def run_loop(
             token_usage=token_usage,
         )
         trace_metrics = cognition.score_task_trace(history)
-        await publish_activity(task_id, {
-            "type": "controller_state",
-            "plan_signal": plan_report.signal,
-            "ledger": controller_ledger,
-            "trace_metrics": trace_metrics,
-        })
+        await publish_activity(
+            task_id,
+            {
+                "type": "controller_state",
+                "plan_signal": plan_report.signal,
+                "ledger": controller_ledger,
+                "trace_metrics": trace_metrics,
+            },
+        )
 
         # Persist after every iteration
         await _checkpoint(
@@ -2578,7 +3330,9 @@ async def run_loop(
                 "replans_used": budget.replans_used,
                 "ledger": controller_ledger,
                 "trace_metrics": trace_metrics,
-                "learning_notes": cognition.derive_trace_learning_notes(trace_metrics, controller_ledger),
+                "learning_notes": cognition.derive_trace_learning_notes(
+                    trace_metrics, controller_ledger
+                ),
                 "last_plan_signal": plan_report.signal,
             },
             token_usage=token_usage,
@@ -2586,10 +3340,13 @@ async def run_loop(
 
     # Max iterations exceeded
     error = "max_iterations_exceeded"
-    await save_task(task_id, status="failed", error=error, completed_at=datetime.now(timezone.utc))
+    await save_task(
+        task_id, status="failed", error=error, completed_at=datetime.now(timezone.utc)
+    )
     maxiter_msg_id = await _persist_to_conversation(
-        task, "The task ran for the maximum number of steps without finishing. "
-        "Try narrowing the goal or breaking it into smaller requests."
+        task,
+        "The task ran for the maximum number of steps without finishing. "
+        "Try narrowing the goal or breaking it into smaller requests.",
     )
     maxiter_event: dict[str, Any] = {"type": "task_failed", "error": error}
     if maxiter_msg_id:

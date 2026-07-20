@@ -60,3 +60,18 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  # ClamAV — private malware scanner for attachment and browser file ingress.
+  # Set MALWARE_SCAN_REQUIRED=true and CLAMAV_HOST=127.0.0.1 when the API runs
+  # on the host, or CLAMAV_HOST=clamav when the API is added to this compose
+  # network. Production runs the same daemon as an essential ECS sidecar.
+  clamav:
+    image: clamav/clamav:1.4.5-debian13-slim
+    ports:
+      - "127.0.0.1:3310:3310"
+    healthcheck:
+      test: ["CMD-SHELL", "clamdscan --ping=1 >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 180s

@@ -113,9 +113,12 @@ class SubAgentManager:
             },
         )
 
-        from runtime.executor import TaskExecutor
+        # Route child work through the same lease-coordinated runner as root
+        # tasks. This makes the child cancellable across replicas and prevents a
+        # detached TaskExecutor coroutine from outliving its cancelled parent.
+        from runtime import task_runner
 
-        asyncio.create_task(TaskExecutor().run(sub_task_id))
+        await task_runner.enqueue_task(sub_task_id, priority=5)
         return await self._forward_until_done(sub_task_id, parent_task["id"])
 
     async def _forward_until_done(self, sub_task_id: str, parent_task_id: str) -> dict[str, Any]:
@@ -131,6 +134,8 @@ class SubAgentManager:
                         return await self._summarize_result(sub_task_id, task)
                     if task and task.get("status") == "failed":
                         raise SubAgentFailed(task.get("error") or "sub-agent failed")
+                    if task and task.get("status") == "cancelled":
+                        raise SubAgentFailed(task.get("error") or "sub-agent cancelled")
                     await asyncio.sleep(0)
                     continue
                 event = json.loads(message["data"])

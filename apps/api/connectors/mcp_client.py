@@ -120,12 +120,33 @@ async def call_mcp(server: dict[str, Any], method: str, params: dict[str, Any] |
 class MCPConnector:
     async def execute(self, tool: str, args: dict[str, Any], agent: AgentContext) -> ToolResult:
         args.pop("__connector_tier", None)
+        args.pop("__org_id", None)
+        args.pop("__task_id", None)
+        args.pop("__member_id", None)
+        write_operation_id = str(args.pop("__write_operation_id", "") or "")
+        args.pop("__provider_idempotency_key", None)
         _, server_id, tool_name = tool.split(".", 2)
         repo = DatabaseConnectorRepository()
         server = await repo.get_mcp_server(server_id, tenant_id=agent.org_id)
         if not server:
             raise ValueError(f"MCP server not found: {server_id}")
-        result = await call_mcp(server, "tools/call", {"name": tool_name, "arguments": args})
+        try:
+            result = await call_mcp(
+                server, "tools/call", {"name": tool_name, "arguments": args}
+            )
+        except MCPTransportError:
+            if write_operation_id:
+                return ToolResult(
+                    data={
+                        "status": "ambiguous",
+                        "manual_review_required": True,
+                        "error": "MCP transport failed after tool dispatch",
+                    },
+                    summary=(
+                        f"MCP {tool_name} outcome is ambiguous; automatic retry is disabled"
+                    ),
+                )
+            raise
         return ToolResult(data={"server_id": server_id, "tool": tool_name, "result": result}, summary=f"MCP {tool_name} executed")
 
 

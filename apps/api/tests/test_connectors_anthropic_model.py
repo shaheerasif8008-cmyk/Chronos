@@ -170,12 +170,14 @@ async def test_tool_permission_round_trip():
 
 @pytest.mark.asyncio
 async def test_connectors_flow_over_http(monkeypatch):
+    from datetime import datetime, timezone
     import uuid
 
     import httpx
 
     import main
     from connectors import composio_client
+    from connectors.framework.repository import DatabaseConnectorRepository
     from core.auth import create_access_token
     from core.db import engine, reflect_table
 
@@ -183,8 +185,29 @@ async def test_connectors_flow_over_http(monkeypatch):
     # report as ready-to-connect without per-provider OAuth env vars.
     monkeypatch.setattr(composio_client, "is_configured", lambda: True)
 
+    async def verified_provider_health(*, refresh=False):
+        del refresh
+        return {
+            provider: {
+                "status": "verified",
+                "tier": "live",
+                "configured": True,
+                "verified": True,
+                "checked_at": "2026-07-12T12:00:00Z",
+                "verified_at": "2026-07-12T12:00:00Z",
+                "stale": False,
+                "latency_ms": 5,
+                "error_code": None,
+                "reason": "Composio control plane verified; a user grant still requires execution proof.",
+            }
+            for provider in ("gmail", "slack", "github", "google_drive")
+        }
+
+    monkeypatch.setattr("core.connector_health.check_connectors", verified_provider_health)
+
     org_id = str(uuid.uuid4())
     member_id = str(uuid.uuid4())
+    peer_id = str(uuid.uuid4())
     orgs = await reflect_table("organizations")
     members = await reflect_table("members")
     connectors_t = await reflect_table("connectors")
@@ -193,6 +216,11 @@ async def test_connectors_flow_over_http(monkeypatch):
         await conn.execute(
             members.insert().values(
                 id=member_id, organization_id=org_id, email=f"{member_id[:8]}@t.io", role="admin"
+            )
+        )
+        await conn.execute(
+            members.insert().values(
+                id=peer_id, organization_id=org_id, email=f"{peer_id[:8]}@t.io", role="operator"
             )
         )
         # A connected Slack account for this org.
@@ -205,6 +233,21 @@ async def test_connectors_flow_over_http(monkeypatch):
                 vault_ref=f"composio:slack:{org_id}:{member_id}",
                 status="active",
                 scopes=["chat:write"],
+                **({"member_id": member_id} if "member_id" in connectors_t.c else {}),
+            )
+        )
+        # A colleague's account must not be surfaced as this member's connected
+        # app or account handle.
+        await conn.execute(
+            connectors_t.insert().values(
+                id=f"notion:{org_id}:{peer_id}",
+                organization_id=org_id,
+                provider="notion",
+                account_handle="peer-private-workspace",
+                vault_ref=f"composio:notion:{org_id}:{peer_id}",
+                status="active",
+                scopes=["read_content"],
+                **({"member_id": peer_id} if "member_id" in connectors_t.c else {}),
             )
         )
 
@@ -220,6 +263,11 @@ async def test_connectors_flow_over_http(monkeypatch):
         assert apps["gmail"]["auth_mode"] == "composio"
         assert apps["slack"]["connected"] is True
         assert apps["slack"]["account_handle"] == "acme-workspace"
+        assert apps["slack"]["health_status"] == "connected_unverified"
+        assert apps["slack"]["health_verified_at"] == "2026-07-12T12:00:00Z"
+        assert apps["gmail"]["health_status"] == "verified"
+        assert apps["notion"]["connected"] is False
+        assert apps["notion"]["account_handle"] == ""
         slack_tools = {t["name"]: t for t in apps["slack"]["tools"]}
         assert "slack__send" in slack_tools and "slack__search" in slack_tools
         assert slack_tools["slack__search"]["permission"] == "default"
@@ -233,9 +281,39 @@ async def test_connectors_flow_over_http(monkeypatch):
         assert put.status_code == 200, put.text
         perms = await client.get("/connectors/tool-permissions", headers=auth)
         assert perms.json()["slack.search"] == "blocked"
+
+        await DatabaseConnectorRepository().upsert_connector_health(
+            tenant_id=org_id,
+            connector_id=f"slack:{org_id}:{member_id}",
+            status="healthy",
+            latency_ms=21,
+            failure_rate=0.0,
+            timeout_rate=0.0,
+            failure_count=0,
+            timeout_count=0,
+            total_count=1,
+            rate_limit_count=0,
+            last_success=True,
+        )
+        # The long-running local Postgres container can have a stale clock; pin
+        # this proof to the application clock so it exercises the recent-success
+        # branch rather than environmental clock drift.
+        health_t = await reflect_table("connector_health")
+        now = datetime.now(timezone.utc)
+        async with engine.begin() as conn:
+            await conn.execute(
+                health_t.update()
+                .where(
+                    (health_t.c.organization_id == org_id)
+                    & (health_t.c.connector_id == f"slack:{org_id}:{member_id}")
+                )
+                .values(last_success_at=now, updated_at=now)
+            )
         catalog2 = await client.get("/connectors/catalog", headers=auth)
         apps2 = {app["id"]: app for app in catalog2.json()}
         assert {t["name"]: t for t in apps2["slack"]["tools"]}["slack__search"]["permission"] == "blocked"
+        assert apps2["slack"]["health_status"] == "verified"
+        assert apps2["slack"]["health_latency_ms"] == 21
 
     # 3. The model's tool list for this org: connected Slack tools present,
     #    except the blocked one; unconnected live SaaS providers hidden.
@@ -248,13 +326,15 @@ async def test_connectors_flow_over_http(monkeypatch):
     from runtime.tool_registry import GMAIL_SEARCH, SLACK_SEARCH, SLACK_READ
 
     resolved = await ct.resolve_agent_tools(
-        [GMAIL_SEARCH, SLACK_SEARCH, SLACK_READ], org_id=org_id
+        [GMAIL_SEARCH, SLACK_SEARCH, SLACK_READ],
+        org_id=org_id,
+        member_id=member_id,
     )
     names = {t["function"]["name"] for t in resolved}
     assert names == {"slack__read"}
 
     # 4. And the system prompt block knows about all of it.
-    block = await ct.connectors_prompt_block(org_id)
+    block = await ct.connectors_prompt_block(org_id, member_id)
     assert "Slack (acme-workspace)" in block
     assert "Gmail" in block  # listed as available to connect
 

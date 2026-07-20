@@ -1,9 +1,11 @@
 """Billing endpoints (W4.2 / W4.3)."""
+
 from __future__ import annotations
 
 import dataclasses
+from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import select as _select
 
@@ -19,26 +21,58 @@ router = APIRouter(tags=["billing"])
 
 
 class CheckoutRequest(BaseModel):
-    plan: str
+    plan: Literal["pro", "enterprise"]
 
 
 @router.post("/settings/billing/checkout")
-async def billing_checkout(req: CheckoutRequest, member: Member = Depends(get_current_member)) -> dict:
+async def billing_checkout(
+    req: CheckoutRequest,
+    member: Member = Depends(get_current_member),
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+        max_length=255,
+    ),
+) -> dict:
     require_admin(member)
     try:
-        url = await billing.create_checkout(member.organization_id, req.plan)
+        url = await billing.create_checkout(
+            member.organization_id,
+            req.plan,
+            idempotency_key=idempotency_key,
+        )
+    except billing.BillingConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except billing.BillingInvalidPlan as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except billing.BillingNotConfigured as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except billing.BillingProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     return {"checkout_url": url}
 
 
 @router.post("/settings/billing/portal")
-async def billing_portal(member: Member = Depends(get_current_member)) -> dict:
+async def billing_portal(
+    member: Member = Depends(get_current_member),
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+        max_length=255,
+    ),
+) -> dict:
     require_admin(member)
     try:
-        url = await billing.create_portal(member.organization_id)
+        url = await billing.create_portal(
+            member.organization_id,
+            idempotency_key=idempotency_key,
+        )
+    except billing.BillingAccountNotFound as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except billing.BillingNotConfigured as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except billing.BillingProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     return {"portal_url": url}
 
 
@@ -80,5 +114,7 @@ async def billing_webhook(request: Request) -> dict:
     signature = request.headers.get("stripe-signature", "")
     try:
         return await billing.handle_webhook(payload, signature)
+    except billing.BillingWebhookError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except billing.BillingNotConfigured as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

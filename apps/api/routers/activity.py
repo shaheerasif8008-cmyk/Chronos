@@ -24,6 +24,8 @@ async def get_activity_actions(
     await permissions.check(member, "list_activity_actions", member.organization_id)
     return await list_activity_actions(
         member.organization_id,
+        member_id=member.id,
+        include_org_wide=member.role in {"admin", "owner"},
         event_type=type,
         status=status,
         task_id=task_id,

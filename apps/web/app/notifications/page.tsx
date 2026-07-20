@@ -1,18 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-
-const CONFIGURED_API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
-function apiBase() {
-  if (CONFIGURED_API_BASE) return CONFIGURED_API_BASE;
-  if (typeof window !== "undefined") {
-    const webPort = Number(window.location.port || "3000");
-    if (Number.isFinite(webPort) && webPort >= 3000 && webPort < 3100) {
-      return `http://${window.location.hostname}:${8000 + (webPort - 3000)}`;
-    }
-  }
-  return "http://localhost:8000";
-}
+import { apiFetch } from "../../lib/api";
 
 type Notification = {
   id: string;
@@ -27,19 +16,16 @@ type Notification = {
 };
 
 async function getJson<T>(path: string): Promise<T> {
-  const res = await fetch(`${apiBase()}${path}`, { credentials: "include" });
-  if (!res.ok) throw new Error(await res.text());
+  const res = await apiFetch(path);
   return res.json() as Promise<T>;
 }
 
 async function post(path: string, body?: object) {
-  const res = await fetch(`${apiBase()}${path}`, {
+  const res = await apiFetch(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: body ? JSON.stringify(body) : undefined,
-    credentials: "include",
   });
-  if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
 
@@ -55,8 +41,11 @@ export default function NotificationsPage() {
   const [unread, setUnread] = useState(0);
   const [error, setError] = useState("");
   const [showDismissed, setShowDismissed] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState("");
 
   const refresh = useCallback(async () => {
+    setLoading(true);
     setError("");
     try {
       const [list, count] = await Promise.all([
@@ -67,6 +56,8 @@ export default function NotificationsPage() {
       setUnread(count.count);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load notifications");
+    } finally {
+      setLoading(false);
     }
   }, [showDismissed]);
 
@@ -75,43 +66,81 @@ export default function NotificationsPage() {
   }, [refresh]);
 
   async function markAllRead() {
-    await post("/notifications/read", {});
-    await refresh();
+    setBusy("all");
+    try {
+      await post("/notifications/read", {});
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not mark notifications as read");
+    } finally {
+      setBusy("");
+    }
   }
   async function dismiss(id: string) {
-    await post("/notifications/dismiss", { ids: [id] });
-    await refresh();
+    setBusy(id);
+    try {
+      await post("/notifications/dismiss", { ids: [id] });
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not dismiss notification");
+    } finally {
+      setBusy("");
+    }
   }
 
   return (
-    <div className="max-w-2xl mx-auto p-6">
-      <div className="flex items-center justify-between mb-4">
-        <h1 className="text-[20px] font-semibold">
+    <main className="mobile-safe-bottom h-[100dvh] overflow-y-auto px-4 py-6 sm:px-6 sm:py-8">
+    <div className="mx-auto max-w-2xl" aria-busy={loading || Boolean(busy)}>
+      <div className="mb-5 flex flex-col items-start justify-between gap-4 sm:flex-row sm:items-end">
+        <header><a href="/chat" className="btn btn-ghost btn-sm -ml-2 mb-3">← Chronos workspace</a><h1 className="h-page">
           Notifications {unread > 0 && <span className="text-[13px] font-normal" style={{ color: "var(--text-dim)" }}>({unread} unread)</span>}
-        </h1>
-        <div className="flex gap-2">
-          <button className="btn btn-sm" onClick={() => setShowDismissed(v => !v)}>{showDismissed ? "Hide dismissed" : "Show dismissed"}</button>
-          <button className="btn btn-sm" onClick={() => void markAllRead()} disabled={unread === 0}>Mark all read</button>
+        </h1></header>
+        <div className="flex flex-wrap gap-2">
+          <button className="btn btn-secondary btn-sm" aria-pressed={showDismissed} disabled={loading || Boolean(busy)} onClick={() => setShowDismissed(v => !v)}>{showDismissed ? "Hide dismissed" : "Show dismissed"}</button>
+          <button className="btn btn-secondary btn-sm" aria-busy={busy === "all"} onClick={() => void markAllRead()} disabled={unread === 0 || loading || Boolean(busy)}>{busy === "all" ? "Marking read…" : "Mark all read"}</button>
         </div>
       </div>
-      {error && <div className="text-[13px] mb-3" style={{ color: "var(--danger, #dc2626)" }}>{error}</div>}
-      {items.length === 0 ? (
-        <div className="surface border border-soft rounded-xl p-6 text-center text-[13px]" style={{ color: "var(--text-dim)" }}>No notifications.</div>
+      {error && <div className="mb-3 rounded-lg border px-3 py-2 text-[13px]" role="alert" style={{ borderColor: "var(--danger)", color: "var(--danger)" }}>{error}</div>}
+      {loading ? (
+        <div className="surface rounded-xl border border-soft p-6 text-center text-[13px]" role="status" aria-live="polite" style={{ color: "var(--text-dim)" }}>Loading notifications…</div>
+      ) : items.length === 0 ? (
+        <div className="surface rounded-xl border border-soft p-6 text-center text-[13px]" role="status" style={{ color: "var(--text-dim)" }}>{showDismissed ? "No dismissed notifications." : "You’re all caught up."}</div>
       ) : (
-        <div className="surface border border-soft rounded-xl overflow-hidden">
+        <ul className="surface overflow-hidden rounded-xl border border-soft" aria-label="Notifications">
           {items.map(n => (
-            <div key={n.id} className="px-4 py-3 border-b hairline last:border-b-0 flex items-start gap-3">
-              <span className="mt-1.5 w-2 h-2 rounded-full flex-shrink-0" style={{ background: n.read_at ? "transparent" : SEVERITY_COLOR[n.severity] || "var(--text-dim)", border: n.read_at ? "1px solid var(--text-dim)" : "none" }} />
+            <li key={n.id} className="flex flex-wrap items-start gap-3 border-b hairline px-4 py-4 last:border-b-0 sm:flex-nowrap">
+              <span aria-hidden="true" className="mt-1.5 h-2 w-2 flex-shrink-0 rounded-full" style={{ background: n.read_at ? "transparent" : SEVERITY_COLOR[n.severity] || "var(--text-dim)", border: n.read_at ? "1px solid var(--text-dim)" : "none" }} />
               <div className="min-w-0 flex-1">
-                <div className="font-medium text-[13px]" style={{ color: SEVERITY_COLOR[n.severity] || "var(--text)" }}>{n.title}</div>
-                {n.body && <div className="text-[12px] mt-0.5 break-words" style={{ color: "var(--text-muted)" }}>{n.body}</div>}
-                <div className="text-[11px] mt-1" style={{ color: "var(--text-dim)" }}>{n.type}{n.created_at ? ` · ${new Date(n.created_at).toLocaleString()}` : ""}</div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <h2 className="text-[13px] font-medium" style={{ color: SEVERITY_COLOR[n.severity] || "var(--text)" }}>{n.title}</h2>
+                  <span className={`tag capitalize ${severityTagClass(n.severity)}`}>{n.severity || "info"}</span>
+                  <span className="sr-only">{n.read_at ? "Read" : "Unread"}</span>
+                </div>
+                {n.body && <p className="mt-1 break-words text-[12px] leading-5" style={{ color: "var(--text-muted)" }}>{n.body}</p>}
+                <p className="mt-1 text-[11px]" style={{ color: "var(--text-dim)" }}>{formatNotificationType(n.type)}{n.created_at ? <> · <time dateTime={n.created_at}>{formatTimestamp(n.created_at)}</time></> : null}</p>
               </div>
-              <button className="btn btn-sm" onClick={() => void dismiss(n.id)}>Dismiss</button>
-            </div>
+              <button className="btn btn-secondary btn-sm ml-5 sm:ml-0" aria-busy={busy === n.id} disabled={Boolean(busy)} onClick={() => void dismiss(n.id)}>{busy === n.id ? "Dismissing…" : "Dismiss"}</button>
+            </li>
           ))}
-        </div>
+        </ul>
       )}
     </div>
+    </main>
   );
+}
+
+function severityTagClass(severity: string): string {
+  if (severity === "critical") return "tag-danger";
+  if (severity === "warning") return "tag-warn";
+  if (severity === "success") return "tag-ok";
+  return "tag-info";
+}
+
+function formatTimestamp(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "Time unavailable" : date.toLocaleString();
+}
+
+function formatNotificationType(value: string): string {
+  return value.replaceAll("_", " ");
 }

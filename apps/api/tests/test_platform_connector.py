@@ -53,7 +53,7 @@ async def test_list_includes_mcp_api_and_browser(monkeypatch):
     monkeypatch.setattr(pf, "_get_repo",
                         lambda: _FakeRepo(servers=[{"id": "s1", "name": "Google Drive", "transport": "remote", "status": "active"}]))
 
-    async def fake_connected(org_id):
+    async def fake_connected(org_id, member_id=None):
         return [{"provider": "notion", "account_handle": "acme", "status": "active"}]
 
     monkeypatch.setattr(pf, "_connected_providers", fake_connected)
@@ -73,7 +73,7 @@ async def test_list_degrades_when_sources_fail(monkeypatch):
 
     monkeypatch.setattr(pf, "_get_repo", boom)
 
-    async def fake_connected(org_id):
+    async def fake_connected(org_id, member_id=None):
         raise RuntimeError("db down")
 
     monkeypatch.setattr(pf, "_connected_providers", fake_connected)
@@ -91,7 +91,8 @@ async def test_actions_mcp_returns_tool_schemas(monkeypatch):
         assert server_id == "s1"
         return {"status": "healthy", "tools": [
             {"name": "create_file", "description": "Create a file",
-             "inputSchema": {"type": "object", "properties": {"title": {"type": "string"}}}},
+             "inputSchema": {"type": "object", "properties": {"title": {"type": "string"}}},
+             "annotations": {"readOnlyHint": False}},
         ]}
 
     monkeypatch.setattr(pf, "_discover_mcp", fake_discover)
@@ -101,6 +102,7 @@ async def test_actions_mcp_returns_tool_schemas(monkeypatch):
     action = result.data["actions"][0]
     assert action["name"] == "create_file"
     assert action["parameters"]["properties"]["title"]["type"] == "string"
+    assert action["annotations"] == {"readOnlyHint": False}
 
 
 @pytest.mark.asyncio

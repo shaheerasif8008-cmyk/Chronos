@@ -71,6 +71,7 @@ class InMemoryConnectorRepository:
         self.traces: list[dict[str, Any]] = []
         self.trace_steps: list[dict[str, Any]] = []
         self.jobs: dict[str, dict[str, Any]] = {}
+        self.write_operations: dict[str, dict[str, Any]] = {}
         self.tool_plans: list[dict[str, Any]] = []
         self.policies: list[dict[str, Any]] = []
         self.workflows: dict[str, dict[str, Any]] = {}
@@ -141,6 +142,17 @@ class InMemoryConnectorRepository:
     async def get_action(self, connector_id: str, action_name: str) -> dict[str, Any] | None:
         action = self.actions.get((connector_id, action_name))
         return dict(action) if action else None
+
+    async def get_write_capabilities(
+        self, connector_id: str, action_name: str, *, tenant_id: str
+    ) -> dict[str, Any]:
+        connector = self.connectors.get(connector_id) or {}
+        action = self.actions.get((connector_id, action_name)) or {}
+        return {
+            "provider": connector.get("provider") or connector_id,
+            "idempotency_header": action.get("idempotency_header"),
+            "supports_reconciliation": bool(action.get("supports_reconciliation", False)),
+        }
 
     async def list_actions(self, connector_id: str) -> list[dict[str, Any]]:
         return [dict(action) for (cid, _), action in self.actions.items() if cid == connector_id]
@@ -331,12 +343,130 @@ class InMemoryConnectorRepository:
         return [dict(row) for row in self.trace_steps if row["trace_id"] == trace_id]
 
     async def create_execution_job(self, **values: Any) -> dict[str, Any]:
-        row = {"id": f"job_{len(self.jobs) + 1}", "status": "queued", "attempts": 0, "created_at": now_iso(), "updated_at": now_iso(), **values}
+        row = {"id": values.pop("id", None) or f"job_{len(self.jobs) + 1}", "status": "queued", "attempts": 0, "created_at": now_iso(), "updated_at": now_iso(), **values}
         self.jobs[row["id"]] = row
         return dict(row)
 
+    async def create_or_get_write_operation(self, **values: Any) -> dict[str, Any]:
+        for operation in self.write_operations.values():
+            if (
+                operation["organization_id"] == values["organization_id"]
+                and operation["member_id"] == values["member_id"]
+                and operation["tool"] == values["tool"]
+                and operation["idempotency_sha256"] == values["idempotency_sha256"]
+            ):
+                return dict(operation)
+        row = {
+            "attempts": 0,
+            "claim_owner": None,
+            "claim_expires_at": None,
+            "next_attempt_at": None,
+            "last_enqueued_at": None,
+            "provider_evidence": {},
+            "result": None,
+            "last_error": None,
+            "provider_responded_at": None,
+            "completed_at": None,
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+            **values,
+        }
+        self.write_operations[str(row["id"])] = row
+        return dict(row)
+
+    async def get_write_operation(
+        self, operation_id: str, *, organization_id: str
+    ) -> dict[str, Any] | None:
+        row = self.write_operations.get(str(operation_id))
+        return dict(row) if row and row["organization_id"] == organization_id else None
+
+    async def update_write_operation(
+        self,
+        operation_id: str,
+        *,
+        organization_id: str,
+        expected_statuses: list[str] | None = None,
+        **values: Any,
+    ) -> dict[str, Any] | None:
+        row = self.write_operations.get(str(operation_id))
+        if not row or row["organization_id"] != organization_id:
+            return None
+        if expected_statuses and row.get("status") not in expected_statuses:
+            return None
+        row.update(values)
+        row["updated_at"] = datetime.now(timezone.utc)
+        return dict(row)
+
+    async def claim_write_operation(
+        self,
+        operation_id: str,
+        *,
+        organization_id: str,
+        owner: str,
+        lease_expires_at: datetime,
+        now: datetime,
+    ) -> dict[str, Any] | None:
+        row = self.write_operations.get(str(operation_id))
+        if not row or row["organization_id"] != organization_id:
+            return None
+        expires = row.get("claim_expires_at")
+        if row.get("status") == "claimed" and expires and expires > now:
+            return None
+        if row.get("status") not in {"pending", "retry", "claimed"}:
+            return None
+        row.update(
+            status="claimed",
+            claim_owner=owner,
+            claim_expires_at=lease_expires_at,
+            attempts=int(row.get("attempts") or 0) + 1,
+            updated_at=now,
+        )
+        return dict(row)
+
+    async def list_recoverable_write_operations(
+        self, *, now: datetime, reenqueue_before: datetime, limit: int
+    ) -> list[dict[str, Any]]:
+        rows = []
+        for row in self.write_operations.values():
+            if row.get("channel") != "framework" or not row.get("encrypted_payload"):
+                continue
+            status = row.get("status")
+            claim_expired = status == "claimed" and row.get("claim_expires_at") and row["claim_expires_at"] <= now
+            due = status in {"pending", "retry", "provider_confirmed"} or claim_expired
+            old_enqueue = not row.get("last_enqueued_at") or row["last_enqueued_at"] <= reenqueue_before
+            if due and old_enqueue and (not row.get("next_attempt_at") or row["next_attempt_at"] <= now):
+                rows.append(dict(row))
+        return rows[:limit]
+
+    async def mark_write_operation_enqueued(
+        self, operation_id: str, *, organization_id: str, enqueued_at: datetime
+    ) -> None:
+        await self.update_write_operation(
+            operation_id,
+            organization_id=organization_id,
+            last_enqueued_at=enqueued_at,
+        )
+
+    async def purge_expired_write_operations(self, *, now: datetime, limit: int) -> int:
+        ids = [
+            operation_id
+            for operation_id, row in self.write_operations.items()
+            if row.get("status") in {"complete", "failed", "cancelled", "manual_review"}
+            and row.get("expires_at")
+            and row["expires_at"] <= now
+        ][:limit]
+        for operation_id in ids:
+            self.write_operations.pop(operation_id, None)
+        return len(ids)
+
     async def finish_execution_job(self, job_id: str, **values: Any) -> dict[str, Any]:
         row = self.jobs.get(job_id, {"id": job_id})
+        if row.get("status") == "cancelled":
+            write_outcome = bool(row.get("write_operation_id")) and values.get(
+                "status"
+            ) in {"success", "manual_review"}
+            if values.get("status") != "cancelled" and not write_outcome:
+                return dict(row)
         row.update(values)
         row["updated_at"] = now_iso()
         self.jobs[job_id] = row
@@ -356,6 +486,16 @@ class InMemoryConnectorRepository:
             raise ValueError("Execution job not found")
         row["status"] = "cancelled"
         row["updated_at"] = now_iso()
+        operation_id = row.get("write_operation_id")
+        if operation_id:
+            await self.update_write_operation(
+                str(operation_id),
+                organization_id=tenant_id,
+                expected_statuses=["pending", "retry"],
+                status="cancelled",
+                last_error="Connector write was cancelled before provider dispatch",
+                completed_at=datetime.now(timezone.utc),
+            )
         return dict(row)
 
     async def create_tool_execution_plan(self, **values: Any) -> dict[str, Any]:
@@ -389,6 +529,14 @@ class InMemoryConnectorRepository:
         return [dict(row) for row in rows[:limit]]
 
     async def create_workflow_run(self, **values: Any) -> dict[str, Any]:
+        idempotency_key = values.get("trigger_idempotency_key")
+        if idempotency_key:
+            for existing in self.workflow_runs.values():
+                if (
+                    existing.get("tenant_id") == values["tenant_id"]
+                    and existing.get("trigger_idempotency_key") == idempotency_key
+                ):
+                    return {**existing, "_idempotency_replayed": True}
         row = {"id": f"run_{len(self.workflow_runs) + 1}", "status": "pending", "created_at": now_iso(), "updated_at": now_iso(), **values}
         self.workflow_runs[row["id"]] = row
         return dict(row)
@@ -637,6 +785,45 @@ class DatabaseConnectorRepository:
             ).mappings().first()
         return dict(row) if row else None
 
+    async def get_write_capabilities(
+        self, connector_id: str, action_name: str, *, tenant_id: str
+    ) -> dict[str, Any]:
+        from sqlalchemy import select
+
+        from core.db import engine, reflect_table
+
+        connectors = await reflect_table("connectors")
+        async with engine.begin() as conn:
+            provider = (
+                await conn.execute(
+                    select(connectors.c.provider).where(
+                        connectors.c.id == connector_id,
+                        connectors.c.organization_id == tenant_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            header = None
+            if provider == "custom_http":
+                custom = await reflect_table("custom_http_connectors")
+                actions = await reflect_table("custom_http_actions")
+                header = (
+                    await conn.execute(
+                        select(actions.c.idempotency_header)
+                        .join(custom, custom.c.id == actions.c.custom_http_connector_id)
+                        .where(
+                            custom.c.organization_id == tenant_id,
+                            custom.c.connector_id == connector_id,
+                            actions.c.organization_id == tenant_id,
+                            actions.c.action_name == action_name,
+                        )
+                    )
+                ).scalar_one_or_none()
+        return {
+            "provider": provider or connector_id,
+            "idempotency_header": header,
+            "supports_reconciliation": False,
+        }
+
     async def list_actions(self, connector_id: str) -> list[dict[str, Any]]:
         from sqlalchemy import select
 
@@ -713,6 +900,7 @@ class DatabaseConnectorRepository:
         from core.db import engine, reflect_table
 
         table = await reflect_table("connector_execution_jobs")
+        write_operations = await reflect_table("connector_write_operations")
         async with engine.begin() as conn:
             row = (
                 await conn.execute(
@@ -722,6 +910,23 @@ class DatabaseConnectorRepository:
                     .returning(table)
                 )
             ).mappings().first()
+            if row and row.get("write_operation_id"):
+                await conn.execute(
+                    update(write_operations)
+                    .where(
+                        write_operations.c.id == row["write_operation_id"],
+                        write_operations.c.organization_id == tenant_id,
+                        write_operations.c.status.in_(["pending", "retry"]),
+                    )
+                    .values(
+                        status="cancelled",
+                        last_error="Connector write was cancelled before provider dispatch",
+                        completed_at=text("NOW()"),
+                        claim_owner=None,
+                        claim_expires_at=None,
+                        updated_at=text("NOW()"),
+                    )
+                )
         if not row:
             raise ValueError("Execution job not found or cannot be cancelled")
         return dict(row)
@@ -729,9 +934,8 @@ class DatabaseConnectorRepository:
     async def revoke_permission(self, *, tenant_id: str, workspace_id: str, employee_id: str, connector_id: str, action_name: str) -> None:
         from sqlalchemy import text
 
-        from core.db import engine, reflect_table
+        from core.db import engine
 
-        permissions = await reflect_table("connector_permissions")
         async with engine.begin() as conn:
             await conn.execute(
                 text(
@@ -919,6 +1123,7 @@ class DatabaseConnectorRepository:
                     .values(
                         organization_id=values["tenant_id"],
                         region=settings.region,
+                        task_id=values.get("task_id"),
                         workspace_id=values["workspace_id"],
                         employee_id=values["employee_id"],
                         user_id=values.get("user_id"),
@@ -1220,34 +1425,244 @@ class DatabaseConnectorRepository:
         from core.db import engine, reflect_table
 
         table = await reflect_table("connector_execution_jobs")
+        insert_values = {
+            "organization_id": values["tenant_id"],
+            "region": settings.region,
+            "task_id": values.get("task_id"),
+            "workspace_id": values["workspace_id"],
+            "employee_id": values["employee_id"],
+            "user_id": values.get("user_id"),
+            "connector_id": values["connector_id"],
+            "action_name": values["action_name"],
+            "arguments_redacted": redact_arguments(values.get("arguments") or {}),
+            "max_attempts": values.get("max_attempts", 1),
+            "timeout_ms": values.get("timeout_ms", 15000),
+            "write_operation_id": values.get("write_operation_id"),
+            "approval_id": values.get("approval_id"),
+        }
+        if values.get("id"):
+            insert_values["id"] = values["id"]
+        if insert_values.get("write_operation_id"):
+            import uuid
+
+            insert_values["write_operation_id"] = uuid.UUID(
+                str(insert_values["write_operation_id"])
+            )
         async with engine.begin() as conn:
             row = (
                 await conn.execute(
                     insert(table)
-                    .values(
-                        organization_id=values["tenant_id"],
-                        region=settings.region,
-                        workspace_id=values["workspace_id"],
-                        employee_id=values["employee_id"],
-                        user_id=values.get("user_id"),
-                        connector_id=values["connector_id"],
-                        action_name=values["action_name"],
-                        arguments_redacted=redact_arguments(values.get("arguments") or {}),
-                        max_attempts=values.get("max_attempts", 1),
-                        timeout_ms=values.get("timeout_ms", 15000),
-                    )
+                    .values(**insert_values)
                     .returning(table)
                 )
             ).mappings().first()
         return dict(row)
 
-    async def finish_execution_job(self, job_id: str, **values: Any) -> dict[str, Any]:
+    async def create_or_get_write_operation(self, **values: Any) -> dict[str, Any]:
+        import uuid
+
+        from sqlalchemy import select
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        from core.db import engine, reflect_table
+
+        table = await reflect_table("connector_write_operations")
+        insert_values = {**values, "id": uuid.UUID(str(values["id"]))}
+        async with engine.begin() as conn:
+            await conn.execute(
+                pg_insert(table)
+                .values(**insert_values)
+                .on_conflict_do_nothing(
+                    constraint="uq_connector_write_operation_identity"
+                )
+            )
+            row = (
+                await conn.execute(
+                    select(table).where(
+                        table.c.organization_id == values["organization_id"],
+                        table.c.member_id == values["member_id"],
+                        table.c.tool == values["tool"],
+                        table.c.idempotency_sha256 == values["idempotency_sha256"],
+                    )
+                )
+            ).mappings().one()
+        return dict(row)
+
+    async def get_write_operation(
+        self, operation_id: str, *, organization_id: str
+    ) -> dict[str, Any] | None:
+        import uuid
+
+        from sqlalchemy import select
+
+        from core.db import engine, reflect_table
+
+        table = await reflect_table("connector_write_operations")
+        async with engine.begin() as conn:
+            row = (
+                await conn.execute(
+                    select(table).where(
+                        table.c.id == uuid.UUID(str(operation_id)),
+                        table.c.organization_id == organization_id,
+                    )
+                )
+            ).mappings().first()
+        return dict(row) if row else None
+
+    async def update_write_operation(
+        self,
+        operation_id: str,
+        *,
+        organization_id: str,
+        expected_statuses: list[str] | None = None,
+        **values: Any,
+    ) -> dict[str, Any] | None:
+        import uuid
+
         from sqlalchemy import text, update
+
+        from core.db import engine, reflect_table
+
+        table = await reflect_table("connector_write_operations")
+        statement = (
+            update(table)
+            .where(
+                table.c.id == uuid.UUID(str(operation_id)),
+                table.c.organization_id == organization_id,
+            )
+            .values(**values, updated_at=text("NOW()"))
+            .returning(table)
+        )
+        if expected_statuses:
+            statement = statement.where(table.c.status.in_(expected_statuses))
+        async with engine.begin() as conn:
+            row = (await conn.execute(statement)).mappings().first()
+        return dict(row) if row else None
+
+    async def claim_write_operation(
+        self,
+        operation_id: str,
+        *,
+        organization_id: str,
+        owner: str,
+        lease_expires_at: datetime,
+        now: datetime,
+    ) -> dict[str, Any] | None:
+        import uuid
+
+        from sqlalchemy import and_, or_, text, update
+
+        from core.db import engine, reflect_table
+
+        table = await reflect_table("connector_write_operations")
+        claimable = or_(
+            table.c.status.in_(["pending", "retry"]),
+            and_(
+                table.c.status == "claimed",
+                or_(
+                    table.c.claim_expires_at.is_(None),
+                    table.c.claim_expires_at <= now,
+                ),
+            ),
+        )
+        async with engine.begin() as conn:
+            row = (
+                await conn.execute(
+                    update(table)
+                    .where(
+                        table.c.id == uuid.UUID(str(operation_id)),
+                        table.c.organization_id == organization_id,
+                        claimable,
+                    )
+                    .values(
+                        status="claimed",
+                        claim_owner=owner,
+                        claim_expires_at=lease_expires_at,
+                        attempts=table.c.attempts + 1,
+                        updated_at=text("NOW()"),
+                    )
+                    .returning(table)
+                )
+            ).mappings().first()
+        return dict(row) if row else None
+
+    async def list_recoverable_write_operations(
+        self, *, now: datetime, reenqueue_before: datetime, limit: int
+    ) -> list[dict[str, Any]]:
+        from sqlalchemy import and_, or_, select
+
+        from core.db import engine, reflect_table
+
+        table = await reflect_table("connector_write_operations")
+        due_status = or_(
+            table.c.status.in_(["pending", "retry", "provider_confirmed"]),
+            and_(table.c.status == "claimed", table.c.claim_expires_at <= now),
+        )
+        async with engine.begin() as conn:
+            rows = (
+                await conn.execute(
+                    select(table)
+                    .where(
+                        table.c.channel == "framework",
+                        table.c.encrypted_payload.is_not(None),
+                        due_status,
+                        or_(table.c.next_attempt_at.is_(None), table.c.next_attempt_at <= now),
+                        or_(table.c.last_enqueued_at.is_(None), table.c.last_enqueued_at <= reenqueue_before),
+                    )
+                    .order_by(table.c.created_at.asc())
+                    .limit(limit)
+                )
+            ).mappings().all()
+        return [dict(row) for row in rows]
+
+    async def mark_write_operation_enqueued(
+        self, operation_id: str, *, organization_id: str, enqueued_at: datetime
+    ) -> None:
+        await self.update_write_operation(
+            operation_id,
+            organization_id=organization_id,
+            last_enqueued_at=enqueued_at,
+        )
+
+    async def purge_expired_write_operations(self, *, now: datetime, limit: int) -> int:
+        from sqlalchemy import delete, select
+
+        from core.db import engine, reflect_table
+
+        table = await reflect_table("connector_write_operations")
+        async with engine.begin() as conn:
+            ids = (
+                await conn.execute(
+                    select(table.c.id)
+                    .where(
+                        table.c.status.in_(["complete", "failed", "cancelled", "manual_review"]),
+                        table.c.expires_at <= now,
+                    )
+                    .limit(limit)
+                )
+            ).scalars().all()
+            if ids:
+                await conn.execute(delete(table).where(table.c.id.in_(ids)))
+        return len(ids)
+
+    async def finish_execution_job(self, job_id: str, **values: Any) -> dict[str, Any]:
+        from sqlalchemy import select, text, update
 
         from core.db import engine, reflect_table
 
         table = await reflect_table("connector_execution_jobs")
         async with engine.begin() as conn:
+            current = (
+                await conn.execute(
+                    select(table).where(table.c.id == job_id).with_for_update()
+                )
+            ).mappings().first()
+            if current and current.get("status") == "cancelled":
+                write_outcome = bool(current.get("write_operation_id")) and values[
+                    "status"
+                ] in {"success", "manual_review"}
+                if values["status"] != "cancelled" and not write_outcome:
+                    return dict(current)
             row = (
                 await conn.execute(
                     update(table)
@@ -1395,7 +1810,8 @@ class DatabaseConnectorRepository:
         return [dict(row) for row in rows]
 
     async def create_workflow_run(self, **values: Any) -> dict[str, Any]:
-        from sqlalchemy import insert, text
+        from sqlalchemy import select, text
+        from sqlalchemy.dialects.postgresql import insert
 
         from core.config import settings
         from core.db import engine, reflect_table
@@ -1412,17 +1828,33 @@ class DatabaseConnectorRepository:
             "correlation_id": values["correlation_id"],
             "started_at": text("NOW()") if values.get("status") == "running" else None,
         }
-        for key in ("trigger_source", "trigger_event_type", "trigger_payload"):
+        for key in (
+            "trigger_source",
+            "trigger_event_type",
+            "trigger_payload",
+            "trigger_idempotency_key",
+        ):
             if key in table.c and key in values:
                 payload[key] = values.get(key)
         async with engine.begin() as conn:
-            row = (
-                await conn.execute(
-                    insert(table)
-                    .values(**payload)
-                    .returning(table)
+            statement = insert(table).values(**payload)
+            idempotency_key = values.get("trigger_idempotency_key")
+            if idempotency_key and "trigger_idempotency_key" in table.c:
+                statement = statement.on_conflict_do_nothing(
+                    index_elements=[table.c.organization_id, table.c.trigger_idempotency_key],
+                    index_where=table.c.trigger_idempotency_key.is_not(None),
                 )
-            ).mappings().first()
+            row = (await conn.execute(statement.returning(table))).mappings().first()
+            if row is None and idempotency_key:
+                existing = (
+                    await conn.execute(
+                        select(table).where(
+                            table.c.organization_id == values["tenant_id"],
+                            table.c.trigger_idempotency_key == idempotency_key,
+                        )
+                    )
+                ).mappings().one()
+                return {**dict(existing), "_idempotency_replayed": True}
         return dict(row)
 
     async def get_workflow_run(self, run_id: str, *, tenant_id: str) -> dict[str, Any] | None:
