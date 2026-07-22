@@ -67,11 +67,15 @@ def test_settings_never_load_unrelated_cwd_env(tmp_path: Path, monkeypatch):
         "DATABASE_URL=postgresql+asyncpg://wrong:wrong@localhost:1/wrong\n"
     )
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("AWS_S3_BUCKET", raising=False)
+    # Provide a legitimate bucket via the real environment so the object-storage
+    # validator is satisfied; the assertions below then prove the stray cwd .env
+    # was ignored in favor of the real environment.
+    monkeypatch.setenv("AWS_S3_BUCKET", "legit-env-bucket")
     monkeypatch.delenv("DATABASE_URL", raising=False)
 
     loaded = Settings()
 
+    assert loaded.aws_s3_bucket == "legit-env-bucket"
     assert loaded.aws_s3_bucket != "attacker-controlled-bucket"
     assert "localhost:1/wrong" not in loaded.database_url
 
